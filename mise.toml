@@ -2,7 +2,7 @@
 # git is a system prerequisite (not in the mise registry); the devcontainer ships 2.47.3.
 [tools]
 rust = { version = "1.98.1", components = ["rustfmt", "clippy"] }
-"cargo:cargo-nextest" = "0.9.143"
+"cargo:cargo-nextest" = "0.9.144"
 cargo-insta = "1.48.0"
 "cargo:cargo-audit" = "0.22.2"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
@@ -11,7 +11,7 @@ gitleaks = "8.30.1"
 tmux = "3.7c"
 gh = "2.100.0"
 nono = "0.76.0"
-claude = "2.1.267"
+claude = "2.1.268"
 
 [tasks.fmt]
 description = "Format the core workspace and every standalone plugin project"

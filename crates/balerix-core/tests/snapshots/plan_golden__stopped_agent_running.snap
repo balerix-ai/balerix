@@ -1,0 +1,6 @@
+---
+source: crates/balerix-core/tests/plan_golden.rs
+expression: "go(Some(&f), Keep::default(), &[\"bob\"], &st, &running(&f))"
+---
+stop payments/backend/bob
+ensure-crew payments/backend

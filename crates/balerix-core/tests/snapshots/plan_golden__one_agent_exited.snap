@@ -1,0 +1,9 @@
+---
+source: crates/balerix-core/tests/plan_golden.rs
+expression: "format!(\"-- unnoted exit --\\n{noted_next}-- dead --\\n{dead}\")"
+---
+-- unnoted exit --
+ensure-crew payments/backend
+note-exit payments/backend/bob Some(1)
+-- dead --
+ensure-crew payments/backend

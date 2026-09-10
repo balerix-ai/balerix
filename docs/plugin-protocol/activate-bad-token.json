@@ -1,0 +1,8 @@
+{
+  "route": "POST /v1/activate",
+  "direction": "daemon-to-plugin",
+  "headers": { "authorization": "Bearer nope" },
+  "request": { "agent": "payments/backend/bob", "config": { "initial": "working" } },
+  "status": 401,
+  "response": { "error": "bad daemon token" }
+}

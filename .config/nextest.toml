@@ -1,0 +1,8 @@
+# A hung test fails instead of waiting for a person: nextest marks a test slow
+# after each `period` and terminates it (SIGTERM, then SIGKILL) after
+# `terminate-after` periods. The e2e journeys finish in seconds; three minutes
+# is well inside the CI budget and far outside any honest run. A killed test
+# leaks its detached daemon and tmux server — the next run's sweep of dead-pid
+# roots and sockets (`balerix_runtime::testing::TempRoot`) reaps them.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }

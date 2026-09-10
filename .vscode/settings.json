@@ -1,0 +1,8 @@
+{
+  "rust-analyzer.linkedProjects": [
+    "Cargo.toml",
+    "plugins/flow/Cargo.toml",
+    "plugins/web/Cargo.toml",
+    "plugins/matrix/Cargo.toml"
+  ]
+}

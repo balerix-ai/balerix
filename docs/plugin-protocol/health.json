@@ -1,0 +1,8 @@
+{
+  "route": "GET /v1/health",
+  "direction": "daemon-to-plugin",
+  "headers": { "authorization": "Bearer tok" },
+  "request": null,
+  "status": 200,
+  "raw": "b2s="
+}

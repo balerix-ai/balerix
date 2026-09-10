@@ -1,0 +1,8 @@
+{
+  "route": "POST /v1/plugin-host/hello",
+  "direction": "plugin-to-daemon",
+  "token": "wrong",
+  "request": { "name": "flow", "version": "0.1.0", "protocol": 1, "listen": "127.0.0.1:4000" },
+  "status": 401,
+  "response": { "error": "unknown plugin or bad token" }
+}

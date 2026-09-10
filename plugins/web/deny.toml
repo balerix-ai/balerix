@@ -1,0 +1,23 @@
+[advisories]
+ignore = []
+
+[licenses]
+# The allowance list is deliberately broader than this project's tree, so a
+# legitimate new dependency does not fail the audit tier; don't warn about
+# the entries nothing here happens to use.
+unused-allowed-license = "allow"
+allow = [
+  "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
+  "ISC", "Zlib", "Unicode-3.0", "Unicode-DFS-2016", "MPL-2.0", "CC0-1.0", "0BSD",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies on the core crates carry no version; every crate is
+# `publish = false`.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

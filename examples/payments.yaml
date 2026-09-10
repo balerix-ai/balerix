@@ -1,0 +1,44 @@
+apiVersion: balerix/v1
+kind: Fleet
+name: payments
+defaults:
+  claude:
+    settings: { model: sonnet, permissions: { allow: ["Bash(git *)"] } }
+    args: ["--verbose"]
+    resume: true
+  sandbox:
+    network: { mode: allow }
+  tools: { node: "22.11.0" }
+  env: { RUST_LOG: info }
+  runner: { type: tmux }
+  plugins:
+    web: {}          # every agent gets a browser terminal (balerix plugin open web)
+crews:
+  backend:
+    repo: acme/payments-api
+    ref: main
+    git: { push: true, auth: gh }
+    defaults:
+      tools: { python: "3.12.8" }
+    agents:
+      alice:
+        # The flow plugin (declare it in plugins.yaml first): block recursive
+        # deletes, and after Claude's first Stop ask for the tests once.
+        plugins:
+          flow:
+            initial: working
+            states:
+              working:
+                on:
+                  - event: PreToolUse
+                    match: { /tool_input/command: "rm -rf.*" }   # full-match
+                    respond: { decision: block, reason: "no recursive deletes" }
+                  - event: Stop
+                    goto: review
+                    send: { text: "Run the tests and fix any failures." }
+              review:
+                on:
+                  - event: Stop
+                    goto: done
+              done: {}
+      bob: { claude: { settings: { model: opus } } }

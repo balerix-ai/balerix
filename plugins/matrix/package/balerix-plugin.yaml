@@ -1,0 +1,15 @@
+apiVersion: balerix/v1
+kind: Plugin
+name: matrix
+version: 0.1.0
+protocol: 1
+start: serve
+# Every event is observed: the set is per-agent config (Spec G-3), so the
+# filtering is the plugin's job, not the subscription's.
+hooks:
+  observe: [SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, SubagentStop, PreCompact]
+  intercept: []
+# fleets: the phase-change feed. actions: send_text. kv: the maps and the
+# sealed session.
+needs: [fleets, actions, kv]
+routes: false

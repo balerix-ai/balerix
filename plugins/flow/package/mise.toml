@@ -1,0 +1,7 @@
+# The development package layout (plugins spec §17.6): the binary is copied
+# into bin/ by `mise run package-plugins`. A release package pins the binary
+# as a mise tool instead and carries no binary of its own.
+[tools]
+
+[tasks.serve]
+run = "./bin/balerix-plugin-flow"

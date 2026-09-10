@@ -1,0 +1,43 @@
+[package]
+name = "balerix-server"
+description = "The balerix daemon: fleet registry, reconcile tasks, HTTP API, hook ingress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+balerix-api = { workspace = true }
+balerix-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+prometheus = { workspace = true }
+chacha20poly1305 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+serde_norway = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+ureq = { workspace = true }
+reqwest = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tracing = { workspace = true }
+# `testing.rs` is a library module (integration tests and the daemon's own
+# tests share it) and its harness owns temporary directories.
+tempfile = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+balerix-plugin-sdk = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+
+[lints]
+workspace = true

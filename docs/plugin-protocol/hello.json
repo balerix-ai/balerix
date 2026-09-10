@@ -1,0 +1,7 @@
+{
+  "route": "POST /v1/plugin-host/hello",
+  "direction": "plugin-to-daemon",
+  "request": { "name": "flow", "version": "0.1.0", "protocol": 1, "listen": "127.0.0.1:4000" },
+  "status": 200,
+  "response": { "config": { "greeting": "hi" } }
+}

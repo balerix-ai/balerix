@@ -1,0 +1,7 @@
+---
+source: crates/balerix-core/tests/plan_golden.rs
+expression: "go(None, Keep { repos: true, sessions: false }, &st, &running(&f))"
+---
+stop payments/backend/alice
+stop payments/backend/bob
+remove-crew payments/backend keep-repos=true keep-sessions=false

@@ -1,0 +1,48 @@
+---
+source: src/render.rs
+expression: "rendered.join(\"\\n\\n---\\n\\n\")"
+---
+SessionStart
+session restarted (compact)
+
+---
+
+SessionEnd
+**session ended** (clear)
+
+---
+
+Notification
+**needs you:** Claude needs your permission to use Bash
+
+---
+
+Stop
+**turn finished**
+
+---
+
+SubagentStop
+subagent finished
+
+---
+
+UserPromptSubmit
+**prompt**
+
+run the tests
+
+---
+
+PreToolUse
+running `Bash` cargo test
+
+---
+
+PostToolUse
+finished `Write` src/a.rs
+
+---
+
+PreCompact
+compacting (auto)

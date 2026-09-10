@@ -1,0 +1,43 @@
+[package]
+name = "balerix"
+description = "Control plane and orchestrator for fleets of coding agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "balerix"
+path = "src/main.rs"
+
+[dependencies]
+balerix-api = { workspace = true }
+balerix-config = { workspace = true }
+balerix-core = { workspace = true }
+balerix-plugin-sdk = { workspace = true }
+balerix-runtime = { workspace = true }
+balerix-server = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+serde_norway = { workspace = true }
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+ureq = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+
+[lints]
+workspace = true

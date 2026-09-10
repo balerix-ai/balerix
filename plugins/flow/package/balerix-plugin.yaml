@@ -1,0 +1,12 @@
+apiVersion: balerix/v1
+kind: Plugin
+name: flow
+version: 0.1.0
+protocol: 1
+start: serve
+hooks:
+  # every event: a rule may name any of the nine (spec §8.1)
+  intercept: [SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, SubagentStop, PreCompact]
+  observe: []
+needs: [actions, kv]
+routes: false

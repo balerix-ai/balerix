@@ -1,0 +1,7 @@
+---
+source: crates/balerix-core/tests/plan_golden.rs
+expression: "go(Some(&f), Keep::default(), &[], &st, &obs)"
+---
+ensure-crew payments/backend
+materialize payments/backend/bob
+start payments/backend/bob 89cf4262

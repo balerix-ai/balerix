@@ -1,0 +1,7 @@
+{
+  "route": "GET /v1/plugin-host/kv/state/payments/backend/bob",
+  "direction": "plugin-to-daemon",
+  "request": null,
+  "status": 200,
+  "raw": "d29ya2luZw=="
+}

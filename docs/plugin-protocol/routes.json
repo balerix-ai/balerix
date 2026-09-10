@@ -1,0 +1,8 @@
+{
+  "route": "GET /v1/routes",
+  "direction": "daemon-to-plugin",
+  "headers": { "authorization": "Bearer tok", "x-balerix-forwarded-prefix": "/v1/plugins/flow" },
+  "request": null,
+  "status": 200,
+  "raw": "aGVsbG8gZnJvbSByb3V0ZXMK"
+}

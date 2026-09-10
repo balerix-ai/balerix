@@ -1,0 +1,18 @@
+apiVersion: balerix/v1
+kind: Fleet
+name: overrides
+defaults:
+  claude: { args: ["--verbose", "--debug"] }
+  tools: { node: "22.11.0", python: "3.12.8" }
+  env: { RUST_LOG: info, FOO: bar }
+crews:
+  web:
+    repo: https://github.com/acme/web.git
+    defaults:
+      tools: { python: null }   # crew deletes python
+      env: { FOO: null }        # and FOO
+    agents:
+      carol:
+        claude: { args: ["--quiet"] }   # list replaces, never appends
+      dave:
+        tools: { python: "3.13.1" }     # re-adds python after the crew deleted it

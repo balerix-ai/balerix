@@ -1,0 +1,48 @@
+---
+source: crates/balerix-config/tests/resolve_golden.rs
+expression: spec
+---
+name: overrides
+tools:
+  node: 22.11.0
+  python: 3.12.8
+crews:
+  web:
+    repo: "https://github.com/acme/web.git"
+    ref: main
+    git:
+      push: true
+      auth: gh
+    agents:
+      carol:
+        claude:
+          settings: {}
+          args:
+            - "--quiet"
+          resume: false
+          binary: claude
+        sandbox: {}
+        tools:
+          node: 22.11.0
+        env:
+          RUST_LOG: info
+        runner:
+          type: tmux
+        plugins: {}
+      dave:
+        claude:
+          settings: {}
+          args:
+            - "--verbose"
+            - "--debug"
+          resume: false
+          binary: claude
+        sandbox: {}
+        tools:
+          node: 22.11.0
+          python: 3.13.1
+        env:
+          RUST_LOG: info
+        runner:
+          type: tmux
+        plugins: {}

@@ -1,0 +1,20 @@
+# gitleaks' defaults plus one narrow exception.
+#
+# The vendored xterm.js build (plugins/web/assets/) is minified
+# JavaScript: `t.FourKeyMap=void 0` and `t.SequencerByKey=void 0` read to the
+# generic-api-key entropy heuristic as `<something>Key=<high-entropy value>`.
+# They are not secrets, and nothing in these files is written by us — they are
+# fetched verbatim by scripts/vendor-xterm.sh and verified against the sha256
+# digests recorded in assets/VENDOR.md, which is the actual supply-chain
+# control here. Only the three vendored files are excepted, by name; every
+# other path, this crate's own sources included, is scanned as before.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Vendored xterm.js assets: minified upstream builds, digest-pinned in VENDOR.md"
+paths = [
+  '''^plugins/web/assets/xterm\.js$''',
+  '''^plugins/web/assets/xterm\.css$''',
+  '''^plugins/web/assets/addon-fit\.js$''',
+]

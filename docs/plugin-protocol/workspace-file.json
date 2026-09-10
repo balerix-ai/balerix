@@ -1,0 +1,7 @@
+{
+  "route": "GET /v1/plugin-host/agents/payments/backend/bob/workspace/file?path=src/lib.rs",
+  "direction": "plugin-to-daemon",
+  "request": null,
+  "status": 200,
+  "raw": "Zm4gbWFpbigpIHt9Cg=="
+}

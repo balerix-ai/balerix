@@ -1,0 +1,7 @@
+{
+  "route": "GET /v1/plugin-host/agents/payments/backend/bob/workspace/version",
+  "direction": "plugin-to-daemon",
+  "request": null,
+  "status": 200,
+  "response": { "head": "b7e0d44a1c2f3e4d5a6b7c8d9e0f1a2b3c4d5e6f", "fingerprint": "6c4fae760ca8310c7986d6dd7138c73d849f643736bd2c1c19f29bd24bed4dbf" }
+}

@@ -1,0 +1,8 @@
+{
+  "route": "GET /v1/metrics",
+  "direction": "daemon-to-plugin",
+  "headers": { "authorization": "Bearer tok" },
+  "request": null,
+  "status": 200,
+  "raw": "IyBIRUxQIGJhbGVyaXhfcGx1Z2luX2Zsb3dfc3RhdGUgQ3VycmVudCBmbG93IHN0YXRlICgxIGZvciB0aGUgY3VycmVudCBzdGF0ZSkKIyBUWVBFIGJhbGVyaXhfcGx1Z2luX2Zsb3dfc3RhdGUgZ2F1Z2UKYmFsZXJpeF9wbHVnaW5fZmxvd19zdGF0ZXthZ2VudD0iYm9iIixzdGF0ZT0id29ya2luZyJ9IDEK"
+}

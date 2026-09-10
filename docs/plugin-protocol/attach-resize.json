@@ -1,0 +1,7 @@
+{
+  "route": "GET /v1/plugin-host/agents/payments/backend/bob/attach",
+  "direction": "plugin-to-daemon",
+  "transport": "websocket",
+  "frame": { "resize": { "cols": 120, "rows": 40 } },
+  "status": 101
+}

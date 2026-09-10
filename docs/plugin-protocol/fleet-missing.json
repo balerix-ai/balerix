@@ -1,0 +1,7 @@
+{
+  "route": "GET /v1/plugin-host/fleets/nope",
+  "direction": "plugin-to-daemon",
+  "request": null,
+  "status": 404,
+  "response": { "error": "fleet not found" }
+}

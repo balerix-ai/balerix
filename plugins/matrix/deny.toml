@@ -1,0 +1,45 @@
+# The matrix plugin's own policy. These four entries were repository-wide
+# until Spec H; they belong to the one artifact that actually carries the
+# risk. Everything else matches the core and sibling-plugin policies.
+[advisories]
+ignore = [
+  # `bitmaps`, archived upstream, reaches us through
+  # imbl -> eyeball-im -> matrix-sdk (the observable collections the SDK
+  # publishes room lists through).
+  { id = "RUSTSEC-2026-0247", reason = "bitmaps is unmaintained; a transitive dependency of matrix-sdk through imbl, with no upgrade available" },
+  # `proc-macro-error2` reaches us through aquamarine, the diagram macro
+  # matrix-sdk uses in its own rustdoc. Build-time only; nothing it expands
+  # ends up in the binary.
+  { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is unmaintained; a build-time dependency of matrix-sdk's rustdoc macro (aquamarine), with no upgrade available" },
+]
+
+[licenses]
+# The allowance list is deliberately broader than this project's tree, so a
+# legitimate new dependency does not fail the audit tier; don't warn about
+# the entries nothing here happens to use.
+unused-allowed-license = "allow"
+allow = [
+  "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
+  "ISC", "Zlib", "Unicode-3.0", "Unicode-DFS-2016", "MPL-2.0", "CC0-1.0", "0BSD",
+  # The Mozilla root certificate bundle, as data: `webpki-roots` (a direct
+  # dependency of matrix-sdk) and `webpki-root-certs` (through
+  # rustls-platform-verifier, which reqwest's `rustls` feature pulls in).
+  # A permissive data licence with no copyleft, whose only condition on
+  # redistribution is that its disclaimer travels with the data.
+  "CDLA-Permissive-2.0",
+  # `xxhash-rust`, through growable-bloom-filter in matrix-sdk-base. The
+  # Boost licence: OSI approved, FSF free, permissive, and it does not even
+  # require the notice in a binary distribution.
+  "BSL-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies on the core crates carry no version; every crate is
+# `publish = false`.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

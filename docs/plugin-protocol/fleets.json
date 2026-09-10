@@ -1,0 +1,15 @@
+{
+  "route": "GET /v1/plugin-host/fleets",
+  "direction": "plugin-to-daemon",
+  "request": null,
+  "status": 200,
+  "response": [
+    {
+      "spec": { "name": "payments", "crews": {} },
+      "generation": 1,
+      "desired": { "state": "up" },
+      "stopped": [],
+      "status": { "generation": 1, "observed_generation": 1, "phase": "ready", "agents": {} }
+    }
+  ]
+}

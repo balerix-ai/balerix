@@ -1,0 +1,8 @@
+{
+  "route": "POST /v1/activate",
+  "direction": "daemon-to-plugin",
+  "headers": { "authorization": "Bearer tok" },
+  "request": { "agent": "payments/backend/bob", "config": { "initial": "working" } },
+  "status": 200,
+  "response": {}
+}

@@ -1,0 +1,7 @@
+{
+  "route": "GET /v1/plugin-host/agents/payments/backend/bob/workspace/tree?path=src",
+  "direction": "plugin-to-daemon",
+  "request": null,
+  "status": 200,
+  "response": { "path": "src", "entries": [ { "name": "lib.rs", "kind": "file", "size": 13 } ] }
+}

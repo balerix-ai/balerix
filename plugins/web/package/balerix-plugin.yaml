@@ -1,0 +1,13 @@
+apiVersion: balerix/v1
+kind: Plugin
+name: web
+version: 0.2.0
+protocol: 1
+start: serve
+# phases come from fleets/watch (plugins spec §18.5); every event is
+# observed for the review page's activity column (Spec C §4.1)
+hooks:
+  observe: [SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, SubagentStop, PreCompact]
+# actions: the review is a send_text; workspace: the diff, file and tree routes
+needs: [fleets, attach, actions, workspace]
+routes: true

@@ -1,0 +1,5 @@
+---
+source: src/render.rs
+expression: "phase_message(&PhaseChange\n{\n    agent: \"payments/backend/alice\".into(), from: AgentPhase::Ready, to:\n    AgentPhase::Dead, message: \"tmux window gone\".into(),\n})"
+---
+phase **Ready** to **Dead**: tmux window gone

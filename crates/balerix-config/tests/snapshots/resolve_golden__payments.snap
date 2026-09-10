@@ -1,0 +1,85 @@
+---
+source: crates/balerix-config/tests/resolve_golden.rs
+expression: spec
+---
+name: payments
+tools:
+  node: 22.11.0
+crews:
+  backend:
+    repo: acme/payments-api
+    ref: main
+    git:
+      push: true
+      auth: gh
+    tools:
+      python: 3.12.8
+    agents:
+      alice:
+        claude:
+          settings:
+            model: sonnet
+            permissions:
+              allow:
+                - Bash(git *)
+            theme: dark
+          args:
+            - "--verbose"
+          resume: true
+          binary: claude
+        sandbox:
+          network:
+            mode: allow
+        tools:
+          node: 22.11.0
+          python: 3.12.8
+        env:
+          RUST_LOG: info
+        runner:
+          type: tmux
+        plugins:
+          flow:
+            initial: working
+            states:
+              done: {}
+              review:
+                "on":
+                  - event: Stop
+                    goto: done
+              working:
+                "on":
+                  - event: PreToolUse
+                    match:
+                      /tool_input/command: rm -rf.*
+                    respond:
+                      decision: block
+                      reason: no recursive deletes
+                  - event: Stop
+                    goto: review
+                    send:
+                      text: Run the tests and fix any failures.
+          web: {}
+      bob:
+        claude:
+          settings:
+            model: opus
+            permissions:
+              allow:
+                - Bash(git *)
+            theme: dark
+          args:
+            - "--verbose"
+          resume: true
+          binary: claude
+        sandbox:
+          network:
+            mode: allow
+        tools:
+          node: 22.11.0
+          python: 3.12.8
+        env:
+          RUST_LOG: info
+        runner:
+          type: tmux
+        plugins:
+          web: {}

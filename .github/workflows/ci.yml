@@ -1,0 +1,85 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"   # nightly tier
+permissions:
+  contents: read
+env:
+  # `mise run` would otherwise install every missing tool in the [tools] table
+  # (two cargo: tools build from source); each job installs only what it needs.
+  MISE_AUTO_INSTALL: "false"
+jobs:
+  # check runs the core workspace, e2e included; BALERIX_REQUIRE_TOOLS makes a missing tool fail.
+  check:
+    runs-on: ubuntu-latest
+    env:
+      BALERIX_REQUIRE_TOOLS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with: { version: 2026.9.2, install: false, cache: true }
+      - run: mise install rust cargo:cargo-nextest cargo-insta tmux nono gh gitleaks
+      # The core workspace, plus the two plugin projects `check` builds for
+      # the e2e (`package-plugins flow web`) — without them here, 180 and 179
+      # packages compile cold on every run and are thrown away. They share
+      # this step rather than getting one of their own: a second
+      # Swatinem/rust-cache step means a second ~/.cargo copy against the
+      # 10 GB per-repository ceiling the `plugins` job's comment worries
+      # about. The cost is that a flow or web lockfile bump now invalidates
+      # the core target cache too; both move rarely, and matrix — the
+      # expensive project, and what Spec H §7's promise is really about —
+      # stays fully independent either way.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            plugins/flow -> target
+            plugins/web -> target
+      - run: mise run check
+  # Each plugin is a standalone project with its own lockfile (Spec H), so
+  # each gets its own job and its own cache. They run concurrently with
+  # `check`, which no longer lints or tests any of them (it still builds
+  # the ones the e2e packages, from their own projects).
+  #
+  # GitHub evicts least-recently-used cache entries past 10 GB per
+  # repository, and four Rust caches can approach that. If eviction starts
+  # thrashing, give the plugin jobs `save-if: ${{ github.ref ==
+  # 'refs/heads/main' }}` so pull requests restore but do not write.
+  plugins:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: [flow, web, matrix]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with: { version: 2026.9.2, install: false, cache: true }
+      - run: mise install rust cargo:cargo-nextest
+      # One cache per plugin project: each has its own lockfile and its own
+      # target directory under plugins/<name>/target (scripts/plugin.sh).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "plugins/${{ matrix.plugin }} -> target"
+          key: ${{ matrix.plugin }}
+      - run: mise run plugin ${{ matrix.plugin }}
+  mutants:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with: { version: 2026.9.2, install: false, cache: true }
+      - run: mise install rust github:sourcefrog/cargo-mutants
+      - run: mise run mutants
+  audit:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with: { version: 2026.9.2, install: false, cache: true }
+      - run: mise install rust cargo:cargo-audit aqua:EmbarkStudios/cargo-deny
+      - run: mise run audit

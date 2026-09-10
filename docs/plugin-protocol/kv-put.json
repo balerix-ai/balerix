@@ -1,0 +1,7 @@
+{
+  "route": "PUT /v1/plugin-host/kv/state/payments/backend/bob?secret=false",
+  "direction": "plugin-to-daemon",
+  "raw": "d29ya2luZw==",
+  "status": 200,
+  "response": {}
+}

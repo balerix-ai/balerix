@@ -1,0 +1,7 @@
+{
+  "route": "POST /v1/plugin-host/agents/payments/backend/bob/actions",
+  "direction": "plugin-to-daemon",
+  "request": { "action": "send_text", "text": "Run the tests.", "submit": true },
+  "status": 200,
+  "response": {}
+}

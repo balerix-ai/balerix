@@ -1,0 +1,112 @@
+# Every entry is an exact version (developer-environment: an unpinned entry is a reproducibility bug).
+# git is a system prerequisite (not in the mise registry); the devcontainer ships 2.47.3.
+[tools]
+rust = { version = "1.98.1", components = ["rustfmt", "clippy"] }
+"cargo:cargo-nextest" = "0.9.143"
+cargo-insta = "1.48.0"
+"cargo:cargo-audit" = "0.22.2"
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
+"github:sourcefrog/cargo-mutants" = "27.1.0"
+gitleaks = "8.30.1"
+tmux = "3.7c"
+gh = "2.100.0"
+nono = "0.76.0"
+claude = "2.1.267"
+
+[tasks.fmt]
+description = "Format the core workspace and every standalone plugin project"
+run = [
+  "cargo fmt --all",
+  "scripts/plugin.sh fmt flow",
+  "scripts/plugin.sh fmt web",
+  "scripts/plugin.sh fmt matrix",
+]
+
+[tasks.lint]
+description = "Static tier: rustfmt check + clippy with warnings denied, then the core dependency-isolation guard"
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "scripts/check-core-deps.sh",
+]
+
+[tasks.test]
+description = "Unit + integration tests for the core workspace"
+depends = ["package-plugins flow web"]
+run = "cargo nextest run --workspace"
+
+[tasks.package-plugins]
+description = "Build the named in-tree plugins (default: all) and assemble them as directory sources under target/plugins/<name>/"
+run = "scripts/package-plugins.sh"
+
+[tasks.plugin]
+description = "Lint and test one standalone plugin project: `mise run plugin matrix`"
+usage = 'arg "<name>" help="the plugin directory under plugins/"'
+run = 'scripts/plugin.sh check "$usage_name"'
+
+[tasks.plugins]
+description = "Lint and test every standalone plugin project (its own tier; not part of `check`)"
+run = [
+  "scripts/plugin.sh check flow",
+  "scripts/plugin.sh check web",
+  "scripts/plugin.sh check matrix",
+]
+
+[tasks.check]
+description = "Everything the PR tier runs"
+depends = ["lint", "test"]
+
+[tasks.precommit]
+description = "Pre-commit tier: staged secret scan, then the PR gate"
+run = [
+  "gitleaks git --pre-commit --staged --redact",
+  "mise run check",
+]
+
+[tasks.audit]
+description = "Nightly tier: dependency CVEs and policy, for the core workspace and each standalone plugin project"
+run = [
+  "cargo audit",
+  "cargo deny check advisories bans sources licenses",
+  "cargo audit --file plugins/flow/Cargo.lock",
+  "cargo deny --manifest-path plugins/flow/Cargo.toml check advisories bans sources licenses",
+  "cargo audit --file plugins/web/Cargo.lock",
+  "cargo deny --manifest-path plugins/web/Cargo.toml check advisories bans sources licenses",
+  "cargo audit --file plugins/matrix/Cargo.lock",
+  "cargo deny --manifest-path plugins/matrix/Cargo.toml check advisories bans sources licenses",
+]
+
+[tasks.mutants]
+description = "Nightly tier: mutation-test the reconciler"
+run = "cargo mutants -p balerix-core --in-place"
+
+[tasks.test-it]
+description = "Integration tests against real git/mise/nono/tmux, failing (not skipping) when a tool is missing"
+env = { BALERIX_REQUIRE_TOOLS = "1" }
+run = "cargo nextest run -p balerix-runtime"
+
+[tasks.e2e]
+description = "End-to-end journey against a real daemon, git, mise, nono and tmux (fails, not skips, without tools)"
+depends = ["package-plugins flow web"]
+env = { BALERIX_REQUIRE_TOOLS = "1" }
+run = "cargo nextest run -p balerix --test e2e"
+
+[tasks.serve]
+# HOME alone is not enough: StateLayout prefers XDG_STATE_HOME/XDG_DATA_HOME/
+# XDG_CONFIG_HOME whenever they are set, so on a machine that exports them the
+# dev daemon would write its endpoint, pid, token and vault key into the user's
+# live balerix state root and collide with a real daemon. Override all four.
+description = "Run a daemon in the foreground under target/tmp/serve (HOME and every XDG root overridden, so it never touches the user's balerix state)"
+env = { HOME = "{{config_root}}/target/tmp/serve/home", XDG_CONFIG_HOME = "{{config_root}}/target/tmp/serve/home/.config", XDG_STATE_HOME = "{{config_root}}/target/tmp/serve/home/.local/state", XDG_DATA_HOME = "{{config_root}}/target/tmp/serve/home/.local/share" }
+run = [
+  "mkdir -p target/tmp/serve/home",
+  "cargo run -q -p balerix -- serve --tmux-socket balerix-dev",
+]
+
+[tasks.verify-claude]
+description = "By-hand spec §8.1 check: a real claude under a scratch daemon (config and state under target/tmp/verify-claude, wiped each run; tool installs kept under target/tmp/verify-data; your HOME kept for credentials); pauses for you to attach and type one prompt, then prints a report to paste back"
+run = "scripts/verify-claude.sh"
+
+[tasks.verify-matrix]
+description = "Spec G's manual check against a real Matrix homeserver (needs MATRIX_* credentials; not part of any CI tier)"
+run = "scripts/verify-matrix.sh"

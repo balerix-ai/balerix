@@ -1,0 +1,7 @@
+---
+source: src/render.rs
+expression: "thread_root(\"payments/backend/alice\", \"0199aa11-2233-4455-6677-889900aabbcc\",\n\"startup\")"
+---
+**alice** session `0199aa11` started (startup)
+
+`payments/backend/alice`

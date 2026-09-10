@@ -1,0 +1,32 @@
+{
+  "route": "GET /v1/plugin-host/agents/payments/backend/bob/workspace/diff",
+  "direction": "plugin-to-daemon",
+  "request": null,
+  "status": 200,
+  "response": {
+    "base_ref": "origin/main",
+    "merge_base": "3f9c2a1d5b7e8c0a4f6d2e1b9a8c7d6e5f4a3b2c",
+    "head": "b7e0d44a1c2f3e4d5a6b7c8d9e0f1a2b3c4d5e6f",
+    "files": [
+      {
+        "path": "src/lib.rs",
+        "old_path": null,
+        "status": "modified",
+        "uncommitted": true,
+        "binary": false,
+        "patch": "diff --git a/src/lib.rs b/src/lib.rs\nindex 1111111..2222222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-fn main() {}\n+fn main() { run(); }\n",
+        "truncated": false
+      },
+      {
+        "path": "COPYING",
+        "old_path": "LICENSE",
+        "status": "renamed",
+        "uncommitted": false,
+        "binary": false,
+        "patch": "diff --git a/LICENSE b/COPYING\nsimilarity index 100%\nrename from LICENSE\nrename to COPYING\n",
+        "truncated": false
+      }
+    ],
+    "truncated": false
+  }
+}

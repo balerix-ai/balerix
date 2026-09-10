@@ -1,0 +1,25 @@
+{
+  "route": "POST /v1/intercept",
+  "direction": "daemon-to-plugin",
+  "headers": { "authorization": "Bearer tok" },
+  "request": {
+    "event": {
+      "agent": "payments/backend/bob",
+      "name": "PreToolUse",
+      "session_id": "s1",
+      "received_at": 1757000000,
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "rm -rf /" }
+      }
+    },
+    "response_so_far": {},
+    "deadline_ms": 1500
+  },
+  "status": 200,
+  "response": {
+    "response": { "decision": "block", "reason": "no recursive deletes" },
+    "actions": [ { "action": "send_text", "text": "Use trash instead.", "submit": true } ]
+  }
+}

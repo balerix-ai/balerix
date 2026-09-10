@@ -1,6 +1,6 @@
 {
   "name": "balerix",
-  "image": "ghcr.io/rahulmutt/dev:sha-3ad9a24",
+  "image": "ghcr.io/rahulmutt/dev:sha-5e218bd",
   "workspaceFolder": "/workspace",
   "remoteUser": "dev",
   "containerEnv": {

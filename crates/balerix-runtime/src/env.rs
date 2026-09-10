@@ -71,6 +71,14 @@ pub fn agent_env(
     for (k, v) in user_env {
         env.entry(k.clone()).or_insert_with(|| v.clone());
     }
+    // The pane's own TERM never arrives: `launch.sh` runs `env -i` and the
+    // profile denies every variable. Without one claude renders no colour.
+    // `tmux-256color` is what tmux 3.7c gives its panes; these are defaults,
+    // not isolation rows, so user `env` wins (a host lacking that terminfo
+    // sets another).
+    for (k, v) in [("TERM", "tmux-256color"), ("COLORTERM", "truecolor")] {
+        env.entry(k.to_string()).or_insert_with(|| v.to_string());
+    }
     env
 }
 
@@ -127,7 +135,7 @@ mod tests {
             env["MISE_AUTO_INSTALL"], "false",
             "launch resolves; installing is the agent's explicit act"
         );
-        assert_eq!(env.len(), 24);
+        assert_eq!(env.len(), 26);
         assert!(!env.contains_key("PATH"), "PATH is nono's");
         assert_eq!(
             env["TMPDIR"],
@@ -137,6 +145,44 @@ mod tests {
             env["CLAUDE_CODE_TMPDIR"], env["TMPDIR"],
             "claude checks its own variable before TMPDIR"
         );
+    }
+
+    fn env_with(user: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let layout = StateLayout::from_env(Path::new("/h"), |_| None);
+        let id: AgentId = "payments/backend/alice".parse().unwrap();
+        let user = user
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        agent_env(
+            &id,
+            &layout.agent(&id),
+            &layout,
+            "http://127.0.0.1:7643",
+            "hook-s3",
+            &user,
+        )
+    }
+
+    #[test]
+    fn the_agent_is_told_it_runs_in_a_colour_tmux_pane() {
+        let env = env_with(&[]);
+        assert_eq!(
+            env["TERM"], "tmux-256color",
+            "launch.sh's `env -i` and the profile's deny_vars drop the pane's TERM; \
+             without one claude renders no colour"
+        );
+        assert_eq!(env["COLORTERM"], "truecolor");
+    }
+
+    #[test]
+    fn user_env_overrides_the_terminal_rows() {
+        let env = env_with(&[("TERM", "screen-256color"), ("COLORTERM", "")]);
+        assert_eq!(
+            env["TERM"], "screen-256color",
+            "a host without tmux-256color terminfo picks another"
+        );
+        assert_eq!(env["COLORTERM"], "");
     }
 
     /// Spec E's guarantee is "what the daemon installs is exactly what the

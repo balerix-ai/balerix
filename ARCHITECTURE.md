@@ -177,7 +177,10 @@ text has newlines.
   and sets the agent's `HOME`, `XDG_*`, `BALERIX_*`, `TMPDIR`/`CLAUDE_CODE_TMPDIR`
   (the 0700 `home/tmp`; nothing under `/tmp` is granted and claude refuses an
   unreachable temp dir) through `environment.set_vars` with `deny_vars: ["*"]`.
-  `PATH` is the one variable that crosses from outside.
+  `PATH` is the one variable that crosses from outside — so the pane's `TERM`
+  does not, and `set_vars` carries `TERM=tmux-256color` and
+  `COLORTERM=truecolor` (user `env` may override both), without which claude
+  renders no colour.
 - **The daemon port is an `open_port`, not a `connect_port`.** On Landlock a
   `connect_port` list is an outbound allowlist: the agent could reach the daemon
   and nothing else, not even DNS or the Anthropic API. `open_port` grants

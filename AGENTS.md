@@ -376,7 +376,11 @@ credentials, hook input, or sandbox rules.
   (`<crate>-v<version>`) whose changelog has that version's section means
   "release pending" (its release PR was merged): `release.yml` releases it
   on the next push and `prepare.sh` answers `in-progress` for it. A version
-  with neither is not proposed yet, and nothing releases it.
+  with neither is not proposed yet, and nothing releases it — unless an
+  older tag exists too (a release has shipped before), in which case the
+  version was changed outside a release PR and `prepare.sh` dies naming it
+  instead of silently doing nothing; recover by reverting the edit or by
+  forcing that exact version to release it.
 - Released `CHANGELOG.md` sections are read back by
   `scripts/release/notes.sh` for the GitHub Release; don't edit them by
   hand.

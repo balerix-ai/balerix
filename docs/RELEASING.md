@@ -36,7 +36,7 @@ minor and `fix` patch.
 
 Run the `release-pr` workflow by hand with `unit` and `version` (for
 example `1.0.0`). The PR gets that exact version and the `release:pinned`
-label, and pushes to `main` stop updating it. Dispatch again with a version to re-pin it, or remove the label to go back to computed versions. A forced version must be above the unit's last release, and nothing is proposed while a merged release PR still awaits its tag.
+label, and pushes to `main` stop updating it. Dispatch again with a version to re-pin it, or remove the label to go back to computed versions. A forced version must be above the unit's last release, and nothing is proposed while a merged release PR still awaits its tag. If a unit's manifest version was changed by hand outside a release PR (no tag, no changelog section, an older tag exists), forcing that exact version is how to release it.
 
 To see what CI would propose, locally: `mise run release-prepare <unit>`
 (then `git checkout -- . && git clean -fd CHANGELOG.md plugins/*/CHANGELOG.md`
@@ -44,10 +44,17 @@ to throw the edits away).
 
 ## Dry run
 
-Run the `release` workflow by hand with `dry-run` checked. It plans, audits,
-builds, smoke-tests, packages, builds and scans images, and runs
-`cargo publish --dry-run`, then uploads every artifact to the run. Nothing is
-pushed, published or tagged.
+Run the `release` workflow by hand with `dry-run` checked. Like a real run,
+it only plans units already proposed on the dispatched ref — an untagged
+manifest version with its changelog section, what a merged release PR
+leaves. On `main` before any release PR has merged, that is nothing, so a
+dry run there plans nothing. To rehearse a release before merging its PR,
+dispatch the dry run on the unit's `release/<unit>` branch (its release PR's
+head): it already carries the prepared version and changelog section.
+
+For whatever it plans, a dry run audits, builds, smoke-tests, packages,
+builds and scans images, and runs `cargo publish --dry-run`, then uploads
+every artifact to the run. Nothing is pushed, published or tagged.
 
 ## Recovery
 

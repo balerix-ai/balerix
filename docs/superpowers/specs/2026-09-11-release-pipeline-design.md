@@ -104,12 +104,20 @@ code. Steps:
 4. Prepend the new section to the unit's `CHANGELOG.md` with git-cliff.
 5. Print the new version and the changelog section (the workflow uses both).
 
-Before step 2: if the manifest version has no tag yet and either an older
-tag exists or the changelog already carries that version's section (a
-merged initial release PR) — a release PR was merged and `release.yml` has
-not finished, or failed (§8.2) — the script prints `release in progress`, exits 0 and changes
-nothing. The workflow leaves that unit's PR state untouched; the next push
-after the tag exists computes from it.
+Before step 2: if the manifest version has no tag yet and the changelog
+already carries that version's section — a release PR was merged and
+`release.yml` has not finished, or failed (§8.2); prepare.sh always writes
+the section, so this also covers a merged initial release PR — the script
+prints `release in progress`, exits 0 and changes nothing. The workflow
+leaves that unit's PR state untouched; the next push after the tag exists
+computes from it.
+
+If instead an older tag exists (a release has shipped before) and the
+manifest version has neither a tag nor that section, nobody proposed it
+through a release PR — the version was changed by hand. The script dies,
+naming the version. Recover by reverting the edit, or by forcing that exact
+version (`release-pr`'s `workflow_dispatch` with `version` set to it, or
+`release-prepare <unit> <version>` locally) to release it.
 
 `git-cliff` and `cargo-edit` are pinned exactly in `mise.toml`.
 
@@ -184,16 +192,26 @@ before merge, so a merged release PR has been tested as it lands.
 
 ### 5.5 `publish-crates` (core only)
 
-- Runs in GitHub environment `release`.
-- Obtains a short-lived token with `rust-lang/crates-io-auth-action`
-  (crates.io trusted publishing).
-- Skips each crate whose version already exists in the crates.io index,
-  then runs `cargo publish --locked -p balerix-api -p balerix-plugin-sdk`
-  (cargo orders them by dependency).
-- Skipped entirely unless `github.repository == 'balerix-ai/balerix'`; under
-  `dry-run` it runs `cargo publish --dry-run` instead.
-- PR-tier guard: `mise run lint` gains
-  `cargo package --no-verify --allow-dirty -p balerix-api -p balerix-plugin-sdk` (`--allow-dirty` so the gate also passes before a commit).
+Two jobs, so a dry run (or a fork's real run, which can never publish)
+never enters environment `release` or requests OIDC:
+
+- `publish-crates-dry-run`: runs when `dry-run`, or outside
+  `balerix-ai/balerix` (a fork's real run). No environment, `contents:
+  read` only. Runs `cargo publish --dry-run --locked -p balerix-api -p
+  balerix-plugin-sdk`.
+- `publish-crates`: runs only when `!dry-run && github.repository ==
+  'balerix-ai/balerix'`, in GitHub environment `release`. Obtains a
+  short-lived token with `rust-lang/crates-io-auth-action` (crates.io
+  trusted publishing). Skips each crate whose version already exists in the
+  crates.io index, then runs `cargo publish --locked -p balerix-api -p
+  balerix-plugin-sdk` (cargo orders them by dependency).
+
+`github-release` needs both jobs: on a fork's real run only
+`publish-crates-dry-run` does anything, and it must still hold
+`github-release` back the way the combined job used to.
+
+PR-tier guard: `mise run lint` gains
+`cargo package --no-verify --allow-dirty -p balerix-api -p balerix-plugin-sdk` (`--allow-dirty` so the gate also passes before a commit).
 
 ### 5.6 `github-release` (per unit)
 
@@ -425,27 +443,56 @@ Verification commands published in the release notes and `docs/RELEASING.md`:
 
 ## 10. Testing
 
-- **`scripts/release/test.sh`** (`mise run release-test`): clones `HEAD` under `target/tmp` (a worktree would share this repository's tags), adds synthetic commits, runs
-  `prepare.sh` and asserts:
+- **`scripts/release/test.sh`** (`mise run release-test`): clones `HEAD`
+  under `target/tmp` (a worktree would share this repository's tags), adds
+  synthetic commits and tags, and runs `prepare.sh`, `plan.sh`, `notes.sh`
+  and `package.sh` against the clones:
 
   | Case | Expected |
   |---|---|
   | unit with no tag | initial release at the manifest version |
-  | `fix:` | patch bump |
+  | `fix:` in `0.x` | patch bump |
   | `feat:` in `0.x` | patch bump |
   | `feat!:` in `0.x` | minor bump |
-  | `docs:` only | `nothing to release`, no file changed |
-  | SDK-only change | pending in core and every plugin |
-  | plugin-only change | core unchanged |
-  | manifest version untagged, older tag exists | `release in progress`, no file changed |
+  | `feat:` from `1.0` | minor bump |
+  | `fix!:` from `1.0` | major bump |
+  | `docs:` only | `status=none`, no file changed |
+  | a change under `crates/balerix-plugin-sdk/` | `status=release` for core and every plugin |
+  | a plugin-only change | core `status=none` |
+  | core `feat!:` in `0.x` | minor bump |
+  | manifest version untagged, changelog section present (a merged release PR) | `status=in-progress`, no file changed |
+  | same, with no last tag (a merged initial release PR) | `status=in-progress` |
+  | forcing an already-released version | refused |
+  | forcing a version while a release is in progress | `status=in-progress` (the forced version is ignored), no file changed |
+  | forcing a version below the last release | refused |
+  | manifest version changed by hand to one with no tag and no changelog section, an older tag exists | `prepare.sh` dies, naming the hand-bumped version; no file changed |
+  | forcing that hand-bumped version | `status=release` at that version; `plan.sh` then proposes the unit once it is committed |
+  | `notes.sh` for a released version | the changelog section's body alone, no neighbouring section |
+  | `notes.sh` for a version with no section | refused |
+  | `package.sh` for a plugin | archive named and checksummed correctly; `mise.toml` rewritten with the full-tag version, per-architecture checksums and start task, no `version_prefix`; mise can parse the result |
+  | `plan.sh`, nothing proposed | empty `units`/`plugins`, `core=false` |
+  | `plan.sh`, a merged initial release PR | proposes that unit in `units` and, for a plugin, `plugins` |
+  | `plan.sh`, once tagged | empty again |
 
-  After every case: each plugin's yaml version equals its Cargo version, and
-  `cargo metadata --locked` succeeds for all four projects. CI runs it in its
-  own job when `scripts/release/**` or `cliff.toml` changes.
+  `assert_consistent`, run after the initial release, the `0.x` breaking
+  bump, the core bump and the hand-bump case, checks that the core
+  `Cargo.lock` carries the core version and that every plugin's
+  `balerix-plugin.yaml` version, its own `Cargo.lock` entry and its
+  `Cargo.lock`'s `balerix-plugin-sdk` entry all agree with its `Cargo.toml`
+  and the core version. CI runs `scripts/release/test.sh` in its own job
+  (`release-scripts.yml`), on push to `main` and on every pull request, when
+  `scripts/release/**`, `scripts/plugin.sh`, `cliff.toml`, `mise.toml` or
+  the workflow file itself changes.
 - **Workflows:** `actionlint` and `zizmor` in `mise run lint`.
 - **Images:** `images.yml` (§6.5).
-- **Dry run:** `release.yml` with `dry-run: true` runs `plan`, `build`,
-  smoke tests, `package`, image builds and scans (no push) and
+- **Dry run:** `release.yml` with `dry-run: true` still runs `plan` with the
+  same rule as a real run (§5.1): a unit is planned only when its manifest
+  version has no tag and its changelog carries that version's section, i.e.
+  its release PR has merged on the dispatched ref. On `main` before any
+  release PR has merged that is nothing, so dispatch the dry run on the
+  unit's `release/<unit>` branch (its release PR's head) to rehearse it
+  before merging. For whatever `plan` finds, the run does `build`, smoke
+  tests, `package`, image builds and scans (no push) and
   `cargo publish --dry-run`, and uploads every artifact.
 - **Fork rehearsal:** nothing hardcodes the owner (`github.repository`
   everywhere), and `publish-crates` skips outside `balerix-ai/balerix`, so a

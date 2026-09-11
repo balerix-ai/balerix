@@ -169,6 +169,8 @@ jobs:
       packages: write
       id-token: write
       attestations: write
+      # The attestation's storage record, for the org's linked artifacts page.
+      artifact-metadata: write
     strategy:
       fail-fast: false
       matrix:

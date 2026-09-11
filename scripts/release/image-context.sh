@@ -3,7 +3,8 @@
 # built binary (Spec I §6.1): nothing compiles inside Docker.
 #
 # usage: image-context.sh <unit> <dist-dir> <context-dir>
-# Prints GitHub step outputs: context=, dockerfile=, image=, version=.
+# Prints GitHub step outputs: context=, dockerfile=, image=, version=, title=,
+# description=.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 # shellcheck source=scripts/release/lib.sh
@@ -32,3 +33,5 @@ echo "context=$(cd "$context" && pwd)"
 echo "dockerfile=$PWD/$dockerfile"
 echo "image=$(unit_image "$unit")"
 echo "version=$(unit_version "$unit")"
+echo "title=$crate"
+echo "description=$(unit_description "$unit")"

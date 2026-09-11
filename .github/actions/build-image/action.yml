@@ -67,7 +67,8 @@ runs:
         IMAGE: ${{ steps.context.outputs.image }}
       run: >-
         mise x -- trivy image --exit-code 1 --severity CRITICAL,HIGH
-        --ignore-unfixed --no-progress "$IMAGE:smoke"
+        --ignore-unfixed --no-progress
+        --ignorefile "$GITHUB_WORKSPACE/.trivyignore.yaml" "$IMAGE:smoke"
     - name: Push by digest
       id: push
       if: inputs.push == 'true'

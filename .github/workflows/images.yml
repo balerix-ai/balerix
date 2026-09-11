@@ -8,6 +8,7 @@ on:
       - docker/**
       - mise.toml
       - .hadolint.yaml
+      - .trivyignore.yaml
       - scripts/release/**
       - .github/actions/**
       - .github/workflows/images.yml

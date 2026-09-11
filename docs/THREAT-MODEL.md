@@ -150,7 +150,7 @@ phases; the rest exist in code today.
 | Cache poisoning into a release | `release.yml` restores no caches; GitHub scopes caches written by pull requests to their own ref | `.github/workflows/release.yml` |
 | Workflow injection and misconfiguration | `zizmor` and `actionlint` in `mise run lint`; untrusted values reach `run:` only through `env:` | `mise.toml` |
 | Shipping a known advisory | `cargo audit` and `cargo deny` gate every unit before it builds | `scripts/release/audit.sh` |
-| Vulnerable image contents | `hadolint`, and `trivy image` failing on fixed CRITICAL/HIGH, before any push and nightly | `.github/actions/build-image/action.yml`, `images.yml` |
+| Vulnerable image contents | `hadolint`, and `trivy image` failing on fixed CRITICAL/HIGH, before any push and nightly; exceptions only through `.trivyignore.yaml`, per binary and expiring | `.github/actions/build-image/action.yml`, `images.yml` |
 | A tampered or substituted artifact | `SHA256SUMS` and GitHub build-provenance attestations on every archive and package; cosign keyless signatures and attestations on every image index; the plugin package pins each archive's sha256 and mise verifies attestations at install | `release.yml`, `scripts/release/package.sh` |
 | A leaked long-lived registry token | none exist: crates.io trusted publishing, `GITHUB_TOKEN` for ghcr and releases; the one bootstrap API token is revoked after the first publish (`docs/RELEASING.md`) | `release.yml` |
 | A half-finished release looking complete | the tag is created last; `latest` image tags move only after the release and its package verification; a failed package verification flags the release as a prerelease | `scripts/release/github-release.sh`, `verify-package.sh`, `promote-image.sh` |

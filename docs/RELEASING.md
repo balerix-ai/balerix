@@ -123,3 +123,8 @@ Nothing releases until all of this is done.
   from that release's `SHASUMS256.txt`; update all three at once.
 - Base images are pinned by digest and action references by commit SHA;
   Renovate proposes both.
+- `.trivyignore.yaml` holds the image scan's reviewed exceptions, each scoped
+  to one binary and carrying an `expired_at`. An expired entry fails
+  `images.yml` and the release image jobs again: renew it only with a fresh
+  reason, and delete it when the pinned tool (for example `gh` in
+  `mise.toml`) ships the fix.

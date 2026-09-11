@@ -1,7 +1,7 @@
 # Balerix — Spec I: release pipeline
 
 **Date:** 2026-09-11
-**Status:** Approved in brainstorm 2026-09-11
+**Status:** Implemented 2026-09-11 (plan: docs/superpowers/plans/2026-09-11-release-pipeline.md)
 **Scope:** release the `balerix` CLI, the three in-tree plugins and the
 plugin SDK. Binaries go to GitHub Releases, multi-arch images (linux/amd64,
 linux/arm64) to ghcr, and `balerix-api` + `balerix-plugin-sdk` to crates.io.
@@ -123,7 +123,7 @@ after the tag exists computes from it.
   the body. With nothing to release, it closes any open `release/<unit>` PR.
 - It pushes with a **GitHub App** installation token
   (`actions/create-github-app-token`) so CI runs on the release PR without
-  manual approval.
+  manual approval. The token is scoped to `contents`, `pull-requests` and `issues` (labels are an issues API).
 - Forcing a version: `workflow_dispatch` with `unit` and `version` sets that
   exact version and labels the PR `release:pinned`. Push-triggered runs skip
   a unit whose open PR carries the label; dispatching again or removing the
@@ -190,7 +190,7 @@ before merge, so a merged release PR has been tested as it lands.
 - Skipped entirely unless `github.repository == 'balerix-ai/balerix'`; under
   `dry-run` it runs `cargo publish --dry-run` instead.
 - PR-tier guard: `mise run lint` gains
-  `cargo package --no-verify -p balerix-api -p balerix-plugin-sdk`.
+  `cargo package --no-verify --allow-dirty -p balerix-api -p balerix-plugin-sdk` (`--allow-dirty` so the gate also passes before a commit).
 
 ### 5.6 `github-release` (per unit)
 
@@ -206,7 +206,7 @@ Needs `build`, `images`/`merge-images`, `package` (plugins) and
 5. `gh release edit <tag> --draft=false` — this creates the tag.
 
 Skipped under `dry-run`, which uploads everything as workflow artifacts
-instead.
+instead. All units in one run wait for every unit's builds and images; a re-run releases whatever is still untagged.
 
 ### 5.7 `verify-package` (plugins only) — §7.3
 
@@ -256,7 +256,7 @@ already-pushed `<ver>` index.
 
 ### 6.3 `ghcr.io/balerix-ai/balerix-plugin-<name>` — `docker/plugin/Dockerfile`
 
-- One Dockerfile, `ARG PLUGIN`.
+- One Dockerfile; the build context holds the binary under the fixed name `plugin` (an exec-form `ENTRYPOINT` cannot expand an `ARG`).
 - Base `gcr.io/distroless/static-debian13:nonroot`, pinned by digest. It
   ships a CA bundle, which matrix needs (its `reqwest` fails to build a
   client against an empty certificate store — `AGENTS.md`).
@@ -335,7 +335,7 @@ be resolved by tag once published):
 
 On failure: `gh release edit <tag> --prerelease`, add a "package
 verification failed" line to the notes, fail the workflow; `promote-images`
-does not run.
+does not run. It requires every `verify-package` leg to succeed, so one failed verification holds back the moving image tags of every unit in that run.
 
 ## 8. Failure handling
 
@@ -387,7 +387,7 @@ Verification commands published in the release notes and `docs/RELEASING.md`:
   `main` only) guards `publish-crates`; the crates.io trusted publisher is
   bound to `release.yml` and that environment. The GitHub App private key
   lives in environment `release-bot` (`main` only); the App is installed on
-  this repository alone with `contents: write` and `pull-requests: write`.
+  this repository alone with `contents: write`, `pull-requests: write` and `issues: write`.
   ghcr uses `GITHUB_TOKEN`; there are no PATs.
 - **No privileged runs on untrusted code.** No workflow uses
   `pull_request_target`. `pr-title.yml` and `images.yml` run with read-only
@@ -396,8 +396,7 @@ Verification commands published in the release notes and `docs/RELEASING.md`:
 - **Pinned actions.** Third-party actions are pinned to full commit SHAs with
   a version comment; `renovate.json` extends `helpers:pinGitHubActionDigests`
   (this also pins the existing `ci.yml`).
-- **Scanners for the new surface.** `zizmor` and `actionlint` join
-  `mise run lint`. `hadolint` on both Dockerfiles and `trivy image` (fail on
+- **Scanners for the new surface.** `zizmor` (`--min-severity medium`), `actionlint` and `shellcheck` (over `scripts/release/`) join `mise run lint`. `hadolint` on both Dockerfiles and `trivy image` (fail on
   fixed CRITICAL/HIGH, `--ignore-unfixed`) run in `images.yml` and before
   every release image push.
 - **Tools** — `git-cliff`, `cargo-edit`, `cosign`, `hadolint`, `trivy`,
@@ -412,8 +411,7 @@ Verification commands published in the release notes and `docs/RELEASING.md`:
 
 ## 10. Testing
 
-- **`scripts/release/test.sh`** (`mise run release-test`): creates a
-  `git worktree` of `HEAD` under `target/tmp`, adds synthetic commits, runs
+- **`scripts/release/test.sh`** (`mise run release-test`): clones `HEAD` under `target/tmp` (a worktree would share this repository's tags), adds synthetic commits, runs
   `prepare.sh` and asserts:
 
   | Case | Expected |

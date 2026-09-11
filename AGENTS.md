@@ -36,6 +36,12 @@ credentials, hook input, or sandbox rules.
   and verifies the web plugin's assets against
   `plugins/web/assets/VENDOR.md` (installing them only when
   every digest matches); `--check` verifies the committed files offline.
+- `release-prepare <unit> [version]` — what `release-pr.yml` runs: works
+  out one release unit's next version (core, flow, web, matrix) and writes
+  it into the manifests, lockfiles, plugin manifest and changelog. Commits
+  nothing. `docs/RELEASING.md` is the release process.
+- `release-test` — scenario tests for `scripts/release/` against throwaway
+  clones under `target/tmp`; CI runs it when the scripts change.
 
 ## Conventions
 - Ports (`Materializer`, `AgentRunner`, `Clock`, `FleetStore`, `EventHandler`)
@@ -357,3 +363,37 @@ credentials, hook input, or sandbox rules.
   — unit-testable without a real homeserver. When changing an ordering
   rule, extend `FakePort`'s recorded calls rather than reaching for an
   integration test against a live server.
+- PR titles are Conventional Commits (`pr-title.yml`) and PRs are
+  squash-merged, so the title is the commit the release scripts read.
+  `feat`/`fix`/`perf`/`refactor`/`build` release the units whose paths the
+  change touches; `docs`/`test`/`ci`/`chore`/`style`/`revert` never do. A
+  change under `crates/balerix-api/` or `crates/balerix-plugin-sdk/` counts
+  for core and for every plugin.
+- Don't bump a version by hand. A plugin's `package/balerix-plugin.yaml`
+  `version` is written from its `Cargo.toml` by
+  `scripts/release/prepare.sh`, and `mise run plugin <name>` fails when the
+  two differ. A version on `main` with no matching tag
+  (`<crate>-v<version>`) means "release pending": `release.yml` releases it
+  on the next push and `prepare.sh` answers `in-progress` for it.
+- Released `CHANGELOG.md` sections are read back by
+  `scripts/release/notes.sh` for the GitHub Release; don't edit them by
+  hand.
+- `scripts/release/test.sh` clones the repository instead of using `git
+  worktree`: a worktree shares this repository's tags, and the scenarios
+  create and delete tags.
+- The release tools in `mise.toml` (git-cliff, cargo-edit, cosign, trivy,
+  hadolint, zizmor, actionlint, shellcheck, jq) never reach agents: the
+  embedded table is filtered to `claude` and `gh`
+  (`balerix-runtime/src/toolchain.rs` `INHERITED`).
+- `docker/balerix/Dockerfile` must not leave a mise config in the final
+  image: a system `/etc/mise/config.toml` would enter every agent's and
+  plugin's tool resolution. The `mise.toml` it installs from stays in the
+  `tools` build stage.
+- `release.yml` builds and tests each binary on a runner of its own
+  architecture (`ubuntu-24.04-arm` for aarch64) because the smoke tests run
+  the binary. On an arm64 host cc-rs wants `aarch64-linux-musl-gcc`, which
+  `musl-tools` lacks; `scripts/release/build.sh` sets
+  `CC_aarch64_unknown_linux_musl=musl-gcc` for matrix's C dependencies.
+- zizmor runs with `--min-severity medium`; release workflows keep
+  `cache: false` on mise-action (a cache restored into a job that publishes
+  is a poisoning path).

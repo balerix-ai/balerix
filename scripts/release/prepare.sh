@@ -11,6 +11,10 @@
 #   status=release       files changed; version=, tag= and notes= follow
 #   status=none          no releasable commit since the last tag
 #   status=in-progress   the manifest version is already awaiting its tag
+#
+# Dies (no status line) if an older tag exists and the manifest version has
+# neither a tag nor a changelog section: it was changed by hand outside a
+# release PR. Force that version to release it, or revert the edit.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 # shellcheck source=scripts/release/lib.sh
@@ -30,10 +34,11 @@ notes="$notes_dir/$unit.md"
 
 emit() { printf '%s=%s\n' "$@"; }
 
-if ! tag_exists "$(unit_tag "$unit" "$current")" && { [[ -n $last ]] || has_section "$unit" "$current"; }; then
+if ! tag_exists "$(unit_tag "$unit" "$current")" && has_section "$unit" "$current"; then
   # A release PR was merged and release.yml has not tagged it yet, or failed
-  # (Spec I §8.2). Proposing anything now would release twice, so this wins
-  # even over a forced version.
+  # (Spec I §8.2): prepare.sh always writes the section, so this also covers
+  # a merged initial release PR. Proposing anything now would release twice,
+  # so this wins even over a forced version.
   echo "$unit: $current is awaiting its tag; release in progress" >&2
   emit status in-progress version "$current"
   exit 0
@@ -50,6 +55,12 @@ elif [[ -n $forced ]]; then
 elif [[ -z $last ]]; then
   next=$current
   echo "$unit: no release tag yet; initial release of $next" >&2
+elif ! tag_exists "$(unit_tag "$unit" "$current")"; then
+  # $last exists, so a release has shipped before, but $current has neither
+  # a tag nor a changelog section: nobody proposed it through prepare.sh.
+  die "$unit: $current has no tag and no $changelog section, though $last exists;" \
+    "it was changed outside a release PR. Revert the edit, or dispatch" \
+    "release-pr with version set to $current to release it."
 else
   count=$(cliff "$unit" --unreleased --context | jq '[.[].commits[]] | length')
   if [[ $count -eq 0 ]]; then

@@ -18,8 +18,9 @@ Binaries are static musl builds for Linux x86_64 and aarch64.
 
 1. Merge pull requests with Conventional Commit titles. `feat`, `fix`,
    `perf`, `refactor` and `build` are releasable; `docs`, `test`, `ci`,
-   `chore`, `style` and `revert` are not. A `!` (`feat!:`) or a
-   `BREAKING CHANGE:` footer is breaking.
+   `chore`, `style` and `revert` are not. A `!` (`feat!:`) marks a breaking
+   change; squash merges use the PR title alone, so a `BREAKING CHANGE:`
+   footer counts only if the merger keeps it in the commit message.
 2. `release-pr.yml` keeps a PR named `chore(release): <crate> v<ver>` open
    for each unit with releasable changes, on branch `release/<unit>`. It is
    rebuilt from `main` on every push.
@@ -62,6 +63,13 @@ release.
 | one unit's GitHub Release, after other units in the same run published | those units are tagged, but their packages are not verified and their images not promoted | Use *Re-run failed jobs* on that run: it retries the failed release, then runs `verify-package` and `promote-images` for every unit. A new run or push skips units that already have tags, so their `latest` stays on the previous release until they release again. |
 | `verify-package` | the release is published and flagged as a prerelease; no image's moving tags move in that run | Fix it; the next patch release follows the normal flow. |
 | a bad release shipped | — | Roll forward with a patch release. `cargo yank` a harmful crate version. Never delete or move a tag. |
+
+A release is built and tagged at the commit of the `release.yml` run that
+releases it, so anything merged after the release PR and before that commit
+(a fix merged to recover, or a later push whose run replaced the release
+PR's queued run) ships in it with no changelog entry or version bump of its
+own, and the next changelog starts after the tag. Check what has landed
+before merging anything behind a release PR.
 
 While a merged release PR waits for its tag, `release-pr.yml` reports
 `release in progress` for that unit and leaves it alone.

@@ -126,8 +126,8 @@ after the tag exists computes from it.
   manual approval. The token is scoped to `contents`, `pull-requests` and `issues` (labels are an issues API).
 - Forcing a version: `workflow_dispatch` with `unit` and `version` sets that
   exact version and labels the PR `release:pinned`. Push-triggered runs skip
-  a unit whose open PR carries the label; dispatching again or removing the
-  label resumes automatic updates.
+  a unit whose open PR carries the label; dispatching again with a version
+  re-pins it, and removing the label resumes automatic updates.
 
 ### 4.3 Keeping commits conventional
 
@@ -361,6 +361,13 @@ does not run. It requires every `verify-package` leg to succeed, so one failed v
 | after image `<ver>` push | unannounced `<ver>` image tag | Re-run; the tag is overwritten, `latest` untouched. |
 | `verify-package` | release published as prerelease | Fix; the next patch release follows the normal flow. |
 | a bad release shipped | — | Roll forward with a patch; `cargo yank` a harmful crate version; never delete or move a git tag. |
+
+A release is built and tagged at the commit the release run checks out, not
+at the release PR's merge commit. Commits merged between the release PR and
+that run (a queued run replaced under `concurrency: release`, or a fix merged
+to recover) ship in the release without their own changelog entry or version
+bump, and the next changelog starts after the tag. Check what has landed
+before merging anything behind a release PR.
 
 ## 9. Integrity and pipeline hardening
 

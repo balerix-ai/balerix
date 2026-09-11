@@ -43,7 +43,11 @@ runs:
       uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
       with:
         images: ${{ steps.context.outputs.image }}
+        # metadata-action defaults title and description to the repository's,
+        # which would label every plugin image as balerix.
         labels: |
+          org.opencontainers.image.title=${{ steps.context.outputs.title }}
+          org.opencontainers.image.description=${{ steps.context.outputs.description }}
           org.opencontainers.image.version=${{ steps.context.outputs.version }}
     - name: Build for the smoke test and scan
       uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0

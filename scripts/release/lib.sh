@@ -64,11 +64,20 @@ unit_paths() {
   fi
 }
 
-unit_version() {
+# The unit's crate as `cargo metadata` reports it.
+unit_package() {
   local crate
   crate=$(unit_crate "$1")
   cargo metadata --manifest-path "$(unit_manifest "$1")" --no-deps --format-version 1 |
-    jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version'
+    jq --arg c "$crate" '.packages[] | select(.name == $c)'
+}
+
+unit_version() { unit_package "$1" | jq -r .version; }
+
+# The crate's description, less a trailing spec reference ("… (Spec G)")
+# that means nothing outside this repository.
+unit_description() {
+  unit_package "$1" | jq -r '.description // ""' | sed -E 's/ \([^()]*\)$//'
 }
 
 tag_exists() { git rev-parse -q --verify "refs/tags/$1" >/dev/null; }

@@ -361,6 +361,22 @@ scenario_package() {
   fi
 }
 
+# Each unit's image carries its own name and description, not the repository's.
+scenario_image_context() {
+  local dir="$root/image-context" out
+  mkdir -p "$dir/dist"
+  touch "$dir/dist/balerix" "$dir/dist/balerix-plugin-flow"
+  out=$(GITHUB_REPOSITORY_OWNER=Example "$repo/scripts/release/image-context.sh" flow "$dir/dist" "$dir/flow" 2>>"$log")
+  expect_eq "image context: flow image" "$(field image "$out")" ghcr.io/example/balerix-plugin-flow
+  expect_eq "image context: flow title" "$(field title "$out")" balerix-plugin-flow
+  expect_eq "image context: flow description drops the spec reference" "$(field description "$out")" \
+    "The flow plugin: a per-agent state machine over hook events"
+  out=$("$repo/scripts/release/image-context.sh" core "$dir/dist" "$dir/core" 2>>"$log")
+  expect_eq "image context: core title" "$(field title "$out")" balerix
+  expect_eq "image context: core description" "$(field description "$out")" \
+    "Control plane and orchestrator for fleets of coding agents"
+}
+
 scenario_initial
 scenario_bumps_0x
 scenario_bumps_1x
@@ -377,6 +393,7 @@ scenario_hand_bump
 scenario_hand_bump_core
 scenario_notes
 scenario_package
+scenario_image_context
 
 if ((failures)); then
   echo "$failures check(s) failed; fixtures and $log kept" >&2

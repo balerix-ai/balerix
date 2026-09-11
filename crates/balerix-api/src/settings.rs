@@ -113,7 +113,7 @@ mod tests {
     fn deserializes_a_full_block() {
         let v = json!({
             "claude": { "settings": { "model": "opus" }, "args": ["--verbose"], "resume": true, "binary": "/opt/claude" },
-            "sandbox": { "network": { "mode": "allow" } },
+            "sandbox": { "network": { "block": false } },
             "tools": { "node": "22.11.0" },
             "env": { "RUST_LOG": "info" },
             "runner": { "type": "tmux" },

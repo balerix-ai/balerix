@@ -16,7 +16,7 @@ fn fleet() -> Fleet {
         json!({ "model": "sonnet", "permissions": { "allow": ["Bash(git *)"] } });
     alice.claude.args = vec!["--verbose".into()];
     alice.claude.resume = true;
-    alice.sandbox = json!({ "network": { "mode": "allow" } });
+    alice.sandbox = json!({ "network": { "block": false } });
     alice.tools = BTreeMap::from([
         ("node".to_string(), "22.11.0".to_string()),
         ("python".to_string(), "3.12.8".to_string()),

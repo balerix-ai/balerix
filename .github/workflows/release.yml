@@ -21,6 +21,9 @@ env:
   MISE_AUTO_INSTALL: "false"
 jobs:
   plan:
+    # A real release only from main; any branch may dry-run. Every other job
+    # needs plan, so all of them skip with it.
+    if: ${{ github.ref == 'refs/heads/main' || inputs.dry-run }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -264,7 +267,7 @@ jobs:
   github-release:
     needs: [plan, build, merge-images, package, publish-crates]
     if: >-
-      ${{ always() && !inputs.dry-run && needs.plan.outputs.units != '[]'
+      ${{ !cancelled() && !inputs.dry-run && needs.plan.outputs.units != '[]'
       && needs.build.result == 'success' && needs.merge-images.result == 'success'
       && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-24.04

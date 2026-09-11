@@ -50,7 +50,9 @@ mise trust
 mise install
 
 set +e
-err=$(env -u BALERIX_PLUGIN_TOKEN mise run serve 2>&1 >/dev/null)
+# The plugin binary runs without the job's tokens; mise install above is
+# the only step that needs them.
+err=$(env -u GH_TOKEN -u GITHUB_TOKEN -u BALERIX_PLUGIN_TOKEN mise run serve 2>&1 >/dev/null)
 code=$?
 set -e
 [[ $code -ne 0 ]] || die "$unit: the packaged plugin started without a daemon environment"

@@ -115,9 +115,12 @@ computes from it.
 If instead an older tag exists (a release has shipped before) and the
 manifest version has neither a tag nor that section, nobody proposed it
 through a release PR — the version was changed by hand. The script dies,
-naming the version. Recover by reverting the edit, or by forcing that exact
-version (`release-pr`'s `workflow_dispatch` with `version` set to it, or
-`release-prepare <unit> <version>` locally) to release it.
+naming the version. Recover by reverting the edit, or, if it is a release
+version above the last one, by forcing that exact version (`release-pr`'s
+`workflow_dispatch` with `version` set to it, or `release-prepare <unit>
+<version>` locally) to release it — a version below the last release or not
+a plain `x.y.z` is not something forcing accepts, so a revert is the only
+way back for those.
 
 `git-cliff` and `cargo-edit` are pinned exactly in `mise.toml`.
 
@@ -197,8 +200,9 @@ never enters environment `release` or requests OIDC:
 
 - `publish-crates-dry-run`: runs when `dry-run`, or outside
   `balerix-ai/balerix` (a fork's real run). No environment, `contents:
-  read` only. Runs `cargo publish --dry-run --locked -p balerix-api -p
-  balerix-plugin-sdk`.
+  read` only. Like `publish-crates`, skips each crate whose version already
+  exists in the crates.io index (exiting 0 with nothing to do if both do),
+  then runs `cargo publish --dry-run --locked` for the rest.
 - `publish-crates`: runs only when `!dry-run && github.repository ==
   'balerix-ai/balerix'`, in GitHub environment `release`. Obtains a
   short-lived token with `rust-lang/crates-io-auth-action` (crates.io
@@ -215,8 +219,10 @@ PR-tier guard: `mise run lint` gains
 
 ### 5.6 `github-release` (per unit)
 
-Needs `build`, `images`/`merge-images`, `package` (plugins) and
-`publish-crates` (core) to have succeeded.
+Needs `build`, `images`/`merge-images`, `package` (plugins) and both
+`publish-crates-dry-run` and `publish-crates` (core; on a fork's real run
+only the dry-run job does anything, and it must still hold this job back)
+to have succeeded or been skipped.
 
 1. Delete any existing draft for the tag (a previous failed run).
 2. `gh release create <tag> --draft --target <sha>` with the unit's
@@ -408,11 +414,12 @@ Verification commands published in the release notes and `docs/RELEASING.md`:
 ### 9.2 Hardening
 
 - **Least privilege.** Every workflow sets `permissions: {}`; jobs grant only:
-  `plan`, `build`, `package`: `contents: read`; image jobs: `contents: read`,
-  `packages: write`, `id-token: write`, `attestations: write`;
-  `publish-crates`: `contents: read`, `id-token: write`; `github-release`:
-  `contents: write`, `id-token: write`, `attestations: write`;
-  `verify-package`: `contents: write` (to flag a prerelease).
+  `plan`, `build`, `package`, `publish-crates-dry-run`: `contents: read`;
+  image jobs: `contents: read`, `packages: write`, `id-token: write`,
+  `attestations: write`; `publish-crates`: `contents: read`, `id-token:
+  write`; `github-release`: `contents: write`, `id-token: write`,
+  `attestations: write`; `verify-package`: `contents: write` (to flag a
+  prerelease).
   `actions/checkout` uses `persist-credentials: false` wherever the job does
   not push. Build jobs hold no secrets and no OIDC permission.
 - **Secrets bound to places.** Environment `release` (deployment branch
@@ -467,15 +474,16 @@ Verification commands published in the release notes and `docs/RELEASING.md`:
   | forcing a version below the last release | refused |
   | manifest version changed by hand to one with no tag and no changelog section, an older tag exists | `prepare.sh` dies, naming the hand-bumped version; no file changed |
   | forcing that hand-bumped version | `status=release` at that version; `plan.sh` then proposes the unit once it is committed |
+  | forcing a hand-bumped **core** version | `status=release`; every plugin's `Cargo.lock` still gets the SDK refresh even though the core manifest itself needs no `cargo set-version` (`next == current`) |
   | `notes.sh` for a released version | the changelog section's body alone, no neighbouring section |
   | `notes.sh` for a version with no section | refused |
-  | `package.sh` for a plugin | archive named and checksummed correctly; `mise.toml` rewritten with the full-tag version, per-architecture checksums and start task, no `version_prefix`; mise can parse the result |
+  | `package.sh` for a plugin | archive named and checksummed correctly; `mise.toml` rewritten with the fork repository owner, the full-tag version, both architectures' checksums, the start task and no `version_prefix`; the unpacked `balerix-plugin.yaml` carries the same version; mise can parse the rendered `mise.toml` |
   | `plan.sh`, nothing proposed | empty `units`/`plugins`, `core=false` |
   | `plan.sh`, a merged initial release PR | proposes that unit in `units` and, for a plugin, `plugins` |
   | `plan.sh`, once tagged | empty again |
 
   `assert_consistent`, run after the initial release, the `0.x` breaking
-  bump, the core bump and the hand-bump case, checks that the core
+  bump, the core bump and both hand-bump cases, checks that the core
   `Cargo.lock` carries the core version and that every plugin's
   `balerix-plugin.yaml` version, its own `Cargo.lock` entry and its
   `Cargo.lock`'s `balerix-plugin-sdk` entry all agree with its `Cargo.toml`

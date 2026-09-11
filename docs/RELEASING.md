@@ -36,7 +36,13 @@ minor and `fix` patch.
 
 Run the `release-pr` workflow by hand with `unit` and `version` (for
 example `1.0.0`). The PR gets that exact version and the `release:pinned`
-label, and pushes to `main` stop updating it. Dispatch again with a version to re-pin it, or remove the label to go back to computed versions. A forced version must be above the unit's last release, and nothing is proposed while a merged release PR still awaits its tag. If a unit's manifest version was changed by hand outside a release PR (no tag, no changelog section, an older tag exists), forcing that exact version is how to release it.
+label, and pushes to `main` stop updating it. Dispatch again with a
+version to re-pin it, or remove the label to go back to computed
+versions. A forced version must be above the unit's last release, and
+nothing is proposed while a merged release PR still awaits its tag. If a
+unit's manifest version was changed by hand outside a release PR (no tag,
+no changelog section, an older tag exists), forcing that exact version is
+how to release it.
 
 To see what CI would propose, locally: `mise run release-prepare <unit>`
 (then `git checkout -- . && git clean -fd CHANGELOG.md plugins/*/CHANGELOG.md`

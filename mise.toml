@@ -23,11 +23,12 @@ run = [
 ]
 
 [tasks.lint]
-description = "Static tier: rustfmt check + clippy with warnings denied, then the core dependency-isolation guard"
+description = "Static tier: rustfmt check + clippy with warnings denied, then the core dependency-isolation guard, and the published crates package cleanly"
 run = [
   "cargo fmt --all --check",
   "cargo clippy --workspace --all-targets -- -D warnings",
   "scripts/check-core-deps.sh",
+  "cargo package --no-verify -p balerix-api -p balerix-plugin-sdk",
 ]
 
 [tasks.test]

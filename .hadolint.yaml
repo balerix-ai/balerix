@@ -1,0 +1,5 @@
+# DL3008 wants apt package versions pinned. The base images are pinned by
+# digest and Renovate moves them; pinning Debian package versions as well
+# breaks the build whenever the security archive supersedes one.
+ignored:
+  - DL3008

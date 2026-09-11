@@ -283,7 +283,12 @@ scenario_package() {
   expect_eq "package: sha256" "$(field sha256 "$result")" "$(sha256sum "$pkg" | cut -d' ' -f1)"
   tar -xzf "$pkg" -C "$dir/unpacked"
   expect_grep "package: repository" '[tools."github:example/fork"]' "$dir/unpacked/mise.toml"
-  expect_grep "package: tag prefix" 'version_prefix = "balerix-plugin-flow-v"' "$dir/unpacked/mise.toml"
+  expect_grep "package: full-tag version" "version = \"balerix-plugin-flow-v$version\"" "$dir/unpacked/mise.toml"
+  if grep -q '^version_prefix' "$dir/unpacked/mise.toml"; then
+    fail "package: mise.toml still sets version_prefix"
+  else
+    pass "package: no version_prefix"
+  fi
   expect_grep "package: x64 checksum" "checksum = \"sha256:$sha_x64\"" "$dir/unpacked/mise.toml"
   expect_grep "package: start task" 'run = "balerix-plugin-flow"' "$dir/unpacked/mise.toml"
   expect_eq "package: manifest version" \

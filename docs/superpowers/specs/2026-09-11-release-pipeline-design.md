@@ -295,8 +295,7 @@ Asset `balerix-plugin-<name>-v<ver>-package.tar.gz`, platform-neutral:
 
 ```toml
 [tools."github:balerix-ai/balerix"]
-version = "0.1.1"
-version_prefix = "balerix-plugin-flow-v"
+version = "balerix-plugin-flow-v0.1.1"
 [tools."github:balerix-ai/balerix".platforms]
 linux-x64   = { asset_pattern = "balerix-plugin-flow-v0.1.1-x86_64-unknown-linux-musl.tar.gz",  checksum = "sha256:<digest>" }
 linux-arm64 = { asset_pattern = "balerix-plugin-flow-v0.1.1-aarch64-unknown-linux-musl.tar.gz", checksum = "sha256:<digest>" }
@@ -306,7 +305,12 @@ run = "balerix-plugin-flow"
 ```
 
 The repository (`balerix-ai/balerix`) is rendered from `github.repository`,
-so a fork rehearsal (§10) resolves against the fork. Explicit per-platform
+so a fork rehearsal (§10) resolves against the fork. The version is the
+full release tag rather than a bare version with a `version_prefix`: mise
+names the install directory after the version, so the full tag keeps each
+plugin's install directory distinct in the daemon's shared mise data dir
+(flow and matrix at the same version would otherwise share one, and the
+second install would be skipped). Explicit per-platform
 `asset_pattern`s make asset selection deterministic and keep mise from
 choosing the package itself. The per-platform `checksum` completes the
 chain: `plugins.yaml` `sha256` pins the package, the package pins each

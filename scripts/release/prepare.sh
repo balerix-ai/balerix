@@ -58,9 +58,12 @@ elif [[ -z $last ]]; then
 elif ! tag_exists "$(unit_tag "$unit" "$current")"; then
   # $last exists, so a release has shipped before, but $current has neither
   # a tag nor a changelog section: nobody proposed it through prepare.sh.
+  # $current need not be above $last (it could be a revert, or not even a
+  # release version), in which case forcing it is refused; say so.
   die "$unit: $current has no tag and no $changelog section, though $last exists;" \
-    "it was changed outside a release PR. Revert the edit, or dispatch" \
-    "release-pr with version set to $current to release it."
+    "it was changed outside a release PR. Revert the edit, or, if it is a" \
+    "release version above ${last#"$prefix"}, dispatch release-pr with" \
+    "version set to it."
 else
   count=$(cliff "$unit" --unreleased --context | jq '[.[].commits[]] | length')
   if [[ $count -eq 0 ]]; then
@@ -77,13 +80,18 @@ tag=$(unit_tag "$unit" "$next")
 if [[ $next != "$current" ]]; then
   if [[ $unit == core ]]; then
     cargo set-version --workspace "$next" >&2
-    # Plugins lock the SDK and api versions through their path dependency.
-    for plugin in "${PLUGIN_UNITS[@]}"; do
-      cargo update --manifest-path "plugins/$plugin/Cargo.toml" -p balerix-api -p balerix-plugin-sdk >&2
-    done
   else
     cargo set-version --manifest-path "plugins/$unit/Cargo.toml" "$next" >&2
   fi
+fi
+if [[ $unit == core ]]; then
+  # Plugins lock the SDK and api versions through their path dependency.
+  # Refresh even when $next == $current: a forced version equal to a
+  # hand-bumped manifest (§8.2) skips cargo set-version above, but the
+  # plugin lockfiles were never updated for that hand edit either.
+  for plugin in "${PLUGIN_UNITS[@]}"; do
+    cargo update --manifest-path "plugins/$plugin/Cargo.toml" -p balerix-api -p balerix-plugin-sdk >&2
+  done
 fi
 if [[ $unit != core ]]; then
   sed -i "s/^version: .*/version: $next/" "plugins/$unit/package/balerix-plugin.yaml"

@@ -8,7 +8,7 @@
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 
-usage() { echo "usage: $0 {target-dir|build|fmt|check} <name>" >&2; exit 2; }
+usage() { echo "usage: $0 {target-dir|build|fmt|version-check|check} <name>" >&2; exit 2; }
 [[ $# -eq 2 ]] || usage
 cmd=$1
 name=$2
@@ -18,6 +18,18 @@ name=$2
 dir="$repo/plugins/$name"
 [[ -d $dir ]] || { echo "no such plugin: $name" >&2; exit 1; }
 target="$dir/target"
+
+# A plugin's balerix-plugin.yaml version is written from its Cargo.toml by
+# the release scripts (Spec I §3); a hand edit to either one fails here.
+version_check() {
+  local cargo_version manifest_version
+  cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$dir/Cargo.toml" | head -n 1)
+  manifest_version=$(sed -n 's/^version: //p' "$dir/package/balerix-plugin.yaml")
+  if [[ $cargo_version != "$manifest_version" ]]; then
+    echo "plugins/$name: Cargo.toml says $cargo_version, package/balerix-plugin.yaml says $manifest_version" >&2
+    exit 1
+  fi
+}
 
 case "$cmd" in
   target-dir)
@@ -29,7 +41,11 @@ case "$cmd" in
   fmt)
     CARGO_TARGET_DIR="$target" cargo fmt --manifest-path "$dir/Cargo.toml" --all
     ;;
+  version-check)
+    version_check
+    ;;
   check)
+    version_check
     CARGO_TARGET_DIR="$target" cargo fmt --manifest-path "$dir/Cargo.toml" --all --check
     CARGO_TARGET_DIR="$target" cargo clippy --manifest-path "$dir/Cargo.toml" --all-targets -- -D warnings
     # nextest resolves .config/nextest.toml from the workspace root, and each

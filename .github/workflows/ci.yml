@@ -17,10 +17,12 @@ jobs:
     env:
       BALERIX_REQUIRE_TOOLS: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with: { version: 2026.9.2, install: false, cache: true }
-      - run: mise install rust cargo:cargo-nextest cargo-insta tmux nono gh gitleaks
+      - run: mise install rust cargo:cargo-nextest cargo-insta tmux nono gh gitleaks zizmor actionlint shellcheck
       # The core workspace, plus the two plugin projects `check` builds for
       # the e2e (`package-plugins flow web`) — without them here, 180 and 179
       # packages compile cold on every run and are thrown away. They share
@@ -31,7 +33,7 @@ jobs:
       # the core target cache too; both move rarely, and matrix — the
       # expensive project, and what Spec H §7's promise is really about —
       # stays fully independent either way.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             . -> target
@@ -54,13 +56,15 @@ jobs:
       matrix:
         plugin: [flow, web, matrix]
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with: { version: 2026.9.2, install: false, cache: true }
       - run: mise install rust cargo:cargo-nextest
       # One cache per plugin project: each has its own lockfile and its own
       # target directory under plugins/<name>/target (scripts/plugin.sh).
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "plugins/${{ matrix.plugin }} -> target"
           key: ${{ matrix.plugin }}
@@ -69,8 +73,10 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with: { version: 2026.9.2, install: false, cache: true }
       - run: mise install rust github:sourcefrog/cargo-mutants
       - run: mise run mutants
@@ -78,8 +84,10 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with: { version: 2026.9.2, install: false, cache: true }
       - run: mise install rust cargo:cargo-audit aqua:EmbarkStudios/cargo-deny
       - run: mise run audit

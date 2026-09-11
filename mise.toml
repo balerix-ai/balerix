@@ -13,6 +13,18 @@ gh = "2.100.0"
 nono = "0.76.0"
 claude = "2.1.268"
 
+# Release and workflow tooling (Spec I). Only `claude` and `gh` from this
+# table reach agents (balerix-runtime's INHERITED list).
+jq = "1.8.2"
+git-cliff = "2.14.1"
+"cargo:cargo-edit" = "0.13.13"
+cosign = "3.1.3"
+hadolint = "2.15.1"
+trivy = "0.74.0"
+zizmor = "1.30.1"
+actionlint = "1.7.12"
+shellcheck = "0.11.0"
+
 [tasks.fmt]
 description = "Format the core workspace and every standalone plugin project"
 run = [
@@ -23,11 +35,15 @@ run = [
 ]
 
 [tasks.lint]
-description = "Static tier: rustfmt check + clippy with warnings denied, then the core dependency-isolation guard"
+description = "Static tier: rustfmt check + clippy with warnings denied, then the core dependency-isolation guard, and the published crates package cleanly"
 run = [
   "cargo fmt --all --check",
   "cargo clippy --workspace --all-targets -- -D warnings",
   "scripts/check-core-deps.sh",
+  "cargo package --no-verify --allow-dirty -p balerix-api -p balerix-plugin-sdk",
+  "actionlint",
+  "zizmor --offline --min-severity medium .github",
+  "shellcheck -x scripts/release/*.sh",
 ]
 
 [tasks.test]
@@ -110,3 +126,15 @@ run = "scripts/verify-claude.sh"
 [tasks.verify-matrix]
 description = "Spec G's manual check against a real Matrix homeserver (needs MATRIX_* credentials; not part of any CI tier)"
 run = "scripts/verify-matrix.sh"
+
+[tasks.release-prepare]
+description = "Prepare one release unit's next release in the working tree (what release-pr.yml runs): `mise run release-prepare flow [version]`"
+usage = '''
+arg "<unit>" help="core, flow, web or matrix"
+arg "[version]" help="an exact version to force"
+'''
+run = 'scripts/release/prepare.sh "$usage_unit" ${usage_version:+"$usage_version"}'
+
+[tasks.release-test]
+description = "Scenario tests for scripts/release/ against throwaway clones under target/tmp (Spec I §10)"
+run = "scripts/release/test.sh"

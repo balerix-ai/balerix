@@ -1,0 +1,60 @@
+name: release-pr
+# Keeps one release PR per unit in step with main (Spec I §4.2). Merging a
+# release PR is what releases (release.yml).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      unit:
+        description: Release unit
+        type: choice
+        options: [core, flow, web, matrix]
+        required: true
+      version:
+        description: Exact version to release; pins the PR until the label is removed
+        type: string
+        required: false
+permissions: {}
+env:
+  MISE_AUTO_INSTALL: "false"
+jobs:
+  pr:
+    name: release PR (${{ matrix.unit }})
+    runs-on: ubuntu-24.04
+    environment: release-bot
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        unit: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('["{0}"]', inputs.unit) || '["core","flow","web","matrix"]') }}
+    concurrency:
+      group: release-pr-${{ matrix.unit }}
+      cancel-in-progress: false
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.9.2
+          install: false
+          cache: false
+      - run: mise install rust jq git-cliff gh
+      # cargo-edit has no prebuilt release; the cargo backend builds it with rust.
+      - run: mise install cargo:cargo-edit
+      - env:
+          UNIT: ${{ matrix.unit }}
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: mise x -- scripts/release/open-pr.sh "$UNIT" "$VERSION"

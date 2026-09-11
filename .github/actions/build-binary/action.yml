@@ -1,0 +1,39 @@
+name: build-binary
+description: >-
+  Build, smoke-test and archive one release unit's static musl binary on a
+  runner of the target's architecture (scripts/release/build.sh). The caller
+  has checked out the repository and installed rust and jq through mise.
+inputs:
+  unit:
+    description: Release unit (core, flow, web, matrix)
+    required: true
+  target:
+    description: x86_64-unknown-linux-musl or aarch64-unknown-linux-musl
+    required: true
+outputs:
+  dist:
+    description: Directory holding the bare binary and its archive
+    value: ${{ steps.build.outputs.dist }}
+runs:
+  using: composite
+  steps:
+    - name: Install musl-tools
+      shell: bash
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -yq --no-install-recommends musl-tools
+    - name: Add the Rust target
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+      run: mise x -- rustup target add "$TARGET"
+    - name: Build, smoke-test and archive
+      id: build
+      shell: bash
+      env:
+        UNIT: ${{ inputs.unit }}
+        TARGET: ${{ inputs.target }}
+      run: |
+        dist="$RUNNER_TEMP/dist"
+        mise x -- scripts/release/build.sh "$UNIT" "$TARGET" "$dist"
+        echo "dist=$dist" >>"$GITHUB_OUTPUT"

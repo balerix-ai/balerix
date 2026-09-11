@@ -5,6 +5,27 @@ first), driven over a loopback HTTP API from a thin CLI. Agents run isolated —
 `$HOME`, own tools, own sandbox — as tmux windows grouped into crews that share
 a repository.
 
+## Install
+
+Releases are on the [releases page](https://github.com/balerix-ai/balerix/releases),
+one tag line per component (`balerix-v…`, `balerix-plugin-<name>-v…`); every
+asset is attested (`gh attestation verify <file> --repo balerix-ai/balerix`).
+`docs/RELEASING.md` covers verification and the release process.
+
+- **CLI and daemon:** download `balerix-v<ver>-<arch>-unknown-linux-musl.tar.gz`
+  (static; x86_64 or aarch64) and put `balerix` on `PATH`. `serve` also needs
+  `git`, `gh`, `mise`, `nono` and `tmux` on `PATH` and a Landlock kernel (5.13+).
+- **Container:** `docker run -d --name balerix -v balerix:/home/balerix
+  ghcr.io/balerix-ai/balerix:<ver>` runs the daemon with its tools. It listens on
+  loopback inside the container only, so run the client there too:
+  `docker exec balerix balerix up fleet.yaml`. Landlock must be allowed by the
+  container's seccomp profile.
+- **Plugins:** download `balerix-plugin-<name>-v<ver>-package.tar.gz` next to
+  `$XDG_CONFIG_HOME/balerix/plugins.yaml` and add the entry printed in that
+  release's notes (`source: ./<file>` plus its `sha256`). The daemon installs the
+  plugin binary through mise for the host's architecture.
+- **Plugin SDK:** `cargo add balerix-plugin-sdk`.
+
 ## Quickstart
 1. `mise trust && mise install` — pinned toolchain (Rust and every tool balerix shells out to).
 2. `git config core.hooksPath .githooks` — enables the pre-commit tier.

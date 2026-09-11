@@ -17,7 +17,8 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# Workspace path dependencies carry no version; every crate is `publish = false`.
+# Path dependencies between private crates carry no version; the two
+# published crates' path dependencies do (Spec I §3).
 allow-wildcard-paths = true
 
 [sources]

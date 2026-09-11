@@ -116,3 +116,41 @@ phases; the rest exist in code today.
 | Script injection through diff content, event payloads or review text | the review page renders every value with `textContent`; the id and prefix reach its script as JSON literals; comment paths pass `check_path`; bodies are capped (200 comments, 64 KiB of bodies, 4 KiB per quoted line, 256 bytes per ref, no NUL in any rendered field) and the rendered message at 256 KiB | `balerix-plugin-web/src/routes.rs::review_html`, `src/review.rs::validate` |
 | Script injection through agent names or messages on the web pages | names are validated identifiers; every rendered value is HTML-escaped and the polled rows are inserted with `textContent` | `balerix-plugin-web/src/routes.rs::{html_escape, index_html}` |
 | The vendored JavaScript | verbatim minified files from the pinned npm tarballs, sha256 recorded in `VENDOR.md` and checked by `scripts/vendor-xterm.sh`; served under the mount only, with `immutable` caching on a path that carries a digest of the bundle (`/assets/<sha256[..12]>/`), so a bump is a new URL | `plugins/web/assets/VENDOR.md` |
+
+## Release pipeline (Spec I)
+
+### Assets
+- **The crates.io publish right** for `balerix-api` and `balerix-plugin-sdk` — anything published there lands in plugin authors' builds.
+- **The ghcr namespace** `ghcr.io/balerix-ai/*` — images operators run with their credentials mounted.
+- **Tags and release assets** — the binaries and plugin packages operators and the daemon's mise install.
+- **The release App's private key** — can push branches and edit pull requests on this repository.
+
+### Trust boundaries
+- **Pull request ↔ CI** — a pull request's code runs in `ci.yml`, `images.yml`, `release-scripts.yml` and `pr-title.yml` with a read-only token and no secrets. **Untrusted input.**
+- **`main` ↔ release workflows** — `release-pr.yml` and `release.yml` run only on push to `main` or dispatch, and hold the App token, OIDC and write permissions.
+- **Build job ↔ publishing jobs** — build and image jobs hand artifacts to jobs that sign, publish and tag.
+- **CI ↔ registries** — crates.io through trusted publishing (OIDC, 30-minute token), ghcr through `GITHUB_TOKEN`, GitHub Releases through `GITHUB_TOKEN`.
+
+### Adversaries
+- **A malicious pull request** — wants secrets, a poisoned cache or artifact that a release later picks up, or a workflow run with write permissions.
+- **A compromised dependency or action** — code in a `build.rs`, a crate, a pinned tool or a third-party action running in a release job.
+- **A leaked App key or registry token.**
+
+### Out of scope / accepted risks
+- **A compromise of GitHub, crates.io or ghcr themselves.**
+- **A maintainer account takeover** — a maintainer can merge a release PR; branch protection and reviews are the control, not this pipeline.
+- **A malicious dependency that passes `cargo audit` and `cargo deny`** is built into the release: the build jobs have no secrets or OIDC, but their output is what gets signed. Attestations say where an artifact was built, not that its inputs were benign.
+
+### Mitigations
+| Threat | Control | Where |
+|---|---|---|
+| A pull request reaching secrets or write tokens | no `pull_request_target`; PR workflows have read-only tokens and no secrets; release workflows trigger only on `main` or dispatch; the App key and the crates.io trusted publisher are bound to `main`-only environments (`release-bot`, `release`) | `.github/workflows/*.yml` |
+| Over-broad job permissions | `permissions: {}` per workflow, least grant per job; build jobs hold no secrets and no `id-token`; `persist-credentials: false` on every checkout; the App token requests only `contents`, `pull-requests`, `issues` | `.github/workflows/release.yml`, `release-pr.yml` |
+| A mutable action or tool changing under us | actions pinned by commit SHA, base images by digest, every tool exact in `mise.toml`, mise in the image checked by sha256; Renovate proposes bumps as reviewable PRs | `mise.toml`, `docker/*/Dockerfile`, `renovate.json` |
+| Cache poisoning into a release | `release.yml` restores no caches; GitHub scopes caches written by pull requests to their own ref | `.github/workflows/release.yml` |
+| Workflow injection and misconfiguration | `zizmor` and `actionlint` in `mise run lint`; untrusted values reach `run:` only through `env:` | `mise.toml` |
+| Shipping a known advisory | `cargo audit` and `cargo deny` gate every unit before it builds | `scripts/release/audit.sh` |
+| Vulnerable image contents | `hadolint`, and `trivy image` failing on fixed CRITICAL/HIGH, before any push and nightly; exceptions only through `.trivyignore.yaml`, per binary and expiring | `.github/actions/build-image/action.yml`, `images.yml` |
+| A tampered or substituted artifact | `SHA256SUMS` and GitHub build-provenance attestations on every archive and package; cosign keyless signatures and attestations on every image index; the plugin package pins each archive's sha256 and mise verifies attestations at install | `release.yml`, `scripts/release/package.sh` |
+| A leaked long-lived registry token | none exist: crates.io trusted publishing, `GITHUB_TOKEN` for ghcr and releases; the one bootstrap API token is revoked after the first publish (`docs/RELEASING.md`) | `release.yml` |
+| A half-finished release looking complete | the tag is created last; `latest` image tags move only after the release and its package verification; a failed package verification flags the release as a prerelease | `scripts/release/github-release.sh`, `verify-package.sh`, `promote-image.sh` |

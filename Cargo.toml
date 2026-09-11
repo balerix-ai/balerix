@@ -8,15 +8,17 @@ edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
 repository = "https://github.com/balerix-ai/balerix"
-# Nothing here is published to crates.io; path dependencies therefore carry no
-# version (cargo-deny: `allow-wildcard-paths` exempts private crates).
+# balerix-api and balerix-plugin-sdk are published to crates.io at this
+# version (Spec I §3); every other crate sets `publish = false`. A published
+# crate's path dependencies need a version, so those two entries carry one,
+# and scripts/release/prepare.sh moves it with the workspace version.
 publish = false
 
 [workspace.dependencies]
-balerix-api = { path = "crates/balerix-api" }
+balerix-api = { path = "crates/balerix-api", version = "0.1.0" }
 balerix-core = { path = "crates/balerix-core" }
 balerix-config = { path = "crates/balerix-config" }
-balerix-plugin-sdk = { path = "crates/balerix-plugin-sdk" }
+balerix-plugin-sdk = { path = "crates/balerix-plugin-sdk", version = "0.1.0" }
 balerix-runtime = { path = "crates/balerix-runtime" }
 balerix-server = { path = "crates/balerix-server" }
 
@@ -73,3 +75,6 @@ unsafe_code = "forbid"
 all = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 expect_used = "warn"
+
+[profile.release]
+strip = true

@@ -275,10 +275,41 @@ scenario_hand_bump() {
   expect_eq "hand bump, forced: status" "$(field status "$out")" release
   expect_eq "hand bump, forced: version" "$(field version "$out")" 0.5.0
   assert_consistent "$dir" "hand bump, forced"
+  expect_grep "hand bump, forced: changelog section" "## 0.5.0 - " "$dir/plugins/flow/CHANGELOG.md"
+  expect_eq "hand bump, forced: manifest untouched, only yaml and changelog written" \
+    "$(git -C "$dir" status --porcelain | awk '{print $2}' | sort)" \
+    "$(printf '%s\n' plugins/flow/CHANGELOG.md plugins/flow/package/balerix-plugin.yaml | sort)"
   gitc "$dir" add -A
   gitc "$dir" commit -q -m "chore(release): flow v0.5.0"
   out=$(plan "$dir")
   expect_eq "hand bump, forced: plan proposes flow" "$(field units "$out")" '["flow"]'
+}
+
+scenario_hand_bump_core() {
+  local dir errfile out
+  dir=$(fixture hand-bump-core)
+  release "$dir" core 0.4.0
+  (cd "$dir" && cargo set-version --workspace 0.5.0) >>"$log" 2>&1
+  gitc "$dir" add -A
+  gitc "$dir" commit -q -m "chore: hand-bump core to 0.5.0"
+
+  errfile="$root/hand-bump-core.stderr"
+  if "$dir/scripts/release/prepare.sh" core >/dev/null 2>"$errfile"; then
+    fail "hand bump core: prepare succeeded for a version changed outside a release PR"
+  else
+    pass "hand bump core: prepare refuses a version changed outside a release PR"
+  fi
+  cat "$errfile" >>"$log"
+  expect_grep "hand bump core: error names the version" "core: 0.5.0" "$errfile"
+  expect_eq "hand bump core: no file changed" "$(git -C "$dir" status --porcelain)" ""
+
+  # The hand-bump above only touched the core manifest and its own
+  # Cargo.lock; every plugin's Cargo.lock still locks the SDK at 0.4.0
+  # until prepare.sh refreshes it (Spec I §10).
+  out=$(prepare "$dir" core 0.5.0)
+  expect_eq "hand bump core, forced: status" "$(field status "$out")" release
+  expect_eq "hand bump core, forced: version" "$(field version "$out")" 0.5.0
+  assert_consistent "$dir" "hand bump core, forced"
 }
 
 scenario_notes() {
@@ -299,12 +330,13 @@ scenario_notes() {
 }
 
 scenario_package() {
-  local dir="$root/package" version result pkg sha_x64
+  local dir="$root/package" version result pkg sha_x64 sha_arm64
   version=$(manifest_version "$repo" flow)
   mkdir -p "$dir/dist" "$dir/unpacked"
   echo x64 >"$dir/dist/balerix-plugin-flow-v$version-x86_64-unknown-linux-musl.tar.gz"
   echo arm64 >"$dir/dist/balerix-plugin-flow-v$version-aarch64-unknown-linux-musl.tar.gz"
   sha_x64=$(sha256sum "$dir/dist/balerix-plugin-flow-v$version-x86_64-unknown-linux-musl.tar.gz" | cut -d' ' -f1)
+  sha_arm64=$(sha256sum "$dir/dist/balerix-plugin-flow-v$version-aarch64-unknown-linux-musl.tar.gz" | cut -d' ' -f1)
   result=$(GITHUB_REPOSITORY=example/fork "$repo/scripts/release/package.sh" flow "$dir/dist" "$dir/out" 2>>"$log")
   pkg=$(field package "$result")
   expect_eq "package: file name" "$(basename "$pkg")" "balerix-plugin-flow-v$version-package.tar.gz"
@@ -318,6 +350,7 @@ scenario_package() {
     pass "package: no version_prefix"
   fi
   expect_grep "package: x64 checksum" "checksum = \"sha256:$sha_x64\"" "$dir/unpacked/mise.toml"
+  expect_grep "package: arm64 checksum" "checksum = \"sha256:$sha_arm64\"" "$dir/unpacked/mise.toml"
   expect_grep "package: start task" 'run = "balerix-plugin-flow"' "$dir/unpacked/mise.toml"
   expect_eq "package: manifest version" \
     "$(sed -n 's/^version: //p' "$dir/unpacked/balerix-plugin.yaml")" "$version"
@@ -341,6 +374,7 @@ scenario_forced_released
 scenario_forced_in_progress
 scenario_forced_below_last
 scenario_hand_bump
+scenario_hand_bump_core
 scenario_notes
 scenario_package
 

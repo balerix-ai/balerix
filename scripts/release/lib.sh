@@ -26,9 +26,15 @@ unit_crate() {
   if [[ $1 == core ]]; then echo balerix; else echo "balerix-plugin-$1"; fi
 }
 
-unit_tag_prefix() { echo "$(unit_crate "$1")-v"; }
+unit_tag_prefix() {
+  require_unit "$1"
+  echo "$(unit_crate "$1")-v"
+}
 
-unit_tag() { echo "$(unit_tag_prefix "$1")$2"; }
+unit_tag() {
+  require_unit "$1"
+  echo "$(unit_tag_prefix "$1")$2"
+}
 
 unit_manifest() {
   require_unit "$1"
@@ -42,6 +48,7 @@ unit_changelog() {
 
 # ghcr repositories must be lowercase; a fork's owner may not be.
 unit_image() {
+  require_unit "$1"
   local owner=${GITHUB_REPOSITORY_OWNER:-balerix-ai}
   echo "ghcr.io/${owner,,}/$(unit_crate "$1")"
 }
@@ -67,10 +74,14 @@ unit_version() {
 tag_exists() { git rev-parse -q --verify "refs/tags/$1" >/dev/null; }
 
 # The unit's newest release tag, or nothing.
-last_tag() { git tag --list "$(unit_tag_prefix "$1")*" --sort=-v:refname | head -n 1; }
+last_tag() {
+  require_unit "$1"
+  git tag --list "$(unit_tag_prefix "$1")*" --sort=-v:refname | head -n 1
+}
 
 # git-cliff scoped to the unit: its tag pattern and its include paths.
 cliff() {
+  require_unit "$1"
   local unit=$1 path
   shift
   local args=(--config cliff.toml --tag-pattern "^$(unit_tag_prefix "$unit")")

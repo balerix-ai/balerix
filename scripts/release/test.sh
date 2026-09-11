@@ -203,6 +203,29 @@ scenario_forced_released() {
   fi
 }
 
+scenario_forced_in_progress() {
+  local dir out
+  dir=$(fixture forced-in-progress)
+  release "$dir" flow 0.4.0
+  change "$dir" plugins/flow/release-test.txt "fix: a flow fix"
+  prepare "$dir" flow >/dev/null
+  gitc "$dir" commit -qam "chore(release): flow v0.4.1"
+  out=$(prepare "$dir" flow 0.5.0)
+  expect_eq "forced, in progress: status" "$(field status "$out")" in-progress
+  expect_eq "forced, in progress: no file changed" "$(git -C "$dir" status --porcelain)" ""
+}
+
+scenario_forced_below_last() {
+  local dir
+  dir=$(fixture forced-below)
+  release "$dir" flow 0.4.0
+  if prepare "$dir" flow 0.3.0 >/dev/null; then
+    fail "forcing a version below the last release succeeded"
+  else
+    pass "forcing a version below the last release is refused"
+  fi
+}
+
 scenario_notes() {
   local dir notes
   dir=$(fixture notes)
@@ -229,6 +252,8 @@ scenario_plugin_only
 scenario_core_bump
 scenario_in_progress
 scenario_forced_released
+scenario_forced_in_progress
+scenario_forced_below_last
 scenario_notes
 
 if ((failures)); then

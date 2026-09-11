@@ -43,6 +43,7 @@ run = [
   "cargo package --no-verify --allow-dirty -p balerix-api -p balerix-plugin-sdk",
   "actionlint",
   "zizmor --offline --min-severity medium .github",
+  "shellcheck -x scripts/release/*.sh",
 ]
 
 [tasks.test]
@@ -125,3 +126,15 @@ run = "scripts/verify-claude.sh"
 [tasks.verify-matrix]
 description = "Spec G's manual check against a real Matrix homeserver (needs MATRIX_* credentials; not part of any CI tier)"
 run = "scripts/verify-matrix.sh"
+
+[tasks.release-prepare]
+description = "Prepare one release unit's next release in the working tree (what release-pr.yml runs): `mise run release-prepare flow [version]`"
+usage = '''
+arg "<unit>" help="core, flow, web or matrix"
+arg "[version]" help="an exact version to force"
+'''
+run = 'scripts/release/prepare.sh "$usage_unit" ${usage_version:+"$usage_version"}'
+
+[tasks.release-test]
+description = "Scenario tests for scripts/release/ against throwaway clones under target/tmp (Spec I §10)"
+run = "scripts/release/test.sh"

@@ -1,0 +1,47 @@
+# git-cliff configuration shared by every release unit (Spec I §4.1).
+# scripts/release/prepare.sh passes the unit's --tag-pattern and
+# --include-path; nothing unit-specific lives here.
+
+[changelog]
+header = "# Changelog\n\n"
+body = """
+{% if version -%}
+## {{ version | split(pat="-v") | last }} - {{ timestamp | date(format="%Y-%m-%d") }}
+{%- else -%}
+## Unreleased
+{%- endif %}
+{% if commits | length == 0 %}
+- Initial release.
+{% endif -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message | upper_first }}
+{%- endfor %}
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+protect_breaking_commits = false
+filter_commits = false
+sort_commits = "oldest"
+# Releasable types get a group; everything else is skipped, so it neither
+# appears in a changelog nor counts toward a release.
+commit_parsers = [
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Bug fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^refactor", group = "<!-- 3 -->Refactoring" },
+  { message = "^build", group = "<!-- 4 -->Build" },
+  { message = ".*", skip = true },
+]
+
+[bump]
+# Cargo semver: in 0.x a breaking change bumps minor, anything else patch.
+features_always_bump_minor = false
+breaking_always_bump_major = false

@@ -1,0 +1,39 @@
+name: release-scripts
+# The release scripts' own tests (Spec I §10), whenever they could change.
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/release/**
+      - scripts/plugin.sh
+      - cliff.toml
+      - mise.toml
+      - .github/workflows/release-scripts.yml
+  pull_request:
+    paths:
+      - scripts/release/**
+      - scripts/plugin.sh
+      - cliff.toml
+      - mise.toml
+      - .github/workflows/release-scripts.yml
+permissions: {}
+env:
+  MISE_AUTO_INSTALL: "false"
+jobs:
+  release-test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.9.2
+          install: false
+          cache: true
+      - run: mise install rust jq git-cliff shellcheck
+      - run: mise install cargo:cargo-edit
+      - run: mise run release-test

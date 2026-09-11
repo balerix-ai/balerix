@@ -373,8 +373,10 @@ credentials, hook input, or sandbox rules.
   `version` is written from its `Cargo.toml` by
   `scripts/release/prepare.sh`, and `mise run plugin <name>` fails when the
   two differ. A version on `main` with no matching tag
-  (`<crate>-v<version>`) means "release pending": `release.yml` releases it
-  on the next push and `prepare.sh` answers `in-progress` for it.
+  (`<crate>-v<version>`) whose changelog has that version's section means
+  "release pending" (its release PR was merged): `release.yml` releases it
+  on the next push and `prepare.sh` answers `in-progress` for it. A version
+  with neither is not proposed yet, and nothing releases it.
 - Released `CHANGELOG.md` sections are read back by
   `scripts/release/notes.sh` for the GitHub Release; don't edit them by
   hand.

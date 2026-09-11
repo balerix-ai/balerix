@@ -104,9 +104,10 @@ code. Steps:
 4. Prepend the new section to the unit's `CHANGELOG.md` with git-cliff.
 5. Print the new version and the changelog section (the workflow uses both).
 
-Before step 2: if the manifest version has no tag yet but an older tag
-exists (a release PR was merged and `release.yml` has not finished, or
-failed — §8.2), the script prints `release in progress`, exits 0 and changes
+Before step 2: if the manifest version has no tag yet and either an older
+tag exists or the changelog already carries that version's section (a
+merged initial release PR) — a release PR was merged and `release.yml` has
+not finished, or failed (§8.2) — the script prints `release in progress`, exits 0 and changes
 nothing. The workflow leaves that unit's PR state untouched; the next push
 after the tag exists computes from it.
 

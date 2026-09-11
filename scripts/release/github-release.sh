@@ -17,6 +17,7 @@ assets=$2
 crate=$(unit_crate "$unit")
 version=$(unit_version "$unit")
 tag=$(unit_tag "$unit" "$version")
+image=$(unit_image "$unit")
 
 [[ -f $assets/SHA256SUMS ]] || die "$unit: no SHA256SUMS in $assets"
 
@@ -42,6 +43,20 @@ plugins:
 \`\`\`
 EOF
 fi
+
+cat >>"$notes" <<EOF
+
+### Verify
+
+\`\`\`sh
+gh attestation verify $crate-v$version-x86_64-unknown-linux-musl.tar.gz --repo $GITHUB_REPOSITORY
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify oci://$image:$version --repo $GITHUB_REPOSITORY
+cosign verify $image:$version \\
+  --certificate-identity https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/heads/main \\
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+\`\`\`
+EOF
 
 # Drafts have no tag yet, so they cannot be looked up by tag name.
 gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \

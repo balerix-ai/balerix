@@ -308,7 +308,7 @@ jobs:
 
   verify-package:
     needs: [plan, github-release]
-    if: ${{ always() && needs.github-release.result == 'success' && needs.plan.outputs.plugins != '[]' }}
+    if: ${{ !cancelled() && needs.github-release.result == 'success' && needs.plan.outputs.plugins != '[]' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
@@ -338,9 +338,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: mise x -- scripts/release/verify-package.sh "$UNIT" --flag
 
+  # Moving tags need a positive verification (I-9): a plugin whose package
+  # failed to install and run holds back promotion for the whole run, not
+  # just that plugin's image.
   promote-images:
     needs: [plan, github-release, verify-package]
-    if: ${{ always() && needs.github-release.result == 'success' }}
+    if: ${{ !cancelled() && needs.github-release.result == 'success' && (needs.verify-package.result == 'success' || needs.verify-package.result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read

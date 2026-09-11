@@ -1,0 +1,13 @@
+# The release package layout (plugin-protocol §7, Spec I §7): the plugin
+# binary is a mise tool pinned to this release's assets, and the package
+# carries no binary of its own. Rendered by scripts/release/package.sh.
+[tools."github:@REPO@"]
+version = "@VERSION@"
+version_prefix = "@CRATE@-v"
+
+[tools."github:@REPO@".platforms]
+linux-x64 = { asset_pattern = "@CRATE@-v@VERSION@-x86_64-unknown-linux-musl.tar.gz", checksum = "sha256:@SHA256_X64@" }
+linux-arm64 = { asset_pattern = "@CRATE@-v@VERSION@-aarch64-unknown-linux-musl.tar.gz", checksum = "sha256:@SHA256_ARM64@" }
+
+[tasks.serve]
+run = "@CRATE@"

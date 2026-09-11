@@ -243,6 +243,31 @@ scenario_notes() {
   fi
 }
 
+scenario_package() {
+  local dir="$root/package" version result pkg sha_x64
+  version=$(manifest_version "$repo" flow)
+  mkdir -p "$dir/dist" "$dir/unpacked"
+  echo x64 >"$dir/dist/balerix-plugin-flow-v$version-x86_64-unknown-linux-musl.tar.gz"
+  echo arm64 >"$dir/dist/balerix-plugin-flow-v$version-aarch64-unknown-linux-musl.tar.gz"
+  sha_x64=$(sha256sum "$dir/dist/balerix-plugin-flow-v$version-x86_64-unknown-linux-musl.tar.gz" | cut -d' ' -f1)
+  result=$(GITHUB_REPOSITORY=example/fork "$repo/scripts/release/package.sh" flow "$dir/dist" "$dir/out" 2>>"$log")
+  pkg=$(field package "$result")
+  expect_eq "package: file name" "$(basename "$pkg")" "balerix-plugin-flow-v$version-package.tar.gz"
+  expect_eq "package: sha256" "$(field sha256 "$result")" "$(sha256sum "$pkg" | cut -d' ' -f1)"
+  tar -xzf "$pkg" -C "$dir/unpacked"
+  expect_grep "package: repository" '[tools."github:example/fork"]' "$dir/unpacked/mise.toml"
+  expect_grep "package: tag prefix" 'version_prefix = "balerix-plugin-flow-v"' "$dir/unpacked/mise.toml"
+  expect_grep "package: x64 checksum" "checksum = \"sha256:$sha_x64\"" "$dir/unpacked/mise.toml"
+  expect_grep "package: start task" 'run = "balerix-plugin-flow"' "$dir/unpacked/mise.toml"
+  expect_eq "package: manifest version" \
+    "$(sed -n 's/^version: //p' "$dir/unpacked/balerix-plugin.yaml")" "$version"
+  if (cd "$dir/unpacked" && MISE_TRUSTED_CONFIG_PATHS="$PWD" mise tasks ls 2>>"$log" | grep -q '^serve'); then
+    pass "package: mise parses mise.toml"
+  else
+    fail "package: mise cannot read the rendered mise.toml"
+  fi
+}
+
 scenario_initial
 scenario_bumps_0x
 scenario_bumps_1x
@@ -255,6 +280,7 @@ scenario_forced_released
 scenario_forced_in_progress
 scenario_forced_below_last
 scenario_notes
+scenario_package
 
 if ((failures)); then
   echo "$failures check(s) failed; fixtures and $log kept" >&2

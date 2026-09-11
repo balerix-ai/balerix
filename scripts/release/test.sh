@@ -253,6 +253,34 @@ scenario_forced_below_last() {
   fi
 }
 
+scenario_hand_bump() {
+  local dir errfile out
+  dir=$(fixture hand-bump)
+  release "$dir" flow 0.4.0
+  cargo set-version --manifest-path "$dir/plugins/flow/Cargo.toml" 0.5.0 >>"$log" 2>&1
+  gitc "$dir" add -A
+  gitc "$dir" commit -q -m "chore: hand-bump flow to 0.5.0"
+
+  errfile="$root/hand-bump.stderr"
+  if "$dir/scripts/release/prepare.sh" flow >/dev/null 2>"$errfile"; then
+    fail "hand bump: prepare succeeded for a version changed outside a release PR"
+  else
+    pass "hand bump: prepare refuses a version changed outside a release PR"
+  fi
+  cat "$errfile" >>"$log"
+  expect_grep "hand bump: error names the version" "flow: 0.5.0" "$errfile"
+  expect_eq "hand bump: no file changed" "$(git -C "$dir" status --porcelain)" ""
+
+  out=$(prepare "$dir" flow 0.5.0)
+  expect_eq "hand bump, forced: status" "$(field status "$out")" release
+  expect_eq "hand bump, forced: version" "$(field version "$out")" 0.5.0
+  assert_consistent "$dir" "hand bump, forced"
+  gitc "$dir" add -A
+  gitc "$dir" commit -q -m "chore(release): flow v0.5.0"
+  out=$(plan "$dir")
+  expect_eq "hand bump, forced: plan proposes flow" "$(field units "$out")" '["flow"]'
+}
+
 scenario_notes() {
   local dir notes
   dir=$(fixture notes)
@@ -312,6 +340,7 @@ scenario_plan
 scenario_forced_released
 scenario_forced_in_progress
 scenario_forced_below_last
+scenario_hand_bump
 scenario_notes
 scenario_package
 

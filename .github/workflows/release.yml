@@ -1,7 +1,8 @@
 name: release
-# Releases every unit whose manifest version has no tag yet (Spec I §5).
-# Merging a release PR is what makes a version untagged, so that is what
-# triggers a release; every job is safe to re-run.
+# Releases every unit whose manifest version has no tag yet and has its
+# changelog section (Spec I §5). Merging a release PR is what leaves a
+# version in that state, so that is what triggers a release; every job is
+# safe to re-run.
 on:
   push:
     branches: [main]

@@ -150,9 +150,11 @@ before merge, so a merged release PR has been tested as it lands.
 
 ### 5.1 `plan`
 
-- For each unit, read the version (`cargo metadata`) and check whether
-  `<prefix>-v<ver>` exists on `origin`. Output the untagged units as a JSON
-  matrix; with none, the workflow ends.
+- For each unit, read the version (`cargo metadata`). A unit is planned when
+  `<prefix>-v<ver>` does not exist on `origin` and the unit's changelog
+  carries a `## <ver> - ` section (its release PR was merged); an untagged
+  version without that section was never proposed and is skipped. Output the
+  planned units as a JSON matrix; with none, the workflow ends.
 - For each unit in the matrix, run `cargo audit` and `cargo deny check
   advisories bans sources licenses` against that unit's lockfile. A release
   cannot ship past a known advisory.

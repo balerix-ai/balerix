@@ -73,6 +73,15 @@ unit_version() {
 
 tag_exists() { git rev-parse -q --verify "refs/tags/$1" >/dev/null; }
 
+# Whether the unit's changelog has a `## <version> - ` section: what a merged
+# release PR leaves behind.
+has_section() {
+  require_unit "$1"
+  local changelog
+  changelog=$(unit_changelog "$1")
+  [[ -f $changelog ]] && grep -q "^## ${2//./\\.} - " "$changelog"
+}
+
 # The unit's newest release tag, or nothing.
 last_tag() {
   require_unit "$1"

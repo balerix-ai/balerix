@@ -29,9 +29,8 @@ notes_dir=${RELEASE_NOTES_DIR:-target/release-notes}
 notes="$notes_dir/$unit.md"
 
 emit() { printf '%s=%s\n' "$@"; }
-has_section() { [[ -f $changelog ]] && grep -q "^## ${1//./\\.} - " "$changelog"; }
 
-if ! tag_exists "$(unit_tag "$unit" "$current")" && { [[ -n $last ]] || has_section "$current"; }; then
+if ! tag_exists "$(unit_tag "$unit" "$current")" && { [[ -n $last ]] || has_section "$unit" "$current"; }; then
   # A release PR was merged and release.yml has not tagged it yet, or failed
   # (Spec I §8.2). Proposing anything now would release twice, so this wins
   # even over a forced version.

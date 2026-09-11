@@ -192,6 +192,33 @@ scenario_in_progress() {
   expect_eq "merged initial, untagged: status" "$(field status "$(prepare "$dir" flow)")" in-progress
 }
 
+plan() {
+  "$1/scripts/release/plan.sh" 2>>"$log"
+}
+
+# plan.sh releases a unit only once its release PR is merged (Spec I §5.1).
+scenario_plan() {
+  local dir out tag
+  dir=$(fixture plan)
+  out=$(plan "$dir")
+  expect_eq "plan, nothing proposed: units" "$(field units "$out")" '[]'
+  expect_eq "plan, nothing proposed: plugins" "$(field plugins "$out")" '[]'
+  expect_eq "plan, nothing proposed: core" "$(field core "$out")" false
+
+  tag=$(field tag "$(prepare "$dir" flow)")
+  gitc "$dir" add -A
+  gitc "$dir" commit -qm "chore(release): flow initial"
+  out=$(plan "$dir")
+  expect_eq "plan, merged initial flow PR: units" "$(field units "$out")" '["flow"]'
+  expect_eq "plan, merged initial flow PR: plugins" "$(field plugins "$out")" '["flow"]'
+  expect_eq "plan, merged initial flow PR: core" "$(field core "$out")" false
+
+  gitc "$dir" tag "$tag"
+  out=$(plan "$dir")
+  expect_eq "plan, flow tagged: units" "$(field units "$out")" '[]'
+  expect_eq "plan, flow tagged: plugins" "$(field plugins "$out")" '[]'
+}
+
 scenario_forced_released() {
   local dir
   dir=$(fixture forced)
@@ -276,6 +303,7 @@ scenario_sdk_change
 scenario_plugin_only
 scenario_core_bump
 scenario_in_progress
+scenario_plan
 scenario_forced_released
 scenario_forced_in_progress
 scenario_forced_below_last

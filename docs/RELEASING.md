@@ -107,8 +107,9 @@ Nothing releases until all of this is done.
 
 1. **GitHub App** `balerix-release`, installed on this repository only, with
    repository permissions *Contents: read and write*, *Pull requests: read
-   and write* and *Issues: read and write*. Store its App ID as the variable
-   `RELEASE_APP_ID` and a private key as the secret
+   and write* and *Issues: read and write*. Store its Client ID (`Iv23…`,
+   on the App's settings page; not the numeric App ID) as the variable
+   `RELEASE_APP_CLIENT_ID` and a private key as the secret
    `RELEASE_APP_PRIVATE_KEY`, both in environment `release-bot`.
 2. **Environments** `release-bot` and `release`, each with deployment
    branches limited to `main`.

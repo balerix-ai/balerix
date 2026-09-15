@@ -2,18 +2,4 @@
 # Every entry names the binary it applies to, why it is accepted and when it
 # lapses. An expired entry fails the gate again: renew it only with a fresh
 # reason, and delete it once the pinned tool ships the fix (docs/RELEASING.md).
-vulnerabilities:
-  # gh 2.100.0, the newest release, vendors golang.org/x/mod v0.39.0 as an
-  # indirect dependency; the advisories are in its sumdb and sumdb/tlog
-  # verification, which gh does not use to fetch Go modules. Drop these when
-  # mise.toml moves to a gh built with x/mod >= 0.40.0.
-  - id: CVE-2026-56864
-    paths:
-      - usr/local/bin/gh
-    expired_at: 2026-10-11
-    statement: gh vendors golang.org/x/mod indirectly and does not verify Go module checksums; no fixed gh release yet
-  - id: CVE-2026-56865
-    paths:
-      - usr/local/bin/gh
-    expired_at: 2026-10-11
-    statement: gh vendors golang.org/x/mod indirectly and does not verify Go module checksums; no fixed gh release yet
+vulnerabilities: []

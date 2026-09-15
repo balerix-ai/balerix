@@ -9,9 +9,9 @@ cargo-insta = "1.48.0"
 "github:sourcefrog/cargo-mutants" = "27.1.0"
 gitleaks = "8.30.1"
 tmux = "3.7c"
-gh = "2.100.0"
+gh = "2.101.0"
 nono = "0.77.0"
-claude = "2.1.269"
+claude = "2.1.272"
 
 # Release and workflow tooling (Spec I). Only `claude` and `gh` from this
 # table reach agents (balerix-runtime's INHERITED list).

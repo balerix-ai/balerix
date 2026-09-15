@@ -179,7 +179,12 @@ fn fleet_yaml(bare: &Path, bob_model: Option<&str>, plugins: Option<&str>) -> St
         None => "      alice: {}\n".to_string(),
     };
     format!(
-        "apiVersion: balerix/v1\nkind: Fleet\nname: e2e\ndefaults:\n  claude:\n    binary: \"{BALERIX}\"\n    args: [dev, fake-claude, \"--verbose\"]\n    settings: {{ model: sonnet }}\n  tools: {{}}\ncrews:\n  c:\n    repo: \"file://{}\"\n    ref: main\n    git: {{ push: false, auth: none }}\n    agents:\n{alice}{bob}",
+        // The `sandbox:` block is deliberate: it is merged into the nono
+        // profile verbatim, and the daemon's materialize runs a real
+        // `nono profile validate`. Without a user block here that merge
+        // reaches the real validator in no test at all — which is how
+        // `network: { mode: allow }` shipped in the example.
+        "apiVersion: balerix/v1\nkind: Fleet\nname: e2e\ndefaults:\n  claude:\n    binary: \"{BALERIX}\"\n    args: [dev, fake-claude, \"--verbose\"]\n    settings: {{ model: sonnet }}\n  sandbox:\n    network: {{ block: false }}\n  tools: {{}}\ncrews:\n  c:\n    repo: \"file://{}\"\n    ref: main\n    git: {{ push: false, auth: none }}\n    agents:\n{alice}{bob}",
         bare.display()
     )
 }

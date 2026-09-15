@@ -205,7 +205,7 @@ python = "3.12.8"
     "name": "balerix-payments-backend-alice"
   },
   "network": {
-    "mode": "allow",
+    "block": false,
     "open_port": [
       7643
     ]
@@ -423,7 +423,7 @@ python = "3.12.8"
     "name": "balerix-payments-backend-bob"
   },
   "network": {
-    "mode": "allow",
+    "block": false,
     "open_port": [
       7643
     ]

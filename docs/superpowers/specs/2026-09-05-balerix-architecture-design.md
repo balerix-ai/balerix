@@ -170,7 +170,7 @@ defaults:                      # settings block, fleet level
     resume: true               # with --keep-sessions, next `up` starts claude with --continue
     binary: claude             # overridable for tests / alternative builds
   sandbox:                     # mirrors the nono profile schema
-    network: { mode: allow }
+    network: { block: false }
   tools: { node: "22.11.0" }   # exact versions only (D9)
   env: { RUST_LOG: info }
   runner: { type: tmux }       # only tmux exists today

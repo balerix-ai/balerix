@@ -15,6 +15,11 @@ pub const DEFAULT_EVENTS: [&str; 4] = ["SessionStart", "Notification", "Stop", "
 /// suppress them.
 pub const LIFECYCLE: [&str; 2] = ["SessionStart", "SessionEnd"];
 
+/// How many messages one body may be split across before the remainder
+/// is dropped (Spec G §8). Ten 4000-character parts is far past any real
+/// assistant turn, and keeps a runaway output from flooding the room.
+pub const DEFAULT_MAX_PARTS: usize = 10;
+
 /// A credential. Hand-written `Debug` printing `<redacted>`, per AGENTS.md.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -51,6 +56,13 @@ pub struct DaemonConfig {
     /// `fleet/crew` to room id (Spec G §7).
     #[serde(default)]
     pub rooms: BTreeMap<String, String>,
+    /// Most messages one body may be split across.
+    #[serde(default = "default_max_parts")]
+    pub max_parts: usize,
+}
+
+fn default_max_parts() -> usize {
+    DEFAULT_MAX_PARTS
 }
 
 fn default_device() -> String {
@@ -166,6 +178,12 @@ pub fn parse_daemon(config: &Value) -> Result<DaemonConfig, ConfigError> {
             message: "must be a full Matrix id starting with @".into(),
         });
     }
+    if c.max_parts == 0 {
+        return Err(ConfigError {
+            path: "maxParts".into(),
+            message: "must be at least 1".into(),
+        });
+    }
     Ok(c)
 }
 
@@ -231,6 +249,29 @@ mod tests {
             parse_daemon(&v).unwrap_err().to_string(),
             "nope: unknown field `nope`"
         );
+    }
+
+    #[test]
+    fn max_parts_defaults_and_is_configurable() {
+        let mut v = json!({
+            "homeserver": "https://matrix.example.org",
+            "userId": "@bot:example.org"
+        });
+        assert_eq!(parse_daemon(&v).unwrap().max_parts, DEFAULT_MAX_PARTS);
+        v["maxParts"] = json!(3);
+        assert_eq!(parse_daemon(&v).unwrap().max_parts, 3);
+    }
+
+    #[test]
+    fn a_zero_max_parts_is_rejected() {
+        let v = json!({
+            "homeserver": "https://matrix.example.org",
+            "userId": "@bot:example.org",
+            "maxParts": 0
+        });
+        let err = parse_daemon(&v).unwrap_err();
+        assert_eq!(err.path, "maxParts");
+        assert_eq!(err.to_string(), "maxParts: must be at least 1");
     }
 
     #[test]

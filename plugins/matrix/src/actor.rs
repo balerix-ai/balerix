@@ -363,17 +363,30 @@ impl<M: MatrixPort> Actor<M> {
         body: &str,
         kind: &str,
     ) -> Option<String> {
-        match retry_once(|| self.port.send(room, thread_root, body)).await {
-            Ok(id) => {
-                self.counters.messages_sent.with_label_values(&[kind]).inc();
-                Some(id)
-            }
-            Err(e) => {
-                self.counters.errors.with_label_values(&["send"]).inc();
-                tracing::warn!("matrix: send to {room}: {e}");
-                None
+        // A body past the limit becomes several messages rather than one
+        // truncated one (Spec G §8). The first part's id is the one the
+        // caller keeps: a thread roots on its opening message.
+        let max_parts = self
+            .config
+            .as_ref()
+            .map(|c| c.max_parts)
+            .unwrap_or(crate::config::DEFAULT_MAX_PARTS);
+        let mut first = None;
+        for part in render::split(body, max_parts) {
+            match retry_once(|| self.port.send(room, thread_root, &part)).await {
+                Ok(id) => {
+                    self.counters.messages_sent.with_label_values(&[kind]).inc();
+                    first.get_or_insert(id);
+                }
+                Err(e) => {
+                    self.counters.errors.with_label_values(&["send"]).inc();
+                    tracing::warn!("matrix: send to {room}: {e}");
+                    // Stopping beats a gap in the middle of a reply.
+                    return first;
+                }
             }
         }
+        first
     }
 
     async fn on_event(&mut self, event: HookEvent) {
@@ -403,7 +416,7 @@ impl<M: MatrixPort> Actor<M> {
                 .unwrap_or("already running");
             // `thread_root` interpolates the hook payload's `source`, so
             // like every other body it goes through the 4000-character cut.
-            let body = render::truncate(&render::thread_root(&event.agent, &session, source));
+            let body = render::thread_root(&event.agent, &session, source);
             let Some(root) = self.send(&room, None, &body, "root").await else {
                 return;
             };
@@ -516,7 +529,7 @@ impl<M: MatrixPort> Actor<M> {
             Err(e) => {
                 count("send_failed");
                 self.counters.errors.with_label_values(&["send_text"]).inc();
-                let body = render::truncate(&format!("**not delivered to {agent}:** {e}"));
+                let body = format!("**not delivered to {agent}:** {e}");
                 self.send(&message.room, Some(&root), &body, "notice").await;
                 self.react(&message, FAILED).await;
             }
@@ -1175,6 +1188,85 @@ mod tests {
         );
     }
 
+    /// A body past the limit arrives as several ordered messages in the
+    /// same thread, not one truncated message.
+    #[tokio::test]
+    async fn a_long_body_is_split_across_ordered_thread_messages() {
+        let (_fake, port, mut a) = actor().await;
+        a.handle(Command::Configure(daemon_config())).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&["Stop"]),
+        })
+        .await;
+        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+            .await;
+        let root = minted_root(&port.take_calls(), 1);
+
+        let long = "abcd\n".repeat(3000);
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "Stop",
+            json!({ "last_assistant_message": long }),
+        )]))
+        .await;
+
+        let s = sends(&port.take_calls());
+        assert!(
+            s.len() > 1,
+            "a long body must split, got {} message(s)",
+            s.len()
+        );
+        for (i, (thread, body)) in s.iter().enumerate() {
+            assert_eq!(
+                thread.as_deref(),
+                Some(root.as_str()),
+                "part {} left the thread",
+                i + 1
+            );
+            assert!(
+                body.ends_with(&format!("({}/{})", i + 1, s.len())),
+                "part {} is out of order or unmarked",
+                i + 1
+            );
+        }
+    }
+
+    /// Nothing is posted after a part fails: a gap in the middle of a
+    /// reply reads worse than a reply that visibly stops.
+    #[tokio::test]
+    async fn a_failed_part_stops_the_rest_of_the_body() {
+        let (_fake, port, mut a) = actor().await;
+        a.handle(Command::Configure(daemon_config())).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&["Stop"]),
+        })
+        .await;
+        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+            .await;
+        port.take_calls();
+
+        // Fails the first part; `retry_once` burns its one retry on it.
+        port.fail_next(crate::matrix::MatrixError::Other("nope".into()));
+        port.fail_next(crate::matrix::MatrixError::Other("nope again".into()));
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "Stop",
+            json!({ "last_assistant_message": "abcd\n".repeat(3000) }),
+        )]))
+        .await;
+
+        let s = sends(&port.take_calls());
+        assert!(
+            s.is_empty(),
+            "the run must stop at the failed part, got {} message(s)",
+            s.len()
+        );
+    }
+
     #[tokio::test]
     async fn a_rate_limited_send_is_retried_once() {
         let (_fake, port, mut a) = actor().await;
@@ -1431,8 +1523,11 @@ mod tests {
         assert!(notice[0].1.contains("no such window"), "{}", notice[0].1);
     }
 
+    /// A long notice splits like any other body: every part fits the
+    /// limit, and all of them stay in the thread. It used to be cut to
+    /// one message, which threw the tail of the error away.
     #[tokio::test]
-    async fn a_long_daemon_error_is_truncated_before_it_is_posted() {
+    async fn a_long_daemon_error_is_split_across_parts_before_it_is_posted() {
         let (fake, port, mut a, room, root) = with_thread().await;
         let long_error = "x".repeat(crate::render::BODY_LIMIT * 2);
         fake.fail_actions(Some(&long_error));
@@ -1444,11 +1539,24 @@ mod tests {
         )))
         .await;
         let notice = sends(&port.calls());
-        assert_eq!(notice.len(), 1, "the failure is posted in the thread");
         assert!(
-            notice[0].1.len() <= crate::render::BODY_LIMIT + 32,
-            "the notice was not truncated: {} bytes",
-            notice[0].1.len()
+            notice.len() > 1,
+            "a long notice splits: {} part(s)",
+            notice.len()
         );
+        for (i, (thread, body)) in notice.iter().enumerate() {
+            assert_eq!(
+                thread.as_deref(),
+                Some(root.as_str()),
+                "part {} left the thread",
+                i + 1
+            );
+            assert!(
+                body.len() <= crate::render::BODY_LIMIT,
+                "part {} is {} bytes",
+                i + 1,
+                body.len()
+            );
+        }
     }
 }

@@ -22,6 +22,17 @@ Stop
 
 ---
 
+Stop
+**turn finished**
+
+Fixed the flaky test:
+
+```rust
+assert_eq!(a, b);
+```
+
+---
+
 SubagentStop
 subagent finished
 

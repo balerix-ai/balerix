@@ -377,6 +377,51 @@ scenario_image_context() {
     "Control plane and orchestrator for fleets of coding agents"
 }
 
+affected() {
+  "$1/scripts/release/affected-units.sh" "${@:2}" 2>>"$log"
+}
+
+# Commits a change to <path> and prints the units affected-units.sh names
+# for it, against the commit before it.
+affected_by() {
+  local dir=$1 path=$2 base
+  base=$(gitc "$dir" rev-parse HEAD)
+  change "$dir" "$path" "test: change $path"
+  field units "$(affected "$dir" "$base" HEAD)"
+}
+
+# affected-units.sh names the units whose image a change can break (Spec I
+# §6.5): a unit's own include paths select it, what every image shares
+# selects all of them, and anything else selects none.
+scenario_affected() {
+  local dir
+  dir=$(fixture affected)
+  expect_eq "affected: a matrix source change" \
+    "$(affected_by "$dir" plugins/matrix/src/release-test.rs)" '["matrix"]'
+  expect_eq "affected: a core crate change" \
+    "$(affected_by "$dir" crates/balerix-server/src/release-test.rs)" '["core"]'
+  expect_eq "affected: an sdk change reaches every plugin" \
+    "$(affected_by "$dir" crates/balerix-plugin-sdk/src/release-test.rs)" '["core","flow","web","matrix"]'
+  expect_eq "affected: the root lockfile is core" \
+    "$(affected_by "$dir" Cargo.lock)" '["core"]'
+  expect_eq "affected: a plugin lockfile is that plugin" \
+    "$(affected_by "$dir" plugins/web/Cargo.lock)" '["web"]'
+  expect_eq "affected: a Dockerfile is every unit" \
+    "$(affected_by "$dir" docker/plugin/release-test.txt)" '["core","flow","web","matrix"]'
+  expect_eq "affected: the tool pins are every unit" \
+    "$(affected_by "$dir" mise.toml)" '["core","flow","web","matrix"]'
+  expect_eq "affected: the scan exceptions are every unit" \
+    "$(affected_by "$dir" .trivyignore.yaml)" '["core","flow","web","matrix"]'
+  expect_eq "affected: the workflow itself is every unit" \
+    "$(affected_by "$dir" .github/workflows/images.yml)" '["core","flow","web","matrix"]'
+  expect_eq "affected: docs are no unit" \
+    "$(affected_by "$dir" docs/release-test.md)" '[]'
+  expect_eq "affected: another workflow is no unit" \
+    "$(affected_by "$dir" .github/workflows/release-test.yml)" '[]'
+  expect_eq "affected: no range is every unit (the nightly)" \
+    "$(field units "$(affected "$dir")")" '["core","flow","web","matrix"]'
+}
+
 scenario_initial
 scenario_bumps_0x
 scenario_bumps_1x
@@ -394,6 +439,7 @@ scenario_hand_bump_core
 scenario_notes
 scenario_package
 scenario_image_context
+scenario_affected
 
 if ((failures)); then
   echo "$failures check(s) failed; fixtures and $log kept" >&2

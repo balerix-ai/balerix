@@ -303,9 +303,21 @@ already-pushed `<ver>` index.
 
 ### 6.5 `.github/workflows/images.yml`
 
-On `pull_request` touching `docker/**` or `mise.toml`, and nightly: build
-both images for both architectures from musl release builds of the PR head
-(as in §5.2), run §6.4 and the scans in §9, push nothing.
+Build units' images for both architectures from musl release builds of the
+PR head (as in §5.2), run §6.4 and the scans in §9, push nothing.
+
+On `pull_request`, a `plan` job picks the units to build with
+`scripts/release/affected-units.sh <base> <head>`: a unit whose include
+paths (§3, `unit_paths`) hold a changed file — so an SDK or api change
+selects every plugin — and every unit when the change touches what all the
+images are built from (`docker/**`, `mise.toml`, the scan configuration,
+`scripts/release/**`, the actions, the workflow itself). The workflow's own
+path filter is the union of those, so a pull request outside them runs
+nothing. Building the affected units on the PR that changes them means a
+dependency that does not build for musl, or on one architecture, is
+attributed to its own commit rather than to whatever the nightly lands on.
+
+Nightly and on dispatch: every unit.
 
 ## 7. Plugin release package
 

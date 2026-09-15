@@ -7,10 +7,6 @@ cd "$(dirname "$0")/../.."
 # shellcheck source=scripts/release/lib.sh
 source scripts/release/lib.sh
 
-json() {
-  if (($#)); then printf '%s\n' "$@" | jq -R . | jq -cs .; else echo '[]'; fi
-}
-
 units=()
 plugins=()
 core=false
@@ -32,6 +28,6 @@ for unit in "${UNITS[@]}"; do
   if [[ $unit == core ]]; then core=true; else plugins+=("$unit"); fi
 done
 
-echo "units=$(json "${units[@]}")"
-echo "plugins=$(json "${plugins[@]}")"
+echo "units=$(json_list "${units[@]}")"
+echo "plugins=$(json_list "${plugins[@]}")"
 echo "core=$core"

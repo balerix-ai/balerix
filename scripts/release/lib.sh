@@ -9,6 +9,15 @@ UNITS=(core flow web matrix)
 # shellcheck disable=SC2034
 PLUGIN_UNITS=(flow web matrix)
 
+# The arguments as a JSON array of strings: unit names and other bare
+# identifiers, nothing that needs escaping.
+json_list() {
+  local quoted=()
+  if (($#)); then quoted=("${@/#/\"}") && quoted=("${quoted[@]/%/\"}"); fi
+  local IFS=,
+  echo "[${quoted[*]}]"
+}
+
 die() {
   echo "$*" >&2
   exit 1

@@ -36,7 +36,9 @@ RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
 FROM base
 # `upgrade` pulls the security archive's fixes for packages the pinned base
 # digest predates; without it the trivy gate fails on the base image's own
-# packages until upstream rebuilds trixie-slim.
+# packages until upstream rebuilds trixie-slim. Temporary: drop the upgrade
+# line, and DL3005 in .hadolint.yaml, once a base digest bump passes the gate
+# without it.
 RUN apt-get update \
   && apt-get upgrade -y --no-install-recommends \
   && apt-get install -y --no-install-recommends ca-certificates git tini \

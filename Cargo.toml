@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -15,10 +15,10 @@ repository = "https://github.com/balerix-ai/balerix"
 publish = false
 
 [workspace.dependencies]
-balerix-api = { path = "crates/balerix-api", version = "0.1.0" }
+balerix-api = { path = "crates/balerix-api", version = "0.1.1" }
 balerix-core = { path = "crates/balerix-core" }
 balerix-config = { path = "crates/balerix-config" }
-balerix-plugin-sdk = { path = "crates/balerix-plugin-sdk", version = "0.1.0" }
+balerix-plugin-sdk = { path = "crates/balerix-plugin-sdk", version = "0.1.1" }
 balerix-runtime = { path = "crates/balerix-runtime" }
 balerix-server = { path = "crates/balerix-server" }
 

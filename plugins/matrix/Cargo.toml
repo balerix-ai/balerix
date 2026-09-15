@@ -8,7 +8,7 @@ resolver = "3"
 [package]
 name = "balerix-plugin-matrix"
 description = "The matrix plugin: agent events to a Matrix room per crew, a thread per agent session, and thread replies back as send_text (Spec G)"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"

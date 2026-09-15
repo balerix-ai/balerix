@@ -1,10 +1,15 @@
 name: images
-# Builds, smoke-tests and scans every unit's image on both architectures
-# without pushing, so a Dockerfile or tool-pin break shows up before release
-# day (Spec I §6.5).
+# Builds, smoke-tests and scans units' images on both architectures without
+# pushing, so a Dockerfile, tool-pin or musl build break shows up before
+# release day (Spec I §6.5). A pull request builds the units its changes can
+# break (scripts/release/affected-units.sh); the nightly builds every unit.
 on:
   pull_request:
     paths:
+      - crates/**
+      - plugins/**
+      - Cargo.toml
+      - Cargo.lock
       - docker/**
       - mise.toml
       - .hadolint.yaml
@@ -19,14 +24,39 @@ permissions: {}
 env:
   MISE_AUTO_INSTALL: "false"
 jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      units: ${{ steps.plan.outputs.units }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The checkout is the pull request's merge commit, so its diff against
+      # the base commit is exactly what the pull request changes.
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ $EVENT == pull_request ]]; then
+            git fetch -q --depth=1 origin "$BASE"
+            scripts/release/affected-units.sh "$BASE" HEAD | tee -a "$GITHUB_OUTPUT"
+          else
+            scripts/release/affected-units.sh | tee -a "$GITHUB_OUTPUT"
+          fi
   image:
+    needs: plan
+    if: needs.plan.outputs.units != '[]'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        unit: [core, flow, web, matrix]
+        unit: ${{ fromJSON(needs.plan.outputs.units) }}
         arch: [amd64, arm64]
         include:
           - arch: amd64

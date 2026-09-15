@@ -34,7 +34,13 @@ RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
   && for tool in gh nono tmux; do install -m 0755 "$(mise which "$tool")" "/out/$tool"; done
 
 FROM base
+# `upgrade` pulls the security archive's fixes for packages the pinned base
+# digest predates; without it the trivy gate fails on the base image's own
+# packages until upstream rebuilds trixie-slim. Temporary: drop the upgrade
+# line, and DL3005 in .hadolint.yaml, once a base digest bump passes the gate
+# without it.
 RUN apt-get update \
+  && apt-get upgrade -y --no-install-recommends \
   && apt-get install -y --no-install-recommends ca-certificates git tini \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --uid 10001 --create-home --shell /bin/bash balerix

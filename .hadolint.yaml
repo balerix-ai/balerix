@@ -1,5 +1,12 @@
 # DL3008 wants apt package versions pinned. The base images are pinned by
 # digest and Renovate moves them; pinning Debian package versions as well
 # breaks the build whenever the security archive supersedes one.
+# DL3005 forbids apt-get upgrade. The runtime image upgrades deliberately:
+# the security archive fixes CVEs faster than upstream rebuilds trixie-slim,
+# and the trivy gate fails on the base image's own packages in between.
+# Temporary: once Renovate lands a trixie-slim digest that carries the fixes
+# (the gate passes with the upgrade line removed), drop the upgrade line in
+# docker/balerix/Dockerfile and this DL3005 entry together.
 ignored:
+  - DL3005
   - DL3008

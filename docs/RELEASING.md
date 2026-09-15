@@ -142,3 +142,8 @@ Nothing releases until all of this is done.
   `images.yml` and the release image jobs again: renew it only with a fresh
   reason, and delete it when the pinned tool (for example `gh` in
   `mise.toml`) ships the fix.
+- `docker/balerix/Dockerfile` runs `apt-get upgrade` in its final stage, with
+  hadolint's DL3005 ignored in `.hadolint.yaml`, because Debian's security
+  archive fixed packages the pinned `trixie-slim` digest still ships. Both
+  are temporary: when a Renovate digest bump passes the image gate with the
+  upgrade line removed, drop the line and the DL3005 entry together.

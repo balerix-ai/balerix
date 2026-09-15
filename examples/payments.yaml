@@ -7,7 +7,9 @@ defaults:
     args: ["--verbose"]
     resume: true
   sandbox:
-    network: { mode: allow }
+    # Passed to nono verbatim, so the keys are nono's: `block: false` is
+    # unrestricted egress. There is no `mode` key.
+    network: { block: false }
   tools: { node: "22.11.0" }
   env: { RUST_LOG: info }
   runner: { type: tmux }

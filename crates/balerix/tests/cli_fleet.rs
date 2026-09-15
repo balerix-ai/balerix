@@ -26,7 +26,7 @@ defaults:
     args: ["--verbose"]
     resume: true
   sandbox:
-    network: { mode: allow }
+    network: { block: false }
   tools: { node: "22.11.0" }
   env: { RUST_LOG: info }
   runner: { type: tmux }

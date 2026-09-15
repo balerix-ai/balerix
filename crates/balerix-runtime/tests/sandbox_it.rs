@@ -95,3 +95,62 @@ fn generated_profile_validates_and_enforces_isolation() {
     assert!(paths.home.join("ok").exists(), "write inside home succeeds");
     assert!(!outside.join("nope").exists());
 }
+
+/// The user's `sandbox:` block is merged into the profile verbatim, so its
+/// keys must be nono's own. The test above renders with an empty block, which
+/// leaves that merge unvalidated — `examples/payments.yaml` shipped
+/// `network: { mode: allow }` because nothing here ever handed real nono a
+/// user block. `mode` is not a nono field (checked against 0.76 and 0.77);
+/// `block` is.
+#[test]
+fn a_user_network_block_validates_and_a_bogus_key_does_not() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("nono", false));
+        return;
+    };
+    let root = support::temp_root("sandbox-user-block");
+    let layout = support::layout(&root);
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let paths = layout.agent(&id);
+    let crew = layout.crew(&id.crew_ref());
+    std::fs::create_dir_all(&paths.nono_home).unwrap();
+    std::fs::create_dir_all(&paths.logs).unwrap();
+
+    let render = |user| {
+        render_profile(
+            &id,
+            &balerix_grants(&id, &paths, &crew, &layout, &tools.balerix, &tools.mise),
+            7643,
+            &Default::default(),
+            &user,
+        )
+        .unwrap()
+    };
+    let validate = |user| {
+        let profile = render(user);
+        write_profile(&id, &paths, &profile).unwrap();
+        validate_profile(&tools, &id, &paths)
+    };
+
+    // What the example ships: unrestricted egress, spelled nono's way.
+    validate(serde_json::json!({ "network": { "block": false } }))
+        .expect("`network: { block: false }` must validate");
+    // And the tightened form, which must keep the daemon port open.
+    let blocked = render(serde_json::json!({ "network": { "block": true } }));
+    assert_eq!(blocked["network"]["open_port"], serde_json::json!([7643]));
+    validate(serde_json::json!({ "network": { "block": true } }))
+        .expect("`network: { block: true }` must validate");
+
+    // Teeth: the key that shipped broken is rejected.
+    validate(serde_json::json!({ "network": { "mode": "allow" } }))
+        .expect_err("`mode` is not a nono network field");
+    // nono names the offending key on stdout, which `CmdFailure` does not
+    // carry, so the error a user sees is only "validation failed" and the
+    // detail lives in the log. Asserted so a future fix that surfaces it
+    // has a test to update rather than silently losing the breadcrumb.
+    let log = std::fs::read_to_string(paths.logs.join("nono.validate.log")).unwrap();
+    assert!(
+        log.contains("unknown field `mode`"),
+        "the log must keep the detail nono printed: {log}"
+    );
+}

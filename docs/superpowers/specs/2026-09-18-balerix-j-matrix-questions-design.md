@@ -106,7 +106,12 @@ daemon before execution and answering 400 with a message that names the field:
 - A `text` step is 1 to 1024 bytes and contains no control character. A newline
   would be an Enter the plan did not count.
 
-Worst case the runner is busy for 64 × 500 ms = 32 s, on a blocking thread, as
+- `steps.len() × delay_ms` is at most `MAX_KEY_SEQUENCE_MS = 8000`. The SDK's
+  `Host::action` gives up after 10 s, and a plugin that timed out while the
+  keys kept arriving could not tell what state the dialog was in. At the
+  default delay that is all 64 steps; at 500 ms it is 16.
+
+The runner is busy for the length of the sequence, on a blocking thread, as
 `send_text` already is.
 
 ### 4.2 Port and adapter
@@ -119,6 +124,12 @@ fn send_keys(&self, agent: &AgentId, steps: &[KeyStep], delay: Duration) -> Resu
 `TmuxRunner` sends each step as its own tmux command and sleeps `delay` after
 each: `send-keys -t <target> Down` for a key, `send-keys -t <target> -l -- <text>`
 for text. The key names are a fixed match on `Key`, never a string from the wire.
+
+tmux reads a `;` that ends an argument as a command separator and drops it
+(measured: `a;` arrives as `a`). A text step therefore sends its trailing
+semicolons separately, each as the escaped argument `\;`, which arrives as
+`;`. `send_text`'s short path has the same flaw today; fixing it is outside
+this spec and is reported separately.
 
 **Per-agent send lock.** A paced sequence lasts up to seconds. A `send_text`
 from the flow plugin landing in the middle of it would corrupt both.
@@ -157,6 +168,9 @@ by commas". A payload that does not parse as questions renders as today's
 **When it posts.** `PreToolUse` is not in the default event set (G-3). An
 `AskUserQuestion` `PreToolUse` is posted when the agent's set wants
 `Notification` **or** `PreToolUse`: it is the detailed form of "needs you".
+
+**Tracking is unconditional.** The open question is recorded whether or not
+it is posted: J-7's protection must not depend on the event filter.
 
 **Suppression.** While a question is open for an agent, a `Notification` whose
 `notification_type` is `permission_prompt` is not posted. It says nothing the
@@ -278,8 +292,13 @@ echo never gains its ✅, and the agent's next clearing event repairs the state.
 
 ### 7.5 Config
 
-One per-agent key, next to `events`: `key_delay_ms`, default 100, validated to
-`20..=500` at `activate` with the config path first in the error.
+One per-agent key, next to `events`: `keyDelayMs` (camelCase, like the daemon
+block), default 100, validated to `20..=500` at `activate` with the config
+path first in the error.
+
+A plan whose length times the delay exceeds `MAX_KEY_SEQUENCE_MS`, or that has
+more than `MAX_KEY_STEPS` steps, is refused in the thread before anything is
+sent.
 
 ## 8. Failure and metrics
 
@@ -310,6 +329,8 @@ which goes through the existing 4000-character cut.
 
 ## 10. Testing
 
+- **Conformance:** a new fixture, `docs/plugin-protocol/action-send-keys.json`,
+  replayed by the SDK's conformance test.
 - **`balerix-api`:** serde round trips for `send_keys`; rejects unknown fields,
   an unknown key name, a step with both `key` and `text`; `validate` boundaries
   for step count, delay and text.
@@ -340,10 +361,12 @@ which goes through the existing 4000-character cut.
   restart of the actor over the same `FakeHost` KV.
 - **`mise run verify-questions`, by hand, not in CI.** A script beside
   `verify-claude.sh` that drives the real pinned `claude` through §2's dialog
-  shapes using the key plans `question.rs` produces (via a hidden
-  `balerix dev question-plan` subcommand printing a plan as JSON), and checks
-  `PostToolUse`'s `answers`. The model in the property test is only as true as
-  this run. AGENTS.md gains a gotcha: bumping `claude` in `mise.toml` means
+  shapes using the key plans `question.rs` produces, and checks
+  `PostToolUse`'s `answers`. The plans come from
+  `plugins/matrix/examples/question_plan.rs`, which prints `match_reply` plus
+  `plan` as JSON for a `tool_input` and a reply; the `balerix` binary cannot
+  depend on plugin code (AGENTS.md), so it is an example of the plugin's own
+  project. The model in the property test is only as true as this run. AGENTS.md gains a gotcha: bumping `claude` in `mise.toml` means
   running it.
 
 ## 11. Deliberately deferred
@@ -364,5 +387,7 @@ which goes through the existing 4000-character cut.
   options; `2` answers it and the echo gains ✅; `gre` asks for a `yes`;
   `purple please` is refused and the agent's dialog is untouched; a
   two-question dialog is answered from one reply.
-- `docs/plugin-protocol.md` §3, `docs/THREAT-MODEL.md`, `ARCHITECTURE.md` and the
-  matrix plugin's changelog describe `send_keys` and the question flow.
+- `docs/plugin-protocol.md` §3, `docs/THREAT-MODEL.md` and `ARCHITECTURE.md`
+  describe `send_keys` and the question flow. Changelogs are written by the
+  release PR from the pull request's Conventional Commit title
+  (`docs/RELEASING.md`), so none is edited by hand.

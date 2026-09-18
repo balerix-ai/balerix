@@ -172,11 +172,21 @@ by commas". A payload that does not parse as questions renders as today's
 `Notification` **or** `PreToolUse`: it is the detailed form of "needs you".
 
 **Tracking is unconditional.** The open question is recorded whether or not
-it is posted: J-7's protection must not depend on the event filter.
+it is posted, before any room or thread work, and for a disabled agent too:
+J-7's protection must not depend on the event filter, on the homeserver
+answering the send that opens the thread, or on `enabled` — a disabled agent
+can still have a routable thread, and a reply in it is not filtered either.
+The agent being one this plugin knows is the only condition.
 
-**Suppression.** While a question is open for an agent, a `Notification` whose
-`notification_type` is `permission_prompt` is not posted. It says nothing the
-question has not.
+**Suppression.** The first `permission_prompt` `Notification` after a question
+was posted is not posted itself: it says nothing the question has not. Only
+that one. A second is a different tool asking, and a prompt that arrives once
+an answer has been sent has nothing to do with the question — after a `skip`
+no `PostToolUse` fires, so the record lives until `Stop`. A question that was
+not posted, because the filter hid it or its send failed, suppresses nothing:
+the notification is then the operator's only notice that the agent is
+waiting. What this needs is two flags in memory, unpersisted, so a restart
+suppresses nothing at all. The worst case is one redundant "needs you" line.
 
 ## 6. Matching and the key plan (`plugins/matrix/src/question.rs`, new, pure)
 
@@ -208,6 +218,25 @@ unknown or repeated header, is a refusal that says what was expected.
 Rungs 4 and 5 matching two or more options refuse with the candidates. No rung
 matching refuses with the option list. A single-select item matching is one
 option; a multi-select answer with a repeated option refuses.
+
+**The labels are the agent's**, so three collisions with those rules are
+settled here rather than guessed at (J-4).
+
+- Labels that normalise equal — `C++` and `C#`, `A+` and `A-`, `<= 5` and
+  `>= 5` — are told apart on rung 3 by their raw trimmed text, compared
+  case-insensitively. Exactly one hit is that option, exact; anything else
+  refuses with the candidates. They cannot slip through rungs 4 and 5 as
+  unique either, matching and missing together.
+- An option whose normalised label is `skip`, in a dialog of one question,
+  takes the reply `skip`: it selects that option, *inexactly*, so the echo
+  asks for a `yes` and the other reading is one `no` away. In every other
+  dialog `skip` still declines; one word cannot be a positional answer to
+  several questions in any case. The footer is unchanged.
+- A number on rung 1 is the row it counts to, but *inexact* when some other
+  option's label normalises to that number: with options `2 / 4 / 8` the
+  reply `2` selects the second option and asks first. A number that is not a
+  valid index falls through to rungs 3 to 5, so `4` and `8` reach the labels
+  they spell; only an item no rung matches earns the "no option N" refusal.
 
 The result is `Matched::Answers { selections: Vec<Selection>, exact: bool }`,
 where `Selection { options: Vec<usize>, other: Option<String> }` holds the
@@ -275,7 +304,8 @@ On `PostToolUse` for `AskUserQuestion`, read `tool_response.answers`.
 - State was `Sent` and the recorded answers equal the intended ones: a ✅
   reaction on the echo message. Multi-select compares as a set of labels.
 - State was `Sent` and they differ: `**recorded answer differs** — Claude
-  recorded Size → Small, you chose Medium. Tell the agent if that matters.`
+  recorded Size → Small; you chose Size → Medium. Tell the agent if that
+  matters.`
 - State was `Open` or `Confirming`: someone answered at the terminal. Post
   `**answered at the terminal** Color → Blue`.
 
@@ -289,8 +319,11 @@ plugin was down. A reply is then matched against a question that is gone, and
 its plan lands on an idle prompt. That is bounded: a plan holds only Down,
 Enter and typed text; Down and Enter at an idle prompt submit nothing (§2);
 and a free-text plan types the text and submits it as a prompt, which is what
-`send_text` would have done with that reply. No `PostToolUse` follows, so the
-echo never gains its ✅, and the agent's next clearing event repairs the state.
+`send_text` would have done with that reply. `skip` is bounded the same way:
+its one Escape at an idle or a working prompt interrupts that prompt, which
+any room member could already cause by prompting. No `PostToolUse` follows, so
+the echo never gains its ✅, and the agent's next clearing event repairs the
+state.
 
 ### 7.5 Config
 

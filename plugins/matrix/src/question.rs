@@ -126,11 +126,22 @@ fn options_list(q: &Question) -> String {
 /// A thread reply against the open questions (Spec J §6.2).
 pub fn match_reply(questions: &[Question], reply: &str) -> Result<Matched, Refusal> {
     let reply = reply.trim();
-    if reply.eq_ignore_ascii_case("skip") {
+    // `skip` declines — unless a lone question offers an option labelled
+    // `skip`, which this rule would otherwise make unreachable (J-4). Then
+    // it selects that option, but never exactly: the echo asks for a `yes`
+    // first, so the other reading is one `no` away. A several-question
+    // reply of one word could not be a positional answer anyway.
+    let labelled_skip = reply.eq_ignore_ascii_case("skip")
+        && questions.len() == 1
+        && questions[0]
+            .options
+            .iter()
+            .any(|o| normalise(&o.label) == "skip");
+    if reply.eq_ignore_ascii_case("skip") && !labelled_skip {
         return Ok(Matched::Skip);
     }
     let parts = split(questions, reply)?;
-    let mut exact = true;
+    let mut exact = !labelled_skip;
     let mut selections = Vec::with_capacity(questions.len());
     for (q, part) in questions.iter().zip(parts) {
         let (selection, e) = match_answer(q, part)?;
@@ -286,15 +297,22 @@ fn check_other(q: &Question, text: &str) -> Result<String, Refusal> {
 /// is whether the rung was exact.
 fn match_item(q: &Question, item: &str) -> Result<(usize, bool), Refusal> {
     let digits = item.trim().trim_end_matches(['.', ')', ':']);
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-        return match digits.parse::<usize>() {
-            Ok(n) if (1..=q.options.len()).contains(&n) => Ok((n - 1, true)),
-            _ => Err(Refusal(format!(
-                "**{}** has no option {digits}. Options: {}",
-                q.name(),
-                options_list(q)
-            ))),
-        };
+    let numeric = !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+    if numeric
+        && let Ok(n) = digits.parse::<usize>()
+        && (1..=q.options.len()).contains(&n)
+    {
+        // The number counts rows. When some *other* option is labelled
+        // with it the reply has two honest readings, so it is inexact and
+        // the echo asks; the operator can always name the other number
+        // (J-4). A number that counts to no row falls through to the
+        // labels below, so options labelled `2 / 4 / 8` stay reachable.
+        let shadowed = q
+            .options
+            .iter()
+            .enumerate()
+            .any(|(i, o)| i != n - 1 && normalise(&o.label) == digits);
+        return Ok((n - 1, !shadowed));
     }
     let want = normalise(item);
     if want.is_empty() {
@@ -305,21 +323,41 @@ fn match_item(q: &Question, item: &str) -> Result<(usize, bool), Refusal> {
         )));
     }
     let labels: Vec<String> = q.options.iter().map(|o| normalise(&o.label)).collect();
-    if let Some(i) = labels.iter().position(|l| *l == want) {
-        return Ok((i, true));
-    }
-    let unique = |hits: Vec<usize>| match hits.as_slice() {
-        [] => None,
-        [i] => Some(Ok((*i, false))),
-        many => Some(Err(Refusal(format!(
+    let candidates = |hits: &[usize]| {
+        Refusal(format!(
             "\"{}\" could be {} in **{}**. Reply with the number.",
             item.trim(),
-            many.iter()
+            hits.iter()
                 .map(|i| format!("{}. {}", i + 1, q.options[*i].label))
                 .collect::<Vec<_>>()
                 .join(" or "),
             q.name()
-        )))),
+        ))
+    };
+    // Labels that normalise alike (`C++` and `C#`, `A+` and `A-`) make the
+    // whole-label rung a coin toss, and the rungs below cannot tell them
+    // apart either — identical normalised labels hit or miss together. The
+    // raw text is what is left to separate them (J-4).
+    let equal: Vec<usize> = (0..labels.len()).filter(|&i| labels[i] == want).collect();
+    match equal.as_slice() {
+        [] => {}
+        [i] => return Ok((*i, true)),
+        many => {
+            let raw: Vec<usize> = many
+                .iter()
+                .copied()
+                .filter(|&i| q.options[i].label.trim().to_lowercase() == item.trim().to_lowercase())
+                .collect();
+            return match raw.as_slice() {
+                [i] => Ok((*i, true)),
+                _ => Err(candidates(many)),
+            };
+        }
+    }
+    let unique = |hits: Vec<usize>| match hits.as_slice() {
+        [] => None,
+        [i] => Some(Ok((*i, false))),
+        many => Some(Err(candidates(many))),
     };
     let by_prefix = (0..labels.len())
         .filter(|&i| labels[i].starts_with(&want))
@@ -334,12 +372,22 @@ fn match_item(q: &Question, item: &str) -> Result<(usize, bool), Refusal> {
     if let Some(result) = unique(by_words) {
         return result;
     }
-    Err(Refusal(format!(
-        "\"{}\" matches nothing in **{}**. Options: {}",
-        item.trim(),
-        q.name(),
-        options_list(q)
-    )))
+    // A number that counted to no row and spells no label is a miscount,
+    // and saying so is more use than "matches nothing".
+    Err(Refusal(if numeric {
+        format!(
+            "**{}** has no option {digits}. Options: {}",
+            q.name(),
+            options_list(q)
+        )
+    } else {
+        format!(
+            "\"{}\" matches nothing in **{}**. Options: {}",
+            item.trim(),
+            q.name(),
+            options_list(q)
+        )
+    }))
 }
 
 /// The keystrokes that answer the dialog (Spec J §6.3). Rows of a question:
@@ -657,6 +705,105 @@ mod tests {
     fn skip_declines() {
         let q = parsed(&[color(), size()]);
         assert_eq!(match_reply(&q, " Skip "), Ok(Matched::Skip));
+    }
+
+    /// J-4: a wrong guess answers a question on the operator's behalf, and
+    /// labels come from the agent, so they can collide with the very rules
+    /// that read them. `C++` and `C#` normalise alike, so the whole-label
+    /// rung has to fall back to the raw text before it calls one of them
+    /// exact.
+    #[test]
+    fn labels_that_normalise_alike_are_told_apart_by_their_raw_text() {
+        let mut langs = color();
+        langs["question"] = json!("Which language?");
+        langs["header"] = json!("Language");
+        langs["options"] = json!([
+            { "label": "C++", "description": "" },
+            { "label": "C#", "description": "" },
+            { "label": "Rust", "description": "" }
+        ]);
+        let q = parsed(&[langs.clone()]);
+        assert_eq!(answers(&q, "C++"), (vec![option(0)], true));
+        assert_eq!(answers(&q, " c# "), (vec![option(1)], true));
+        assert_eq!(answers(&q, "rust"), (vec![option(2)], true));
+        let r = refusal(&q, "c");
+        assert!(
+            r.contains("1. C++") && r.contains("2. C#") && !r.contains("Rust"),
+            "{r}"
+        );
+
+        // the same through a multi-select answer's comma list
+        langs["multiSelect"] = json!(true);
+        let q = parsed(&[langs]);
+        assert_eq!(
+            answers(&q, "c#, rust"),
+            (
+                vec![Selection {
+                    options: vec![1, 2],
+                    other: None
+                }],
+                true
+            )
+        );
+        assert!(refusal(&q, "rust, c").contains("could be"));
+    }
+
+    /// An option labelled `skip` would otherwise be unreachable, `skip`
+    /// being tested before any label is looked at. In a lone question the
+    /// label wins — inexactly, so the echo asks and the other reading is
+    /// one `no` away. Everywhere else `skip` keeps meaning decline.
+    #[test]
+    fn skip_as_a_label_selects_it_only_in_a_lone_question() {
+        let mut retry = color();
+        retry["question"] = json!("What now?");
+        retry["header"] = json!("Next");
+        retry["options"] = json!([
+            { "label": "Skip", "description": "" },
+            { "label": "Retry", "description": "" }
+        ]);
+        let q = parsed(&[retry.clone()]);
+        assert_eq!(answers(&q, "skip"), (vec![option(0)], false));
+        assert_eq!(answers(&q, "1"), (vec![option(0)], true));
+
+        assert_eq!(match_reply(&parsed(&[color()]), "skip"), Ok(Matched::Skip));
+        assert_eq!(
+            match_reply(&parsed(&[retry, size()]), " SKIP "),
+            Ok(Matched::Skip),
+            "one word cannot be a positional answer to two questions"
+        );
+    }
+
+    /// Options labelled with numbers: `2` counts to a row and also names a
+    /// label, so it is confirmed rather than guessed; `4` and `8` count to
+    /// no row at all and must still reach the labels they spell.
+    #[test]
+    fn a_number_counts_rows_and_a_numeric_label_is_still_reachable() {
+        let mut counts = color();
+        counts["question"] = json!("How many?");
+        counts["header"] = json!("Count");
+        counts["options"] = json!([
+            { "label": "2", "description": "" },
+            { "label": "4", "description": "" },
+            { "label": "8", "description": "" }
+        ]);
+        let q = parsed(&[counts]);
+        assert_eq!(
+            answers(&q, "2"),
+            (vec![option(1)], false),
+            "row 2 is `4`, but another option is labelled `2`: ask first"
+        );
+        assert_eq!(
+            answers(&q, "4"),
+            (vec![option(1)], true),
+            "there is no row 4, so the label matches"
+        );
+        assert_eq!(answers(&q, "8"), (vec![option(2)], true));
+        assert_eq!(
+            answers(&q, "1"),
+            (vec![option(0)], true),
+            "no option is labelled 1, so the row is unambiguous"
+        );
+        assert!(refusal(&q, "9").contains("no option 9"));
     }
 
     /// `D` Down, `E` Enter, `T` the text step `t`.

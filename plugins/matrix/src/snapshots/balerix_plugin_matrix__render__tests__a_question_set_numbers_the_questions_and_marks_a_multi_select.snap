@@ -1,0 +1,21 @@
+---
+source: src/render.rs
+expression: "question_message(&questions(&[fixtures::colors_multi(), fixtures::size()]))"
+---
+**question 1 of 2** · Colors
+
+Which colors? *(choose any, separated by commas)*
+
+1. **Red** — A warm, bold color
+2. **Green** — A calm, natural color
+3. **Blue** — A cool, serene color
+
+**question 2 of 2** · Size
+
+Which size?
+
+1. **Small**
+2. **Medium**
+3. **Large**
+
+Reply with one line per question, in order: a number or a label. `other: …` gives your own answer, `skip` declines.

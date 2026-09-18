@@ -1,0 +1,13 @@
+---
+source: src/render.rs
+expression: "question_message(&questions(&[fixtures::color()]))"
+---
+**question** · Color
+
+Which color?
+
+1. **Red** — A warm, bold color
+2. **Green** — A calm, natural color
+3. **Blue** — A cool, serene color
+
+Reply with a number or a label. `other: …` gives your own answer, `skip` declines.

@@ -5,6 +5,8 @@
 use balerix_api::{AgentPhase, HookEvent};
 use serde_json::Value;
 
+use crate::question::Question;
+
 /// One message holds this much (Spec G §8): comfortably under the 64 KiB
 /// event limit a homeserver enforces, and the limit OpenClaw defaults to.
 /// A longer body is split across messages by `split`, never cut — the
@@ -97,6 +99,52 @@ pub fn event_message(event: &HookEvent) -> String {
         "PreCompact" => format!("compacting ({})", text(p, "trigger", "unknown")),
         other => other.to_string(),
     }
+}
+
+/// An `AskUserQuestion` dialog for the thread (Spec J §5). Paragraphs are
+/// separated by blank lines: a lone newline is not a break in markdown.
+pub fn question_message(questions: &[Question]) -> String {
+    let many = questions.len() > 1;
+    let mut paragraphs = Vec::new();
+    for (i, q) in questions.iter().enumerate() {
+        let mut title = if many {
+            format!("**question {} of {}**", i + 1, questions.len())
+        } else {
+            "**question**".to_string()
+        };
+        if !q.header.is_empty() {
+            title.push_str(&format!(" · {}", q.header));
+        }
+        paragraphs.push(title);
+        let mut ask = q.text.trim().to_string();
+        if q.multi_select {
+            ask.push_str(" *(choose any, separated by commas)*");
+        }
+        paragraphs.push(ask);
+        paragraphs.push(
+            q.options
+                .iter()
+                .enumerate()
+                .map(|(n, o)| {
+                    if o.description.is_empty() {
+                        format!("{}. **{}**", n + 1, o.label)
+                    } else {
+                        format!("{}. **{}** — {}", n + 1, o.label, o.description)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    paragraphs.push(if many {
+        "Reply with one line per question, in order: a number or a label. \
+         `other: …` gives your own answer, `skip` declines."
+            .to_string()
+    } else {
+        "Reply with a number or a label. `other: …` gives your own answer, `skip` declines."
+            .to_string()
+    });
+    paragraphs.join("\n\n")
 }
 
 pub fn phase_message(change: &PhaseChange) -> String {
@@ -223,6 +271,7 @@ pub fn split(text: &str, max_parts: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::question::{self, fixtures};
     use balerix_plugin_sdk::testing::event;
     use serde_json::json;
 
@@ -404,5 +453,32 @@ mod tests {
     fn a_short_session_is_the_first_eight_characters() {
         assert_eq!(short_session("0199aa11-2233-4455"), "0199aa11");
         assert_eq!(short_session("abc"), "abc");
+    }
+
+    fn questions(list: &[serde_json::Value]) -> Vec<question::Question> {
+        question::parse(&fixtures::input(list)).unwrap()
+    }
+
+    #[test]
+    fn a_question_lists_its_numbered_options() {
+        insta::assert_snapshot!(question_message(&questions(&[fixtures::color()])));
+    }
+
+    #[test]
+    fn a_question_set_numbers_the_questions_and_marks_a_multi_select() {
+        insta::assert_snapshot!(question_message(&questions(&[
+            fixtures::colors_multi(),
+            fixtures::size()
+        ])));
+    }
+
+    #[test]
+    fn an_unparsable_question_falls_back_to_the_generic_tool_line() {
+        let e = event(
+            "f/c/a",
+            "PreToolUse",
+            json!({ "tool_name": "AskUserQuestion", "tool_input": { "questions": [] } }),
+        );
+        assert_eq!(event_message(&e), "running `AskUserQuestion`");
     }
 }

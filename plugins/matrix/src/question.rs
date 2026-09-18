@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use balerix_api::MAX_KEY_TEXT;
+use balerix_api::{Key, KeyStep, MAX_KEY_TEXT};
 use serde_json::Value;
 
 /// The tool whose `PreToolUse` opens a question.
@@ -342,6 +342,103 @@ fn match_item(q: &Question, item: &str) -> Result<(usize, bool), Refusal> {
     )))
 }
 
+/// The keystrokes that answer the dialog (Spec J §6.3). Rows of a question:
+/// the options, then `Type something`, then — multi-select only — `Submit`
+/// or `Next`. The cursor starts on the first row of every question. Only
+/// Down, Enter and text: Tab behaves differently from different rows.
+pub fn plan(questions: &[Question], selections: &[Selection]) -> Vec<KeyStep> {
+    fn down(steps: &mut Vec<KeyStep>, count: usize) {
+        steps.extend(std::iter::repeat_n(KeyStep::Key(Key::Down), count));
+    }
+    let enter = KeyStep::Key(Key::Enter);
+    let mut steps = Vec::new();
+    for (q, s) in questions.iter().zip(selections) {
+        let n = q.options.len();
+        if q.multi_select {
+            let mut row = 0;
+            for &option in &s.options {
+                down(&mut steps, option - row);
+                row = option;
+                steps.push(enter.clone()); // toggles
+            }
+            if let Some(text) = &s.other {
+                down(&mut steps, n - row);
+                row = n;
+                steps.push(KeyStep::Text(text.clone())); // typing ticks the row
+            }
+            down(&mut steps, n + 1 - row);
+            steps.push(enter.clone()); // `Submit` or `Next`
+        } else if let Some(text) = &s.other {
+            down(&mut steps, n);
+            steps.push(KeyStep::Text(text.clone()));
+            steps.push(enter.clone());
+        } else {
+            down(&mut steps, s.options[0]);
+            steps.push(enter.clone());
+        }
+    }
+    // Everything but a lone single-select question ends on the review
+    // screen, with `Submit answers` highlighted.
+    let lone_single = questions.len() == 1 && !questions[0].multi_select;
+    if !lone_single {
+        steps.push(enter);
+    }
+    steps
+}
+
+/// Declining the dialog: Claude sees "User declined to answer questions".
+pub fn skip_plan() -> Vec<KeyStep> {
+    vec![KeyStep::Key(Key::Escape)]
+}
+
+fn answer_text(q: &Question, s: &Selection) -> String {
+    s.options
+        .iter()
+        .map(|&i| q.options[i].label.clone())
+        .chain(s.other.clone())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `Color → Blue · Size → Medium`, for the echo.
+pub fn describe(questions: &[Question], selections: &[Selection]) -> String {
+    questions
+        .iter()
+        .zip(selections)
+        .map(|(q, s)| format!("{} → {}", q.name(), answer_text(q, s)))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The same line from `PostToolUse`'s `tool_response.answers`.
+pub fn describe_recorded(questions: &[Question], answers: &Value) -> String {
+    questions
+        .iter()
+        .map(|q| {
+            let got = answers
+                .get(&q.text)
+                .and_then(Value::as_str)
+                .unwrap_or("(nothing)");
+            format!("{} → {got}", q.name())
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Whether Claude recorded what was intended (Spec J §7.3). A multi-select
+/// answer is its labels joined with `", "`, in Claude's order, so it is
+/// compared as a set.
+pub fn recorded_matches(questions: &[Question], selections: &[Selection], answers: &Value) -> bool {
+    questions.iter().zip(selections).all(|(q, s)| {
+        let Some(got) = answers.get(&q.text).and_then(Value::as_str) else {
+            return false;
+        };
+        let want = answer_text(q, s);
+        let set = |t: &str| t.split(", ").map(str::to_string).collect::<BTreeSet<_>>();
+        got == want || (q.multi_select && set(got) == set(&want))
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     use serde_json::{Value, json};
@@ -378,7 +475,11 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::fixtures::*;
-    use crate::question::{Matched, Question, Refusal, Selection, match_reply, parse};
+    use crate::question::{
+        Matched, Opt, Question, Refusal, Selection, describe, describe_recorded, match_reply,
+        parse, plan, recorded_matches, skip_plan,
+    };
+    use balerix_api::{Key, KeyStep};
     use serde_json::json;
 
     fn parsed(questions: &[serde_json::Value]) -> Vec<Question> {
@@ -556,5 +657,237 @@ mod tests {
     fn skip_declines() {
         let q = parsed(&[color(), size()]);
         assert_eq!(match_reply(&q, " Skip "), Ok(Matched::Skip));
+    }
+
+    /// `D` Down, `E` Enter, `T` the text step `t`.
+    fn keys(pattern: &str, t: &str) -> Vec<KeyStep> {
+        pattern
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| match c {
+                'D' => KeyStep::Key(Key::Down),
+                'E' => KeyStep::Key(Key::Enter),
+                'T' => KeyStep::Text(t.to_string()),
+                other => panic!("{other}"),
+            })
+            .collect()
+    }
+
+    fn sel(options: &[usize], other: Option<&str>) -> Selection {
+        Selection {
+            options: options.to_vec(),
+            other: other.map(str::to_string),
+        }
+    }
+
+    /// Each case is a row of Spec J §2's table: the sequence that was
+    /// measured against the real `claude`.
+    #[test]
+    fn the_plan_is_the_measured_sequence() {
+        let one = parsed(&[color()]);
+        assert_eq!(plan(&one, &[sel(&[1], None)]), keys("DE", ""));
+        assert_eq!(plan(&one, &[sel(&[0], None)]), keys("E", ""));
+        assert_eq!(
+            plan(&one, &[sel(&[], Some("teal"))]),
+            keys("DDD T E", "teal")
+        );
+
+        let two = parsed(&[color(), size()]);
+        assert_eq!(
+            plan(&two, &[sel(&[2], None), sel(&[1], None)]),
+            keys("DDE DE E", "")
+        );
+        assert_eq!(
+            plan(&two, &[sel(&[], Some("teal")), sel(&[2], None)]),
+            keys("DDD T E  DDE  E", "teal")
+        );
+
+        let multi = parsed(&[colors_multi()]);
+        assert_eq!(plan(&multi, &[sel(&[0, 2], None)]), keys("E DDE DDE E", ""));
+        assert_eq!(
+            plan(&multi, &[sel(&[1], Some("gold"))]),
+            keys("DE DD T DE E", "gold")
+        );
+        assert_eq!(
+            plan(&multi, &[sel(&[], Some("gold"))]),
+            keys("DDD T DE E", "gold")
+        );
+
+        let mixed = parsed(&[colors_multi(), size()]);
+        assert_eq!(
+            plan(&mixed, &[sel(&[0, 2], None), sel(&[1], None)]),
+            keys("E DDE DDE  DE  E", "")
+        );
+        assert_eq!(skip_plan(), vec![KeyStep::Key(Key::Escape)]);
+    }
+
+    #[test]
+    fn describe_and_the_recorded_answers() {
+        let q = parsed(&[colors_multi(), size()]);
+        let chosen = [sel(&[0, 2], Some("gold")), sel(&[1], None)];
+        assert_eq!(
+            describe(&q, &chosen),
+            "Colors → Red, Blue, gold · Size → Medium"
+        );
+
+        let same = json!({ "Which colors?": "Blue, gold, Red", "Which size?": "Medium" });
+        assert!(
+            recorded_matches(&q, &chosen, &same),
+            "multi-select compares as a set"
+        );
+        let differs = json!({ "Which colors?": "Red, Blue, gold", "Which size?": "Small" });
+        assert!(!recorded_matches(&q, &chosen, &differs));
+        assert!(!recorded_matches(
+            &q,
+            &chosen,
+            &json!({ "Which size?": "Medium" })
+        ));
+        assert!(!recorded_matches(&q, &chosen, &json!(null)));
+        assert_eq!(
+            describe_recorded(&q, &differs),
+            "Colors → Red, Blue, gold · Size → Small"
+        );
+        assert_eq!(
+            describe_recorded(&q, &json!({ "Which size?": "Small" })),
+            "Colors → (nothing) · Size → Small"
+        );
+    }
+
+    /// The dialog as Spec J §2 measured it: what each key does. `plan` is
+    /// correct when, fed to this, it records exactly the selections and ends
+    /// submitted. The model is only as true as `mise run verify-questions`.
+    struct Dialog<'a> {
+        questions: &'a [Question],
+        /// The question on screen; `questions.len()` is the review screen.
+        at: usize,
+        row: usize,
+        picked: Vec<Selection>,
+        submitted: bool,
+        /// A key landed somewhere the plan must never reach.
+        broken: Option<String>,
+    }
+
+    impl<'a> Dialog<'a> {
+        fn new(questions: &'a [Question]) -> Self {
+            Self {
+                questions,
+                at: 0,
+                row: 0,
+                picked: vec![sel(&[], None); questions.len()],
+                submitted: false,
+                broken: None,
+            }
+        }
+
+        fn advance(&mut self) {
+            self.at += 1;
+            self.row = 0;
+            let lone_single = self.questions.len() == 1 && !self.questions[0].multi_select;
+            if self.at == self.questions.len() && lone_single {
+                self.submitted = true; // no review screen for one single-select
+            }
+        }
+
+        fn press(&mut self, step: &KeyStep) {
+            if self.submitted || self.broken.is_some() {
+                self.broken = Some(format!("{step:?} after the end"));
+                return;
+            }
+            if self.at == self.questions.len() {
+                // review: `Submit answers` is highlighted
+                match step {
+                    KeyStep::Key(Key::Enter) => self.submitted = true,
+                    other => self.broken = Some(format!("{other:?} on the review screen")),
+                }
+                return;
+            }
+            // copy the `&'a [Question]` out so `q` does not borrow `self`
+            let questions = self.questions;
+            let q = &questions[self.at];
+            let n = q.options.len();
+            let row = self.row;
+            match step {
+                KeyStep::Key(Key::Down) => self.row += 1,
+                KeyStep::Text(t) if self.row == n => self.picked[self.at].other = Some(t.clone()),
+                KeyStep::Key(Key::Enter) if self.row < n && q.multi_select => {
+                    let options = &mut self.picked[self.at].options;
+                    match options.iter().position(|o| *o == row) {
+                        // Enter toggles
+                        Some(i) => {
+                            options.remove(i);
+                        }
+                        None => options.push(row),
+                    }
+                }
+                KeyStep::Key(Key::Enter) if self.row < n => {
+                    self.picked[self.at].options = vec![self.row];
+                    self.advance();
+                }
+                // single-select: Enter on the typed text submits it
+                KeyStep::Key(Key::Enter)
+                    if self.row == n && !q.multi_select && self.picked[self.at].other.is_some() =>
+                {
+                    self.advance()
+                }
+                // multi-select: row n+1 is `Submit` or `Next`
+                KeyStep::Key(Key::Enter) if self.row == n + 1 && q.multi_select => self.advance(),
+                other => {
+                    self.broken = Some(format!("{other:?} at row {} of {}", self.row, q.name()))
+                }
+            }
+        }
+    }
+
+    use proptest::prelude::*;
+
+    fn dialogs() -> impl Strategy<Value = (Vec<Question>, Vec<Selection>)> {
+        prop::collection::vec(
+            (any::<bool>(), 2usize..=4, any::<u8>(), any::<bool>()),
+            1..=4,
+        )
+        .prop_map(|specs| {
+            specs
+                .into_iter()
+                .enumerate()
+                .map(|(qi, (multi, n, bits, other))| {
+                    let q = Question {
+                        text: format!("Q{qi}?"),
+                        header: format!("H{qi}"),
+                        multi_select: multi,
+                        options: (0..n)
+                            .map(|i| Opt {
+                                label: format!("opt{i}"),
+                                description: String::new(),
+                            })
+                            .collect(),
+                    };
+                    let s = if multi {
+                        let options: Vec<usize> = (0..n).filter(|i| (bits >> i) & 1 == 1).collect();
+                        let other = (other || options.is_empty()).then(|| "free".to_string());
+                        Selection { options, other }
+                    } else if other {
+                        sel(&[], Some("free"))
+                    } else {
+                        sel(&[bits as usize % n], None)
+                    };
+                    (q, s)
+                })
+                .unzip()
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn the_plan_drives_the_model_to_exactly_the_selections((questions, selections) in dialogs()) {
+            let steps = plan(&questions, &selections);
+            prop_assert!(steps.len() <= balerix_api::MAX_KEY_STEPS, "{} steps", steps.len());
+            let mut dialog = Dialog::new(&questions);
+            for step in &steps {
+                dialog.press(step);
+            }
+            prop_assert_eq!(&dialog.broken, &None);
+            prop_assert!(dialog.submitted, "not submitted: {:?}", steps);
+            prop_assert_eq!(dialog.picked, selections);
+        }
     }
 }

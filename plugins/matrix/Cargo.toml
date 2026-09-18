@@ -42,6 +42,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 insta = { version = "1.48.0", features = ["yaml", "json"] }
+# The model-based test of the key plan (Spec J §10). Same exact version as
+# the core workspace's.
+proptest = "1.11.0"
 
 [lints.rust]
 unsafe_code = "forbid"

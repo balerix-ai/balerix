@@ -6,6 +6,7 @@ pub mod client;
 pub mod config;
 pub mod matrix;
 pub mod plugin;
+pub mod question;
 pub mod render;
 pub mod routing;
 pub mod session;

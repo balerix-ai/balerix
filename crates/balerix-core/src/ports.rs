@@ -243,6 +243,14 @@ pub trait AgentRunner: Send + Sync {
     fn stop_crew(&self, crew: &CrewRef) -> Result<(), RunnerError>;
     fn observe(&self, fleet: &FleetName) -> Result<ObservedState, RunnerError>;
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError>;
+    /// Presses each step in order, pausing `delay` after every one (Spec J
+    /// §4.2). Returns when the last step has been sent.
+    fn send_keys(
+        &self,
+        agent: &AgentId,
+        steps: &[balerix_api::KeyStep],
+        delay: std::time::Duration,
+    ) -> Result<(), RunnerError>;
     /// A terminal on the agent's window (plugins spec §18.4). The runner
     /// decides how; nothing about tmux crosses this port.
     fn attach(&self, agent: &AgentId) -> Result<Box<dyn PtyStream>, RunnerError>;

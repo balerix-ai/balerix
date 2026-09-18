@@ -399,6 +399,28 @@ impl AgentRunner for FakeRunner {
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
         self.check("send_text", &format!("{agent} {text:?} submit={submit}"))
     }
+    fn send_keys(
+        &self,
+        agent: &AgentId,
+        steps: &[balerix_api::KeyStep],
+        delay: std::time::Duration,
+    ) -> Result<(), RunnerError> {
+        let shown: Vec<String> = steps
+            .iter()
+            .map(|s| match s {
+                balerix_api::KeyStep::Key(k) => format!("{k:?}").to_lowercase(),
+                balerix_api::KeyStep::Text(t) => format!("{t:?}"),
+            })
+            .collect();
+        self.check(
+            "send_keys",
+            &format!(
+                "{agent} [{}] delay={}ms",
+                shown.join(","),
+                delay.as_millis()
+            ),
+        )
+    }
     fn attach(&self, agent: &AgentId) -> Result<Box<dyn PtyStream>, RunnerError> {
         let id = agent.to_string();
         self.check("attach", &id)?;
@@ -837,6 +859,33 @@ mod tests {
         assert_eq!(r.calls(), vec!["send_text f/c/a \"hi\" submit=true"]);
         r.fail_next("send_text", "f/c/a \"no\" submit=false", "no window");
         assert!(r.send_text(&id("f/c/a"), "no", false).is_err());
+    }
+
+    #[test]
+    fn send_keys_is_recorded_and_failable() {
+        use balerix_api::{Key, KeyStep};
+        let r = FakeRunner::default();
+        let steps = [
+            KeyStep::Key(Key::Down),
+            KeyStep::Key(Key::Down),
+            KeyStep::Text("teal-ish".into()),
+            KeyStep::Key(Key::Enter),
+        ];
+        r.send_keys(&id("f/c/a"), &steps, std::time::Duration::from_millis(100))
+            .unwrap();
+        assert_eq!(
+            r.calls(),
+            vec!["send_keys f/c/a [down,down,\"teal-ish\",enter] delay=100ms"]
+        );
+        r.fail_next("send_keys", "f/c/a [escape] delay=20ms", "no window");
+        assert!(
+            r.send_keys(
+                &id("f/c/a"),
+                &[KeyStep::Key(Key::Escape)],
+                std::time::Duration::from_millis(20)
+            )
+            .is_err()
+        );
     }
 
     #[test]

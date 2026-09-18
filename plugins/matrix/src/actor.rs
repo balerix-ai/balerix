@@ -574,8 +574,14 @@ impl<M: MatrixPort> Actor<M> {
         match tracking {
             Tracking::Opened(questions) => {
                 let body = render::question_message(&questions);
-                if shown && let Some(root) = root {
-                    self.send(room, Some(&root), &body, "question").await;
+                if shown
+                    && let Some(root) = root
+                    && self
+                        .send(room, Some(&root), &body, "question")
+                        .await
+                        .is_some()
+                {
+                    self.questions.mark_posted(&event.agent);
                 }
                 true
             }
@@ -626,15 +632,17 @@ impl<M: MatrixPort> Actor<M> {
                 true
             }
             Tracking::Other => {
-                // Spec J §5: while a question is open, the permission
-                // prompt says nothing the question has not.
+                // Spec J §5: the prompt that announced a posted question
+                // says nothing the question has not — that one, and no
+                // other. Anything further is a different tool asking, and
+                // swallowing it leaves the agent waiting in silence.
                 event.name == "Notification"
                     && event
                         .payload
                         .get("notification_type")
                         .and_then(Value::as_str)
                         == Some("permission_prompt")
-                    && self.questions.is_open(&event.agent)
+                    && self.questions.suppress_permission_prompt(&event.agent)
             }
         }
     }
@@ -1831,6 +1839,76 @@ mod tests {
                 .1
                 .contains("needs your permission to use Bash")
         );
+    }
+
+    /// The bare `permission_prompt` that follows a question about six
+    /// seconds later (Spec J §2).
+    fn permission_prompt(agent: &str, session: &str) -> HookEvent {
+        during(
+            agent,
+            session,
+            "Notification",
+            json!({ "notification_type": "permission_prompt", "message": "Claude needs your permission" }),
+        )
+    }
+
+    /// Spec J §5: the question stands in for the prompt that announced it,
+    /// and for that one only. A second `permission_prompt` is a different
+    /// tool asking, and swallowing it would leave the agent waiting with
+    /// nothing in the room to say so — Spec G's core signal, gone.
+    #[tokio::test]
+    async fn at_most_one_permission_prompt_is_suppressed_per_question() {
+        let (_fake, port, mut a, _room, _root) = asked(&[color()]).await;
+        a.handle(Command::Events(vec![permission_prompt("f/c/alice", "s1")]))
+            .await;
+        assert!(
+            sends(&port.take_calls()).is_empty(),
+            "the question already said it"
+        );
+
+        a.handle(Command::Events(vec![permission_prompt("f/c/alice", "s1")]))
+            .await;
+        let s = sends(&port.take_calls());
+        assert_eq!(s.len(), 1, "a second prompt is another tool asking: {s:?}");
+        assert!(s[0].1.contains("needs your permission"), "{}", s[0].1);
+    }
+
+    /// After a `skip` no `PostToolUse` fires, so the record lives until the
+    /// next `Stop`. Claude is free again by then, and the prompt it hits
+    /// next has nothing to do with the question (Spec J §5).
+    #[tokio::test]
+    async fn a_permission_prompt_after_an_answer_is_on_its_way_still_posts() {
+        let (_fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "skip").await;
+        assert!(matches!(
+            a.questions.get("f/c/alice").unwrap().stage,
+            Stage::Sent { .. }
+        ));
+        port.take_calls();
+
+        a.handle(Command::Events(vec![permission_prompt("f/c/alice", "s1")]))
+            .await;
+        let s = sends(&port.calls());
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(s[0].1.contains("needs your permission"), "{}", s[0].1);
+    }
+
+    /// A question the operator never saw cannot stand in for anything: the
+    /// notification is their only notice that the agent is waiting.
+    #[tokio::test]
+    async fn a_permission_prompt_posts_when_the_question_message_never_landed() {
+        let (_fake, port, mut a, _room, _root) = with_question_thread().await;
+        port.fail_next(crate::matrix::MatrixError::Other("nope".into()));
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        assert!(sends(&port.take_calls()).is_empty(), "the question is lost");
+        assert!(a.questions.is_open("f/c/alice"), "but still tracked");
+
+        a.handle(Command::Events(vec![permission_prompt("f/c/alice", "s1")]))
+            .await;
+        let s = sends(&port.calls());
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(s[0].1.contains("needs your permission"), "{}", s[0].1);
     }
 
     /// Spec J §5: tracking is unconditional. The event that opens the

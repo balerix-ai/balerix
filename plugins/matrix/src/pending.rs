@@ -37,6 +37,12 @@ pub enum Stage {
 pub struct OpenQuestion {
     pub questions: Vec<Question>,
     pub stage: Stage,
+    /// Whether the question message reached the room. Only a message the
+    /// operator can see may stand in for the `permission_prompt` that
+    /// follows it (Spec J §5).
+    pub posted: bool,
+    /// Whether that one prompt has already been swallowed.
+    pub notified: bool,
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +69,11 @@ impl Questions {
                         OpenQuestion {
                             questions: list,
                             stage: Stage::Open,
+                            // Neither flag is persisted: after a restart
+                            // nothing is suppressed, which is the safe
+                            // direction — one redundant "needs you" line.
+                            posted: false,
+                            notified: false,
                         },
                     );
                 }
@@ -86,6 +97,30 @@ impl Questions {
         }
     }
 
+    /// Records that the question message landed in the room.
+    pub fn mark_posted(&mut self, agent: &str) {
+        if let Some(open) = self.open.get_mut(agent) {
+            open.posted = true;
+        }
+    }
+
+    /// Whether this `permission_prompt` is the one the question already
+    /// announced (Spec J §5). At most one per question, never once an
+    /// answer is on its way, and never when the question was not shown:
+    /// after a `skip` no `PostToolUse` fires, so the record lives until the
+    /// next `Stop`, and every real tool permission prompt in between is
+    /// Spec G's only "needs you" signal.
+    pub fn suppress_permission_prompt(&mut self, agent: &str) -> bool {
+        let Some(open) = self.open.get_mut(agent) else {
+            return false;
+        };
+        if !open.posted || open.notified || matches!(open.stage, Stage::Sent { .. }) {
+            return false;
+        }
+        open.notified = true;
+        true
+    }
+
     /// Memory first, unlike `Maps`: the record in memory is what keeps a
     /// reply off `send_text`, so it must exist even when the KV write fails.
     pub async fn open(
@@ -100,6 +135,8 @@ impl Questions {
             OpenQuestion {
                 questions,
                 stage: Stage::Open,
+                posted: false,
+                notified: false,
             },
         );
         let bytes = tool_input.to_string().into_bytes();
@@ -154,9 +191,12 @@ mod tests {
             reloaded.get("f/c/a"),
             Some(&OpenQuestion {
                 questions,
-                stage: Stage::Open
+                stage: Stage::Open,
+                posted: false,
+                notified: false
             }),
-            "only `Open` is persisted; the operator answers again"
+            "only `Open` is persisted; the operator answers again, and the \
+             notification that follows is not suppressed"
         );
     }
 

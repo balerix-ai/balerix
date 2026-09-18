@@ -5,6 +5,7 @@ pub mod actor;
 pub mod client;
 pub mod config;
 pub mod matrix;
+pub mod pending;
 pub mod plugin;
 pub mod question;
 pub mod render;

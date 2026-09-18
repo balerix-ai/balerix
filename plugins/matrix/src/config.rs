@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use balerix_api::HOOK_EVENTS;
+use balerix_api::{DEFAULT_KEY_DELAY_MS, HOOK_EVENTS, MAX_KEY_DELAY_MS, MIN_KEY_DELAY_MS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -75,6 +75,9 @@ pub struct AgentConfig {
     pub enabled: bool,
     pub events: Vec<String>,
     pub phases: bool,
+    /// The pause after each key when answering a question (Spec J §7.5).
+    #[serde(rename = "keyDelayMs")]
+    pub key_delay_ms: u64,
 }
 
 impl Default for AgentConfig {
@@ -83,6 +86,7 @@ impl Default for AgentConfig {
             enabled: true,
             events: DEFAULT_EVENTS.iter().map(|e| (*e).to_string()).collect(),
             phases: true,
+            key_delay_ms: DEFAULT_KEY_DELAY_MS,
         }
     }
 }
@@ -196,6 +200,15 @@ pub fn parse_agent(config: &Value) -> Result<AgentConfig, ConfigError> {
                 message: format!("unknown event {name:?}"),
             });
         }
+    }
+    if !(MIN_KEY_DELAY_MS..=MAX_KEY_DELAY_MS).contains(&c.key_delay_ms) {
+        return Err(ConfigError {
+            path: "keyDelayMs".into(),
+            message: format!(
+                "expected {MIN_KEY_DELAY_MS} to {MAX_KEY_DELAY_MS} milliseconds, got {}",
+                c.key_delay_ms
+            ),
+        });
     }
     Ok(c)
 }
@@ -344,5 +357,25 @@ mod tests {
             "events[1]: unknown event \"Frobnicate\""
         );
         assert!(parse_agent(&json!([])).unwrap_err().path.is_empty());
+    }
+
+    #[test]
+    fn key_delay_defaults_to_100_and_is_bounded() {
+        assert_eq!(parse_agent(&json!({})).unwrap().key_delay_ms, 100);
+        assert_eq!(
+            parse_agent(&json!({ "keyDelayMs": 250 }))
+                .unwrap()
+                .key_delay_ms,
+            250
+        );
+        for bad in [19, 501] {
+            let e = parse_agent(&json!({ "keyDelayMs": bad })).unwrap_err();
+            assert_eq!(e.path, "keyDelayMs");
+            assert!(e.message.contains("20 to 500"), "{e}");
+        }
+        assert!(
+            parse_agent(&json!({ "key_delay_ms": 100 })).is_err(),
+            "camelCase only"
+        );
     }
 }

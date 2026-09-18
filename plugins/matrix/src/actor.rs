@@ -635,6 +635,14 @@ impl<M: MatrixPort> Actor<M> {
             return;
         }
 
+        // Spec J-7: while a question is open a reply is an answer, never a
+        // prompt. `send_text` here would type the body into the dialog and
+        // its Enter would pick whatever row is highlighted.
+        if self.questions.is_open(&agent) {
+            self.on_answer(&agent, &root, &message).await;
+            return;
+        }
+
         let action = PluginAction::SendText {
             text: message.body.clone(),
             submit: true,
@@ -650,6 +658,152 @@ impl<M: MatrixPort> Actor<M> {
                 let body = format!("**not delivered to {agent}:** {e}");
                 self.send(&message.room, Some(&root), &body, "notice").await;
                 self.react(&message, FAILED).await;
+            }
+        }
+    }
+
+    /// A thread reply while `agent` has a question open (Spec J §7.2).
+    async fn on_answer(&mut self, agent: &str, root: &str, message: &Inbound) {
+        let count = |outcome: &str| self.counters.inbound.with_label_values(&[outcome]).inc();
+        let Some(open) = self.questions.get(agent).cloned() else {
+            return;
+        };
+        match &open.stage {
+            Stage::Sent { .. } => {
+                count("answer_refused");
+                let body = "an answer is already on its way; wait for the agent.";
+                self.send(&message.room, Some(root), body, "question").await;
+                self.react(message, REFUSED).await;
+                return;
+            }
+            Stage::Confirming { selections, echo } => {
+                match message.body.trim().to_ascii_lowercase().as_str() {
+                    "yes" | "y" => {
+                        count("confirmed");
+                        let (selections, echo) = (selections.clone(), echo.clone());
+                        self.deliver(
+                            agent,
+                            root,
+                            message,
+                            &open.questions,
+                            Some(selections),
+                            echo,
+                        )
+                        .await;
+                        return;
+                    }
+                    "no" | "n" => {
+                        self.questions.set_stage(agent, Stage::Open);
+                        self.react(message, ACK).await;
+                        return;
+                    }
+                    _ => {} // anything else is a fresh answer, matched below
+                }
+            }
+            Stage::Open => {}
+        }
+
+        match question::match_reply(&open.questions, &message.body) {
+            Err(question::Refusal(reason)) => {
+                count("answer_refused");
+                self.questions.set_stage(agent, Stage::Open);
+                self.send(&message.room, Some(root), &reason, "question")
+                    .await;
+                self.react(message, REFUSED).await;
+            }
+            Ok(question::Matched::Skip) => {
+                let echo = self
+                    .send(
+                        &message.room,
+                        Some(root),
+                        "**declining the question**",
+                        "question",
+                    )
+                    .await;
+                self.deliver(agent, root, message, &open.questions, None, echo)
+                    .await;
+            }
+            Ok(question::Matched::Answers { selections, exact }) => {
+                let chosen = question::describe(&open.questions, &selections);
+                if exact {
+                    let body = format!("**answering** {chosen}");
+                    let echo = self
+                        .send(&message.room, Some(root), &body, "question")
+                        .await;
+                    self.deliver(
+                        agent,
+                        root,
+                        message,
+                        &open.questions,
+                        Some(selections),
+                        echo,
+                    )
+                    .await;
+                } else {
+                    count("confirm_asked");
+                    let body = format!("**I read that as** {chosen}. Reply **yes** to send.");
+                    let echo = self
+                        .send(&message.room, Some(root), &body, "question")
+                        .await;
+                    self.questions
+                        .set_stage(agent, Stage::Confirming { selections, echo });
+                }
+            }
+        }
+    }
+
+    /// Sends the keys. `selections` is `None` for a `skip`.
+    async fn deliver(
+        &mut self,
+        agent: &str,
+        root: &str,
+        message: &Inbound,
+        questions: &[question::Question],
+        selections: Option<Vec<question::Selection>>,
+        echo: Option<String>,
+    ) {
+        let count = |outcome: &str| self.counters.inbound.with_label_values(&[outcome]).inc();
+        let steps = match &selections {
+            Some(selections) => question::plan(questions, selections),
+            None => question::skip_plan(),
+        };
+        let delay_ms = self
+            .agents
+            .get(agent)
+            .map(|c| c.key_delay_ms)
+            .unwrap_or(balerix_api::DEFAULT_KEY_DELAY_MS);
+        let action = PluginAction::SendKeys { steps, delay_ms };
+        // The daemon would refuse it; say why here, before anything is sent.
+        if let Err(reason) = action.validate() {
+            count("answer_refused");
+            self.questions.set_stage(agent, Stage::Open);
+            let body = format!(
+                "this answer needs more keystrokes than can be sent from here ({reason}); \
+                 answer at the terminal."
+            );
+            self.send(&message.room, Some(root), &body, "question")
+                .await;
+            self.react(message, REFUSED).await;
+            return;
+        }
+        match self.host.action(agent, &action).await {
+            Ok(()) => {
+                count(if selections.is_some() {
+                    "answered"
+                } else {
+                    "skipped"
+                });
+                self.questions
+                    .set_stage(agent, Stage::Sent { selections, echo });
+                self.react(message, ACK).await;
+            }
+            Err(e) => {
+                count("send_failed");
+                self.counters.errors.with_label_values(&["send_keys"]).inc();
+                self.questions.set_stage(agent, Stage::Open);
+                let body = format!("**not delivered to {agent}:** {e}");
+                self.send(&message.room, Some(root), &body, "notice").await;
+                self.react(message, FAILED).await;
             }
         }
     }
@@ -1907,5 +2061,254 @@ mod tests {
                 body.len()
             );
         }
+    }
+
+    use balerix_api::{Key, KeyStep};
+
+    /// A thread with `questions` open; calls so far are cleared.
+    async fn asked(
+        questions: &[serde_json::Value],
+    ) -> (FakeHost, FakePort, Actor<FakePort>, String, String) {
+        let (fake, port, mut a, room, root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", questions)]))
+            .await;
+        port.take_calls();
+        (fake, port, a, room, root)
+    }
+
+    async fn reply(a: &mut Actor<FakePort>, room: &str, root: &str, body: &str) {
+        a.handle(Command::Inbound(inbound(
+            room,
+            Some(root),
+            "@rahul:example.org",
+            body,
+        )))
+        .await;
+    }
+
+    fn down_enter(downs: usize) -> Vec<KeyStep> {
+        let mut steps = vec![KeyStep::Key(Key::Down); downs];
+        steps.push(KeyStep::Key(Key::Enter));
+        steps
+    }
+
+    #[tokio::test]
+    async fn an_exact_reply_is_echoed_then_sent_as_keys_and_never_as_text() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "3").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: down_enter(2),
+                delay_ms: 100,
+            }]
+        );
+        assert_eq!(
+            sends(&port.calls()),
+            vec![(Some(root.clone()), "**answering** Color → Blue".to_string())]
+        );
+        assert_eq!(reactions(&port.calls()), vec![ACK.to_string()]);
+        assert_eq!(
+            a.questions.get("f/c/alice").unwrap().stage,
+            Stage::Sent {
+                selections: Some(vec![crate::question::Selection {
+                    options: vec![2],
+                    other: None
+                }]),
+                echo: Some("$evt4:fake".into()),
+            }
+        );
+
+        // the recorded answer then lands as a ✅ on that echo
+        port.take_calls();
+        a.handle(Command::Events(vec![answered(
+            "f/c/alice",
+            "s1",
+            json!({ "Which color?": "Blue" }),
+        )]))
+        .await;
+        assert_eq!(
+            port.calls(),
+            vec![Call::React {
+                room,
+                event_id: "$evt4:fake".into(),
+                key: CONFIRMED.into()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agents_key_delay_is_used() {
+        let (fake, _port, mut a, room, root) = asked(&[color()]).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: crate::config::parse_agent(
+                &json!({ "events": ["Notification"], "keyDelayMs": 250 }),
+            )
+            .unwrap(),
+        })
+        .await;
+        reply(&mut a, &room, &root, "1").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: down_enter(0),
+                delay_ms: 250,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inexact_reply_asks_first_and_yes_sends_it() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "gre").await;
+        assert!(
+            fake.actions_for("f/c/alice").is_empty(),
+            "nothing typed yet"
+        );
+        assert_eq!(
+            sends(&port.calls())[0].1,
+            "**I read that as** Color → Green. Reply **yes** to send."
+        );
+        assert!(matches!(
+            a.questions.get("f/c/alice").unwrap().stage,
+            Stage::Confirming { .. }
+        ));
+
+        port.take_calls();
+        reply(&mut a, &room, &root, " Yes ").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: down_enter(1),
+                delay_ms: 100,
+            }]
+        );
+        assert!(sends(&port.calls()).is_empty(), "no second echo");
+        assert_eq!(
+            a.questions.get("f/c/alice").unwrap().stage,
+            Stage::Sent {
+                selections: Some(vec![crate::question::Selection {
+                    options: vec![1],
+                    other: None
+                }]),
+                echo: Some("$evt4:fake".into()),
+            },
+            "the ✅ goes on the echo that asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_drops_the_confirmation_and_another_reply_replaces_it() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "gre").await;
+        reply(&mut a, &room, &root, "no").await;
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);
+        assert!(fake.actions_for("f/c/alice").is_empty());
+
+        reply(&mut a, &room, &root, "gre").await;
+        port.take_calls();
+        reply(&mut a, &room, &root, "blue").await; // not yes/no: a fresh answer
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: down_enter(2),
+                delay_ms: 100,
+            }]
+        );
+        assert_eq!(sends(&port.calls())[0].1, "**answering** Color → Blue");
+    }
+
+    #[tokio::test]
+    async fn prose_is_refused_and_nothing_reaches_the_agent() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "purple please").await;
+        assert!(fake.actions_for("f/c/alice").is_empty(), "the §1 hazard");
+        assert_eq!(reactions(&port.calls()), vec![REFUSED.to_string()]);
+        let body = &sends(&port.calls())[0].1;
+        assert!(
+            body.contains("matches nothing") && body.contains("1. Red"),
+            "{body}"
+        );
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);
+    }
+
+    #[tokio::test]
+    async fn skip_declines_with_one_escape() {
+        let (fake, port, mut a, room, root) = asked(&[color(), size()]).await;
+        reply(&mut a, &room, &root, "skip").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: vec![KeyStep::Key(Key::Escape)],
+                delay_ms: 100,
+            }]
+        );
+        assert_eq!(sends(&port.calls())[0].1, "**declining the question**");
+        assert_eq!(
+            a.questions.get("f/c/alice").unwrap().stage,
+            Stage::Sent {
+                selections: None,
+                echo: Some("$evt4:fake".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn one_reply_answers_several_questions() {
+        let (fake, port, mut a, room, root) = asked(&[color(), size()]).await;
+        reply(&mut a, &room, &root, "blue\nmedium").await;
+        let mut steps = down_enter(2);
+        steps.extend(down_enter(1));
+        steps.push(KeyStep::Key(Key::Enter)); // the review screen
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps,
+                delay_ms: 100,
+            }]
+        );
+        assert_eq!(
+            sends(&port.calls())[0].1,
+            "**answering** Color → Blue · Size → Medium"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_while_keys_are_on_their_way_is_refused() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "1").await;
+        port.take_calls();
+        reply(&mut a, &room, &root, "2").await;
+        assert_eq!(fake.actions_for("f/c/alice").len(), 1, "only the first");
+        assert_eq!(reactions(&port.calls()), vec![REFUSED.to_string()]);
+        assert!(sends(&port.calls())[0].1.contains("already on its way"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_keys_is_reported_and_the_question_stays_open() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        fake.fail_actions(Some("no window"));
+        reply(&mut a, &room, &root, "1").await;
+        assert_eq!(reactions(&port.calls()), vec![FAILED.to_string()]);
+        let bodies = sends(&port.calls());
+        assert!(
+            bodies[1].1.starts_with("**not delivered to f/c/alice:**"),
+            "{bodies:?}"
+        );
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);
+    }
+
+    #[tokio::test]
+    async fn with_no_question_open_a_reply_is_still_a_prompt() {
+        let (fake, _port, mut a, room, root) = with_question_thread().await;
+        reply(&mut a, &room, &root, "3").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendText {
+                text: "3".into(),
+                submit: true,
+            }]
+        );
     }
 }

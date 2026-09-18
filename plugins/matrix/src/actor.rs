@@ -14,7 +14,9 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 use crate::config::{AgentConfig, DaemonConfig};
-use crate::matrix::{ACK, FAILED, Inbound, MatrixError, MatrixPort, REFUSED};
+use crate::matrix::{ACK, CONFIRMED, FAILED, Inbound, MatrixError, MatrixPort, REFUSED};
+use crate::pending::{Questions, Stage};
+use crate::question;
 use crate::render::{self, PhaseChange};
 use crate::routing::{Maps, Thread, crew_of};
 
@@ -121,6 +123,7 @@ pub struct Counters {
     pub rooms: IntGauge,
     pub threads_open: IntGauge,
     pub errors: IntCounterVec,
+    pub answers_mismatched: IntCounter,
 }
 
 impl Counters {
@@ -147,6 +150,10 @@ impl Counters {
                 "errors_total",
                 "Matrix failures, by kind",
                 &["kind"],
+            )?,
+            answers_mismatched: metrics.int_counter(
+                "answers_mismatched_total",
+                "Answers Claude recorded differently from what the thread chose",
             )?,
         })
     }
@@ -188,6 +195,8 @@ pub struct Actor<M: MatrixPort> {
     pending: Vec<Command>,
     agents: HashMap<String, AgentConfig>,
     maps: Maps,
+    /// The `AskUserQuestion` each agent is waiting on (Spec J §7).
+    questions: Questions,
     /// Crews whose room creation the homeserver refused, and when each may
     /// be tried again. Only failures are kept: a crew whose room exists is
     /// answered from `maps` and never reaches the creation path again.
@@ -205,6 +214,7 @@ impl<M: MatrixPort> Actor<M> {
             pending: Vec::new(),
             agents: HashMap::new(),
             maps: Maps::new(),
+            questions: Questions::default(),
             cooldowns: HashMap::new(),
         }
     }
@@ -239,6 +249,10 @@ impl<M: MatrixPort> Actor<M> {
             Ok(maps) => self.maps = maps,
             Err(e) => tracing::warn!("matrix: loading maps: {e}"),
         }
+        match Questions::load(&self.host).await {
+            Ok(questions) => self.questions = questions,
+            Err(e) => tracing::warn!("matrix: loading questions: {e}"),
+        }
         self.publish_gauges();
     }
 
@@ -268,6 +282,7 @@ impl<M: MatrixPort> Actor<M> {
             }
             Command::Deactivate { agent } => {
                 self.agents.remove(&agent);
+                self.questions.clear(&self.host, &agent).await;
                 if let Err(e) = self.maps.forget(&self.host, &agent).await {
                     tracing::warn!("matrix: forgetting {agent}: {e}");
                 }
@@ -396,6 +411,14 @@ impl<M: MatrixPort> Actor<M> {
         if !config.enabled {
             return;
         }
+        // Spec J §7.1: these prove no dialog is on screen any more. Done
+        // before the thread logic, which returns early for `SessionStart`.
+        if matches!(
+            event.name.as_str(),
+            "Stop" | "UserPromptSubmit" | "SessionStart" | "SessionEnd"
+        ) {
+            self.questions.clear(&self.host, &event.agent).await;
+        }
         let Some(room) = self.room_for(&event.agent).await else {
             return;
         };
@@ -458,6 +481,9 @@ impl<M: MatrixPort> Actor<M> {
             self.publish_gauges();
         }
 
+        if self.on_question_event(&config, &room, &event).await {
+            return;
+        }
         if !config.wants(&event.name) {
             return;
         }
@@ -472,6 +498,98 @@ impl<M: MatrixPort> Actor<M> {
                 tracing::warn!("matrix: closing thread for {}: {e}", event.agent);
             }
             self.publish_gauges();
+        }
+    }
+
+    /// The `AskUserQuestion` lifecycle (Spec J §5, §7.3). `true` when the
+    /// event was handled here and must not also post as a generic line.
+    async fn on_question_event(
+        &mut self,
+        config: &AgentConfig,
+        room: &str,
+        event: &HookEvent,
+    ) -> bool {
+        let is_question =
+            event.payload.get("tool_name").and_then(Value::as_str) == Some(question::TOOL);
+        // The question is the detailed form of "needs you", so either event
+        // being wanted shows it. Tracking below never depends on this (J-7).
+        let shown = config.wants("Notification") || config.wants("PreToolUse");
+        let root = self.maps.thread(&event.agent).map(|t| t.root.clone());
+        match event.name.as_str() {
+            "PreToolUse" if is_question => {
+                let input = event
+                    .payload
+                    .get("tool_input")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let Some(questions) = question::parse(&input) else {
+                    return false; // posts as `running AskUserQuestion`, as before
+                };
+                let body = render::question_message(&questions);
+                self.questions
+                    .open(&self.host, &event.agent, &input, questions)
+                    .await;
+                if shown && let Some(root) = root {
+                    self.send(room, Some(&root), &body, "question").await;
+                }
+                true
+            }
+            "Notification"
+                if self.questions.is_open(&event.agent)
+                    && event
+                        .payload
+                        .get("notification_type")
+                        .and_then(Value::as_str)
+                        == Some("permission_prompt") =>
+            {
+                true // says nothing the question has not
+            }
+            "PostToolUse" if is_question => {
+                let Some(open) = self.questions.clear(&self.host, &event.agent).await else {
+                    return false;
+                };
+                let answers = event
+                    .payload
+                    .pointer("/tool_response/answers")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let recorded = question::describe_recorded(&open.questions, &answers);
+                match open.stage {
+                    Stage::Sent {
+                        selections: Some(selections),
+                        echo,
+                    } => {
+                        if question::recorded_matches(&open.questions, &selections, &answers) {
+                            if let Some(echo) = echo {
+                                self.react_to(room, &echo, CONFIRMED).await;
+                            }
+                        } else {
+                            // Posted whatever the filter says: it answers
+                            // the operator's own action.
+                            self.counters.answers_mismatched.inc();
+                            let body = format!(
+                                "**recorded answer differs** — Claude recorded {recorded}; \
+                                 you chose {}. Tell the agent if that matters.",
+                                question::describe(&open.questions, &selections)
+                            );
+                            if let Some(root) = root {
+                                self.send(room, Some(&root), &body, "question").await;
+                            }
+                        }
+                    }
+                    Stage::Sent {
+                        selections: None, ..
+                    } => {}
+                    Stage::Open | Stage::Confirming { .. } => {
+                        if shown && let Some(root) = root {
+                            let body = format!("**answered at the terminal** {recorded}");
+                            self.send(room, Some(&root), &body, "question").await;
+                        }
+                    }
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -537,9 +655,13 @@ impl<M: MatrixPort> Actor<M> {
     }
 
     async fn react(&self, message: &Inbound, key: &str) {
-        if let Err(e) = self.port.react(&message.room, &message.event_id, key).await {
+        self.react_to(&message.room, &message.event_id, key).await;
+    }
+
+    async fn react_to(&self, room: &str, event_id: &str, key: &str) {
+        if let Err(e) = self.port.react(room, event_id, key).await {
             self.counters.errors.with_label_values(&["react"]).inc();
-            tracing::warn!("matrix: reacting to {}: {e}", message.event_id);
+            tracing::warn!("matrix: reacting to {event_id}: {e}");
         }
     }
 }
@@ -654,6 +776,7 @@ mod tests {
         c.rooms.set(2);
         c.threads_open.set(3);
         c.events_dropped.inc();
+        c.answers_mismatched.inc();
         let text = m.render().unwrap();
         for family in [
             "balerix_plugin_matrix_messages_sent_total",
@@ -662,6 +785,7 @@ mod tests {
             "balerix_plugin_matrix_rooms",
             "balerix_plugin_matrix_threads_open",
             "balerix_plugin_matrix_errors_total",
+            "balerix_plugin_matrix_answers_mismatched_total",
         ] {
             assert!(text.contains(family), "missing {family} in\n{text}");
         }
@@ -1416,6 +1540,231 @@ mod tests {
         };
         port.take_calls();
         (fake, port, a, room, root)
+    }
+
+    use crate::matrix::CONFIRMED;
+    use crate::pending::Stage;
+    use crate::question::fixtures::{color, size};
+
+    fn asks(agent: &str, session: &str, questions: &[serde_json::Value]) -> HookEvent {
+        during(
+            agent,
+            session,
+            "PreToolUse",
+            json!({ "tool_name": "AskUserQuestion", "tool_input": { "questions": questions } }),
+        )
+    }
+
+    fn answered(agent: &str, session: &str, answers: serde_json::Value) -> HookEvent {
+        during(
+            agent,
+            session,
+            "PostToolUse",
+            json!({ "tool_name": "AskUserQuestion", "tool_response": { "answers": answers } }),
+        )
+    }
+
+    /// `with_thread`, for an agent that posts `Notification` and `Stop`.
+    async fn with_question_thread() -> (FakeHost, FakePort, Actor<FakePort>, String, String) {
+        let (fake, port, mut a) = actor().await;
+        a.handle(Command::Configure(daemon_config())).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&["Notification", "Stop"]),
+        })
+        .await;
+        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+            .await;
+        let room = match port.calls().last() {
+            Some(Call::Send { room, .. }) => room.clone(),
+            other => panic!("expected a root send, got {other:?}"),
+        };
+        port.take_calls();
+        (fake, port, a, room, "$evt2:fake".to_string())
+    }
+
+    #[tokio::test]
+    async fn a_question_is_posted_in_the_thread_and_the_permission_line_is_suppressed() {
+        let (fake, port, mut a, _room, root) = with_question_thread().await;
+        a.handle(Command::Events(vec![
+            asks("f/c/alice", "s1", &[color()]),
+            during(
+                "f/c/alice",
+                "s1",
+                "Notification",
+                json!({ "notification_type": "permission_prompt", "message": "Claude needs your permission" }),
+            ),
+        ]))
+        .await;
+        let sent = sends(&port.calls());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0.as_deref(), Some(root.as_str()));
+        assert!(
+            sent[0].1.starts_with("**question** · Color"),
+            "{}",
+            sent[0].1
+        );
+        assert!(sent[0].1.contains("3. **Blue**"));
+        assert!(
+            fake.kv_json("question/f/c/alice").is_some(),
+            "mirrored to KV"
+        );
+
+        // with no question open the same notification posts as before
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "Stop",
+            json!({}),
+        )]))
+        .await;
+        port.take_calls();
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "Notification",
+            json!({ "notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash" }),
+        )]))
+        .await;
+        assert!(
+            sends(&port.calls())[0]
+                .1
+                .contains("needs your permission to use Bash")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_question_is_tracked_even_when_the_event_filter_hides_it() {
+        let (fake, port, mut a, _room, _root) = with_thread().await; // events: []
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        assert!(sends(&port.calls()).is_empty(), "nothing posted");
+        assert!(
+            a.questions.is_open("f/c/alice"),
+            "but J-7's protection is on"
+        );
+        assert!(fake.kv_json("question/f/c/alice").is_some());
+    }
+
+    #[tokio::test]
+    async fn every_clearing_event_closes_the_question() {
+        for (name, payload) in [
+            ("Stop", json!({})),
+            ("UserPromptSubmit", json!({ "prompt": "x" })),
+            ("SessionEnd", json!({ "reason": "clear" })),
+            ("SessionStart", json!({ "source": "clear" })),
+        ] {
+            let (fake, _port, mut a, _room, _root) = with_question_thread().await;
+            a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+                .await;
+            assert!(a.questions.is_open("f/c/alice"));
+            a.handle(Command::Events(vec![during(
+                "f/c/alice",
+                "s1",
+                name,
+                payload,
+            )]))
+            .await;
+            assert!(!a.questions.is_open("f/c/alice"), "{name}");
+            assert!(fake.kv_json("question/f/c/alice").is_none(), "{name}");
+        }
+        let (_fake, _port, mut a, _room, _root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        a.handle(deactivate("f/c/alice")).await;
+        assert!(!a.questions.is_open("f/c/alice"), "deactivate");
+    }
+
+    #[tokio::test]
+    async fn an_answer_given_at_the_terminal_is_reported() {
+        let (_fake, port, mut a, _room, _root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks(
+            "f/c/alice",
+            "s1",
+            &[color(), size()],
+        )]))
+        .await;
+        port.take_calls();
+        a.handle(Command::Events(vec![answered(
+            "f/c/alice",
+            "s1",
+            json!({ "Which color?": "Blue", "Which size?": "Medium" }),
+        )]))
+        .await;
+        assert_eq!(
+            sends(&port.calls())[0].1,
+            "**answered at the terminal** Color → Blue · Size → Medium"
+        );
+        assert!(!a.questions.is_open("f/c/alice"));
+    }
+
+    #[tokio::test]
+    async fn a_sent_answer_is_confirmed_on_the_echo_or_reported_when_it_differs() {
+        let chosen = vec![crate::question::Selection {
+            options: vec![2],
+            other: None,
+        }];
+        let sent = |echo: &str| Stage::Sent {
+            selections: Some(chosen.clone()),
+            echo: Some(echo.to_string()),
+        };
+
+        let (_fake, port, mut a, room, _root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        a.questions.set_stage("f/c/alice", sent("$echo:fake"));
+        port.take_calls();
+        a.handle(Command::Events(vec![answered(
+            "f/c/alice",
+            "s1",
+            json!({ "Which color?": "Blue" }),
+        )]))
+        .await;
+        assert_eq!(
+            port.calls(),
+            vec![Call::React {
+                room: room.clone(),
+                event_id: "$echo:fake".into(),
+                key: CONFIRMED.into()
+            }],
+            "a reaction, not another message"
+        );
+
+        let (_fake, port, mut a, _room, _root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        a.questions.set_stage("f/c/alice", sent("$echo:fake"));
+        port.take_calls();
+        a.handle(Command::Events(vec![answered(
+            "f/c/alice",
+            "s1",
+            json!({ "Which color?": "Red" }),
+        )]))
+        .await;
+        let body = &sends(&port.calls())[0].1;
+        assert!(body.starts_with("**recorded answer differs**"), "{body}");
+        assert!(
+            body.contains("Color → Red") && body.contains("Color → Blue"),
+            "{body}"
+        );
+        assert_eq!(a.counters.answers_mismatched.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_open_question_survives_an_actor_restart() {
+        let (fake, _port, mut a, _room, _root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        drop(a);
+        let host = Host::new(fake.env("matrix", std::path::Path::new("scratch"))).unwrap();
+        let mut again = Actor::new(
+            host,
+            FakePort::new("@balerix:example.org"),
+            counters(),
+            Health::new(),
+        );
+        again.load().await;
+        assert!(again.questions.is_open("f/c/alice"));
     }
 
     #[tokio::test]

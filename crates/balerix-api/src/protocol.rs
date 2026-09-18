@@ -12,6 +12,38 @@ pub const OBSERVER_BATCH: usize = 64;
 pub const OBSERVER_QUEUE: usize = 1024;
 /// The interceptor chain's shared budget inside Claude's 2 s hook timeout.
 pub const CHAIN_BUDGET_MS: u64 = 1500;
+/// `send_keys`: the pause after each step when the action names none.
+pub const DEFAULT_KEY_DELAY_MS: u64 = 100;
+/// The floor is the point of the action (Spec J §2): keys sent with no
+/// pause are dropped at a dialog transition.
+pub const MIN_KEY_DELAY_MS: u64 = 20;
+pub const MAX_KEY_DELAY_MS: u64 = 500;
+pub const MAX_KEY_STEPS: usize = 64;
+/// Bytes in one `text` step.
+pub const MAX_KEY_TEXT: usize = 1024;
+/// `steps × delay_ms` may not pass this: the SDK's `Host::action` gives up
+/// after 10 s, and a plugin that timed out mid-sequence cannot know what
+/// state the dialog is in.
+pub const MAX_KEY_SEQUENCE_MS: u64 = 8000;
+
+/// The keys `send_keys` may press. A closed set: the runner matches each to
+/// a fixed tmux key name, so nothing from the wire reaches tmux as a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Key {
+    Up,
+    Down,
+    Enter,
+    Escape,
+}
+
+/// One step of a `send_keys`: `{"key": …}` or `{"text": …}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStep {
+    Key(Key),
+    Text(String),
+}
 
 /// What a verdict may ask the daemon to do (spec §3, §4.3, §8.1).
 ///
@@ -27,6 +59,10 @@ pub enum PluginAction {
         text: String,
         #[serde(default)]
         submit: bool,
+    },
+    SendKeys {
+        steps: Vec<KeyStep>,
+        delay_ms: u64,
     },
     Restart,
     Stop,
@@ -71,6 +107,20 @@ impl<'de> Deserialize<'de> for PluginAction {
                 };
                 Ok(PluginAction::SendText { text, submit })
             }
+            "send_keys" => {
+                reject_extra(&["action", "steps", "delay_ms"])?;
+                let steps = obj
+                    .get("steps")
+                    .cloned()
+                    .ok_or_else(|| D::Error::custom("missing field `steps`"))?;
+                let steps: Vec<KeyStep> =
+                    serde_json::from_value(steps).map_err(D::Error::custom)?;
+                let delay_ms = match obj.get("delay_ms") {
+                    Some(v) => serde_json::from_value(v.clone()).map_err(D::Error::custom)?,
+                    None => DEFAULT_KEY_DELAY_MS,
+                };
+                Ok(PluginAction::SendKeys { steps, delay_ms })
+            }
             "restart" => {
                 reject_extra(&["action"])?;
                 Ok(PluginAction::Restart)
@@ -89,9 +139,51 @@ impl PluginAction {
     pub fn label(&self) -> &'static str {
         match self {
             PluginAction::SendText { .. } => "send_text",
+            PluginAction::SendKeys { .. } => "send_keys",
             PluginAction::Restart => "restart",
             PluginAction::Stop => "stop",
         }
+    }
+
+    /// What serde cannot say: the bounds of a `send_keys` (Spec J §4.1).
+    /// The message starts with the field, for the daemon's 400.
+    pub fn validate(&self) -> Result<(), String> {
+        let PluginAction::SendKeys { steps, delay_ms } = self else {
+            return Ok(());
+        };
+        if steps.is_empty() || steps.len() > MAX_KEY_STEPS {
+            return Err(format!(
+                "steps: expected 1 to {MAX_KEY_STEPS} steps, got {}",
+                steps.len()
+            ));
+        }
+        if !(MIN_KEY_DELAY_MS..=MAX_KEY_DELAY_MS).contains(delay_ms) {
+            return Err(format!(
+                "delay_ms: expected {MIN_KEY_DELAY_MS} to {MAX_KEY_DELAY_MS}, got {delay_ms}"
+            ));
+        }
+        let total = steps.len() as u64 * delay_ms;
+        if total > MAX_KEY_SEQUENCE_MS {
+            return Err(format!(
+                "steps: {} steps at {delay_ms} ms is {total} ms, over the {MAX_KEY_SEQUENCE_MS} ms limit",
+                steps.len()
+            ));
+        }
+        for (i, step) in steps.iter().enumerate() {
+            let KeyStep::Text(text) = step else { continue };
+            if text.is_empty() || text.len() > MAX_KEY_TEXT {
+                return Err(format!(
+                    "steps[{i}].text: expected 1 to {MAX_KEY_TEXT} bytes, got {}",
+                    text.len()
+                ));
+            }
+            if text.chars().any(char::is_control) {
+                return Err(format!(
+                    "steps[{i}].text: a control character is not allowed"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -312,5 +404,113 @@ mod tests {
         ] {
             assert_eq!(ResizeFrame::parse(bad), TextFrame::Malformed, "{bad}");
         }
+    }
+
+    #[test]
+    fn send_keys_round_trips_and_defaults_its_delay() {
+        let wire = json!({
+            "action": "send_keys",
+            "steps": [{ "key": "down" }, { "text": "teal-ish" }, { "key": "enter" }],
+            "delay_ms": 150
+        });
+        let a: PluginAction = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            a,
+            PluginAction::SendKeys {
+                steps: vec![
+                    KeyStep::Key(Key::Down),
+                    KeyStep::Text("teal-ish".into()),
+                    KeyStep::Key(Key::Enter),
+                ],
+                delay_ms: 150,
+            }
+        );
+        assert_eq!(a.label(), "send_keys");
+        assert_eq!(serde_json::to_value(&a).unwrap(), wire);
+
+        let defaulted: PluginAction = serde_json::from_value(
+            json!({ "action": "send_keys", "steps": [{ "key": "escape" }] }),
+        )
+        .unwrap();
+        assert_eq!(
+            defaulted,
+            PluginAction::SendKeys {
+                steps: vec![KeyStep::Key(Key::Escape)],
+                delay_ms: DEFAULT_KEY_DELAY_MS,
+            }
+        );
+    }
+
+    #[test]
+    fn send_keys_rejects_what_the_allowlist_does_not_name() {
+        let bad = [
+            json!({ "action": "send_keys", "steps": [{ "key": "tab" }] }),
+            json!({ "action": "send_keys", "steps": [{ "key": "down", "text": "x" }] }),
+            json!({ "action": "send_keys", "steps": [{}] }),
+            json!({ "action": "send_keys", "steps": [{ "key": "down" }], "x": 1 }),
+            json!({ "action": "send_keys" }),
+        ];
+        for v in bad {
+            assert!(
+                serde_json::from_value::<PluginAction>(v.clone()).is_err(),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_bounds_steps_delay_text_and_the_whole_sequence() {
+        let keys = |n: usize, delay_ms: u64| PluginAction::SendKeys {
+            steps: vec![KeyStep::Key(Key::Down); n],
+            delay_ms,
+        };
+        let text = |t: &str| PluginAction::SendKeys {
+            steps: vec![KeyStep::Text(t.into())],
+            delay_ms: DEFAULT_KEY_DELAY_MS,
+        };
+        assert_eq!(keys(1, 100).validate(), Ok(()));
+        assert_eq!(keys(MAX_KEY_STEPS, 100).validate(), Ok(()));
+        assert!(keys(0, 100).validate().unwrap_err().starts_with("steps:"));
+        assert!(
+            keys(MAX_KEY_STEPS + 1, 100)
+                .validate()
+                .unwrap_err()
+                .starts_with("steps:")
+        );
+        assert!(keys(1, 19).validate().unwrap_err().starts_with("delay_ms:"));
+        assert!(
+            keys(1, 501)
+                .validate()
+                .unwrap_err()
+                .starts_with("delay_ms:")
+        );
+        assert_eq!(keys(16, 500).validate(), Ok(()));
+        assert!(
+            keys(17, 500)
+                .validate()
+                .unwrap_err()
+                .starts_with("steps: 17 steps at 500 ms")
+        );
+        assert_eq!(text("teal-ish; really").validate(), Ok(()));
+        assert!(
+            text("")
+                .validate()
+                .unwrap_err()
+                .starts_with("steps[0].text:")
+        );
+        assert!(
+            text(&"x".repeat(MAX_KEY_TEXT + 1))
+                .validate()
+                .unwrap_err()
+                .starts_with("steps[0].text:")
+        );
+        assert!(
+            text("two\nlines")
+                .validate()
+                .unwrap_err()
+                .contains("control character")
+        );
+        assert!(text("esc\u{1b}[B").validate().is_err());
+        assert_eq!(PluginAction::Stop.validate(), Ok(()));
     }
 }

@@ -25,9 +25,10 @@ pub use plugin::{
     PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport,
 };
 pub use protocol::{
-    ActivateRequest, CHAIN_BUDGET_MS, DeactivateRequest, EventBatch, InterceptRequest,
-    InterceptResponse, KvKeys, OBSERVER_BATCH, OBSERVER_QUEUE, PluginAction, Resize, ResizeFrame,
-    TextFrame,
+    ActivateRequest, CHAIN_BUDGET_MS, DEFAULT_KEY_DELAY_MS, DeactivateRequest, EventBatch,
+    InterceptRequest, InterceptResponse, Key, KeyStep, KvKeys, MAX_KEY_DELAY_MS,
+    MAX_KEY_SEQUENCE_MS, MAX_KEY_STEPS, MAX_KEY_TEXT, MIN_KEY_DELAY_MS, OBSERVER_BATCH,
+    OBSERVER_QUEUE, PluginAction, Resize, ResizeFrame, TextFrame,
 };
 pub use record::{Desired, FleetRecord, Keep};
 pub use request::{DownQuery, ErrorBody, FleetRequest, SessionRequest, SessionResponse};

@@ -24,7 +24,7 @@ fn fixtures() -> BTreeMap<String, Value> {
     }
     assert_eq!(
         out.len(),
-        22,
+        23,
         "every fixture accounted for: {:?}",
         out.keys()
     );
@@ -223,6 +223,15 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
     assert_eq!(
         fake.actions()[0],
         ("payments/backend/bob".to_string(), action)
+    );
+
+    let keys: PluginAction =
+        serde_json::from_value(fx["action-send-keys"]["request"].clone()).unwrap();
+    assert_eq!(keys.validate(), Ok(()));
+    host.action("payments/backend/bob", &keys).await.unwrap();
+    assert_eq!(
+        fake.actions()[1],
+        ("payments/backend/bob".to_string(), keys)
     );
 
     let bytes = b64(fx["kv-put"]["raw"].as_str().unwrap());

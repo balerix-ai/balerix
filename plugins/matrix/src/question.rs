@@ -482,8 +482,16 @@ pub fn recorded_matches(questions: &[Question], selections: &[Selection], answer
             return false;
         };
         let want = answer_text(q, s);
-        let set = |t: &str| t.split(", ").map(str::to_string).collect::<BTreeSet<_>>();
-        got == want || (q.multi_select && set(got) == set(&want))
+        // Labels were trimmed at parse and Claude's text is verbatim, so
+        // both sides are trimmed before they are compared — items of a
+        // multi-select set too. A mismatch over a stray space would be a
+        // false alarm on the counter that is meant to stay at zero (§8).
+        let set = |t: &str| {
+            t.split(", ")
+                .map(|i| i.trim().to_string())
+                .collect::<BTreeSet<_>>()
+        };
+        got.trim() == want || (q.multi_select && set(got) == set(&want))
     })
 }
 
@@ -898,6 +906,25 @@ mod tests {
             describe_recorded(&q, &json!({ "Which size?": "Small" })),
             "Colors → (nothing) · Size → Small"
         );
+    }
+
+    /// Labels are trimmed at parse; Claude's recorded text is verbatim. A
+    /// mismatch reported over a stray space is a false alarm on the one
+    /// counter that is meant to stay at zero (Spec J §8).
+    #[test]
+    fn recorded_answers_are_compared_with_both_sides_trimmed() {
+        let one = parsed(&[color()]);
+        assert!(recorded_matches(
+            &one,
+            &[sel(&[2], None)],
+            &json!({ "Which color?": "Blue " })
+        ));
+        let multi = parsed(&[colors_multi()]);
+        assert!(recorded_matches(
+            &multi,
+            &[sel(&[0, 2], None)],
+            &json!({ "Which colors?": " Blue ,  Red " })
+        ));
     }
 
     /// The dialog as Spec J §2 measured it: what each key does. `plan` is

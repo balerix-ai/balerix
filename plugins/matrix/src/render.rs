@@ -101,6 +101,28 @@ pub fn event_message(event: &HookEvent) -> String {
     }
 }
 
+/// A run of whitespace holding a newline, collapsed to one space. The
+/// agent's own text is interpolated into the markdown ordered list the
+/// options are rendered as, and a line of it beginning `N.` renumbers that
+/// list — after which the displayed numbers no longer match the option the
+/// operator's reply would select. Display only: the parsed `Question` keeps
+/// its verbatim `text`, which is the key of `PostToolUse`'s `answers`.
+fn one_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(char::is_whitespace) {
+        let end = rest[at..]
+            .find(|c: char| !c.is_whitespace())
+            .map_or(rest.len(), |i| at + i);
+        out.push_str(&rest[..at]);
+        let run = &rest[at..end];
+        out.push_str(if run.contains('\n') { " " } else { run });
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// An `AskUserQuestion` dialog for the thread (Spec J §5). Paragraphs are
 /// separated by blank lines: a lone newline is not a break in markdown.
 pub fn question_message(questions: &[Question]) -> String {
@@ -113,10 +135,10 @@ pub fn question_message(questions: &[Question]) -> String {
             "**question**".to_string()
         };
         if !q.header.is_empty() {
-            title.push_str(&format!(" · {}", q.header));
+            title.push_str(&format!(" · {}", one_line(&q.header)));
         }
         paragraphs.push(title);
-        let mut ask = q.text.trim().to_string();
+        let mut ask = one_line(q.text.trim());
         if q.multi_select {
             ask.push_str(" *(choose any, separated by commas)*");
         }
@@ -127,9 +149,14 @@ pub fn question_message(questions: &[Question]) -> String {
                 .enumerate()
                 .map(|(n, o)| {
                     if o.description.is_empty() {
-                        format!("{}. **{}**", n + 1, o.label)
+                        format!("{}. **{}**", n + 1, one_line(&o.label))
                     } else {
-                        format!("{}. **{}** — {}", n + 1, o.label, o.description)
+                        format!(
+                            "{}. **{}** — {}",
+                            n + 1,
+                            one_line(&o.label),
+                            one_line(&o.description)
+                        )
                     }
                 })
                 .collect::<Vec<_>>()
@@ -470,6 +497,38 @@ mod tests {
             fixtures::colors_multi(),
             fixtures::size()
         ])));
+    }
+
+    /// Header, question, label and description come from the agent and are
+    /// interpolated into a markdown ordered list. A line of one of them
+    /// beginning `N.` renumbers that list, and the displayed numbers are
+    /// what the operator replies with (THREAT-MODEL: they are untrusted).
+    #[test]
+    fn a_newline_in_an_agents_text_cannot_renumber_the_option_list() {
+        let mut sneaky = fixtures::color();
+        sneaky["header"] = json!("Colour\n9. or not");
+        sneaky["question"] = json!("Which\ncolor?");
+        sneaky["options"][0]["label"] = json!("Red\n2. Not really");
+        sneaky["options"][1]["description"] = json!("calm\n\n3. nor this");
+        let q = questions(&[sneaky]);
+        let body = question_message(&q);
+
+        let numbered: Vec<&str> = body
+            .lines()
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+            .collect();
+        assert_eq!(
+            numbered.len(),
+            3,
+            "the list must hold one line per option: {body}"
+        );
+        for (i, line) in numbered.iter().enumerate() {
+            assert!(line.starts_with(&format!("{}. ", i + 1)), "{body}");
+        }
+        assert_eq!(
+            q[0].text, "Which\ncolor?",
+            "the parsed text stays verbatim: it is the key of `answers`"
+        );
     }
 
     #[test]

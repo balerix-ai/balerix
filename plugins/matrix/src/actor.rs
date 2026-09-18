@@ -766,44 +766,74 @@ impl<M: MatrixPort> Actor<M> {
                 self.react(message, REFUSED).await;
             }
             Ok(question::Matched::Skip) => {
-                let echo = self
+                let Some(echo) = self
                     .send(
                         &message.room,
                         Some(root),
                         "**declining the question**",
                         "question",
                     )
-                    .await;
-                self.deliver(agent, root, message, &open.questions, None, echo)
+                    .await
+                else {
+                    return self.echo_lost(agent, message).await;
+                };
+                self.deliver(agent, root, message, &open.questions, None, Some(echo))
                     .await;
             }
             Ok(question::Matched::Answers { selections, exact }) => {
                 let chosen = question::describe(&open.questions, &selections);
                 if exact {
                     let body = format!("**answering** {chosen}");
-                    let echo = self
+                    let Some(echo) = self
                         .send(&message.room, Some(root), &body, "question")
-                        .await;
+                        .await
+                    else {
+                        return self.echo_lost(agent, message).await;
+                    };
                     self.deliver(
                         agent,
                         root,
                         message,
                         &open.questions,
                         Some(selections),
-                        echo,
+                        Some(echo),
                     )
                     .await;
                 } else {
-                    count("confirm_asked");
                     let body = format!("**I read that as** {chosen}. Reply **yes** to send.");
-                    let echo = self
+                    let Some(echo) = self
                         .send(&message.room, Some(root), &body, "question")
-                        .await;
-                    self.questions
-                        .set_stage(agent, Stage::Confirming { selections, echo });
+                        .await
+                    else {
+                        return self.echo_lost(agent, message).await;
+                    };
+                    count("confirm_asked");
+                    self.questions.set_stage(
+                        agent,
+                        Stage::Confirming {
+                            selections,
+                            echo: Some(echo),
+                        },
+                    );
                 }
             }
         }
+    }
+
+    /// The echo did not reach the room. J-5: the plugin *always* echoes, so
+    /// nothing may be sent to the agent on an answer the operator cannot
+    /// see, and no `Confirming` may be entered on a reading nobody was
+    /// shown — a later stray `yes` would send it. The question stays open
+    /// and the operator can answer again. The failed send has already
+    /// counted `errors{kind="send"}`, and a notice would take the very path
+    /// that just failed, so the reaction is the whole report.
+    async fn echo_lost(&mut self, agent: &str, message: &Inbound) {
+        self.counters
+            .inbound
+            .with_label_values(&["send_failed"])
+            .inc();
+        self.questions.set_stage(agent, Stage::Open);
+        self.react(message, FAILED).await;
     }
 
     /// Sends the keys. `selections` is `None` for a `skip`.
@@ -2521,6 +2551,90 @@ mod tests {
         let bodies = sends(&port.calls());
         assert!(
             bodies[1].1.starts_with("**not delivered to f/c/alice:**"),
+            "{bodies:?}"
+        );
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);
+    }
+
+    /// J-5: the plugin always echoes, so an answer the operator cannot see
+    /// must not reach the agent — the thread would show a dialog that
+    /// answered itself.
+    #[tokio::test]
+    async fn an_answer_whose_echo_never_landed_sends_no_keys() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        for body in ["1", "skip"] {
+            port.fail_next(crate::matrix::MatrixError::Other("nope".into()));
+            reply(&mut a, &room, &root, body).await;
+            assert!(
+                fake.actions_for("f/c/alice").is_empty(),
+                "{body} reached the agent unseen"
+            );
+            assert_eq!(
+                reactions(&port.take_calls()),
+                vec![FAILED.to_string()],
+                "{body}"
+            );
+            assert_eq!(
+                a.questions.get("f/c/alice").unwrap().stage,
+                Stage::Open,
+                "{body}"
+            );
+        }
+    }
+
+    /// The same for the question the echo asks: without it in the room, a
+    /// later stray `yes` would send a reading nobody ever saw.
+    #[tokio::test]
+    async fn a_confirmation_whose_echo_never_landed_is_not_entered() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        port.fail_next(crate::matrix::MatrixError::Other("nope".into()));
+        reply(&mut a, &room, &root, "gre").await;
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);
+        assert_eq!(reactions(&port.take_calls()), vec![FAILED.to_string()]);
+
+        reply(&mut a, &room, &root, "yes").await;
+        assert!(
+            fake.actions_for("f/c/alice").is_empty(),
+            "a `yes` confirmed a question that was never asked"
+        );
+    }
+
+    /// One question with enough options that its plan outlasts the delay
+    /// (Spec J §7.5): 17 steps at 500 ms is past `MAX_KEY_SEQUENCE_MS`.
+    fn many_options(n: usize) -> serde_json::Value {
+        json!({ "question": "Which one?", "header": "Many", "multiSelect": false,
+                "options": (1..=n).map(|i| json!({ "label": format!("opt{i}") }))
+                    .collect::<Vec<_>>() })
+    }
+
+    #[tokio::test]
+    async fn a_plan_too_long_for_the_agents_delay_is_refused_before_anything_is_sent() {
+        let (fake, port, mut a, room, root) = with_question_thread().await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: crate::config::parse_agent(
+                &json!({ "events": ["Notification"], "keyDelayMs": 500 }),
+            )
+            .unwrap(),
+        })
+        .await;
+        a.handle(Command::Events(vec![asks(
+            "f/c/alice",
+            "s1",
+            &[many_options(17)],
+        )]))
+        .await;
+        port.take_calls();
+
+        reply(&mut a, &room, &root, "17").await;
+        assert!(
+            fake.actions_for("f/c/alice").is_empty(),
+            "the daemon would have refused it; nothing may be sent"
+        );
+        assert_eq!(reactions(&port.calls()), vec![REFUSED.to_string()]);
+        let bodies = sends(&port.calls());
+        assert!(
+            bodies.last().unwrap().1.contains("answer at the terminal"),
             "{bodies:?}"
         );
         assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);

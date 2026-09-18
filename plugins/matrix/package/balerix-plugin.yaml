@@ -9,7 +9,8 @@ start: serve
 hooks:
   observe: [SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, SubagentStop, PreCompact]
   intercept: []
-# fleets: the phase-change feed. actions: send_text. kv: the maps and the
-# sealed session.
+# fleets: the phase-change feed. actions: send_text for a thread reply, and
+# send_keys for the answer to an AskUserQuestion dialog (Spec J). kv: the
+# maps, the open question and the sealed session.
 needs: [fleets, actions, kv]
 routes: false

@@ -152,16 +152,18 @@ A new pure function renders `tool_input` as markdown:
 
 ```
 **question** · Color
+
 Which color?
+
 1. **Red** — A warm, bold color
 2. **Green** — A calm, natural color
 3. **Blue** — A cool, serene color
 
-Reply with a number or a label. `other: …` for your own answer, `skip` to decline.
+Reply with a number or a label. `other: …` gives your own answer, `skip` declines.
 ```
 
-Several questions are numbered `Q1`, `Q2` with their headers, and the footer
-says one line per question. A multi-select question says "choose any, separated
+Several questions are titled `question 1 of 2`, `question 2 of 2` with their
+headers, and the footer says one line per question, in order. A multi-select question says "choose any, separated
 by commas". A payload that does not parse as questions renders as today's
 `running AskUserQuestion` line and opens no pending state.
 
@@ -207,10 +209,10 @@ Rungs 4 and 5 matching two or more options refuse with the candidates. No rung
 matching refuses with the option list. A single-select item matching is one
 option; a multi-select answer with a repeated option refuses.
 
-`Matched { selections: Vec<Selection>, exact: bool }`, where
-`Selection` is `Options(Vec<usize>)` or, for free text,
-`Other { options: Vec<usize>, text }`. `exact` is true only when every item
-came from rung 1 or 3.
+The result is `Matched::Answers { selections: Vec<Selection>, exact: bool }`,
+where `Selection { options: Vec<usize>, other: Option<String> }` holds the
+chosen options, ascending, and the free text if any. `exact` is true only when
+every item came from rung 1 or 3.
 
 `skip` alone, in any case, is `Matched::Skip`: one Escape, exact.
 

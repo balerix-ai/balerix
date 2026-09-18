@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 
 use crate::config::{AgentConfig, DaemonConfig};
 use crate::matrix::{ACK, CONFIRMED, FAILED, Inbound, MatrixError, MatrixPort, REFUSED};
-use crate::pending::{Questions, Stage};
+use crate::pending::{OpenQuestion, Questions, Stage};
 use crate::question;
 use crate::render::{self, PhaseChange};
 use crate::routing::{Maps, Thread, crew_of};
@@ -49,6 +49,21 @@ const MAX_INLINE_RETRY: Duration = Duration::from_secs(3);
 struct Cooldown {
     until: Instant,
     wait: Duration,
+}
+
+/// What `track_question` did with an event (Spec J §5). The posting half
+/// reads this instead of asking `questions` again, so the two halves cannot
+/// drift: the lifecycle runs unconditionally, the posting does not.
+enum Tracking {
+    /// Nothing that opens or closes a question.
+    Other,
+    /// A `PreToolUse` whose dialog parsed, and is now open.
+    Opened(Vec<question::Question>),
+    /// A `PreToolUse` for `AskUserQuestion` whose `tool_input` is not a
+    /// dialog: nothing was opened, and it posts as a plain tool line.
+    Unparsed,
+    /// A `PostToolUse` for `AskUserQuestion`, with the record it closed.
+    Closed(Option<OpenQuestion>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -408,16 +423,16 @@ impl<M: MatrixPort> Actor<M> {
         let Some(config) = self.agents.get(&event.agent).cloned() else {
             return;
         };
+        // Spec J §5: tracking is unconditional, so it runs above everything
+        // that can return early — the `enabled` check, `room_for`, a failed
+        // root send, a failed `set_thread`. A question left untracked is
+        // §1's silent wrong answer: the next thread reply goes to
+        // `send_text`, which types it into the dialog. A disabled agent can
+        // still have a routable thread, and `on_inbound` does not read
+        // `enabled` either, so only "the agent is known to us" gates this.
+        let tracking = self.track_question(&event).await;
         if !config.enabled {
             return;
-        }
-        // Spec J §7.1: these prove no dialog is on screen any more. Done
-        // before the thread logic, which returns early for `SessionStart`.
-        if matches!(
-            event.name.as_str(),
-            "Stop" | "UserPromptSubmit" | "SessionStart" | "SessionEnd"
-        ) {
-            self.questions.clear(&self.host, &event.agent).await;
         }
         let Some(room) = self.room_for(&event.agent).await else {
             return;
@@ -481,7 +496,10 @@ impl<M: MatrixPort> Actor<M> {
             self.publish_gauges();
         }
 
-        if self.on_question_event(&config, &room, &event).await {
+        if self
+            .on_question_event(&config, &room, &event, tracking)
+            .await
+        {
             return;
         }
         if !config.wants(&event.name) {
@@ -501,53 +519,71 @@ impl<M: MatrixPort> Actor<M> {
         }
     }
 
-    /// The `AskUserQuestion` lifecycle (Spec J §5, §7.3). `true` when the
-    /// event was handled here and must not also post as a generic line.
-    async fn on_question_event(
-        &mut self,
-        config: &AgentConfig,
-        room: &str,
-        event: &HookEvent,
-    ) -> bool {
-        let is_question =
-            event.payload.get("tool_name").and_then(Value::as_str) == Some(question::TOOL);
-        // The question is the detailed form of "needs you", so either event
-        // being wanted shows it. Tracking below never depends on this (J-7).
-        let shown = config.wants("Notification") || config.wants("PreToolUse");
-        let root = self.maps.thread(&event.agent).map(|t| t.root.clone());
+    /// The `AskUserQuestion` lifecycle's state half (Spec J §5, §7.1): the
+    /// only part that must happen for every event of a known agent,
+    /// whatever the filter, the room or the homeserver do afterwards.
+    async fn track_question(&mut self, event: &HookEvent) -> Tracking {
+        // These prove no dialog is on screen any more (Spec J §7.1).
+        if matches!(
+            event.name.as_str(),
+            "Stop" | "UserPromptSubmit" | "SessionStart" | "SessionEnd"
+        ) {
+            self.questions.clear(&self.host, &event.agent).await;
+            return Tracking::Other;
+        }
+        if event.payload.get("tool_name").and_then(Value::as_str) != Some(question::TOOL) {
+            return Tracking::Other;
+        }
         match event.name.as_str() {
-            "PreToolUse" if is_question => {
+            "PreToolUse" => {
                 let input = event
                     .payload
                     .get("tool_input")
                     .cloned()
                     .unwrap_or(Value::Null);
-                let Some(questions) = question::parse(&input) else {
-                    return false; // posts as `running AskUserQuestion`, as before
-                };
+                match question::parse(&input) {
+                    Some(questions) => {
+                        self.questions
+                            .open(&self.host, &event.agent, &input, questions.clone())
+                            .await;
+                        Tracking::Opened(questions)
+                    }
+                    None => Tracking::Unparsed,
+                }
+            }
+            "PostToolUse" => Tracking::Closed(self.questions.clear(&self.host, &event.agent).await),
+            _ => Tracking::Other,
+        }
+    }
+
+    /// The lifecycle's visible half (Spec J §5, §7.3): what the thread
+    /// shows for an event `track_question` has already accounted for.
+    /// `true` when the event was handled here and must not also post as a
+    /// generic line.
+    async fn on_question_event(
+        &mut self,
+        config: &AgentConfig,
+        room: &str,
+        event: &HookEvent,
+        tracking: Tracking,
+    ) -> bool {
+        // The question is the detailed form of "needs you", so either event
+        // being wanted shows it. Tracking never depends on this (J-7).
+        let shown = config.wants("Notification") || config.wants("PreToolUse");
+        let root = self.maps.thread(&event.agent).map(|t| t.root.clone());
+        match tracking {
+            Tracking::Opened(questions) => {
                 let body = render::question_message(&questions);
-                self.questions
-                    .open(&self.host, &event.agent, &input, questions)
-                    .await;
                 if shown && let Some(root) = root {
                     self.send(room, Some(&root), &body, "question").await;
                 }
                 true
             }
-            "Notification"
-                if self.questions.is_open(&event.agent)
-                    && event
-                        .payload
-                        .get("notification_type")
-                        .and_then(Value::as_str)
-                        == Some("permission_prompt") =>
-            {
-                true // says nothing the question has not
-            }
-            "PostToolUse" if is_question => {
-                let Some(open) = self.questions.clear(&self.host, &event.agent).await else {
-                    return false;
-                };
+            // Posts as `running AskUserQuestion`, as before.
+            Tracking::Unparsed => false,
+            // Nothing was open: `finished AskUserQuestion`, as before.
+            Tracking::Closed(None) => false,
+            Tracking::Closed(Some(open)) => {
                 let answers = event
                     .payload
                     .pointer("/tool_response/answers")
@@ -589,7 +625,17 @@ impl<M: MatrixPort> Actor<M> {
                 }
                 true
             }
-            _ => false,
+            Tracking::Other => {
+                // Spec J §5: while a question is open, the permission
+                // prompt says nothing the question has not.
+                event.name == "Notification"
+                    && event
+                        .payload
+                        .get("notification_type")
+                        .and_then(Value::as_str)
+                        == Some("permission_prompt")
+                    && self.questions.is_open(&event.agent)
+            }
         }
     }
 
@@ -1784,6 +1830,109 @@ mod tests {
             sends(&port.calls())[0]
                 .1
                 .contains("needs your permission to use Bash")
+        );
+    }
+
+    /// Spec J §5: tracking is unconditional. The event that opens the
+    /// thread can be the `PreToolUse` itself, and its root send can fail —
+    /// a homeserver hiccup. The `permission_prompt` six seconds later then
+    /// opens the thread, the operator replies in it, and if the question
+    /// was never recorded that reply becomes §1's `send_text`: the body is
+    /// typed into the dialog and its Enter picks the highlighted row.
+    #[tokio::test]
+    async fn a_question_is_tracked_when_the_send_that_opens_its_thread_fails() {
+        let (fake, port, mut a) = actor().await;
+        let mut cfg = daemon_config();
+        // Pinning the room makes the call that fails the root's send.
+        cfg.rooms.insert("f/c".into(), "!pinned:example.org".into());
+        a.handle(Command::Configure(cfg)).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&["Notification"]),
+        })
+        .await;
+
+        port.fail_next(crate::matrix::MatrixError::Other("no rights".into()));
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        assert!(
+            sends(&port.calls()).is_empty(),
+            "nothing landed: {:?}",
+            port.calls()
+        );
+
+        // The notification that follows opens the thread the reply arrives in.
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "Notification",
+            json!({ "notification_type": "permission_prompt", "message": "Claude needs your permission" }),
+        )]))
+        .await;
+        let root = minted_root(&port.take_calls(), 0);
+        reply(&mut a, "!pinned:example.org", &root, "3").await;
+
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: down_enter(2),
+                delay_ms: 100,
+            }],
+            "the reply answered the dialog rather than typing into it"
+        );
+        assert!(
+            fake.kv_json("question/f/c/alice").is_some(),
+            "and the question was mirrored to KV all the same"
+        );
+    }
+
+    /// A disabled agent posts nothing, but its thread stays routable and
+    /// `on_inbound` does not read `enabled`, so J-7 has to hold there too.
+    #[tokio::test]
+    async fn a_disabled_agents_question_is_tracked_so_its_thread_still_answers() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: crate::config::parse_agent(&json!({ "enabled": false })).unwrap(),
+        })
+        .await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        assert!(port.calls().is_empty(), "{:?}", port.calls());
+
+        reply(&mut a, &room, &root, "3").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: down_enter(2),
+                delay_ms: 100,
+            }],
+        );
+        assert!(fake.kv_json("question/f/c/alice").is_some());
+    }
+
+    /// A payload that is not a dialog opens nothing and reads as the plain
+    /// tool line it always did (Spec J §5).
+    #[tokio::test]
+    async fn an_unparsable_question_opens_nothing_and_posts_the_generic_line() {
+        let (fake, port, mut a, _room, root) = with_question_thread().await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&["PreToolUse"]),
+        })
+        .await;
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "PreToolUse",
+            json!({ "tool_name": "AskUserQuestion", "tool_input": { "questions": [] } }),
+        )]))
+        .await;
+        assert!(!a.questions.is_open("f/c/alice"));
+        assert!(fake.kv_json("question/f/c/alice").is_none(), "no KV record");
+        assert_eq!(
+            sends(&port.calls()),
+            vec![(Some(root), "running `AskUserQuestion`".to_string())]
         );
     }
 

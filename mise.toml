@@ -123,6 +123,10 @@ run = [
 description = "By-hand spec §8.1 check: a real claude under a scratch daemon (config and state under target/tmp/verify-claude, wiped each run; tool installs kept under target/tmp/verify-data; your HOME kept for credentials); pauses for you to attach and type one prompt, then prints a report to paste back"
 run = "scripts/verify-claude.sh"
 
+[tasks.verify-questions]
+description = "By-hand Spec J check: drives the real pinned claude through every AskUserQuestion dialog shape with the matrix plugin's own key plans and checks the recorded answers (scratch under target/tmp/verify-questions; your HOME kept for credentials; a few short model turns). Run after bumping claude. Not part of any CI tier"
+run = "scripts/verify-questions.sh"
+
 [tasks.verify-matrix]
 description = "Spec G's manual check against a real Matrix homeserver (needs MATRIX_* credentials; not part of any CI tier)"
 run = "scripts/verify-matrix.sh"

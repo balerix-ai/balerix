@@ -1,0 +1,11 @@
+{
+  "route": "POST /v1/plugin-host/agents/payments/backend/bob/actions",
+  "direction": "plugin-to-daemon",
+  "request": {
+    "action": "send_keys",
+    "steps": [{ "key": "down" }, { "key": "down" }, { "text": "teal-ish" }, { "key": "enter" }],
+    "delay_ms": 100
+  },
+  "status": 200,
+  "response": {}
+}

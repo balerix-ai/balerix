@@ -5,6 +5,8 @@
 use balerix_api::{AgentPhase, HookEvent};
 use serde_json::Value;
 
+use crate::question::Question;
+
 /// One message holds this much (Spec G §8): comfortably under the 64 KiB
 /// event limit a homeserver enforces, and the limit OpenClaw defaults to.
 /// A longer body is split across messages by `split`, never cut — the
@@ -97,6 +99,79 @@ pub fn event_message(event: &HookEvent) -> String {
         "PreCompact" => format!("compacting ({})", text(p, "trigger", "unknown")),
         other => other.to_string(),
     }
+}
+
+/// A run of whitespace holding a newline, collapsed to one space. The
+/// agent's own text is interpolated into the markdown ordered list the
+/// options are rendered as, and a line of it beginning `N.` renumbers that
+/// list — after which the displayed numbers no longer match the option the
+/// operator's reply would select. Display only: the parsed `Question` keeps
+/// its verbatim `text`, which is the key of `PostToolUse`'s `answers`.
+fn one_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(char::is_whitespace) {
+        let end = rest[at..]
+            .find(|c: char| !c.is_whitespace())
+            .map_or(rest.len(), |i| at + i);
+        out.push_str(&rest[..at]);
+        let run = &rest[at..end];
+        out.push_str(if run.contains('\n') { " " } else { run });
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// An `AskUserQuestion` dialog for the thread (Spec J §5). Paragraphs are
+/// separated by blank lines: a lone newline is not a break in markdown.
+pub fn question_message(questions: &[Question]) -> String {
+    let many = questions.len() > 1;
+    let mut paragraphs = Vec::new();
+    for (i, q) in questions.iter().enumerate() {
+        let mut title = if many {
+            format!("**question {} of {}**", i + 1, questions.len())
+        } else {
+            "**question**".to_string()
+        };
+        if !q.header.is_empty() {
+            title.push_str(&format!(" · {}", one_line(&q.header)));
+        }
+        paragraphs.push(title);
+        let mut ask = one_line(q.text.trim());
+        if q.multi_select {
+            ask.push_str(" *(choose any, separated by commas)*");
+        }
+        paragraphs.push(ask);
+        paragraphs.push(
+            q.options
+                .iter()
+                .enumerate()
+                .map(|(n, o)| {
+                    if o.description.is_empty() {
+                        format!("{}. **{}**", n + 1, one_line(&o.label))
+                    } else {
+                        format!(
+                            "{}. **{}** — {}",
+                            n + 1,
+                            one_line(&o.label),
+                            one_line(&o.description)
+                        )
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    paragraphs.push(if many {
+        "Reply with one line per question, in order: a number or a label. \
+         `other: …` gives your own answer, `skip` declines."
+            .to_string()
+    } else {
+        "Reply with a number or a label. `other: …` gives your own answer, `skip` declines."
+            .to_string()
+    });
+    paragraphs.join("\n\n")
 }
 
 pub fn phase_message(change: &PhaseChange) -> String {
@@ -223,6 +298,7 @@ pub fn split(text: &str, max_parts: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::question::{self, fixtures};
     use balerix_plugin_sdk::testing::event;
     use serde_json::json;
 
@@ -404,5 +480,64 @@ mod tests {
     fn a_short_session_is_the_first_eight_characters() {
         assert_eq!(short_session("0199aa11-2233-4455"), "0199aa11");
         assert_eq!(short_session("abc"), "abc");
+    }
+
+    fn questions(list: &[serde_json::Value]) -> Vec<question::Question> {
+        question::parse(&fixtures::input(list)).unwrap()
+    }
+
+    #[test]
+    fn a_question_lists_its_numbered_options() {
+        insta::assert_snapshot!(question_message(&questions(&[fixtures::color()])));
+    }
+
+    #[test]
+    fn a_question_set_numbers_the_questions_and_marks_a_multi_select() {
+        insta::assert_snapshot!(question_message(&questions(&[
+            fixtures::colors_multi(),
+            fixtures::size()
+        ])));
+    }
+
+    /// Header, question, label and description come from the agent and are
+    /// interpolated into a markdown ordered list. A line of one of them
+    /// beginning `N.` renumbers that list, and the displayed numbers are
+    /// what the operator replies with (THREAT-MODEL: they are untrusted).
+    #[test]
+    fn a_newline_in_an_agents_text_cannot_renumber_the_option_list() {
+        let mut sneaky = fixtures::color();
+        sneaky["header"] = json!("Colour\n9. or not");
+        sneaky["question"] = json!("Which\ncolor?");
+        sneaky["options"][0]["label"] = json!("Red\n2. Not really");
+        sneaky["options"][1]["description"] = json!("calm\n\n3. nor this");
+        let q = questions(&[sneaky]);
+        let body = question_message(&q);
+
+        let numbered: Vec<&str> = body
+            .lines()
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+            .collect();
+        assert_eq!(
+            numbered.len(),
+            3,
+            "the list must hold one line per option: {body}"
+        );
+        for (i, line) in numbered.iter().enumerate() {
+            assert!(line.starts_with(&format!("{}. ", i + 1)), "{body}");
+        }
+        assert_eq!(
+            q[0].text, "Which\ncolor?",
+            "the parsed text stays verbatim: it is the key of `answers`"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_question_falls_back_to_the_generic_tool_line() {
+        let e = event(
+            "f/c/a",
+            "PreToolUse",
+            json!({ "tool_name": "AskUserQuestion", "tool_input": { "questions": [] } }),
+        );
+        assert_eq!(event_message(&e), "running `AskUserQuestion`");
     }
 }

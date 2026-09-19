@@ -712,6 +712,7 @@ impl Daemon {
         action: &PluginAction,
         plugin: Option<&str>,
     ) -> Result<(), DaemonError> {
+        action.validate().map_err(DaemonError::Invalid)?;
         self.shared.metrics.hook_action(agent, action.label());
         if let Some(p) = plugin {
             self.shared.metrics.plugin_action(p, action.label());
@@ -729,6 +730,15 @@ impl Daemon {
             PluginAction::Restart => {
                 self.set_stopped(agent, true).await?;
                 self.set_stopped(agent, false).await.map(|_| ())
+            }
+            PluginAction::SendKeys { steps, delay_ms } => {
+                let runner = self.ports.runner.clone();
+                let (id, steps) = (agent.clone(), steps.clone());
+                let delay = std::time::Duration::from_millis(*delay_ms);
+                tokio::task::spawn_blocking(move || runner.send_keys(&id, &steps, delay))
+                    .await
+                    .map_err(|e| DaemonError::Internal(e.to_string()))?
+                    .map_err(|e| DaemonError::Internal(e.to_string()))
             }
         }
     }
@@ -1410,6 +1420,61 @@ mod tests {
         .await
         .expect("the observer batch arrived");
         assert_eq!(stub.calls_named("events")[0]["events"][0]["name"], "Stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_keys_reaches_the_runner_and_an_invalid_one_never_does() {
+        use balerix_api::{Key, KeyStep};
+        let w = world().await;
+        let stub = stub_plugin(StubScript {
+            health_ok: true,
+            ..StubScript::default()
+        })
+        .await;
+        hello(&w, &stub.listen).await;
+        let name: FleetName = "f".parse().unwrap();
+        w.daemon
+            .apply(
+                &name,
+                spec(&[("a", &[("flow", json!({}))])]),
+                Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        wait_gen(&w.daemon, 1).await;
+        let agent: AgentId = "f/c/a".parse().unwrap();
+        let ok = PluginAction::SendKeys {
+            steps: vec![KeyStep::Key(Key::Down), KeyStep::Key(Key::Enter)],
+            delay_ms: 20,
+        };
+        w.daemon
+            .execute_action(&agent, &ok, Some("matrix"))
+            .await
+            .unwrap();
+        assert!(
+            w.h.runner
+                .calls()
+                .contains(&"send_keys f/c/a [down,enter] delay=20ms".to_string()),
+            "{:?}",
+            w.h.runner.calls()
+        );
+
+        let before = w.h.runner.calls().len();
+        let too_fast = PluginAction::SendKeys {
+            steps: vec![KeyStep::Key(Key::Enter)],
+            delay_ms: 0,
+        };
+        let err = w
+            .daemon
+            .execute_action(&agent, &too_fast, Some("matrix"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, DaemonError::Invalid(m) if m.starts_with("delay_ms:")),
+            "{err:?}"
+        );
+        assert_eq!(w.h.runner.calls().len(), before, "never reached the runner");
     }
 
     /// A refused apply must not have told a plugin anything: the 409 and

@@ -597,3 +597,133 @@ fn a_long_single_line_send_text_arrives_whole() {
     assert!(!String::from_utf8_lossy(&buffers.stdout).contains("balerix-send-"));
     r.stop_crew(&crew).unwrap();
 }
+
+/// What `cat_v_pane` hands back. `_root` and `_server` are held for their
+/// `Drop`: the temp root removes itself, so it must outlive the pane.
+struct CatPane {
+    r: TmuxRunner,
+    id: AgentId,
+    stdin_log: std::path::PathBuf,
+    _server: KillServer,
+    _root: balerix_runtime::testing::TempRoot,
+}
+
+/// A `cat -v` pane writing to `stdin.log`.
+fn cat_v_pane(label: &str) -> Option<CatPane> {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("tmux", false));
+        return None;
+    };
+    let root = support::temp_root(label);
+    let socket = format!("balerix-test-{label}-{}", std::process::id());
+    let guard = KillServer {
+        tmux: tools.tmux.clone(),
+        socket: socket.clone(),
+    };
+    let r = TmuxRunner::new(tools.tmux.clone(), socket);
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let agent_dir = root.join("a");
+    std::fs::create_dir_all(agent_dir.join("logs")).unwrap();
+    let stdin_log = agent_dir.join("stdin.log");
+    let script = agent_dir.join("launch.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nexec cat -v >> {}\n", stdin_log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plan = LaunchPlan {
+        cwd: agent_dir.clone(),
+        env: BTreeMap::new(),
+        argv: vec![],
+        script,
+    };
+    r.ensure_crew(&id.crew_ref()).unwrap();
+    r.ensure_agent(&id, &plan).unwrap();
+    wait_for(|| {
+        matches!(
+            r.observe(&id.fleet).unwrap().get(&id),
+            Some(ProcessState::Running { .. })
+        )
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    Some(CatPane {
+        r,
+        id,
+        stdin_log,
+        _server: guard,
+        _root: root,
+    })
+}
+
+/// Spec J §4.2: steps arrive in order, a key as its escape sequence and
+/// text literally (a trailing `;` included: tmux drops an unescaped one),
+/// and the call takes at least one delay per step.
+#[test]
+fn send_keys_arrives_in_order_paced_with_semicolons_intact() {
+    use balerix_api::{Key, KeyStep};
+    let Some(pane) = cat_v_pane("keys") else {
+        return;
+    };
+    // Named bindings, not `..`: a field left unbound is dropped at once,
+    // which would kill the tmux server before the first key.
+    let CatPane {
+        r,
+        id,
+        stdin_log,
+        _server,
+        _root,
+    } = pane;
+    let steps = [
+        KeyStep::Key(Key::Down),
+        KeyStep::Key(Key::Up),
+        KeyStep::Text("a;;".into()),
+        KeyStep::Text("x\\;".into()),
+        KeyStep::Text("-l mid;dle".into()),
+        KeyStep::Key(Key::Enter),
+    ];
+    let started = Instant::now();
+    r.send_keys(&id, &steps, Duration::from_millis(50)).unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(50 * steps.len() as u64),
+        "{:?}",
+        started.elapsed()
+    );
+    wait_for(|| std::fs::read_to_string(&stdin_log).is_ok_and(|s| s.ends_with('\n')));
+    let got = std::fs::read_to_string(&stdin_log).unwrap();
+    // an arrow is ESC [ B or ESC O B depending on the pane's cursor-key mode
+    let arrows = got.replace("^[O", "^[[");
+    assert_eq!(arrows, "^[[B^[[Aa;;x\\;-l mid;dle\n", "{got:?}");
+    r.stop_crew(&id.crew_ref()).unwrap();
+}
+
+/// The per-agent send lock: a `send_text` that starts while a paced
+/// `send_keys` is running lands after it, never inside it.
+#[test]
+fn a_send_text_never_lands_inside_a_running_send_keys() {
+    use balerix_api::KeyStep;
+    let Some(pane) = cat_v_pane("keylock") else {
+        return;
+    };
+    let CatPane {
+        r,
+        id,
+        stdin_log,
+        _server,
+        _root,
+    } = pane;
+    let r = std::sync::Arc::new(r);
+    let steps: Vec<KeyStep> = (0..10).map(|i| KeyStep::Text(format!("k{i}"))).collect();
+    let (r2, id2) = (r.clone(), id.clone());
+    let keys = std::thread::spawn(move || {
+        r2.send_keys(&id2, &steps, Duration::from_millis(40))
+            .unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    r.send_text(&id, "TEXT", true).unwrap();
+    keys.join().unwrap();
+    wait_for(|| std::fs::read_to_string(&stdin_log).is_ok_and(|s| s.ends_with('\n')));
+    let got = std::fs::read_to_string(&stdin_log).unwrap();
+    assert_eq!(got, "k0k1k2k3k4k5k6k7k8k9TEXT\n", "{got:?}");
+    r.stop_crew(&id.crew_ref()).unwrap();
+}

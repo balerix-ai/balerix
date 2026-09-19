@@ -408,6 +408,17 @@ async fn host_routes_are_gated_by_needs_and_kv_and_actions_work() {
         r.stopped.is_empty() && r.status.agents["f/c/a"].phase == AgentPhase::Starting
     })
     .await;
+    let e = host
+        .action(
+            "f/c/a",
+            &PluginAction::SendKeys {
+                steps: vec![balerix_api::KeyStep::Key(balerix_api::Key::Enter)],
+                delay_ms: 5,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("delay_ms"), "{e}");
     let e = host.action("f/c/b", &PluginAction::Stop).await.unwrap_err();
     assert_eq!(
         e.to_string(),

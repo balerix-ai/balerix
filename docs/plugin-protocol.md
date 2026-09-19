@@ -82,6 +82,13 @@ shape for one fleet.
 
 - `{ "action": "send_text", "text": <string>, "submit": <bool> }`
   (`action.json`)
+- `{ "action": "send_keys", "steps": [<step>…], "delay_ms": <int> }`
+  (`action-send-keys.json`). A step is `{ "key": "up" | "down" | "enter" |
+  "escape" }` or `{ "text": <string> }`. The daemon pauses `delay_ms`
+  (20 to 500, default 100) after every step. At most 64 steps, at most
+  8000 ms in all, a `text` of 1 to 1024 bytes with no control character;
+  anything else answers 400 naming the field. The call returns when the
+  last step has been sent.
 - `{ "action": "restart" }`
 - `{ "action": "stop" }`
 
@@ -235,7 +242,7 @@ never activates simply never runs for that agent.
 
 ## 6. Conformance
 
-`docs/plugin-protocol/*.json` holds twenty-two fixtures, one JSON object
+`docs/plugin-protocol/*.json` holds twenty-three fixtures, one JSON object
 each: `{ route, direction, request, status, response }` for
 `daemon-to-plugin` and most `plugin-to-daemon` routes; `raw` (base64)
 replaces `request`/`response` for the kv byte bodies, `health.json` and

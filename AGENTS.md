@@ -31,6 +31,10 @@ credentials, hook input, or sandbox rules.
 - `verify-matrix` — Spec G's manual check against a real Matrix homeserver
   (`scripts/verify-matrix.sh`); needs `MATRIX_HOMESERVER`, `MATRIX_USER_ID`,
   `MATRIX_PASSWORD` and `MATRIX_INVITE`. Not part of any CI tier.
+- `verify-questions` — Spec J's manual check (`scripts/verify-questions.sh`):
+  the real pinned `claude` in tmux, answered with the key plans the matrix
+  plugin's `question.rs` produces, the recorded answers read back from the
+  `PostToolUse` hook. Needs a logged-in `claude`. Not part of any CI tier.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 - `vendor-xterm` is a script, not a task: `scripts/vendor-xterm.sh` re-fetches
   and verifies the web plugin's assets against
@@ -91,6 +95,14 @@ credentials, hook input, or sandbox rules.
 - The embedded default tool table is `include_str!("../../../mise.toml")` in
   `balerix-runtime/src/toolchain.rs`; bumping `claude` or `gh` in `mise.toml`
   changes what agents get.
+- The matrix plugin answers `AskUserQuestion` by counting rows and pressing
+  Down and Enter (`plugins/matrix/src/question.rs::plan`). That encodes
+  Claude Code's dialog layout, which no API promises. The property test
+  there proves `plan` against a *model* of the dialog; only
+  `mise run verify-questions` proves the model. Bump `claude` in `mise.toml`
+  and you run it. Keys sent with no pause are dropped at a question
+  transition, which is why `send_keys` has a 20 ms floor; and never use Tab
+  in a plan: it goes to different places from different rows.
 - nono's state root follows nono's own `$HOME`; never point that at the agent's
   `home/` (see ARCHITECTURE.md).
 - The sandbox grants read on exactly two binaries outside `/usr`, `/bin`,

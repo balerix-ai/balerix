@@ -12,10 +12,11 @@
 //! through an idle pane first, and only ever attaching `pipe-pane` to a live
 //! one, removes the race (a dead pane refuses `pipe-pane` outright).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use balerix_core::{
@@ -138,6 +139,11 @@ impl Drop for TmuxAttach {
 pub struct TmuxRunner {
     pub tmux: PathBuf,
     pub socket: String,
+    /// One lock per agent, held for the whole of a `send_text` or a
+    /// `send_keys` (Spec J §4.2): a paced key sequence lasts seconds, and
+    /// another send landing inside it would corrupt both. Entries are never
+    /// removed; agents are few.
+    sends: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl TmuxRunner {
@@ -145,7 +151,32 @@ impl TmuxRunner {
         Self {
             tmux,
             socket: socket.into(),
+            sends: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn send_lock(&self, agent: &AgentId) -> Arc<Mutex<()>> {
+        self.sends
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(agent.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// `send-keys -l`, with the one thing `-l` does not make literal: tmux
+    /// reads a `;` ending an argument as a command separator and drops it
+    /// (`a;` arrives as `a`). Trailing semicolons go separately, each as the
+    /// escaped argument `\;`, which arrives as `;`.
+    fn send_literal(&self, id: &str, target: &str, text: &str) -> Result<(), RunnerError> {
+        let body = text.trim_end_matches(';');
+        if !body.is_empty() {
+            self.run(id, &["send-keys", "-t", target, "-l", "--", body])?;
+        }
+        for _ in 0..(text.len() - body.len()) {
+            self.run(id, &["send-keys", "-t", target, "-l", "--", "\\;"])?;
+        }
+        Ok(())
     }
 
     fn cmd(&self) -> Cmd {
@@ -475,6 +506,8 @@ impl AgentRunner for TmuxRunner {
     /// paste (the target window gone, say) the buffer is deleted before
     /// the error is returned, so failures do not leak buffers.
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
+        let lock = self.send_lock(agent);
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         let id = agent.to_string();
         let target = Self::window_target(agent);
         if text.contains('\n') || text.len() > SEND_KEYS_LIMIT {
@@ -496,6 +529,35 @@ impl AgentRunner for TmuxRunner {
         }
         if submit {
             self.run(&id, &["send-keys", "-t", &target, "Enter"])?;
+        }
+        Ok(())
+    }
+
+    fn send_keys(
+        &self,
+        agent: &AgentId,
+        steps: &[balerix_api::KeyStep],
+        delay: Duration,
+    ) -> Result<(), RunnerError> {
+        let lock = self.send_lock(agent);
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let id = agent.to_string();
+        let target = Self::window_target(agent);
+        for step in steps {
+            match step {
+                balerix_api::KeyStep::Key(key) => {
+                    // a fixed name per variant: nothing from the wire is a key name
+                    let name = match key {
+                        balerix_api::Key::Up => "Up",
+                        balerix_api::Key::Down => "Down",
+                        balerix_api::Key::Enter => "Enter",
+                        balerix_api::Key::Escape => "Escape",
+                    };
+                    self.run(&id, &["send-keys", "-t", &target, name])?;
+                }
+                balerix_api::KeyStep::Text(text) => self.send_literal(&id, &target, text)?,
+            }
+            std::thread::sleep(delay);
         }
         Ok(())
     }

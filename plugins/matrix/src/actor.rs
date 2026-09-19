@@ -14,7 +14,9 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 use crate::config::{AgentConfig, DaemonConfig};
-use crate::matrix::{ACK, FAILED, Inbound, MatrixError, MatrixPort, REFUSED};
+use crate::matrix::{ACK, CONFIRMED, FAILED, Inbound, MatrixError, MatrixPort, REFUSED};
+use crate::pending::{OpenQuestion, Questions, Stage};
+use crate::question;
 use crate::render::{self, PhaseChange};
 use crate::routing::{Maps, Thread, crew_of};
 
@@ -47,6 +49,21 @@ const MAX_INLINE_RETRY: Duration = Duration::from_secs(3);
 struct Cooldown {
     until: Instant,
     wait: Duration,
+}
+
+/// What `track_question` did with an event (Spec J §5). The posting half
+/// reads this instead of asking `questions` again, so the two halves cannot
+/// drift: the lifecycle runs unconditionally, the posting does not.
+enum Tracking {
+    /// Nothing that opens or closes a question.
+    Other,
+    /// A `PreToolUse` whose dialog parsed, and is now open.
+    Opened(Vec<question::Question>),
+    /// A `PreToolUse` for `AskUserQuestion` whose `tool_input` is not a
+    /// dialog: nothing was opened, and it posts as a plain tool line.
+    Unparsed,
+    /// A `PostToolUse` for `AskUserQuestion`, with the record it closed.
+    Closed(Option<OpenQuestion>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +138,7 @@ pub struct Counters {
     pub rooms: IntGauge,
     pub threads_open: IntGauge,
     pub errors: IntCounterVec,
+    pub answers_mismatched: IntCounter,
 }
 
 impl Counters {
@@ -147,6 +165,10 @@ impl Counters {
                 "errors_total",
                 "Matrix failures, by kind",
                 &["kind"],
+            )?,
+            answers_mismatched: metrics.int_counter(
+                "answers_mismatched_total",
+                "Answers Claude recorded differently from what the thread chose",
             )?,
         })
     }
@@ -188,6 +210,8 @@ pub struct Actor<M: MatrixPort> {
     pending: Vec<Command>,
     agents: HashMap<String, AgentConfig>,
     maps: Maps,
+    /// The `AskUserQuestion` each agent is waiting on (Spec J §7).
+    questions: Questions,
     /// Crews whose room creation the homeserver refused, and when each may
     /// be tried again. Only failures are kept: a crew whose room exists is
     /// answered from `maps` and never reaches the creation path again.
@@ -205,6 +229,7 @@ impl<M: MatrixPort> Actor<M> {
             pending: Vec::new(),
             agents: HashMap::new(),
             maps: Maps::new(),
+            questions: Questions::default(),
             cooldowns: HashMap::new(),
         }
     }
@@ -239,6 +264,10 @@ impl<M: MatrixPort> Actor<M> {
             Ok(maps) => self.maps = maps,
             Err(e) => tracing::warn!("matrix: loading maps: {e}"),
         }
+        match Questions::load(&self.host).await {
+            Ok(questions) => self.questions = questions,
+            Err(e) => tracing::warn!("matrix: loading questions: {e}"),
+        }
         self.publish_gauges();
     }
 
@@ -268,6 +297,7 @@ impl<M: MatrixPort> Actor<M> {
             }
             Command::Deactivate { agent } => {
                 self.agents.remove(&agent);
+                self.questions.clear(&self.host, &agent).await;
                 if let Err(e) = self.maps.forget(&self.host, &agent).await {
                     tracing::warn!("matrix: forgetting {agent}: {e}");
                 }
@@ -393,6 +423,14 @@ impl<M: MatrixPort> Actor<M> {
         let Some(config) = self.agents.get(&event.agent).cloned() else {
             return;
         };
+        // Spec J §5: tracking is unconditional, so it runs above everything
+        // that can return early — the `enabled` check, `room_for`, a failed
+        // root send, a failed `set_thread`. A question left untracked is
+        // §1's silent wrong answer: the next thread reply goes to
+        // `send_text`, which types it into the dialog. A disabled agent can
+        // still have a routable thread, and `on_inbound` does not read
+        // `enabled` either, so only "the agent is known to us" gates this.
+        let tracking = self.track_question(&event).await;
         if !config.enabled {
             return;
         }
@@ -458,6 +496,12 @@ impl<M: MatrixPort> Actor<M> {
             self.publish_gauges();
         }
 
+        if self
+            .on_question_event(&config, &room, &event, tracking)
+            .await
+        {
+            return;
+        }
         if !config.wants(&event.name) {
             return;
         }
@@ -472,6 +516,134 @@ impl<M: MatrixPort> Actor<M> {
                 tracing::warn!("matrix: closing thread for {}: {e}", event.agent);
             }
             self.publish_gauges();
+        }
+    }
+
+    /// The `AskUserQuestion` lifecycle's state half (Spec J §5, §7.1): the
+    /// only part that must happen for every event of a known agent,
+    /// whatever the filter, the room or the homeserver do afterwards.
+    async fn track_question(&mut self, event: &HookEvent) -> Tracking {
+        // These prove no dialog is on screen any more (Spec J §7.1).
+        if matches!(
+            event.name.as_str(),
+            "Stop" | "UserPromptSubmit" | "SessionStart" | "SessionEnd"
+        ) {
+            self.questions.clear(&self.host, &event.agent).await;
+            return Tracking::Other;
+        }
+        if event.payload.get("tool_name").and_then(Value::as_str) != Some(question::TOOL) {
+            return Tracking::Other;
+        }
+        match event.name.as_str() {
+            "PreToolUse" => {
+                let input = event
+                    .payload
+                    .get("tool_input")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                match question::parse(&input) {
+                    Some(questions) => {
+                        self.questions
+                            .open(&self.host, &event.agent, &input, questions.clone())
+                            .await;
+                        Tracking::Opened(questions)
+                    }
+                    None => Tracking::Unparsed,
+                }
+            }
+            "PostToolUse" => Tracking::Closed(self.questions.clear(&self.host, &event.agent).await),
+            _ => Tracking::Other,
+        }
+    }
+
+    /// The lifecycle's visible half (Spec J §5, §7.3): what the thread
+    /// shows for an event `track_question` has already accounted for.
+    /// `true` when the event was handled here and must not also post as a
+    /// generic line.
+    async fn on_question_event(
+        &mut self,
+        config: &AgentConfig,
+        room: &str,
+        event: &HookEvent,
+        tracking: Tracking,
+    ) -> bool {
+        // The question is the detailed form of "needs you", so either event
+        // being wanted shows it. Tracking never depends on this (J-7).
+        let shown = config.wants("Notification") || config.wants("PreToolUse");
+        let root = self.maps.thread(&event.agent).map(|t| t.root.clone());
+        match tracking {
+            Tracking::Opened(questions) => {
+                let body = render::question_message(&questions);
+                if shown
+                    && let Some(root) = root
+                    && self
+                        .send(room, Some(&root), &body, "question")
+                        .await
+                        .is_some()
+                {
+                    self.questions.mark_posted(&event.agent);
+                }
+                true
+            }
+            // Posts as `running AskUserQuestion`, as before.
+            Tracking::Unparsed => false,
+            // Nothing was open: `finished AskUserQuestion`, as before.
+            Tracking::Closed(None) => false,
+            Tracking::Closed(Some(open)) => {
+                let answers = event
+                    .payload
+                    .pointer("/tool_response/answers")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let recorded = question::describe_recorded(&open.questions, &answers);
+                match open.stage {
+                    Stage::Sent {
+                        selections: Some(selections),
+                        echo,
+                    } => {
+                        if question::recorded_matches(&open.questions, &selections, &answers) {
+                            if let Some(echo) = echo {
+                                self.react_to(room, &echo, CONFIRMED).await;
+                            }
+                        } else {
+                            // Posted whatever the filter says: it answers
+                            // the operator's own action.
+                            self.counters.answers_mismatched.inc();
+                            let body = format!(
+                                "**recorded answer differs** — Claude recorded {recorded}; \
+                                 you chose {}. Tell the agent if that matters.",
+                                question::describe(&open.questions, &selections)
+                            );
+                            if let Some(root) = root {
+                                self.send(room, Some(&root), &body, "question").await;
+                            }
+                        }
+                    }
+                    Stage::Sent {
+                        selections: None, ..
+                    } => {}
+                    Stage::Open | Stage::Confirming { .. } => {
+                        if shown && let Some(root) = root {
+                            let body = format!("**answered at the terminal** {recorded}");
+                            self.send(room, Some(&root), &body, "question").await;
+                        }
+                    }
+                }
+                true
+            }
+            Tracking::Other => {
+                // Spec J §5: the prompt that announced a posted question
+                // says nothing the question has not — that one, and no
+                // other. Anything further is a different tool asking, and
+                // swallowing it leaves the agent waiting in silence.
+                event.name == "Notification"
+                    && event
+                        .payload
+                        .get("notification_type")
+                        .and_then(Value::as_str)
+                        == Some("permission_prompt")
+                    && self.questions.suppress_permission_prompt(&event.agent)
+            }
         }
     }
 
@@ -517,6 +689,14 @@ impl<M: MatrixPort> Actor<M> {
             return;
         }
 
+        // Spec J-7: while a question is open a reply is an answer, never a
+        // prompt. `send_text` here would type the body into the dialog and
+        // its Enter would pick whatever row is highlighted.
+        if self.questions.is_open(&agent) {
+            self.on_answer(&agent, &root, &message).await;
+            return;
+        }
+
         let action = PluginAction::SendText {
             text: message.body.clone(),
             submit: true,
@@ -536,10 +716,190 @@ impl<M: MatrixPort> Actor<M> {
         }
     }
 
+    /// A thread reply while `agent` has a question open (Spec J §7.2).
+    async fn on_answer(&mut self, agent: &str, root: &str, message: &Inbound) {
+        let count = |outcome: &str| self.counters.inbound.with_label_values(&[outcome]).inc();
+        let Some(open) = self.questions.get(agent).cloned() else {
+            return;
+        };
+        match &open.stage {
+            Stage::Sent { .. } => {
+                count("answer_refused");
+                let body = "an answer is already on its way; wait for the agent.";
+                self.send(&message.room, Some(root), body, "question").await;
+                self.react(message, REFUSED).await;
+                return;
+            }
+            Stage::Confirming { selections, echo } => {
+                match message.body.trim().to_ascii_lowercase().as_str() {
+                    "yes" | "y" => {
+                        count("confirmed");
+                        let (selections, echo) = (selections.clone(), echo.clone());
+                        self.deliver(
+                            agent,
+                            root,
+                            message,
+                            &open.questions,
+                            Some(selections),
+                            echo,
+                        )
+                        .await;
+                        return;
+                    }
+                    "no" | "n" => {
+                        self.questions.set_stage(agent, Stage::Open);
+                        self.react(message, ACK).await;
+                        return;
+                    }
+                    _ => {} // anything else is a fresh answer, matched below
+                }
+            }
+            Stage::Open => {}
+        }
+
+        match question::match_reply(&open.questions, &message.body) {
+            Err(question::Refusal(reason)) => {
+                count("answer_refused");
+                self.questions.set_stage(agent, Stage::Open);
+                self.send(&message.room, Some(root), &reason, "question")
+                    .await;
+                self.react(message, REFUSED).await;
+            }
+            Ok(question::Matched::Skip) => {
+                let Some(echo) = self
+                    .send(
+                        &message.room,
+                        Some(root),
+                        "**declining the question**",
+                        "question",
+                    )
+                    .await
+                else {
+                    return self.echo_lost(agent, message).await;
+                };
+                self.deliver(agent, root, message, &open.questions, None, Some(echo))
+                    .await;
+            }
+            Ok(question::Matched::Answers { selections, exact }) => {
+                let chosen = question::describe(&open.questions, &selections);
+                if exact {
+                    let body = format!("**answering** {chosen}");
+                    let Some(echo) = self
+                        .send(&message.room, Some(root), &body, "question")
+                        .await
+                    else {
+                        return self.echo_lost(agent, message).await;
+                    };
+                    self.deliver(
+                        agent,
+                        root,
+                        message,
+                        &open.questions,
+                        Some(selections),
+                        Some(echo),
+                    )
+                    .await;
+                } else {
+                    let body = format!("**I read that as** {chosen}. Reply **yes** to send.");
+                    let Some(echo) = self
+                        .send(&message.room, Some(root), &body, "question")
+                        .await
+                    else {
+                        return self.echo_lost(agent, message).await;
+                    };
+                    count("confirm_asked");
+                    self.questions.set_stage(
+                        agent,
+                        Stage::Confirming {
+                            selections,
+                            echo: Some(echo),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// The echo did not reach the room. J-5: the plugin *always* echoes, so
+    /// nothing may be sent to the agent on an answer the operator cannot
+    /// see, and no `Confirming` may be entered on a reading nobody was
+    /// shown — a later stray `yes` would send it. The question stays open
+    /// and the operator can answer again. The failed send has already
+    /// counted `errors{kind="send"}`, and a notice would take the very path
+    /// that just failed, so the reaction is the whole report.
+    async fn echo_lost(&mut self, agent: &str, message: &Inbound) {
+        self.counters
+            .inbound
+            .with_label_values(&["send_failed"])
+            .inc();
+        self.questions.set_stage(agent, Stage::Open);
+        self.react(message, FAILED).await;
+    }
+
+    /// Sends the keys. `selections` is `None` for a `skip`.
+    async fn deliver(
+        &mut self,
+        agent: &str,
+        root: &str,
+        message: &Inbound,
+        questions: &[question::Question],
+        selections: Option<Vec<question::Selection>>,
+        echo: Option<String>,
+    ) {
+        let count = |outcome: &str| self.counters.inbound.with_label_values(&[outcome]).inc();
+        let steps = match &selections {
+            Some(selections) => question::plan(questions, selections),
+            None => question::skip_plan(),
+        };
+        let delay_ms = self
+            .agents
+            .get(agent)
+            .map(|c| c.key_delay_ms)
+            .unwrap_or(balerix_api::DEFAULT_KEY_DELAY_MS);
+        let action = PluginAction::SendKeys { steps, delay_ms };
+        // The daemon would refuse it; say why here, before anything is sent.
+        if let Err(reason) = action.validate() {
+            count("answer_refused");
+            self.questions.set_stage(agent, Stage::Open);
+            let body = format!(
+                "this answer needs more keystrokes than can be sent from here ({reason}); \
+                 answer at the terminal."
+            );
+            self.send(&message.room, Some(root), &body, "question")
+                .await;
+            self.react(message, REFUSED).await;
+            return;
+        }
+        match self.host.action(agent, &action).await {
+            Ok(()) => {
+                count(if selections.is_some() {
+                    "answered"
+                } else {
+                    "skipped"
+                });
+                self.questions
+                    .set_stage(agent, Stage::Sent { selections, echo });
+                self.react(message, ACK).await;
+            }
+            Err(e) => {
+                count("send_failed");
+                self.counters.errors.with_label_values(&["send_keys"]).inc();
+                self.questions.set_stage(agent, Stage::Open);
+                let body = format!("**not delivered to {agent}:** {e}");
+                self.send(&message.room, Some(root), &body, "notice").await;
+                self.react(message, FAILED).await;
+            }
+        }
+    }
+
     async fn react(&self, message: &Inbound, key: &str) {
-        if let Err(e) = self.port.react(&message.room, &message.event_id, key).await {
+        self.react_to(&message.room, &message.event_id, key).await;
+    }
+
+    async fn react_to(&self, room: &str, event_id: &str, key: &str) {
+        if let Err(e) = self.port.react(room, event_id, key).await {
             self.counters.errors.with_label_values(&["react"]).inc();
-            tracing::warn!("matrix: reacting to {}: {e}", message.event_id);
+            tracing::warn!("matrix: reacting to {event_id}: {e}");
         }
     }
 }
@@ -654,6 +1014,7 @@ mod tests {
         c.rooms.set(2);
         c.threads_open.set(3);
         c.events_dropped.inc();
+        c.answers_mismatched.inc();
         let text = m.render().unwrap();
         for family in [
             "balerix_plugin_matrix_messages_sent_total",
@@ -662,6 +1023,7 @@ mod tests {
             "balerix_plugin_matrix_rooms",
             "balerix_plugin_matrix_threads_open",
             "balerix_plugin_matrix_errors_total",
+            "balerix_plugin_matrix_answers_mismatched_total",
         ] {
             assert!(text.contains(family), "missing {family} in\n{text}");
         }
@@ -1418,6 +1780,404 @@ mod tests {
         (fake, port, a, room, root)
     }
 
+    use crate::matrix::CONFIRMED;
+    use crate::pending::Stage;
+    use crate::question::fixtures::{color, size};
+
+    fn asks(agent: &str, session: &str, questions: &[serde_json::Value]) -> HookEvent {
+        during(
+            agent,
+            session,
+            "PreToolUse",
+            json!({ "tool_name": "AskUserQuestion", "tool_input": { "questions": questions } }),
+        )
+    }
+
+    fn answered(agent: &str, session: &str, answers: serde_json::Value) -> HookEvent {
+        during(
+            agent,
+            session,
+            "PostToolUse",
+            json!({ "tool_name": "AskUserQuestion", "tool_response": { "answers": answers } }),
+        )
+    }
+
+    /// `with_thread`, for an agent that posts `Notification` and `Stop`.
+    async fn with_question_thread() -> (FakeHost, FakePort, Actor<FakePort>, String, String) {
+        let (fake, port, mut a) = actor().await;
+        a.handle(Command::Configure(daemon_config())).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&["Notification", "Stop"]),
+        })
+        .await;
+        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+            .await;
+        let room = match port.calls().last() {
+            Some(Call::Send { room, .. }) => room.clone(),
+            other => panic!("expected a root send, got {other:?}"),
+        };
+        port.take_calls();
+        (fake, port, a, room, "$evt2:fake".to_string())
+    }
+
+    #[tokio::test]
+    async fn a_question_is_posted_in_the_thread_and_the_permission_line_is_suppressed() {
+        let (fake, port, mut a, _room, root) = with_question_thread().await;
+        a.handle(Command::Events(vec![
+            asks("f/c/alice", "s1", &[color()]),
+            during(
+                "f/c/alice",
+                "s1",
+                "Notification",
+                json!({ "notification_type": "permission_prompt", "message": "Claude needs your permission" }),
+            ),
+        ]))
+        .await;
+        let sent = sends(&port.calls());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0.as_deref(), Some(root.as_str()));
+        assert!(
+            sent[0].1.starts_with("**question** · Color"),
+            "{}",
+            sent[0].1
+        );
+        assert!(sent[0].1.contains("3. **Blue**"));
+        assert!(
+            fake.kv_json("question/f/c/alice").is_some(),
+            "mirrored to KV"
+        );
+
+        // with no question open the same notification posts as before
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "Stop",
+            json!({}),
+        )]))
+        .await;
+        port.take_calls();
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "Notification",
+            json!({ "notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash" }),
+        )]))
+        .await;
+        assert!(
+            sends(&port.calls())[0]
+                .1
+                .contains("needs your permission to use Bash")
+        );
+    }
+
+    /// The bare `permission_prompt` that follows a question about six
+    /// seconds later (Spec J §2).
+    fn permission_prompt(agent: &str, session: &str) -> HookEvent {
+        during(
+            agent,
+            session,
+            "Notification",
+            json!({ "notification_type": "permission_prompt", "message": "Claude needs your permission" }),
+        )
+    }
+
+    /// Spec J §5: the question stands in for the prompt that announced it,
+    /// and for that one only. A second `permission_prompt` is a different
+    /// tool asking, and swallowing it would leave the agent waiting with
+    /// nothing in the room to say so — Spec G's core signal, gone.
+    #[tokio::test]
+    async fn at_most_one_permission_prompt_is_suppressed_per_question() {
+        let (_fake, port, mut a, _room, _root) = asked(&[color()]).await;
+        a.handle(Command::Events(vec![permission_prompt("f/c/alice", "s1")]))
+            .await;
+        assert!(
+            sends(&port.take_calls()).is_empty(),
+            "the question already said it"
+        );
+
+        a.handle(Command::Events(vec![permission_prompt("f/c/alice", "s1")]))
+            .await;
+        let s = sends(&port.take_calls());
+        assert_eq!(s.len(), 1, "a second prompt is another tool asking: {s:?}");
+        assert!(s[0].1.contains("needs your permission"), "{}", s[0].1);
+    }
+
+    /// After a `skip` no `PostToolUse` fires, so the record lives until the
+    /// next `Stop`. Claude is free again by then, and the prompt it hits
+    /// next has nothing to do with the question (Spec J §5).
+    #[tokio::test]
+    async fn a_permission_prompt_after_an_answer_is_on_its_way_still_posts() {
+        let (_fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "skip").await;
+        assert!(matches!(
+            a.questions.get("f/c/alice").unwrap().stage,
+            Stage::Sent { .. }
+        ));
+        port.take_calls();
+
+        a.handle(Command::Events(vec![permission_prompt("f/c/alice", "s1")]))
+            .await;
+        let s = sends(&port.calls());
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(s[0].1.contains("needs your permission"), "{}", s[0].1);
+    }
+
+    /// A question the operator never saw cannot stand in for anything: the
+    /// notification is their only notice that the agent is waiting.
+    #[tokio::test]
+    async fn a_permission_prompt_posts_when_the_question_message_never_landed() {
+        let (_fake, port, mut a, _room, _root) = with_question_thread().await;
+        port.fail_next(crate::matrix::MatrixError::Other("nope".into()));
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        assert!(sends(&port.take_calls()).is_empty(), "the question is lost");
+        assert!(a.questions.is_open("f/c/alice"), "but still tracked");
+
+        a.handle(Command::Events(vec![permission_prompt("f/c/alice", "s1")]))
+            .await;
+        let s = sends(&port.calls());
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(s[0].1.contains("needs your permission"), "{}", s[0].1);
+    }
+
+    /// Spec J §5: tracking is unconditional. The event that opens the
+    /// thread can be the `PreToolUse` itself, and its root send can fail —
+    /// a homeserver hiccup. The `permission_prompt` six seconds later then
+    /// opens the thread, the operator replies in it, and if the question
+    /// was never recorded that reply becomes §1's `send_text`: the body is
+    /// typed into the dialog and its Enter picks the highlighted row.
+    #[tokio::test]
+    async fn a_question_is_tracked_when_the_send_that_opens_its_thread_fails() {
+        let (fake, port, mut a) = actor().await;
+        let mut cfg = daemon_config();
+        // Pinning the room makes the call that fails the root's send.
+        cfg.rooms.insert("f/c".into(), "!pinned:example.org".into());
+        a.handle(Command::Configure(cfg)).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&["Notification"]),
+        })
+        .await;
+
+        port.fail_next(crate::matrix::MatrixError::Other("no rights".into()));
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        assert!(
+            sends(&port.calls()).is_empty(),
+            "nothing landed: {:?}",
+            port.calls()
+        );
+
+        // The notification that follows opens the thread the reply arrives in.
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "Notification",
+            json!({ "notification_type": "permission_prompt", "message": "Claude needs your permission" }),
+        )]))
+        .await;
+        let root = minted_root(&port.take_calls(), 0);
+        reply(&mut a, "!pinned:example.org", &root, "3").await;
+
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: down_enter(2),
+                delay_ms: 100,
+            }],
+            "the reply answered the dialog rather than typing into it"
+        );
+        assert!(
+            fake.kv_json("question/f/c/alice").is_some(),
+            "and the question was mirrored to KV all the same"
+        );
+    }
+
+    /// A disabled agent posts nothing, but its thread stays routable and
+    /// `on_inbound` does not read `enabled`, so J-7 has to hold there too.
+    #[tokio::test]
+    async fn a_disabled_agents_question_is_tracked_so_its_thread_still_answers() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: crate::config::parse_agent(&json!({ "enabled": false })).unwrap(),
+        })
+        .await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        assert!(port.calls().is_empty(), "{:?}", port.calls());
+
+        reply(&mut a, &room, &root, "3").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: down_enter(2),
+                delay_ms: 100,
+            }],
+        );
+        assert!(fake.kv_json("question/f/c/alice").is_some());
+    }
+
+    /// A payload that is not a dialog opens nothing and reads as the plain
+    /// tool line it always did (Spec J §5).
+    #[tokio::test]
+    async fn an_unparsable_question_opens_nothing_and_posts_the_generic_line() {
+        let (fake, port, mut a, _room, root) = with_question_thread().await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&["PreToolUse"]),
+        })
+        .await;
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "PreToolUse",
+            json!({ "tool_name": "AskUserQuestion", "tool_input": { "questions": [] } }),
+        )]))
+        .await;
+        assert!(!a.questions.is_open("f/c/alice"));
+        assert!(fake.kv_json("question/f/c/alice").is_none(), "no KV record");
+        assert_eq!(
+            sends(&port.calls()),
+            vec![(Some(root), "running `AskUserQuestion`".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_question_is_tracked_even_when_the_event_filter_hides_it() {
+        let (fake, port, mut a, _room, _root) = with_thread().await; // events: []
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        assert!(sends(&port.calls()).is_empty(), "nothing posted");
+        assert!(
+            a.questions.is_open("f/c/alice"),
+            "but J-7's protection is on"
+        );
+        assert!(fake.kv_json("question/f/c/alice").is_some());
+    }
+
+    #[tokio::test]
+    async fn every_clearing_event_closes_the_question() {
+        for (name, payload) in [
+            ("Stop", json!({})),
+            ("UserPromptSubmit", json!({ "prompt": "x" })),
+            ("SessionEnd", json!({ "reason": "clear" })),
+            ("SessionStart", json!({ "source": "clear" })),
+        ] {
+            let (fake, _port, mut a, _room, _root) = with_question_thread().await;
+            a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+                .await;
+            assert!(a.questions.is_open("f/c/alice"));
+            a.handle(Command::Events(vec![during(
+                "f/c/alice",
+                "s1",
+                name,
+                payload,
+            )]))
+            .await;
+            assert!(!a.questions.is_open("f/c/alice"), "{name}");
+            assert!(fake.kv_json("question/f/c/alice").is_none(), "{name}");
+        }
+        let (_fake, _port, mut a, _room, _root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        a.handle(deactivate("f/c/alice")).await;
+        assert!(!a.questions.is_open("f/c/alice"), "deactivate");
+    }
+
+    #[tokio::test]
+    async fn an_answer_given_at_the_terminal_is_reported() {
+        let (_fake, port, mut a, _room, _root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks(
+            "f/c/alice",
+            "s1",
+            &[color(), size()],
+        )]))
+        .await;
+        port.take_calls();
+        a.handle(Command::Events(vec![answered(
+            "f/c/alice",
+            "s1",
+            json!({ "Which color?": "Blue", "Which size?": "Medium" }),
+        )]))
+        .await;
+        assert_eq!(
+            sends(&port.calls())[0].1,
+            "**answered at the terminal** Color → Blue · Size → Medium"
+        );
+        assert!(!a.questions.is_open("f/c/alice"));
+    }
+
+    #[tokio::test]
+    async fn a_sent_answer_is_confirmed_on_the_echo_or_reported_when_it_differs() {
+        let chosen = vec![crate::question::Selection {
+            options: vec![2],
+            other: None,
+        }];
+        let sent = |echo: &str| Stage::Sent {
+            selections: Some(chosen.clone()),
+            echo: Some(echo.to_string()),
+        };
+
+        let (_fake, port, mut a, room, _root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        a.questions.set_stage("f/c/alice", sent("$echo:fake"));
+        port.take_calls();
+        a.handle(Command::Events(vec![answered(
+            "f/c/alice",
+            "s1",
+            json!({ "Which color?": "Blue" }),
+        )]))
+        .await;
+        assert_eq!(
+            port.calls(),
+            vec![Call::React {
+                room: room.clone(),
+                event_id: "$echo:fake".into(),
+                key: CONFIRMED.into()
+            }],
+            "a reaction, not another message"
+        );
+
+        let (_fake, port, mut a, _room, _root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        a.questions.set_stage("f/c/alice", sent("$echo:fake"));
+        port.take_calls();
+        a.handle(Command::Events(vec![answered(
+            "f/c/alice",
+            "s1",
+            json!({ "Which color?": "Red" }),
+        )]))
+        .await;
+        let body = &sends(&port.calls())[0].1;
+        assert!(body.starts_with("**recorded answer differs**"), "{body}");
+        assert!(
+            body.contains("Color → Red") && body.contains("Color → Blue"),
+            "{body}"
+        );
+        assert_eq!(a.counters.answers_mismatched.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_open_question_survives_an_actor_restart() {
+        let (fake, _port, mut a, _room, _root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        drop(a);
+        let host = Host::new(fake.env("matrix", std::path::Path::new("scratch"))).unwrap();
+        let mut again = Actor::new(
+            host,
+            FakePort::new("@balerix:example.org"),
+            counters(),
+            Health::new(),
+        );
+        again.load().await;
+        assert!(again.questions.is_open("f/c/alice"));
+    }
+
     #[tokio::test]
     async fn a_thread_reply_becomes_a_submitted_send_text_and_is_acknowledged() {
         let (fake, port, mut a, room, root) = with_thread().await;
@@ -1558,5 +2318,338 @@ mod tests {
                 body.len()
             );
         }
+    }
+
+    use balerix_api::{Key, KeyStep};
+
+    /// A thread with `questions` open; calls so far are cleared.
+    async fn asked(
+        questions: &[serde_json::Value],
+    ) -> (FakeHost, FakePort, Actor<FakePort>, String, String) {
+        let (fake, port, mut a, room, root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", questions)]))
+            .await;
+        port.take_calls();
+        (fake, port, a, room, root)
+    }
+
+    async fn reply(a: &mut Actor<FakePort>, room: &str, root: &str, body: &str) {
+        a.handle(Command::Inbound(inbound(
+            room,
+            Some(root),
+            "@rahul:example.org",
+            body,
+        )))
+        .await;
+    }
+
+    fn down_enter(downs: usize) -> Vec<KeyStep> {
+        let mut steps = vec![KeyStep::Key(Key::Down); downs];
+        steps.push(KeyStep::Key(Key::Enter));
+        steps
+    }
+
+    #[tokio::test]
+    async fn an_exact_reply_is_echoed_then_sent_as_keys_and_never_as_text() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "3").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: down_enter(2),
+                delay_ms: 100,
+            }]
+        );
+        assert_eq!(
+            sends(&port.calls()),
+            vec![(Some(root.clone()), "**answering** Color → Blue".to_string())]
+        );
+        assert_eq!(reactions(&port.calls()), vec![ACK.to_string()]);
+        assert_eq!(
+            a.questions.get("f/c/alice").unwrap().stage,
+            Stage::Sent {
+                selections: Some(vec![crate::question::Selection {
+                    options: vec![2],
+                    other: None
+                }]),
+                echo: Some("$evt4:fake".into()),
+            }
+        );
+
+        // the recorded answer then lands as a ✅ on that echo
+        port.take_calls();
+        a.handle(Command::Events(vec![answered(
+            "f/c/alice",
+            "s1",
+            json!({ "Which color?": "Blue" }),
+        )]))
+        .await;
+        assert_eq!(
+            port.calls(),
+            vec![Call::React {
+                room,
+                event_id: "$evt4:fake".into(),
+                key: CONFIRMED.into()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agents_key_delay_is_used() {
+        let (fake, _port, mut a, room, root) = asked(&[color()]).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: crate::config::parse_agent(
+                &json!({ "events": ["Notification"], "keyDelayMs": 250 }),
+            )
+            .unwrap(),
+        })
+        .await;
+        reply(&mut a, &room, &root, "1").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: down_enter(0),
+                delay_ms: 250,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inexact_reply_asks_first_and_yes_sends_it() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "gre").await;
+        assert!(
+            fake.actions_for("f/c/alice").is_empty(),
+            "nothing typed yet"
+        );
+        assert_eq!(
+            sends(&port.calls())[0].1,
+            "**I read that as** Color → Green. Reply **yes** to send."
+        );
+        assert!(matches!(
+            a.questions.get("f/c/alice").unwrap().stage,
+            Stage::Confirming { .. }
+        ));
+
+        port.take_calls();
+        reply(&mut a, &room, &root, " Yes ").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: down_enter(1),
+                delay_ms: 100,
+            }]
+        );
+        assert!(sends(&port.calls()).is_empty(), "no second echo");
+        assert_eq!(
+            a.questions.get("f/c/alice").unwrap().stage,
+            Stage::Sent {
+                selections: Some(vec![crate::question::Selection {
+                    options: vec![1],
+                    other: None
+                }]),
+                echo: Some("$evt4:fake".into()),
+            },
+            "the ✅ goes on the echo that asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_drops_the_confirmation_and_another_reply_replaces_it() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "gre").await;
+        reply(&mut a, &room, &root, "no").await;
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);
+        assert!(fake.actions_for("f/c/alice").is_empty());
+
+        reply(&mut a, &room, &root, "gre").await;
+        port.take_calls();
+        reply(&mut a, &room, &root, "blue").await; // not yes/no: a fresh answer
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: down_enter(2),
+                delay_ms: 100,
+            }]
+        );
+        assert_eq!(sends(&port.calls())[0].1, "**answering** Color → Blue");
+    }
+
+    #[tokio::test]
+    async fn prose_is_refused_and_nothing_reaches_the_agent() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "purple please").await;
+        assert!(fake.actions_for("f/c/alice").is_empty(), "the §1 hazard");
+        assert_eq!(reactions(&port.calls()), vec![REFUSED.to_string()]);
+        let body = &sends(&port.calls())[0].1;
+        assert!(
+            body.contains("matches nothing") && body.contains("1. Red"),
+            "{body}"
+        );
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);
+    }
+
+    #[tokio::test]
+    async fn skip_declines_with_one_escape() {
+        let (fake, port, mut a, room, root) = asked(&[color(), size()]).await;
+        reply(&mut a, &room, &root, "skip").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps: vec![KeyStep::Key(Key::Escape)],
+                delay_ms: 100,
+            }]
+        );
+        assert_eq!(sends(&port.calls())[0].1, "**declining the question**");
+        assert_eq!(
+            a.questions.get("f/c/alice").unwrap().stage,
+            Stage::Sent {
+                selections: None,
+                echo: Some("$evt4:fake".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn one_reply_answers_several_questions() {
+        let (fake, port, mut a, room, root) = asked(&[color(), size()]).await;
+        reply(&mut a, &room, &root, "blue\nmedium").await;
+        let mut steps = down_enter(2);
+        steps.extend(down_enter(1));
+        steps.push(KeyStep::Key(Key::Enter)); // the review screen
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendKeys {
+                steps,
+                delay_ms: 100,
+            }]
+        );
+        assert_eq!(
+            sends(&port.calls())[0].1,
+            "**answering** Color → Blue · Size → Medium"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_while_keys_are_on_their_way_is_refused() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "1").await;
+        port.take_calls();
+        reply(&mut a, &room, &root, "2").await;
+        assert_eq!(fake.actions_for("f/c/alice").len(), 1, "only the first");
+        assert_eq!(reactions(&port.calls()), vec![REFUSED.to_string()]);
+        assert!(sends(&port.calls())[0].1.contains("already on its way"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_keys_is_reported_and_the_question_stays_open() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        fake.fail_actions(Some("no window"));
+        reply(&mut a, &room, &root, "1").await;
+        assert_eq!(reactions(&port.calls()), vec![FAILED.to_string()]);
+        let bodies = sends(&port.calls());
+        assert!(
+            bodies[1].1.starts_with("**not delivered to f/c/alice:**"),
+            "{bodies:?}"
+        );
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);
+    }
+
+    /// J-5: the plugin always echoes, so an answer the operator cannot see
+    /// must not reach the agent — the thread would show a dialog that
+    /// answered itself.
+    #[tokio::test]
+    async fn an_answer_whose_echo_never_landed_sends_no_keys() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        for body in ["1", "skip"] {
+            port.fail_next(crate::matrix::MatrixError::Other("nope".into()));
+            reply(&mut a, &room, &root, body).await;
+            assert!(
+                fake.actions_for("f/c/alice").is_empty(),
+                "{body} reached the agent unseen"
+            );
+            assert_eq!(
+                reactions(&port.take_calls()),
+                vec![FAILED.to_string()],
+                "{body}"
+            );
+            assert_eq!(
+                a.questions.get("f/c/alice").unwrap().stage,
+                Stage::Open,
+                "{body}"
+            );
+        }
+    }
+
+    /// The same for the question the echo asks: without it in the room, a
+    /// later stray `yes` would send a reading nobody ever saw.
+    #[tokio::test]
+    async fn a_confirmation_whose_echo_never_landed_is_not_entered() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        port.fail_next(crate::matrix::MatrixError::Other("nope".into()));
+        reply(&mut a, &room, &root, "gre").await;
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);
+        assert_eq!(reactions(&port.take_calls()), vec![FAILED.to_string()]);
+
+        reply(&mut a, &room, &root, "yes").await;
+        assert!(
+            fake.actions_for("f/c/alice").is_empty(),
+            "a `yes` confirmed a question that was never asked"
+        );
+    }
+
+    /// One question with enough options that its plan outlasts the delay
+    /// (Spec J §7.5): 17 steps at 500 ms is past `MAX_KEY_SEQUENCE_MS`.
+    fn many_options(n: usize) -> serde_json::Value {
+        json!({ "question": "Which one?", "header": "Many", "multiSelect": false,
+                "options": (1..=n).map(|i| json!({ "label": format!("opt{i}") }))
+                    .collect::<Vec<_>>() })
+    }
+
+    #[tokio::test]
+    async fn a_plan_too_long_for_the_agents_delay_is_refused_before_anything_is_sent() {
+        let (fake, port, mut a, room, root) = with_question_thread().await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: crate::config::parse_agent(
+                &json!({ "events": ["Notification"], "keyDelayMs": 500 }),
+            )
+            .unwrap(),
+        })
+        .await;
+        a.handle(Command::Events(vec![asks(
+            "f/c/alice",
+            "s1",
+            &[many_options(17)],
+        )]))
+        .await;
+        port.take_calls();
+
+        reply(&mut a, &room, &root, "17").await;
+        assert!(
+            fake.actions_for("f/c/alice").is_empty(),
+            "the daemon would have refused it; nothing may be sent"
+        );
+        assert_eq!(reactions(&port.calls()), vec![REFUSED.to_string()]);
+        let bodies = sends(&port.calls());
+        assert!(
+            bodies.last().unwrap().1.contains("answer at the terminal"),
+            "{bodies:?}"
+        );
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);
+    }
+
+    #[tokio::test]
+    async fn with_no_question_open_a_reply_is_still_a_prompt() {
+        let (fake, _port, mut a, room, root) = with_question_thread().await;
+        reply(&mut a, &room, &root, "3").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendText {
+                text: "3".into(),
+                submit: true,
+            }]
+        );
     }
 }

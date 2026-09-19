@@ -2,7 +2,7 @@
 # git is a system prerequisite (not in the mise registry); the devcontainer ships 2.47.3.
 [tools]
 rust = { version = "1.98.1", components = ["rustfmt", "clippy"] }
-"cargo:cargo-nextest" = "0.9.144"
+"cargo:cargo-nextest" = "0.9.145"
 cargo-insta = "1.48.0"
 "cargo:cargo-audit" = "0.22.2"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
@@ -10,8 +10,8 @@ cargo-insta = "1.48.0"
 gitleaks = "8.30.1"
 tmux = "3.7c"
 gh = "2.101.0"
-nono = "0.77.0"
-claude = "2.1.272"
+nono = "0.78.0"
+claude = "2.1.277"
 
 # Release and workflow tooling (Spec I). Only `claude` and `gh` from this
 # table reach agents (balerix-runtime's INHERITED list).
@@ -122,6 +122,10 @@ run = [
 [tasks.verify-claude]
 description = "By-hand spec §8.1 check: a real claude under a scratch daemon (config and state under target/tmp/verify-claude, wiped each run; tool installs kept under target/tmp/verify-data; your HOME kept for credentials); pauses for you to attach and type one prompt, then prints a report to paste back"
 run = "scripts/verify-claude.sh"
+
+[tasks.verify-questions]
+description = "By-hand Spec J check: drives the real pinned claude through every AskUserQuestion dialog shape with the matrix plugin's own key plans and checks the recorded answers (scratch under target/tmp/verify-questions; your HOME kept for credentials; a few short model turns). Run after bumping claude. Not part of any CI tier"
+run = "scripts/verify-questions.sh"
 
 [tasks.verify-matrix]
 description = "Spec G's manual check against a real Matrix homeserver (needs MATRIX_* credentials; not part of any CI tier)"

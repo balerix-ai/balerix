@@ -13,6 +13,8 @@ pub const ACK: &str = "👍";
 pub const REFUSED: &str = "🚫";
 /// A routed message the daemon rejected.
 pub const FAILED: &str = "❗";
+/// On the plugin's own echo: Claude recorded exactly what was chosen.
+pub const CONFIRMED: &str = "✅";
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MatrixError {

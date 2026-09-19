@@ -1,11 +1,15 @@
 //! The matrix plugin (Spec G): a room per crew, a thread per agent
-//! session, and a thread reply back to that agent as `send_text`.
+//! session, and a thread reply back to that agent as `send_text` — or, while
+//! Claude has an `AskUserQuestion` dialog open, as the paced `send_keys`
+//! that answers it (Spec J).
 
 pub mod actor;
 pub mod client;
 pub mod config;
 pub mod matrix;
+pub mod pending;
 pub mod plugin;
+pub mod question;
 pub mod render;
 pub mod routing;
 pub mod session;

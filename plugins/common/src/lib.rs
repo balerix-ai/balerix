@@ -31,3 +31,6 @@ pub mod render;
 
 /// A code review as one message for the agent (Spec C §4.4, Spec K-7).
 pub mod review;
+
+/// The answer flow of Spec J §7.2 and §7.3 as pure decisions (Spec K §4).
+pub mod answer;

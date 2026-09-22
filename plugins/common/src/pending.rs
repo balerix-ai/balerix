@@ -35,6 +35,18 @@ pub enum Stage {
     },
 }
 
+impl Stage {
+    /// The same stage carrying the echo message's id, once it is known.
+    /// `Open` has no echo and is returned unchanged.
+    pub fn with_echo(self, echo: Option<String>) -> Stage {
+        match self {
+            Stage::Open => Stage::Open,
+            Stage::Confirming { selections, .. } => Stage::Confirming { selections, echo },
+            Stage::Sent { selections, .. } => Stage::Sent { selections, echo },
+        }
+    }
+}
+
 /// One agent's open question, held in memory and mirrored to KV.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenQuestion {

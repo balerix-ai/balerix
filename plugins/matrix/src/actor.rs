@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use balerix_api::{HookEvent, PluginAction};
+use balerix_plugin_common::answer::{self, Decision, Reaction, Verdict};
 use balerix_plugin_common::metrics::Shared;
 use balerix_plugin_sdk::metrics::{IntCounter, IntCounterVec, IntGauge};
 use balerix_plugin_sdk::{Host, Metrics, SdkError};
@@ -505,39 +506,26 @@ impl<M: MatrixPort> Actor<M> {
                     .pointer("/tool_response/answers")
                     .cloned()
                     .unwrap_or(Value::Null);
-                let recorded = question::describe_recorded(&open.questions, &answers);
-                match open.stage {
-                    Stage::Sent {
-                        selections: Some(selections),
-                        echo,
-                    } => {
-                        if question::recorded_matches(&open.questions, &selections, &answers) {
-                            if let Some(echo) = echo {
-                                self.react_to(room, &echo, CONFIRMED).await;
-                            }
-                        } else {
-                            // Posted whatever the filter says: it answers
-                            // the operator's own action.
-                            self.counters.answers_mismatched.inc();
-                            let body = format!(
-                                "**recorded answer differs** — Claude recorded {recorded}; \
-                                 you chose {}. Tell the agent if that matters.",
-                                question::describe(&open.questions, &selections)
-                            );
-                            if let Some(root) = root {
-                                self.send(room, Some(&root), &body, "question").await;
-                            }
+                match answer::on_closed(&open, &answers) {
+                    Verdict::Confirmed { echo } => {
+                        if let Some(echo) = echo {
+                            self.react_to(room, &echo, CONFIRMED).await;
                         }
                     }
-                    Stage::Sent {
-                        selections: None, ..
-                    } => {}
-                    Stage::Open | Stage::Confirming { .. } => {
+                    Verdict::Mismatch { message } => {
+                        // Posted whatever the filter says: it answers the
+                        // operator's own action.
+                        self.counters.answers_mismatched.inc();
+                        if let Some(root) = root {
+                            self.send(room, Some(&root), &message, "question").await;
+                        }
+                    }
+                    Verdict::AnsweredAtTerminal { message } => {
                         if shown && let Some(root) = root {
-                            let body = format!("**answered at the terminal** {recorded}");
-                            self.send(room, Some(&root), &body, "question").await;
+                            self.send(room, Some(&root), &message, "question").await;
                         }
                     }
+                    Verdict::Nothing => {}
                 }
                 true
             }
@@ -626,179 +614,75 @@ impl<M: MatrixPort> Actor<M> {
         }
     }
 
-    /// A thread reply while `agent` has a question open (Spec J §7.2).
+    /// A thread reply while `agent` has a question open (Spec J §7.2):
+    /// decide in common, execute here under `Decision`'s contract.
     async fn on_answer(&mut self, agent: &str, root: &str, message: &Inbound) {
-        let count = |outcome: &str| self.counters.inbound.with_label_values(&[outcome]).inc();
         let Some(open) = self.questions.get(agent).cloned() else {
             return;
-        };
-        match &open.stage {
-            Stage::Sent { .. } => {
-                count("answer_refused");
-                let body = "an answer is already on its way; wait for the agent.";
-                self.send(&message.room, Some(root), body, "question").await;
-                self.react(message, REFUSED).await;
-                return;
-            }
-            Stage::Confirming { selections, echo } => {
-                match message.body.trim().to_ascii_lowercase().as_str() {
-                    "yes" | "y" => {
-                        count("confirmed");
-                        let (selections, echo) = (selections.clone(), echo.clone());
-                        self.deliver(
-                            agent,
-                            root,
-                            message,
-                            &open.questions,
-                            Some(selections),
-                            echo,
-                        )
-                        .await;
-                        return;
-                    }
-                    "no" | "n" => {
-                        self.questions.set_stage(agent, Stage::Open);
-                        self.react(message, ACK).await;
-                        return;
-                    }
-                    _ => {} // anything else is a fresh answer, matched below
-                }
-            }
-            Stage::Open => {}
-        }
-
-        match question::match_reply(&open.questions, &message.body) {
-            Err(question::Refusal(reason)) => {
-                count("answer_refused");
-                self.questions.set_stage(agent, Stage::Open);
-                self.send(&message.room, Some(root), &reason, "question")
-                    .await;
-                self.react(message, REFUSED).await;
-            }
-            Ok(question::Matched::Skip) => {
-                let Some(echo) = self
-                    .send(
-                        &message.room,
-                        Some(root),
-                        "**declining the question**",
-                        "question",
-                    )
-                    .await
-                else {
-                    return self.echo_lost(agent, message).await;
-                };
-                self.deliver(agent, root, message, &open.questions, None, Some(echo))
-                    .await;
-            }
-            Ok(question::Matched::Answers { selections, exact }) => {
-                let chosen = question::describe(&open.questions, &selections);
-                if exact {
-                    let body = format!("**answering** {chosen}");
-                    let Some(echo) = self
-                        .send(&message.room, Some(root), &body, "question")
-                        .await
-                    else {
-                        return self.echo_lost(agent, message).await;
-                    };
-                    self.deliver(
-                        agent,
-                        root,
-                        message,
-                        &open.questions,
-                        Some(selections),
-                        Some(echo),
-                    )
-                    .await;
-                } else {
-                    let body = format!("**I read that as** {chosen}. Reply **yes** to send.");
-                    let Some(echo) = self
-                        .send(&message.room, Some(root), &body, "question")
-                        .await
-                    else {
-                        return self.echo_lost(agent, message).await;
-                    };
-                    count("confirm_asked");
-                    self.questions.set_stage(
-                        agent,
-                        Stage::Confirming {
-                            selections,
-                            echo: Some(echo),
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    /// The echo did not reach the room. J-5: the plugin *always* echoes, so
-    /// nothing may be sent to the agent on an answer the operator cannot
-    /// see, and no `Confirming` may be entered on a reading nobody was
-    /// shown — a later stray `yes` would send it. The question stays open
-    /// and the operator can answer again. The failed send has already
-    /// counted `errors{kind="send"}`, and a notice would take the very path
-    /// that just failed, so the reaction is the whole report.
-    async fn echo_lost(&mut self, agent: &str, message: &Inbound) {
-        self.counters
-            .inbound
-            .with_label_values(&["send_failed"])
-            .inc();
-        self.questions.set_stage(agent, Stage::Open);
-        self.react(message, FAILED).await;
-    }
-
-    /// Sends the keys. `selections` is `None` for a `skip`.
-    async fn deliver(
-        &mut self,
-        agent: &str,
-        root: &str,
-        message: &Inbound,
-        questions: &[question::Question],
-        selections: Option<Vec<question::Selection>>,
-        echo: Option<String>,
-    ) {
-        let count = |outcome: &str| self.counters.inbound.with_label_values(&[outcome]).inc();
-        let steps = match &selections {
-            Some(selections) => question::plan(questions, selections),
-            None => question::skip_plan(),
         };
         let delay_ms = self
             .agents
             .get(agent)
             .map(|c| c.key_delay_ms)
             .unwrap_or(balerix_api::DEFAULT_KEY_DELAY_MS);
-        let action = PluginAction::SendKeys { steps, delay_ms };
-        // The daemon would refuse it; say why here, before anything is sent.
-        if let Err(reason) = action.validate() {
-            count("answer_refused");
+        let decision = answer::on_reply(&open, &message.body, delay_ms);
+        self.execute(agent, root, message, decision).await;
+    }
+
+    fn reaction_key(reaction: Reaction) -> &'static str {
+        match reaction {
+            Reaction::Ack => ACK,
+            Reaction::Refused => REFUSED,
+            Reaction::Failed => FAILED,
+            Reaction::Confirmed => CONFIRMED,
+        }
+    }
+
+    /// The executor contract of `balerix_plugin_common::answer::Decision`.
+    async fn execute(&mut self, agent: &str, root: &str, message: &Inbound, d: Decision) {
+        let count = |outcome: &str| self.counters.inbound.with_label_values(&[outcome]).inc();
+        let mut echo = None;
+        if let Some(body) = &d.post {
+            match self.send(&message.room, Some(root), body, "question").await {
+                Some(id) => echo = Some(id),
+                None if d.gates_on_post() => {
+                    // J-5: nothing may be sent, and no `Confirming` entered,
+                    // on an echo the operator cannot see. The failed send
+                    // already counted `errors{kind="send"}`; a notice would
+                    // take the path that just failed, so the reaction is
+                    // the whole report.
+                    count("send_failed");
+                    self.questions.set_stage(agent, Stage::Open);
+                    self.react(message, FAILED).await;
+                    return;
+                }
+                None => {}
+            }
+        }
+        if let Some(action) = &d.send
+            && let Err(e) = self.host.action(agent, action).await
+        {
+            count("send_failed");
+            self.counters.errors.with_label_values(&["send_keys"]).inc();
             self.questions.set_stage(agent, Stage::Open);
-            let body = format!(
-                "this answer needs more keystrokes than can be sent from here ({reason}); \
-                 answer at the terminal."
-            );
-            self.send(&message.room, Some(root), &body, "question")
-                .await;
-            self.react(message, REFUSED).await;
+            let body = format!("**not delivered to {agent}:** {e}");
+            self.send(&message.room, Some(root), &body, "notice").await;
+            self.react(message, FAILED).await;
             return;
         }
-        match self.host.action(agent, &action).await {
-            Ok(()) => {
-                count(if selections.is_some() {
-                    "answered"
-                } else {
-                    "skipped"
-                });
-                self.questions
-                    .set_stage(agent, Stage::Sent { selections, echo });
-                self.react(message, ACK).await;
-            }
-            Err(e) => {
-                count("send_failed");
-                self.counters.errors.with_label_values(&["send_keys"]).inc();
-                self.questions.set_stage(agent, Stage::Open);
-                let body = format!("**not delivered to {agent}:** {e}");
-                self.send(&message.room, Some(root), &body, "notice").await;
-                self.react(message, FAILED).await;
-            }
+        // Only a gating post is an echo. A refusal while `Sent` must not
+        // replace the id where the `PostToolUse` confirms (Spec J §7.3).
+        let stage = if d.gates_on_post() {
+            d.stage.with_echo(echo)
+        } else {
+            d.stage
+        };
+        self.questions.set_stage(agent, stage);
+        if let Some(outcome) = d.outcome {
+            count(outcome);
+        }
+        if let Some(reaction) = d.react {
+            self.react(message, Self::reaction_key(reaction)).await;
         }
     }
 
@@ -2395,6 +2279,21 @@ mod tests {
         assert_eq!(fake.actions_for("f/c/alice").len(), 1, "only the first");
         assert_eq!(reactions(&port.calls()), vec![REFUSED.to_string()]);
         assert!(sends(&port.calls())[0].1.contains("already on its way"));
+    }
+
+    /// The refusal is not an echo: the `Sent` stage keeps the id of the
+    /// message that announced the keys, where the `PostToolUse` confirms.
+    #[tokio::test]
+    async fn a_refusal_while_keys_are_on_their_way_keeps_the_echo() {
+        let (_fake, _port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "1").await;
+        let sent = a.questions.get("f/c/alice").unwrap().stage.clone();
+        assert!(
+            matches!(sent, Stage::Sent { echo: Some(_), .. }),
+            "{sent:?}"
+        );
+        reply(&mut a, &room, &root, "2").await;
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, sent);
     }
 
     #[tokio::test]

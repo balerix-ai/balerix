@@ -170,7 +170,14 @@ mod tests {
             move |changes: Vec<PhaseChange>| seen.lock().unwrap().extend(changes)
         };
         let task = tokio::spawn(run(host, sink));
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let connect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fake.watch_connections() == 0 && std::time::Instant::now() < connect_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            fake.watch_connections() > 0,
+            "run never opened the fleet watch"
+        );
         fake.set_fleets(fleet(&[("f/c/a", AgentPhase::Ready, "up")]));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while seen.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {

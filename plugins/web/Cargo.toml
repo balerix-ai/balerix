@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 balerix-api = { path = "../../crates/balerix-api" }
+balerix-plugin-common = { path = "../common" }
 balerix-plugin-sdk = { path = "../../crates/balerix-plugin-sdk" }
 axum = { version = "0.8.9", features = ["ws"] }
 serde = { version = "1.0.229", features = ["derive"] }

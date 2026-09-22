@@ -93,6 +93,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "balerix-plugin-common"
+version = "0.1.0"
+dependencies = [
+ "balerix-api",
+ "balerix-plugin-sdk",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "balerix-plugin-sdk"
 version = "0.1.0"
 dependencies = [
@@ -118,6 +132,7 @@ dependencies = [
  "anyhow",
  "axum",
  "balerix-api",
+ "balerix-plugin-common",
  "balerix-plugin-sdk",
  "futures-util",
  "hex",

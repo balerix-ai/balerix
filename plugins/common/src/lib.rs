@@ -28,3 +28,6 @@ pub mod phases;
 
 /// Every message body the plugin sends (Spec G §8), as pure functions.
 pub mod render;
+
+/// A code review as one message for the agent (Spec C §4.4, Spec K-7).
+pub mod review;

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use balerix_api::{HookEvent, PluginAction};
+use balerix_plugin_common::metrics::Shared;
 use balerix_plugin_sdk::metrics::{IntCounter, IntCounterVec, IntGauge};
 use balerix_plugin_sdk::{Host, Metrics, SdkError};
 use serde_json::Value;
@@ -76,7 +77,8 @@ pub enum Command {
     Inbound(Inbound),
 }
 
-/// The metric families of Spec G §10.
+/// The metric families of Spec G §10: the shared set plus the two gauges
+/// only a room-and-thread plugin has.
 #[derive(Debug, Clone)]
 pub struct Counters {
     pub messages_sent: IntCounterVec,
@@ -90,33 +92,16 @@ pub struct Counters {
 
 impl Counters {
     pub fn new(metrics: &Metrics) -> Result<Self, SdkError> {
+        let shared = Shared::new(metrics)?;
         Ok(Self {
-            messages_sent: metrics.int_counter_vec(
-                "messages_sent_total",
-                "Messages sent to Matrix, by kind",
-                &["kind"],
-            )?,
-            events_dropped: metrics.int_counter(
-                "events_dropped_total",
-                "Commands dropped because the queue was full",
-            )?,
-            inbound: metrics.int_counter_vec(
-                "inbound_total",
-                "Matrix messages seen, by what became of them",
-                &["outcome"],
-            )?,
+            messages_sent: shared.messages_sent,
+            events_dropped: shared.events_dropped,
+            inbound: shared.inbound,
             rooms: metrics.int_gauge("rooms", "Crew rooms the plugin knows")?,
             threads_open: metrics
                 .int_gauge("threads_open", "Agent sessions with an open thread")?,
-            errors: metrics.int_counter_vec(
-                "errors_total",
-                "Matrix failures, by kind",
-                &["kind"],
-            )?,
-            answers_mismatched: metrics.int_counter(
-                "answers_mismatched_total",
-                "Answers Claude recorded differently from what the thread chose",
-            )?,
+            errors: shared.errors,
+            answers_mismatched: shared.answers_mismatched,
         })
     }
 }

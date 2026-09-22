@@ -8,6 +8,9 @@
 /// deserializer that attaches serde's path, and the curated event filter.
 pub mod config;
 
+/// The metric families every chat plugin registers.
+pub mod metrics;
+
 /// The bounded drop-oldest command queue and the health cell an actor
 /// publishes through.
 pub mod queue;

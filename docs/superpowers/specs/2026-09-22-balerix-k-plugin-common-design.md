@@ -49,7 +49,8 @@ Discord plugin needs the same.
 ```
 plugins/common/
   Cargo.toml        publish = true; balerix-api and balerix-plugin-sdk by
-                    { version = "<exact>", path = "../../crates/…" }
+                    { version = "<exact>", path = "../../crates/…" };
+                    plugins reach it by path = "../common"
   Cargo.lock
   clippy.toml
   deny.toml
@@ -203,11 +204,15 @@ A fifth release unit, `common`:
   the SDK (`docs/RELEASING.md` §crates.io bootstrap).
 - The manifest names the SDK and API by `{ version = "<exact>", path }`.
   `cargo publish` needs those versions on crates.io, so `prepare.sh`
-  refuses to propose `common` while the SDK version it names has no tag,
-  with a message naming the core release to run first.
-- In-tree plugins depend on common the same way: `{ version = "<exact>",
-  path = "../common" }`. A plugin release must likewise follow the common
-  release it names; `prepare.sh` applies the same rule.
+  refuses to propose `common` while the SDK version it names has no
+  `balerix-v<ver>` tag, with a message naming the core release to run
+  first. A core release moves those two versions in common's manifest
+  (and its lockfile), as it already refreshes every plugin's lockfile.
+- In-tree plugins are `publish = false` and depend on common by plain
+  `path = "../common"`, so no second ordering rule exists. A plugin's
+  paths for release detection gain `plugins/common/**` when its manifest
+  names common, so a common change proposes a release of every plugin
+  built on it.
 - `mise run plugin common` lints and tests it; `plugins` and CI's
   per-plugin jobs include it; `package-plugins` skips it (a library
   packages nothing). `scripts/plugin.sh` and `mise.toml` gain the entry;

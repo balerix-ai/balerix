@@ -22,5 +22,9 @@ pub mod question;
 /// The question each agent is waiting on, mirrored to KV (Spec J §7.1).
 pub mod pending;
 
+/// Agent phase changes derived from `fleets/watch`, and the loop that
+/// feeds them to a sink for as long as the plugin runs.
+pub mod phases;
+
 /// Every message body the plugin sends (Spec G §8), as pure functions.
 pub mod render;

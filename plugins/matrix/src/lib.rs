@@ -11,6 +11,6 @@ pub mod plugin;
 pub mod routing;
 pub mod session;
 
-pub use balerix_plugin_common::{pending, question, render};
+pub use balerix_plugin_common::{pending, phases, question, render};
 pub use client::MatrixLauncher;
 pub use plugin::{Launcher, MatrixPlugin};

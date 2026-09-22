@@ -2,23 +2,13 @@
 //! Output is markdown; the adapter turns it into a plain `body` and an
 //! HTML `formatted_body`.
 
-use balerix_api::{AgentPhase, HookEvent};
+use balerix_api::HookEvent;
 use serde_json::Value;
 
 use crate::question::Question;
 
 /// One agent's phase transition, from the fleet watch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PhaseChange {
-    /// The agent that changed phase.
-    pub agent: String,
-    /// The phase it left.
-    pub from: AgentPhase,
-    /// The phase it entered.
-    pub to: AgentPhase,
-    /// Why, for the thread.
-    pub message: String,
-}
+pub use crate::phases::PhaseChange;
 
 /// The first eight characters of a session id: enough to tell two apart
 /// in a room, short enough to read on a phone.
@@ -302,6 +292,7 @@ pub fn split(text: &str, limit: usize, max_parts: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::question::{self, fixtures};
+    use balerix_api::AgentPhase;
     use balerix_plugin_sdk::testing::event;
     use serde_json::json;
 

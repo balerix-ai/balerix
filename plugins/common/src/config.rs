@@ -14,9 +14,11 @@ use serde_json::Value;
 pub struct Secret(String);
 
 impl Secret {
+    /// Wrap a value so it never prints in full.
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+    /// The plain value, for the one place that actually needs it.
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -31,7 +33,10 @@ impl fmt::Debug for Secret {
 /// One line, config path first; an empty path prints the message alone.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub struct ConfigError {
+    /// The config path, in the same dotted/`[i]` notation as a fleet spec
+    /// key; empty when the error precedes any field (a non-map config).
     pub path: String,
+    /// What went wrong, with no path prefix.
     pub message: String,
 }
 
@@ -116,6 +121,8 @@ impl Default for EventFilter {
 }
 
 impl EventFilter {
+    /// Whether `event` should be shown: true for anything in `LIFECYCLE`,
+    /// otherwise true when the configured list names it.
     pub fn wants(&self, event: &str) -> bool {
         LIFECYCLE.contains(&event) || self.0.iter().any(|e| e == event)
     }

@@ -16,6 +16,12 @@ use serde_json::Value;
 /// assistant turn, and keeps a runaway output from flooding the room.
 pub const DEFAULT_MAX_PARTS: usize = 10;
 
+/// One message holds this much (Spec G §8): comfortably under the 64 KiB
+/// event limit a homeserver enforces, and the limit OpenClaw defaults to.
+/// A longer body is split across messages by `split`, never cut — the
+/// ceiling is readability on a phone, not the protocol's.
+pub const BODY_LIMIT: usize = 4000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DaemonConfig {

@@ -312,7 +312,7 @@ impl<M: MatrixPort> Actor<M> {
             .map(|c| c.max_parts)
             .unwrap_or(crate::config::DEFAULT_MAX_PARTS);
         let mut first = None;
-        for part in render::split(body, max_parts) {
+        for part in render::split(body, crate::config::BODY_LIMIT, max_parts) {
             match retry_once(|| self.port.send(room, thread_root, &part)).await {
                 Ok(id) => {
                     self.counters.messages_sent.with_label_values(&[kind]).inc();
@@ -2144,7 +2144,7 @@ mod tests {
     #[tokio::test]
     async fn a_long_daemon_error_is_split_across_parts_before_it_is_posted() {
         let (fake, port, mut a, room, root) = with_thread().await;
-        let long_error = "x".repeat(crate::render::BODY_LIMIT * 2);
+        let long_error = "x".repeat(crate::config::BODY_LIMIT * 2);
         fake.fail_actions(Some(&long_error));
         a.handle(Command::Inbound(inbound(
             &room,
@@ -2167,7 +2167,7 @@ mod tests {
                 i + 1
             );
             assert!(
-                body.len() <= crate::render::BODY_LIMIT,
+                body.len() <= crate::config::BODY_LIMIT,
                 "part {} is {} bytes",
                 i + 1,
                 body.len()

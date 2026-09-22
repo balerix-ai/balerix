@@ -10,18 +10,26 @@ use serde_json::Value;
 /// The tool whose `PreToolUse` opens a question.
 pub const TOOL: &str = "AskUserQuestion";
 
+/// One option of a question.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opt {
+    /// What the operator picks it by: a number, the whole label or a
+    /// unique prefix or word of it (Spec J §6.2).
     pub label: String,
+    /// Shown beside the label; may be empty.
     pub description: String,
 }
 
+/// One question of an `AskUserQuestion` dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Question {
     /// Verbatim: it is the key of `PostToolUse`'s `answers` map.
     pub text: String,
+    /// Shown instead of `text` when it is not empty (`name`).
     pub header: String,
+    /// Whether more than one option may be chosen.
     pub multi_select: bool,
+    /// In display order; never empty.
     pub options: Vec<Opt>,
 }
 
@@ -41,17 +49,22 @@ impl Question {
 /// at least one of either.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
+    /// Indices into the question's `options`.
     pub options: Vec<usize>,
+    /// Free text from `other: …`, if any.
     pub other: Option<String>,
 }
 
+/// The outcome of matching a thread reply against the open questions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Matched {
     /// `exact` is true only when every item was a number or a whole label.
     Answers {
+        /// One per question, in question order.
         selections: Vec<Selection>,
         exact: bool,
     },
+    /// The reply declined the dialog.
     Skip,
 }
 
@@ -495,10 +508,12 @@ pub fn recorded_matches(questions: &[Question], selections: &[Selection], answer
     })
 }
 
-#[cfg(test)]
-pub(crate) mod fixtures {
+/// Dialogs the tests share. Always compiled, like `FakePort` and the
+/// SDK's `testing`: downstream crates build their tests on them.
+pub mod fixtures {
     use serde_json::{Value, json};
 
+    /// A single-select question, `tool_input` shape.
     pub fn color() -> Value {
         json!({ "question": "Which color?", "header": "Color", "multiSelect": false,
                 "options": [
@@ -507,6 +522,7 @@ pub(crate) mod fixtures {
                     { "label": "Blue", "description": "A cool, serene color" } ] })
     }
 
+    /// A second single-select question, for a several-questions dialog.
     pub fn size() -> Value {
         json!({ "question": "Which size?", "header": "Size", "multiSelect": false,
                 "options": [
@@ -515,6 +531,7 @@ pub(crate) mod fixtures {
                     { "label": "Large", "description": "" } ] })
     }
 
+    /// `color()` with `multiSelect` on.
     pub fn colors_multi() -> Value {
         let mut q = color();
         q["question"] = json!("Which colors?");
@@ -523,6 +540,7 @@ pub(crate) mod fixtures {
         q
     }
 
+    /// `questions` wrapped as an `AskUserQuestion` `tool_input`.
     pub fn input(questions: &[Value]) -> Value {
         json!({ "questions": questions })
     }
@@ -531,7 +549,7 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::fixtures::*;
-    use crate::question::{
+    use super::{
         Matched, Opt, Question, Refusal, Selection, describe, describe_recorded, match_reply,
         parse, plan, recorded_matches, skip_plan,
     };

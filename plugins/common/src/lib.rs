@@ -14,3 +14,13 @@ pub mod metrics;
 /// The bounded drop-oldest command queue and the health cell an actor
 /// publishes through.
 pub mod queue;
+
+/// `AskUserQuestion` (Spec J §6): parse the dialog, match a thread reply
+/// to its options, plan the keystrokes.
+pub mod question;
+
+/// The question each agent is waiting on, mirrored to KV (Spec J §7.1).
+pub mod pending;
+
+/// Every message body the plugin sends (Spec G §8), as pure functions.
+pub mod render;

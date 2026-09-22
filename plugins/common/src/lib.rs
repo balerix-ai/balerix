@@ -7,3 +7,7 @@
 /// Config helpers: a redacted `Secret`, a path-first `ConfigError`, the
 /// deserializer that attaches serde's path, and the curated event filter.
 pub mod config;
+
+/// The bounded drop-oldest command queue and the health cell an actor
+/// publishes through.
+pub mod queue;

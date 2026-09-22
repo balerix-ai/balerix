@@ -2,16 +2,15 @@
 //! bounded drop-oldest queue that feeds it (G-11), and the counters and
 //! health cell it publishes through.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use balerix_api::{HookEvent, OBSERVER_QUEUE, PluginAction};
+use balerix_api::{HookEvent, PluginAction};
 use balerix_plugin_sdk::metrics::{IntCounter, IntCounterVec, IntGauge};
 use balerix_plugin_sdk::{Host, Metrics, SdkError};
 use serde_json::Value;
-use tokio::sync::Notify;
 
 use crate::config::{AgentConfig, DaemonConfig};
 use crate::matrix::{ACK, CONFIRMED, FAILED, Inbound, MatrixError, MatrixPort, REFUSED};
@@ -20,8 +19,9 @@ use crate::question;
 use crate::render::{self, PhaseChange};
 use crate::routing::{Maps, Thread, crew_of};
 
-/// Queue depth, the same as the daemon's own observer queues.
-pub const QUEUE: usize = OBSERVER_QUEUE;
+pub use balerix_plugin_common::queue::{Health, QUEUE};
+/// The actor's inbound queue over this plugin's commands.
+pub type Queue = balerix_plugin_common::queue::Queue<Command>;
 
 /// How long a crew waits after its room creation failed, and the most it
 /// will ever wait. Without this the actor issues one `create_room` per hook
@@ -76,59 +76,6 @@ pub enum Command {
     Inbound(Inbound),
 }
 
-/// A bounded queue that drops its oldest entry rather than blocking its
-/// producer: `observe` is a daemon-to-plugin HTTP call and must return.
-pub struct Queue {
-    inner: Mutex<VecDeque<Command>>,
-    notify: Notify,
-    dropped: IntCounter,
-}
-
-impl Queue {
-    pub fn new(dropped: IntCounter) -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(VecDeque::with_capacity(QUEUE)),
-            notify: Notify::new(),
-            dropped,
-        })
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Command>> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    pub fn push(&self, command: Command) {
-        {
-            let mut q = self.lock();
-            if q.len() >= QUEUE {
-                q.pop_front();
-                self.dropped.inc();
-            }
-            q.push_back(command);
-        }
-        // `notify_one` stores a permit when nobody is waiting, so a pop
-        // that arrives afterwards returns at once: no lost wakeups.
-        self.notify.notify_one();
-    }
-
-    pub async fn pop(&self) -> Command {
-        loop {
-            if let Some(command) = self.lock().pop_front() {
-                return command;
-            }
-            self.notify.notified().await;
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
 /// The metric families of Spec G §10.
 #[derive(Debug, Clone)]
 pub struct Counters {
@@ -171,28 +118,6 @@ impl Counters {
                 "Answers Claude recorded differently from what the thread chose",
             )?,
         })
-    }
-}
-
-/// What `Plugin::health` reports. The actor writes it; the plugin reads it.
-#[derive(Debug, Clone, Default)]
-pub struct Health(Arc<Mutex<Option<String>>>);
-
-impl Health {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn ok(&self) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    }
-    pub fn fail(&self, message: String) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
-    }
-    pub fn get(&self) -> Result<(), String> {
-        match self.0.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            Some(m) => Err(m),
-            None => Ok(()),
-        }
     }
 }
 
@@ -947,61 +872,6 @@ mod tests {
         Command::Deactivate {
             agent: agent.to_string(),
         }
-    }
-
-    #[tokio::test]
-    async fn the_queue_is_fifo_and_wakes_a_waiting_pop() {
-        let c = counters();
-        let q = Queue::new(c.events_dropped.clone());
-        let popper = {
-            let q = q.clone();
-            tokio::spawn(async move { q.pop().await })
-        };
-        // Hand control to the scheduler so the popper actually runs, finds
-        // the queue empty, and parks on `notified()` before the push below
-        // exercises the wake path. Nothing here can assert that it parked —
-        // the queue is empty either way — so the yield is what makes the
-        // test reach that path at all, and the pop returning below is what
-        // proves the wake happened.
-        tokio::task::yield_now().await;
-        q.push(deactivate("f/c/a"));
-        assert_eq!(popper.await.unwrap(), deactivate("f/c/a"));
-
-        q.push(deactivate("one"));
-        q.push(deactivate("two"));
-        assert_eq!(q.pop().await, deactivate("one"));
-        assert_eq!(q.pop().await, deactivate("two"));
-        assert_eq!(q.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_full_queue_drops_the_oldest_and_counts_it() {
-        let c = counters();
-        let q = Queue::new(c.events_dropped.clone());
-        for i in 0..QUEUE {
-            q.push(deactivate(&format!("a{i}")));
-        }
-        assert_eq!(q.len(), QUEUE);
-        assert_eq!(c.events_dropped.get(), 0);
-
-        q.push(deactivate("newest"));
-        assert_eq!(q.len(), QUEUE, "capacity is held");
-        assert_eq!(c.events_dropped.get(), 1);
-        assert_eq!(
-            q.pop().await,
-            deactivate("a1"),
-            "the oldest was dropped, not the newest"
-        );
-    }
-
-    #[test]
-    fn health_starts_ok_and_reports_the_last_failure_until_cleared() {
-        let h = Health::new();
-        assert_eq!(h.get(), Ok(()));
-        h.fail("create room for f/c: no rights".into());
-        assert_eq!(h.get(), Err("create room for f/c: no rights".into()));
-        h.ok();
-        assert_eq!(h.get(), Ok(()));
     }
 
     #[test]

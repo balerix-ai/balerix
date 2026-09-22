@@ -1,0 +1,5 @@
+//! `balerix-plugin-common` (Spec K): the channel-independent half of a
+//! balerix chat plugin. Rendering, the `AskUserQuestion` answer flow,
+//! config helpers, a drop-oldest command queue, shared metric families
+//! and phase diffing — everything the matrix plugin needed that knew
+//! nothing about Matrix. See README.md for how to build a plugin on it.

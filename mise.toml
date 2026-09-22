@@ -29,6 +29,7 @@ shellcheck = "0.11.0"
 description = "Format the core workspace and every standalone plugin project"
 run = [
   "cargo fmt --all",
+  "scripts/plugin.sh fmt common",
   "scripts/plugin.sh fmt flow",
   "scripts/plugin.sh fmt web",
   "scripts/plugin.sh fmt matrix",
@@ -41,6 +42,7 @@ run = [
   "cargo clippy --workspace --all-targets -- -D warnings",
   "scripts/check-core-deps.sh",
   "cargo package --no-verify --allow-dirty -p balerix-api -p balerix-plugin-sdk",
+  "cargo package --no-verify --allow-dirty --manifest-path plugins/common/Cargo.toml",
   "actionlint",
   "zizmor --offline --min-severity medium .github",
   "shellcheck -x scripts/release/*.sh",
@@ -57,12 +59,13 @@ run = "scripts/package-plugins.sh"
 
 [tasks.plugin]
 description = "Lint and test one standalone plugin project: `mise run plugin matrix`"
-usage = 'arg "<name>" help="the plugin directory under plugins/"'
+usage = 'arg "<name>" help="the plugin directory under plugins/ (common is the shared library)"'
 run = 'scripts/plugin.sh check "$usage_name"'
 
 [tasks.plugins]
-description = "Lint and test every standalone plugin project (its own tier; not part of `check`)"
+description = "Lint and test every standalone plugin project, the shared library included (its own tier; not part of `check`)"
 run = [
+  "scripts/plugin.sh check common",
   "scripts/plugin.sh check flow",
   "scripts/plugin.sh check web",
   "scripts/plugin.sh check matrix",
@@ -84,6 +87,8 @@ description = "Nightly tier: dependency CVEs and policy, for the core workspace 
 run = [
   "cargo audit",
   "cargo deny check advisories bans sources licenses",
+  "cargo audit --file plugins/common/Cargo.lock",
+  "cargo deny --manifest-path plugins/common/Cargo.toml check advisories bans sources licenses",
   "cargo audit --file plugins/flow/Cargo.lock",
   "cargo deny --manifest-path plugins/flow/Cargo.toml check advisories bans sources licenses",
   "cargo audit --file plugins/web/Cargo.lock",

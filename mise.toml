@@ -42,7 +42,11 @@ run = [
   "cargo clippy --workspace --all-targets -- -D warnings",
   "scripts/check-core-deps.sh",
   "cargo package --no-verify --allow-dirty -p balerix-api -p balerix-plugin-sdk",
-  "cargo package --no-verify --allow-dirty --manifest-path plugins/common/Cargo.toml",
+  # A core release PR moves common's `balerix-api`/`balerix-plugin-sdk` pins to
+  # a version crates.io does not have yet, so resolve those two from the tree:
+  # the package then holds exactly what publish-crates.sh will upload once core
+  # is published.
+  "cargo package --no-verify --allow-dirty --manifest-path plugins/common/Cargo.toml --config 'patch.crates-io.balerix-api.path=\"crates/balerix-api\"' --config 'patch.crates-io.balerix-plugin-sdk.path=\"crates/balerix-plugin-sdk\"'",
   "actionlint",
   "zizmor --offline --min-severity medium .github",
   "shellcheck -x scripts/release/*.sh",

@@ -1,17 +1,11 @@
-# The matrix plugin's own policy. These four entries were repository-wide
-# until Spec H; they belong to the one artifact that actually carries the
-# risk. Everything else matches the core and sibling-plugin policies.
+# The matrix plugin's own policy. Its entries were repository-wide until
+# Spec H; they belong to the one artifact that actually carries the risk.
+# Everything else matches the core and sibling-plugin policies.
 [advisories]
-ignore = [
-  # `bitmaps`, archived upstream, reaches us through
-  # imbl -> eyeball-im -> matrix-sdk (the observable collections the SDK
-  # publishes room lists through).
-  { id = "RUSTSEC-2026-0247", reason = "bitmaps is unmaintained; a transitive dependency of matrix-sdk through imbl, with no upgrade available" },
-  # `proc-macro-error2` reaches us through aquamarine, the diagram macro
-  # matrix-sdk uses in its own rustdoc. Build-time only; nothing it expands
-  # ends up in the binary.
-  { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is unmaintained; a build-time dependency of matrix-sdk's rustdoc macro (aquamarine), with no upgrade available" },
-]
+# Nothing ignored. The unmaintained `bitmaps` (RUSTSEC-2026-0247) and
+# `proc-macro-error2` (RUSTSEC-2026-0173) left the tree with matrix-sdk
+# 0.19; an entry here needs a reason naming what blocks the upgrade.
+ignore = []
 
 [licenses]
 # The allowance list is deliberately broader than this project's tree, so a

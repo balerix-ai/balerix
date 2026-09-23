@@ -286,3 +286,10 @@ pub branch: Option<String>,
 - `FakeHost` records refused calls too (`applied_fleets`, `downed_fleets`)
   and fails both routes with `fail_manage(Some((status, message)))`.
 - `check_branch_name` also refuses the bare `@`, as git does.
+- Adding, changing or removing `branch` on a live agent re-materializes
+  it (`Stop, Materialize, Start`), and `ensure_worktree` reads the
+  registered worktree's HEAD: on `branch`, reused; on another branch with
+  a clean tree, the worktree is removed and re-created on `branch` (the
+  old branch stays in the crew clone); with local changes, the step fails
+  naming both branches and the agent is `Failed` with it. A detached HEAD
+  is reused as is, since its commits may be on no branch.

@@ -119,6 +119,9 @@ impl World {
     fn status(&self) -> FleetRecord {
         serde_json::from_str(&self.ok(&["status", "e2e", "--json"])).unwrap()
     }
+    fn status_of(&self, fleet: &str) -> FleetRecord {
+        serde_json::from_str(&self.ok(&["status", fleet, "--json"])).unwrap()
+    }
     fn window_pids(&self) -> String {
         let out = Command::new(&self.tmux)
             .args([
@@ -187,6 +190,32 @@ fn fleet_yaml(bare: &Path, bob_model: Option<&str>, plugins: Option<&str>) -> St
         "apiVersion: balerix/v1\nkind: Fleet\nname: e2e\ndefaults:\n  claude:\n    binary: \"{BALERIX}\"\n    args: [dev, fake-claude, \"--verbose\"]\n    settings: {{ model: sonnet }}\n  sandbox:\n    network: {{ block: false }}\n  tools: {{}}\ncrews:\n  c:\n    repo: \"file://{}\"\n    ref: main\n    git: {{ push: false, auth: none }}\n    agents:\n{alice}{bob}",
         bare.display()
     )
+}
+
+/// The fleet a managed-fleet journey's plugin applies: `fleet_yaml`'s
+/// shape as the JSON object `PUT fleets/{name}` takes, one agent, on
+/// fake-claude, under a real nono profile.
+fn managed_fleet_file(bare: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "balerix/v1", "kind": "Fleet", "name": "managed",
+        "defaults": {
+            "claude": {
+                "binary": BALERIX,
+                "args": ["dev", "fake-claude", "--verbose"],
+                "settings": { "model": "sonnet" }
+            },
+            "sandbox": { "network": { "block": false } },
+            "tools": {}
+        },
+        "crews": {
+            "c": {
+                "repo": format!("file://{}", bare.display()),
+                "ref": "main",
+                "git": { "push": false, "auth": "none" },
+                "agents": { "alice": {} }
+            }
+        }
+    })
 }
 
 fn hook_secrets(w: &World) -> Vec<String> {
@@ -929,6 +958,177 @@ fn plugin_protocol_journey() {
         std::thread::sleep(Duration::from_millis(250));
     }
     w.ok(&["down", "e2e", "--purge", "--timeout", "60s"]);
+    drop(w);
+}
+
+/// Spec L, end to end: a plugin with `manage` applies a fleet from its
+/// config at hello; the fleet runs under the plugin's name; the CLI is
+/// refused; removing the plugin takes the fleet down; `--force` purges it.
+#[test]
+fn plugin_manage_journey() {
+    let Some(nono) = tool("nono") else {
+        assert!(!require_or_skip("nono", false));
+        return;
+    };
+    for t in ["git", "gh", "mise", "tmux"] {
+        if !require_or_skip(t, tool(t).is_some()) {
+            return;
+        }
+    }
+    reap_earlier_runs();
+    let root = TempRoot::new(Path::new(env!("CARGO_TARGET_TMPDIR")), "e2e-manage");
+    if !require_or_skip("landlock", landlock_works(&nono, &root)) {
+        return;
+    }
+    let w = World {
+        home: root.join("home"),
+        socket: format!("balerix-e2e-manage-{}", std::process::id()),
+        tmux: tool("tmux").unwrap(),
+    };
+    fs::create_dir_all(&w.home).unwrap();
+    let cfg = w.home.join(".config/balerix");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::write(cfg.join("mise.toml"), "[tools]\n").unwrap();
+
+    // the same bare repo recipe as the first journey
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    fs::write(work.join("README"), "hi\n").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "init"]);
+    let bare = root.join("repo.git");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &work.display().to_string(),
+            &bare.display().to_string(),
+        ],
+    );
+
+    // the package: `fake`, with `manage`, told which fleet to apply
+    let pkg = root.join("fake-pkg");
+    plugin_package(&pkg, "needs: [fleets, manage]\n");
+    let manifest = fs::read_to_string(pkg.join("balerix-plugin.yaml"))
+        .unwrap()
+        .replace("name: hello", "name: fake");
+    fs::write(pkg.join("balerix-plugin.yaml"), manifest).unwrap();
+    let config = serde_json::json!({
+        "manage": { "fleet": "managed", "file": managed_fleet_file(&bare) }
+    });
+    // JSON is YAML: the object rides on one line after `config:`
+    fs::write(
+        cfg.join("plugins.yaml"),
+        format!(
+            "plugins:\n  - name: fake\n    source: \"{}\"\n    config: {}\n",
+            pkg.display(),
+            config
+        ),
+    )
+    .unwrap();
+
+    let out = w.ok(&[
+        "serve",
+        "-d",
+        "--bind",
+        "127.0.0.1:0",
+        "--tmux-socket",
+        &w.socket,
+    ]);
+    assert!(out.contains("http://127.0.0.1:"), "{out}");
+    let plugin_dir = w.state().join("plugins/fake");
+    wait_plugin_ready(&w, "fake", &plugin_dir);
+
+    // the plugin applied its fleet at hello, and owns it
+    let outcome = wait_file(&plugin_dir.join("scratch/fake-plugin.manage"));
+    let outcome: serde_json::Value = serde_json::from_str(&outcome).unwrap();
+    assert!(outcome.get("error").is_none(), "{outcome}");
+    assert_eq!(outcome["owner"], "fake", "{outcome}");
+    assert_eq!(outcome["generation"], 1, "{outcome}");
+    let status = w.ok(&["status", "managed"]);
+    assert!(status.contains("  managed by fake"), "{status}");
+    let list = w.ok(&["list"]);
+    assert!(
+        list.lines()
+            .any(|l| l.starts_with("managed ") && l.ends_with("fake")),
+        "{list}"
+    );
+
+    // it becomes ready like any fleet: the relay's SessionStart from
+    // fake-claude, through a real nono profile
+    let start = Instant::now();
+    loop {
+        let rec = w.status_of("managed");
+        if rec.status.phase == balerix_api::FleetPhase::Ready {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(180),
+            "managed fleet never ready: {rec:?}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        w.state()
+            .join("fleets/managed/crews/c/agents/alice/workspace/README")
+            .exists(),
+        "the agent's worktree was created from the file's repo"
+    );
+
+    // the CLI may not take it over
+    let fleet = root.join("managed.yaml");
+    fs::write(
+        &fleet,
+        fleet_yaml(&bare, None, None).replace("name: e2e", "name: managed"),
+    )
+    .unwrap();
+    let out = w.run(&[
+        "up",
+        &fleet.display().to_string(),
+        "--no-host-defaults",
+        "--no-wait",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("fleet managed is managed by plugin fake"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = w.run(&["down", "managed", "--timeout", "30s"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("fleet managed is managed by plugin fake"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // removing the plugin takes its fleet down; --force purges what is left
+    let out = w.ok(&["plugin", "remove", "fake"]);
+    assert!(out.contains("stopped: fake"), "{out}");
+    assert!(out.contains("fleet managed: down"), "{out}");
+    let start = Instant::now();
+    loop {
+        let rec = w.status_of("managed");
+        if rec.status.phase == balerix_api::FleetPhase::Down {
+            assert_eq!(
+                rec.owner.as_deref(),
+                Some("fake"),
+                "the owner survives the down"
+            );
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "managed fleet never down: {rec:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let out = w.ok(&["down", "managed", "--force", "--purge", "--timeout", "60s"]);
+    assert!(out.contains("managed: purged"), "{out}");
+    assert_eq!(w.ok(&["list"]), "no fleets\n");
     drop(w);
 }
 

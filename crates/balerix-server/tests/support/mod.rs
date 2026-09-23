@@ -169,6 +169,12 @@ impl Drop for World {
 /// actions+kv) and one package `web` (observes SessionStart, needs
 /// fleets+attach+workspace, serves routes).
 pub async fn world() -> World {
+    world_with(&[]).await
+}
+
+/// `world`, plus one package per `(name, manifest lines)` in `extra`,
+/// declared after `flow` and `web`.
+pub async fn world_with(extra: &[(&str, &str)]) -> World {
     let h = Harness::new(Duration::from_secs(3600));
     let dir = tempfile::tempdir().unwrap();
     write_plugin_package(
@@ -181,11 +187,14 @@ pub async fn world() -> World {
         "web",
         "hooks: { observe: [SessionStart] }\nneeds: [fleets, attach, workspace]\nroutes: true\n",
     );
-    std::fs::write(
-        dir.path().join("plugins.yaml"),
+    let mut plugins_yaml = String::from(
         "plugins:\n  - name: flow\n    source: ./flow-pkg\n  - name: web\n    source: ./web-pkg\n",
-    )
-    .unwrap();
+    );
+    for (name, manifest) in extra {
+        write_plugin_package(&dir.path().join(format!("{name}-pkg")), name, manifest);
+        plugins_yaml.push_str(&format!("  - name: {name}\n    source: ./{name}-pkg\n"));
+    }
+    std::fs::write(dir.path().join("plugins.yaml"), plugins_yaml).unwrap();
     // One registry for both: the handler's counters are the ones `/metrics`
     // encodes, so the daemon and the chain must share a `Metrics`.
     let metrics = Metrics::new().unwrap();

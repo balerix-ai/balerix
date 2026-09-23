@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::auth::{RateLimiter, bearer, constant_time_eq};
-use crate::daemon::{Daemon, DaemonError};
+use crate::daemon::{Caller, Daemon, DaemonError};
 use crate::hooks;
 use crate::plugins::{PluginAddr, PluginError};
 use crate::proxy;
@@ -319,11 +319,11 @@ async fn list_fleets(State(state): State<AppState>) -> Json<Vec<FleetSummary>> {
     Json(state.daemon.list().await)
 }
 
-async fn delete_fleet(
-    State(state): State<AppState>,
-    name: Result<Path<String>, PathRejection>,
+/// The `DownQuery` of a `DELETE`, with the one rule both routes apply:
+/// purge excludes keep.
+pub(crate) fn down_flags(
     q: Result<Query<DownQuery>, QueryRejection>,
-) -> Result<Json<FleetRecord>, ApiError> {
+) -> Result<DownQuery, ApiError> {
     let Query(q) = q.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
     if q.purge && (q.keep_repos || q.keep_sessions) {
         return Err(ApiError::new(
@@ -331,12 +331,27 @@ async fn delete_fleet(
             "purge cannot be combined with keep flags",
         ));
     }
+    Ok(q)
+}
+
+async fn delete_fleet(
+    State(state): State<AppState>,
+    name: Result<Path<String>, PathRejection>,
+    q: Result<Query<DownQuery>, QueryRejection>,
+) -> Result<Json<FleetRecord>, ApiError> {
+    let q = down_flags(q)?;
     let name = fleet_name(&path_name(name)?)?;
     let keep = Keep {
         repos: q.keep_repos,
         sessions: q.keep_sessions,
     };
-    Ok(Json(state.daemon.down(&name, keep, q.purge).await?))
+    // Spec L §5: a managed fleet needs `--force` from the admin side.
+    Ok(Json(
+        state
+            .daemon
+            .down_as(&name, keep, q.purge, &Caller::Admin { force: q.force })
+            .await?,
+    ))
 }
 
 /// `POST /v1/plugin-host/hello`: the plugin's bearer token, verified

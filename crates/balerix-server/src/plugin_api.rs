@@ -10,22 +10,25 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use balerix_api::{
-    Capability, KvKeys, PluginAction, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
+    Capability, DownQuery, KvKeys, PluginAction, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
 };
-use balerix_core::{AgentId, AgentName, FleetName, FleetRecord, is_reserved_fleet};
+use balerix_core::{AgentId, AgentName, FleetName, FleetRecord, Keep, is_reserved_fleet};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, AppState};
+use crate::api::{ApiError, AppState, down_flags};
 use crate::auth::bearer;
-use crate::daemon::DaemonError;
+use crate::daemon::{Caller, DaemonError};
 use crate::plugins::PluginError;
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/plugin-host/fleets", get(list_fleets))
         .route("/v1/plugin-host/fleets/watch", get(watch_fleets))
-        .route("/v1/plugin-host/fleets/{name}", get(get_fleet))
+        .route(
+            "/v1/plugin-host/fleets/{name}",
+            get(get_fleet).put(put_fleet).delete(delete_fleet),
+        )
         .route(
             "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/actions",
             axum::routing::post(post_action),
@@ -103,6 +106,72 @@ async fn get_fleet(
         .await
         .map(Json)
         .ok_or_else(|| DaemonError::NotFound.into())
+}
+
+/// Body of `PUT fleets/{name}` (Spec L §3.1): the YAML fleet file's
+/// structure as JSON. Nothing else: the daemon resolves and reads the
+/// credentials itself.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetFileBody {
+    file: Value,
+}
+
+/// The fleet of a manage route. A bad name is a 400 that names it: the
+/// daemon has nothing to be "not found" for a name it never accepts, and
+/// the plugin built it.
+fn manage_name(name: Result<Path<String>, PathRejection>) -> Result<FleetName, ApiError> {
+    let Path(name) = name.map_err(|e| ApiError::new(e.status(), e.body_text()))?;
+    name.parse().map_err(|e: balerix_core::NameError| {
+        ApiError::new(StatusCode::BAD_REQUEST, format!("name: {e}"))
+    })
+}
+
+/// `PUT fleets/{name}` (Spec L §3.1): an unresolved fleet file becomes a
+/// fleet this plugin owns. `manage` gates it; the name, the owner and
+/// the file's resolution are `Daemon::manage_fleet`'s.
+async fn put_fleet(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    name: Result<Path<String>, PathRejection>,
+    body: Result<Json<FleetFileBody>, JsonRejection>,
+) -> Result<Json<FleetRecord>, ApiError> {
+    let plugin = caller(&state, &headers, Capability::Manage).await?;
+    let name = manage_name(name)?;
+    let Json(body) = body.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    if !body.file.is_object() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "file: expected a mapping",
+        ));
+    }
+    Ok(Json(
+        state.daemon.manage_fleet(&plugin, &name, body.file).await?,
+    ))
+}
+
+/// `DELETE fleets/{name}?…` (Spec L §3.2): the admin `DELETE`'s flags,
+/// for a fleet this plugin owns. `force` is read and ignored: ownership
+/// is the rule here.
+async fn delete_fleet(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    name: Result<Path<String>, PathRejection>,
+    q: Result<Query<DownQuery>, QueryRejection>,
+) -> Result<Json<FleetRecord>, ApiError> {
+    let plugin = caller(&state, &headers, Capability::Manage).await?;
+    let name = manage_name(name)?;
+    let q = down_flags(q)?;
+    let keep = Keep {
+        repos: q.keep_repos,
+        sessions: q.keep_sessions,
+    };
+    Ok(Json(
+        state
+            .daemon
+            .down_as(&name, keep, q.purge, &Caller::Plugin(plugin))
+            .await?,
+    ))
 }
 
 /// `GET fleets/watch` (WS): every change, as the whole list (§18.4).

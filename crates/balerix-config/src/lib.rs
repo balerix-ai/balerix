@@ -10,7 +10,7 @@ pub mod validate;
 
 pub use balerix_core::is_exact_version;
 pub use error::ConfigError;
-pub use file::{CrewFile, FleetFile, parse, read};
+pub use file::{CrewFile, FleetFile, from_value, parse, read};
 pub use host::{HostDefaults, HostPaths};
 pub use merge::{merge, merge_layers, strip_nulls};
 pub use resolve::{ResolveOptions, resolve};

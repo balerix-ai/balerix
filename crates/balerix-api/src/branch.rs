@@ -13,14 +13,8 @@ pub fn check_branch_name(name: &str) -> Result<(), String> {
     if name.len() > 255 {
         return Err("longer than 255 bytes".into());
     }
-    if name == "@" {
-        return Err("is \"@\"".into());
-    }
     if name.starts_with('-') {
         return Err("starts with '-'".into());
-    }
-    if name.starts_with("refs/") {
-        return Err("starts with \"refs/\"".into());
     }
     if name.starts_with('/') {
         return Err("starts with '/'".into());
@@ -79,6 +73,13 @@ mod tests {
             "ünïcode",
             "a/b.lockfile",
             "v1.0",
+            // `check-ref-format --branch` always validates `refs/heads/<name>`,
+            // so a name that already looks fully qualified is just another
+            // slash-separated ref component, not a special case; and a bare
+            // "@" is only the reserved alias for HEAD when it is the *whole*
+            // refname, which `refs/heads/@` never is.
+            "refs/heads/main",
+            "@",
         ] {
             assert_eq!(check_branch_name(ok), Ok(()), "{ok:?}");
         }
@@ -90,14 +91,12 @@ mod tests {
             ("", "empty"),
             ("-x", "starts with '-'"),
             ("--force", "starts with '-'"),
-            ("refs/heads/main", "starts with \"refs/\""),
             ("/main", "starts with '/'"),
             ("main/", "ends with '/'"),
             ("main.", "ends with '.'"),
             ("a//b", "contains \"//\""),
             ("a..b", "contains \"..\""),
             ("a@{1}", "contains \"@{\""),
-            ("@", "is \"@\""),
             ("a b", "contains a space"),
             ("a\tb", "contains a control character"),
             ("a\x7fb", "contains a control character"),

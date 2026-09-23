@@ -33,9 +33,10 @@ credentials, hook input, or sandbox rules.
   (`scripts/verify-matrix.sh`); needs `MATRIX_HOMESERVER`, `MATRIX_USER_ID`,
   `MATRIX_PASSWORD` and `MATRIX_INVITE`. Not part of any CI tier.
 - `verify-questions` — Spec J's manual check (`scripts/verify-questions.sh`):
-  the real pinned `claude` in tmux, answered with the key plans the matrix
-  plugin's `question.rs` produces, the recorded answers read back from the
-  `PostToolUse` hook. Needs a logged-in `claude`. Not part of any CI tier.
+  the real pinned `claude` in tmux, answered with the key plans common's
+  `question.rs` (`plugins/common`) produces, the recorded answers read
+  back from the `PostToolUse` hook. Needs a logged-in `claude`. Not part
+  of any CI tier.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 - `vendor-xterm` is a script, not a task: `scripts/vendor-xterm.sh` re-fetches
   and verifies the web plugin's assets against
@@ -97,7 +98,7 @@ credentials, hook input, or sandbox rules.
   `balerix-runtime/src/toolchain.rs`; bumping `claude` or `gh` in `mise.toml`
   changes what agents get.
 - The matrix plugin answers `AskUserQuestion` by counting rows and pressing
-  Down and Enter (`plugins/matrix/src/question.rs::plan`). That encodes
+  Down and Enter (`plugins/common/src/question.rs::plan`). That encodes
   Claude Code's dialog layout, which no API promises. The property test
   there proves `plan` against a *model* of the dialog; only
   `mise run verify-questions` proves the model. Bump `claude` in `mise.toml`
@@ -364,12 +365,12 @@ credentials, hook input, or sandbox rules.
   of truth (mirrored to the daemon's KV) and `.routes` is derived from it
   and rebuilt at startup (`Maps::load`), never persisted itself — don't add
   a second place that writes routes.
-- The actor's inbound `Queue` (`plugins/matrix/src/actor.rs`)
-  is bounded and drops its *oldest* entry rather than blocking its
-  producer: `observe` is a daemon-to-plugin HTTP call and must return, so a
-  slow or wedged homeserver can never stall hook delivery to Claude. It can
-  silently lose old, stale commands under sustained overload instead —
-  that's the intended trade.
+- The actor's inbound `Queue` (`plugins/common/src/queue.rs`, used by
+  `plugins/matrix/src/actor.rs`) is bounded and drops its *oldest* entry
+  rather than blocking its producer: `observe` is a daemon-to-plugin HTTP
+  call and must return, so a slow or wedged homeserver can never stall
+  hook delivery to Claude. It can silently lose old, stale commands under
+  sustained overload instead — that's the intended trade.
 - `matrix::fake::FakePort` (always compiled, like the SDK's `FakeHost`) is
   what makes the actor's ordering rules — thread creation before the first
   event, refusing a room-level reply, refusing a reply after `SessionEnd`

@@ -120,7 +120,7 @@ Nothing releases until all of this is done.
    `RELEASE_APP_PRIVATE_KEY`, both in environment `release-bot`.
 2. **Environments** `release-bot` and `release`, each with deployment
    branches limited to `main`.
-3. **Branch protection** on `main`: require `check`, `plugins` (all three
+3. **Branch protection** on `main`: require `check`, `plugins` (all four
    legs) and `conventional` (pr-title) to pass, and require branches to be
    up to date before merging.
 4. **Merge settings:** allow squash merging only, with *Default commit

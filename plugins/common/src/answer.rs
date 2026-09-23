@@ -29,8 +29,8 @@ pub enum Reaction {
 /// never send what the operator cannot see, never enter `Confirming` on a
 /// reading nobody was shown. Otherwise send `send` if any; on success
 /// commit `stage` (with the echo id filled in by `Stage::with_echo` when
-/// `post` was posted), react `react` and count `outcome`; on failure post
-/// the daemon's error, commit `Stage::Open`, react `Failed`.
+/// `gates_on_post()` is true), react `react` and count `outcome`; on
+/// failure post the daemon's error, commit `Stage::Open`, react `Failed`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
     /// The message to post to the thread, if any.

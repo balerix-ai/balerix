@@ -10,8 +10,10 @@ use serde_json::Value;
 
 use crate::question::{self, Question, Selection};
 
+/// KV key prefix an open question is mirrored under (Spec J §7.1).
 pub const QUESTION_PREFIX: &str = "question/";
 
+/// The KV key an agent's open question is mirrored under.
 pub fn question_key(agent: &str) -> String {
     format!("{QUESTION_PREFIX}{agent}")
 }
@@ -20,22 +22,44 @@ pub fn question_key(agent: &str) -> String {
 /// own echo message, kept for the ✅ that follows `PostToolUse`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
+    /// Shown and waiting for a reply; nothing echoed or sent yet.
     Open,
     /// An inexact match was echoed; waiting for `yes`.
     Confirming {
+        /// The reading the echo showed, sent as-is on `yes`.
         selections: Vec<Selection>,
+        /// The echo message's id, once it is known.
         echo: Option<String>,
     },
     /// Keys were sent. `selections` is `None` for a `skip`.
     Sent {
+        /// What the keys answered, compared with the recorded answers at
+        /// `PostToolUse`; `None` for a `skip`.
         selections: Option<Vec<Selection>>,
+        /// The echo message's id, where the ✅ goes once the answer is
+        /// confirmed.
         echo: Option<String>,
     },
 }
 
+impl Stage {
+    /// The same stage carrying the echo message's id, once it is known.
+    /// `Open` has no echo and is returned unchanged.
+    pub fn with_echo(self, echo: Option<String>) -> Stage {
+        match self {
+            Stage::Open => Stage::Open,
+            Stage::Confirming { selections, .. } => Stage::Confirming { selections, echo },
+            Stage::Sent { selections, .. } => Stage::Sent { selections, echo },
+        }
+    }
+}
+
+/// One agent's open question, held in memory and mirrored to KV.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenQuestion {
+    /// Parsed from the tool call that opened it.
     pub questions: Vec<Question>,
+    /// Where it stands: open, being confirmed or answered.
     pub stage: Stage,
     /// Whether the question message reached the room. Only a message the
     /// operator can see may stand in for the `permission_prompt` that
@@ -45,6 +69,7 @@ pub struct OpenQuestion {
     pub notified: bool,
 }
 
+/// Every agent's open question, keyed by agent (Spec J §7.1).
 #[derive(Debug, Default)]
 pub struct Questions {
     open: HashMap<String, OpenQuestion>,
@@ -77,20 +102,23 @@ impl Questions {
                         },
                     );
                 }
-                None => tracing::warn!("matrix: bad question record {key}"),
+                None => tracing::warn!("bad question record {key}"),
             }
         }
         Ok(questions)
     }
 
+    /// The agent's open question, if it has one.
     pub fn get(&self, agent: &str) -> Option<&OpenQuestion> {
         self.open.get(agent)
     }
 
+    /// Whether the agent has a question open.
     pub fn is_open(&self, agent: &str) -> bool {
         self.open.contains_key(agent)
     }
 
+    /// Updates the agent's open question's stage; a no-op if it has none.
     pub fn set_stage(&mut self, agent: &str, stage: Stage) {
         if let Some(open) = self.open.get_mut(agent) {
             open.stage = stage;
@@ -141,7 +169,7 @@ impl Questions {
         );
         let bytes = tool_input.to_string().into_bytes();
         if let Err(e) = host.kv_put(&question_key(agent), &bytes, false).await {
-            tracing::warn!("matrix: mirroring the question for {agent}: {e}");
+            tracing::warn!("mirroring the question for {agent}: {e}");
         }
     }
 
@@ -149,7 +177,7 @@ impl Questions {
     pub async fn clear(&mut self, host: &Host, agent: &str) -> Option<OpenQuestion> {
         let was = self.open.remove(agent)?;
         if let Err(e) = host.kv_delete(&question_key(agent)).await {
-            tracing::warn!("matrix: clearing the question for {agent}: {e}");
+            tracing::warn!("clearing the question for {agent}: {e}");
         }
         Some(was)
     }

@@ -8,11 +8,30 @@ Design: `docs/superpowers/specs/2026-09-11-release-pipeline-design.md`
 | Unit | Tag | Ships |
 |---|---|---|
 | core | `balerix-v<ver>` | `balerix` binaries, `ghcr.io/balerix-ai/balerix`, `balerix-api` and `balerix-plugin-sdk` on crates.io |
+| common | `balerix-plugin-common-v<ver>` | `balerix-plugin-common` on crates.io |
 | flow | `balerix-plugin-flow-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-flow`, release package |
 | web | `balerix-plugin-web-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-web`, release package |
 | matrix | `balerix-plugin-matrix-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-matrix`, release package |
 
 Binaries are static musl builds for Linux x86_64 and aarch64.
+
+A library unit ships crates only: no binary, image or package. `common`
+names the SDK and API by version, and crates.io builds it against exactly
+those versions. So `prepare.sh` proposes nothing for it (it answers
+`status=none` and says why, naming the core release) until the core
+release that published that version is tagged, and again whenever
+`crates/balerix-api` or `crates/balerix-plugin-sdk` has changed since that
+tag; a core release moves those versions in `plugins/common/Cargo.toml`.
+While refused, an open common release PR is closed like any unit with
+nothing to release, and opened again on the first push to `main` after
+core's tag exists.
+
+**Common's first release waits for the next core release.** Its manifest
+names SDK and API 0.1.0, but its code needs SDK and API changes made
+after `balerix-v0.1.0`; publishing it against 0.1.0 would fail. The
+refusal above keeps the bot from proposing it; if a bot-opened common
+release PR is open anyway, do not merge it before the core release that
+moves those versions has landed (its tag exists).
 
 ## Cutting a release
 
@@ -113,7 +132,7 @@ Nothing releases until all of this is done.
    `RELEASE_APP_PRIVATE_KEY`, both in environment `release-bot`.
 2. **Environments** `release-bot` and `release`, each with deployment
    branches limited to `main`.
-3. **Branch protection** on `main`: require `check`, `plugins` (all three
+3. **Branch protection** on `main`: require `check`, `plugins` (all four
    legs) and `conventional` (pr-title) to pass, and require branches to be
    up to date before merging.
 4. **Merge settings:** allow squash merging only, with *Default commit
@@ -121,13 +140,17 @@ Nothing releases until all of this is done.
 5. **Fork rehearsal:** on a fork, do steps 1–4, merge one plugin's release
    PR and watch `release.yml` publish, sign, verify and promote. Crates are
    never published from a fork.
-6. **First releases**, in order: flow, then web, then matrix.
+6. **First releases**, in order: flow, then web, then matrix, then common
+   (after the next core release, not `balerix-v0.1.0`; see above).
 7. **crates.io bootstrap** before merging core's first release PR: from that
    PR's head commit, `mise x -- cargo publish --locked -p balerix-api -p
    balerix-plugin-sdk` with a personal API token; then on crates.io add a
    trusted publisher for each crate: repository `balerix-ai/balerix`,
    workflow `release.yml`, environment `release`. Revoke the token. Merge the
-   PR; `publish-crates` will skip the versions that already exist.
+   PR; `publish-crates` will skip the versions that already exist. And, once
+   core's crates are published, from common's first release PR head: `mise
+   x -- cargo publish --locked --manifest-path plugins/common/Cargo.toml`,
+   plus its trusted publisher.
 8. **ghcr visibility:** after each image's first push, set its package to
    public (ghcr creates packages private).
 

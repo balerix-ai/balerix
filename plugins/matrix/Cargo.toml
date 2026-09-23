@@ -22,6 +22,7 @@ path = "src/main.rs"
 [dependencies]
 balerix-api = { path = "../../crates/balerix-api" }
 balerix-plugin-sdk = { path = "../../crates/balerix-plugin-sdk" }
+balerix-plugin-common = { path = "../common" }
 # The Matrix client (Spec G-9). Default features carry `e2e-encryption`
 # (the crew rooms are encrypted), `sqlite` (the state and crypto store the
 # plugin keeps under its scratch dir) and `automatic-room-key-forwarding`;

@@ -23,6 +23,8 @@ target="$dir/target"
 # the release scripts (Spec I §3); a hand edit to either one fails here.
 version_check() {
   local cargo_version manifest_version
+  # A library project (plugins/common) ships no package; nothing to compare.
+  [[ -f $dir/package/balerix-plugin.yaml ]] || return 0
   cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$dir/Cargo.toml" | head -n 1)
   manifest_version=$(sed -n 's/^version: //p' "$dir/package/balerix-plugin.yaml")
   if [[ $cargo_version != "$manifest_version" ]]; then

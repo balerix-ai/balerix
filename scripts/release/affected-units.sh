@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Which release units a change can break the image of, for images.yml's
-# pull-request tier (Spec I §6.5): a unit whose include paths (lib.sh
-# `unit_paths`) hold a changed file, and every unit when the change touches
-# what all the images are built from — the Dockerfiles, the tool pins, the
-# scan configuration, these scripts, the actions and the workflow itself.
-# Without a range (the nightly, a dispatch) every unit.
+# Which image-bearing release units a change can break the image of, for
+# images.yml's pull-request tier (Spec I §6.5): a unit whose include paths
+# (lib.sh `unit_paths`) hold a changed file, and every unit when the change
+# touches what all the images are built from — the Dockerfiles, the tool
+# pins, the scan configuration, these scripts, the actions and the workflow
+# itself. Without a range (the nightly, a dispatch) every unit.
 #
 # usage: affected-units.sh [<base> <head>]
-# Prints a GitHub step output: units= (JSON array, in UNITS order).
+# Prints a GitHub step output: units= (JSON array, in IMAGE_UNITS order).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 # shellcheck source=scripts/release/lib.sh
@@ -16,7 +16,7 @@ source scripts/release/lib.sh
 [[ $# -eq 0 || $# -eq 2 ]] || die "usage: $0 [<base> <head>]"
 
 if (($# == 0)); then
-  echo "units=$(json_list "${UNITS[@]}")"
+  echo "units=$(json_list "${IMAGE_UNITS[@]}")"
   exit 0
 fi
 
@@ -57,7 +57,7 @@ first_match() {
 mapfile -t changed < <(git diff --name-only "$1" "$2")
 
 affected=()
-for unit in "${UNITS[@]}"; do
+for unit in "${IMAGE_UNITS[@]}"; do
   while IFS= read -r pattern; do
     if hit=$(first_match "$pattern"); then
       echo "$unit: $hit" >&2

@@ -2,72 +2,15 @@
 //! nothing here talks to Matrix. Starting the actor is a `Launcher`, so
 //! this file is testable without a Matrix client.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use balerix_api::{AgentStatus, FleetRecord, HookEvent};
+use balerix_api::HookEvent;
 use balerix_plugin_sdk::{Metrics, Plugin};
 use serde_json::Value;
 
 use crate::actor::{Command, Health, Queue};
 use crate::config::{DaemonConfig, parse_agent, parse_daemon};
-use crate::render::PhaseChange;
-
-/// The phase changes between two `fleets/watch` frames (Spec G §8's phase
-/// feed). The watch yields a full snapshot each time, not a delta
-/// (`FleetWatch::next` docs), so a phase *change* has to be derived here,
-/// by diffing the new snapshot against the previous one, keyed by each
-/// agent's full id (`fleet/crew/agent`, as `FleetStatus::agents` keys it).
-///
-/// `previous` is `None` on the very first frame: that frame is the
-/// fleet's current state, not a change, and diffing it against nothing
-/// would post a phase message for every agent in the fleet at every
-/// plugin start. So the first frame yields no changes — the caller is
-/// expected to keep it only as next call's `previous`.
-///
-/// An agent that just appeared has no prior phase to report a change
-/// from, and one that disappeared has no new phase to report a change
-/// to; neither yields a row — only an agent present in both snapshots
-/// with a phase that differs does.
-pub fn phase_changes(
-    previous: Option<&[FleetRecord]>,
-    current: &[FleetRecord],
-) -> Vec<PhaseChange> {
-    let Some(previous) = previous else {
-        return Vec::new();
-    };
-    let before = flatten(previous);
-    flatten(current)
-        .into_iter()
-        .filter_map(|(agent, status)| {
-            let prior = before.get(&agent)?;
-            if prior.phase == status.phase {
-                return None;
-            }
-            Some(PhaseChange {
-                agent,
-                from: prior.phase,
-                to: status.phase,
-                message: status.message,
-            })
-        })
-        .collect()
-}
-
-/// Every agent across every fleet in one `fleets/watch` frame, keyed by
-/// its full id.
-fn flatten(fleets: &[FleetRecord]) -> BTreeMap<String, AgentStatus> {
-    fleets
-        .iter()
-        .flat_map(|f| {
-            f.status
-                .agents
-                .iter()
-                .map(|(id, s)| (id.clone(), s.clone()))
-        })
-        .collect()
-}
 
 /// Proves the credentials and starts the actor and the inbound pump.
 /// `Err(message)` fails `configure`, so `serve` returns and the process
@@ -294,72 +237,5 @@ mod tests {
             h.metrics().await.contains("balerix_plugin_matrix_"),
             "the registry is served"
         );
-    }
-
-    mod phase_changes_tests {
-        use super::*;
-        use balerix_api::{AgentPhase, FleetSpec};
-
-        /// One `fleets/watch` frame: a single fleet carrying exactly the
-        /// agents given, each at its phase and status message.
-        fn fleet(agents: &[(&str, AgentPhase, &str)]) -> Vec<FleetRecord> {
-            let mut record = FleetRecord::new(FleetSpec {
-                name: "f".into(),
-                ..Default::default()
-            });
-            for (id, phase, message) in agents {
-                record.status.agents.insert(
-                    (*id).to_string(),
-                    AgentStatus {
-                        phase: *phase,
-                        message: (*message).to_string(),
-                        ..Default::default()
-                    },
-                );
-            }
-            vec![record]
-        }
-
-        #[test]
-        fn the_first_frame_seeds_silently_and_reports_nothing() {
-            let current = fleet(&[("f/c/alice", AgentPhase::Ready, "")]);
-            assert_eq!(phase_changes(None, &current), Vec::new());
-        }
-
-        #[test]
-        fn an_agent_that_changed_phase_is_reported() {
-            let previous = fleet(&[("f/c/alice", AgentPhase::Starting, "")]);
-            let current = fleet(&[("f/c/alice", AgentPhase::Ready, "agent ready")]);
-            assert_eq!(
-                phase_changes(Some(&previous), &current),
-                vec![PhaseChange {
-                    agent: "f/c/alice".into(),
-                    from: AgentPhase::Starting,
-                    to: AgentPhase::Ready,
-                    message: "agent ready".into(),
-                }]
-            );
-        }
-
-        #[test]
-        fn an_agent_whose_phase_held_is_not_reported() {
-            let previous = fleet(&[("f/c/alice", AgentPhase::Ready, "")]);
-            let current = fleet(&[("f/c/alice", AgentPhase::Ready, "")]);
-            assert_eq!(phase_changes(Some(&previous), &current), Vec::new());
-        }
-
-        #[test]
-        fn an_agent_that_appeared_has_no_prior_phase_and_is_not_reported() {
-            let previous = fleet(&[]);
-            let current = fleet(&[("f/c/alice", AgentPhase::Pending, "")]);
-            assert_eq!(phase_changes(Some(&previous), &current), Vec::new());
-        }
-
-        #[test]
-        fn an_agent_that_disappeared_has_no_new_phase_and_is_not_reported() {
-            let previous = fleet(&[("f/c/alice", AgentPhase::Ready, "")]);
-            let current = fleet(&[]);
-            assert_eq!(phase_changes(Some(&previous), &current), Vec::new());
-        }
     }
 }

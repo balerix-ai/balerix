@@ -11,8 +11,9 @@ credentials, hook input, or sandbox rules.
   git/mise/nono/tmux, with `BALERIX_REQUIRE_TOOLS=1` so a missing tool fails
   instead of skipping.
 - `plugin <name>` — lint and test one standalone plugin project
-  (`mise run plugin matrix`). `plugins` does all three. Neither is part of
-  `check`; CI runs them as their own concurrent jobs.
+  (`mise run plugin matrix`). `plugins` does all four (common is the shared
+  library, Spec K). Neither is part of `check`; CI runs them as their own
+  concurrent jobs.
 - `mutants` — nightly tier: mutation-tests `balerix-core` (the reconciler).
 - `e2e` — the Phase 3 journey against a real daemon; needs the same tools as `test-it`.
 - `package-plugins [names…]` — builds the named in-tree plugins inside
@@ -32,18 +33,19 @@ credentials, hook input, or sandbox rules.
   (`scripts/verify-matrix.sh`); needs `MATRIX_HOMESERVER`, `MATRIX_USER_ID`,
   `MATRIX_PASSWORD` and `MATRIX_INVITE`. Not part of any CI tier.
 - `verify-questions` — Spec J's manual check (`scripts/verify-questions.sh`):
-  the real pinned `claude` in tmux, answered with the key plans the matrix
-  plugin's `question.rs` produces, the recorded answers read back from the
-  `PostToolUse` hook. Needs a logged-in `claude`. Not part of any CI tier.
+  the real pinned `claude` in tmux, answered with the key plans common's
+  `question.rs` (`plugins/common`) produces, the recorded answers read
+  back from the `PostToolUse` hook. Needs a logged-in `claude`. Not part
+  of any CI tier.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 - `vendor-xterm` is a script, not a task: `scripts/vendor-xterm.sh` re-fetches
   and verifies the web plugin's assets against
   `plugins/web/assets/VENDOR.md` (installing them only when
   every digest matches); `--check` verifies the committed files offline.
 - `release-prepare <unit> [version]` — what `release-pr.yml` runs: works
-  out one release unit's next version (core, flow, web, matrix) and writes
-  it into the manifests, lockfiles, plugin manifest and changelog. Commits
-  nothing. `docs/RELEASING.md` is the release process.
+  out one release unit's next version (core, common, flow, web, matrix) and
+  writes it into the manifests, lockfiles, plugin manifest and changelog.
+  Commits nothing. `docs/RELEASING.md` is the release process.
 - `release-test` — scenario tests for `scripts/release/` against throwaway
   clones under `target/tmp`; CI runs it when the scripts change.
 
@@ -96,7 +98,7 @@ credentials, hook input, or sandbox rules.
   `balerix-runtime/src/toolchain.rs`; bumping `claude` or `gh` in `mise.toml`
   changes what agents get.
 - The matrix plugin answers `AskUserQuestion` by counting rows and pressing
-  Down and Enter (`plugins/matrix/src/question.rs::plan`). That encodes
+  Down and Enter (`plugins/common/src/question.rs::plan`). That encodes
   Claude Code's dialog layout, which no API promises. The property test
   there proves `plan` against a *model* of the dialog; only
   `mise run verify-questions` proves the model. Bump `claude` in `mise.toml`
@@ -363,12 +365,12 @@ credentials, hook input, or sandbox rules.
   of truth (mirrored to the daemon's KV) and `.routes` is derived from it
   and rebuilt at startup (`Maps::load`), never persisted itself — don't add
   a second place that writes routes.
-- The actor's inbound `Queue` (`plugins/matrix/src/actor.rs`)
-  is bounded and drops its *oldest* entry rather than blocking its
-  producer: `observe` is a daemon-to-plugin HTTP call and must return, so a
-  slow or wedged homeserver can never stall hook delivery to Claude. It can
-  silently lose old, stale commands under sustained overload instead —
-  that's the intended trade.
+- The actor's inbound `Queue` (`plugins/common/src/queue.rs`, used by
+  `plugins/matrix/src/actor.rs`) is bounded and drops its *oldest* entry
+  rather than blocking its producer: `observe` is a daemon-to-plugin HTTP
+  call and must return, so a slow or wedged homeserver can never stall
+  hook delivery to Claude. It can silently lose old, stale commands under
+  sustained overload instead — that's the intended trade.
 - `matrix::fake::FakePort` (always compiled, like the SDK's `FakeHost`) is
   what makes the actor's ordering rules — thread creation before the first
   event, refusing a room-level reply, refusing a reply after `SessionEnd`
@@ -392,6 +394,13 @@ credentials, hook input, or sandbox rules.
   tag exists too, the version was changed outside a release PR:
   `prepare.sh` dies naming it; recover by reverting the edit or, for a
   release version above the last one, forcing it.
+- `plugins/common` is published to crates.io, so its `balerix-api` and
+  `balerix-plugin-sdk` dependencies carry a version beside their path.
+  `release-prepare core` moves them; `release-prepare common` answers
+  `status=none` (the reason on stderr) until that core version is tagged,
+  and while `crates/balerix-api` or `crates/balerix-plugin-sdk` has changed
+  since that tag. In-tree plugins depend on common by
+  path only (they are `publish = false`).
 - Released `CHANGELOG.md` sections are read back by
   `scripts/release/notes.sh` for the GitHub Release; don't edit them by
   hand.

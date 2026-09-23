@@ -3,42 +3,24 @@
 //! any file-backed secret (§5.1), so a password is a plain value here.
 
 use std::collections::BTreeMap;
-use std::fmt;
 
-use balerix_api::{DEFAULT_KEY_DELAY_MS, HOOK_EVENTS, MAX_KEY_DELAY_MS, MIN_KEY_DELAY_MS};
-use serde::{Deserialize, Serialize};
+use balerix_api::DEFAULT_KEY_DELAY_MS;
+pub use balerix_plugin_common::config::{
+    ConfigError, DEFAULT_EVENTS, EventFilter, LIFECYCLE, Secret, deserialize, validate_key_delay,
+};
+use serde::Deserialize;
 use serde_json::Value;
-
-/// The curated default event set (Spec G §4.2).
-pub const DEFAULT_EVENTS: [&str; 4] = ["SessionStart", "Notification", "Stop", "SessionEnd"];
-/// Always posted: these open and close the thread, so `events` cannot
-/// suppress them.
-pub const LIFECYCLE: [&str; 2] = ["SessionStart", "SessionEnd"];
 
 /// How many messages one body may be split across before the remainder
 /// is dropped (Spec G §8). Ten 4000-character parts is far past any real
 /// assistant turn, and keeps a runaway output from flooding the room.
 pub const DEFAULT_MAX_PARTS: usize = 10;
 
-/// A credential. Hand-written `Debug` printing `<redacted>`, per AGENTS.md.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Secret(String);
-
-impl Secret {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("<redacted>")
-    }
-}
+/// One message holds this much (Spec G §8): comfortably under the 64 KiB
+/// event limit a homeserver enforces, and the limit OpenClaw defaults to.
+/// A longer body is split across messages by `split`, never cut — the
+/// ceiling is readability on a phone, not the protocol's.
+pub const BODY_LIMIT: usize = 4000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -73,7 +55,7 @@ fn default_device() -> String {
 #[serde(deny_unknown_fields, default)]
 pub struct AgentConfig {
     pub enabled: bool,
-    pub events: Vec<String>,
+    pub events: EventFilter,
     pub phases: bool,
     /// The pause after each key when answering a question (Spec J §7.5).
     #[serde(rename = "keyDelayMs")]
@@ -84,7 +66,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            events: DEFAULT_EVENTS.iter().map(|e| (*e).to_string()).collect(),
+            events: EventFilter::default(),
             phases: true,
             key_delay_ms: DEFAULT_KEY_DELAY_MS,
         }
@@ -95,77 +77,8 @@ impl AgentConfig {
     /// Lifecycle events are always posted; everything else is filtered by
     /// `events` (Spec G §4.2).
     pub fn wants(&self, event: &str) -> bool {
-        LIFECYCLE.contains(&event) || self.events.iter().any(|e| e == event)
+        self.events.wants(event)
     }
-}
-
-/// One line, config path first; an empty path prints the message alone.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub struct ConfigError {
-    pub path: String,
-    pub message: String,
-}
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.path.is_empty() {
-            f.write_str(&self.message)
-        } else {
-            write!(f, "{}: {}", self.path, self.message)
-        }
-    }
-}
-
-/// Serde's message trimmed to its first clause, with its path attached.
-/// A non-map is rejected first: both structs are fully defaulted or have a
-/// `default` on the struct, so serde would otherwise read a bare array as a
-/// sequence of zero fields, exactly as `balerix-plugin-web` documents.
-fn deserialize<T: serde::de::DeserializeOwned>(config: &Value) -> Result<T, ConfigError> {
-    if !config.is_object() {
-        let kind = match config {
-            Value::Null => "null",
-            Value::Bool(_) => "boolean",
-            Value::Number(_) => "number",
-            Value::String(_) => "string",
-            Value::Array(_) => "array",
-            Value::Object(_) => "object",
-        };
-        return Err(ConfigError {
-            path: String::new(),
-            message: format!("invalid type: {kind}, expected a map"),
-        });
-    }
-    serde_path_to_error::deserialize(config.clone()).map_err(|e| {
-        let path = match e.path().to_string() {
-            p if p == "." => String::new(),
-            p => p,
-        };
-        let inner = e.into_inner().to_string();
-        let message = inner
-            .split(", expected one of")
-            .next()
-            .unwrap_or(&inner)
-            .split(", expected `")
-            .next()
-            .unwrap_or(&inner)
-            .to_string();
-        // `serde_path_to_error` only records a path for a field it visits; a
-        // required field that is simply absent is detected after the map is
-        // done, so the path comes back empty. Serde's own message still
-        // names the field (`missing field `homeserver``), so pull it out of
-        // the message and use it as the path rather than leave the error
-        // pathless.
-        let path = if path.is_empty() {
-            message
-                .strip_prefix("missing field `")
-                .and_then(|rest| rest.strip_suffix('`'))
-                .map(str::to_string)
-                .unwrap_or(path)
-        } else {
-            path
-        };
-        ConfigError { path, message }
-    })
 }
 
 pub fn parse_daemon(config: &Value) -> Result<DaemonConfig, ConfigError> {
@@ -193,23 +106,8 @@ pub fn parse_daemon(config: &Value) -> Result<DaemonConfig, ConfigError> {
 
 pub fn parse_agent(config: &Value) -> Result<AgentConfig, ConfigError> {
     let c: AgentConfig = deserialize(config)?;
-    for (i, name) in c.events.iter().enumerate() {
-        if !HOOK_EVENTS.contains(&name.as_str()) {
-            return Err(ConfigError {
-                path: format!("events[{i}]"),
-                message: format!("unknown event {name:?}"),
-            });
-        }
-    }
-    if !(MIN_KEY_DELAY_MS..=MAX_KEY_DELAY_MS).contains(&c.key_delay_ms) {
-        return Err(ConfigError {
-            path: "keyDelayMs".into(),
-            message: format!(
-                "expected {MIN_KEY_DELAY_MS} to {MAX_KEY_DELAY_MS} milliseconds, got {}",
-                c.key_delay_ms
-            ),
-        });
-    }
+    c.events.validate()?;
+    validate_key_delay(c.key_delay_ms)?;
     Ok(c)
 }
 
@@ -328,7 +226,7 @@ mod tests {
         let c = parse_agent(&json!({})).unwrap();
         assert!(c.enabled);
         assert!(c.phases);
-        assert_eq!(c.events, DEFAULT_EVENTS.map(String::from).to_vec());
+        assert_eq!(c.events.0, DEFAULT_EVENTS.map(String::from).to_vec());
         assert!(c.wants("Notification"));
         assert!(!c.wants("PreToolUse"));
 

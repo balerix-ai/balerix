@@ -80,6 +80,16 @@ lock_version() {
   awk -v name="name = \"$2\"" '$0 == name { getline; gsub(/^version = "|"$/, ""); print; exit }' "$1"
 }
 
+# The version a `{ version = "…" }` dependency names in <manifest>.
+dep_version_of() {
+  (
+    cd "$1"
+    # shellcheck source=scripts/release/lib.sh
+    source scripts/release/lib.sh
+    dep_version "$2" "$3"
+  )
+}
+
 # Every manifest, lockfile and plugin manifest agrees (Spec I §10).
 assert_consistent() {
   local dir=$1 label=$2 core plugin version
@@ -94,6 +104,8 @@ assert_consistent() {
     expect_eq "$label: $plugin Cargo.lock has the SDK at $core" \
       "$(lock_version "$dir/plugins/$plugin/Cargo.lock" balerix-plugin-sdk)" "$core"
   done
+  expect_eq "$label: common Cargo.lock has the SDK at $core" \
+    "$(lock_version "$dir/plugins/common/Cargo.lock" balerix-plugin-sdk)" "$core"
 }
 
 scenario_initial() {
@@ -420,6 +432,111 @@ scenario_affected() {
     "$(affected_by "$dir" .github/workflows/release-test.yml)" '[]'
   expect_eq "affected: no range is every unit (the nightly)" \
     "$(field units "$(affected "$dir")")" '["core","flow","web","matrix"]'
+  expect_eq "affected: a common change reaches the plugins built on it" \
+    "$(affected_by "$dir" plugins/common/src/release-test.rs)" '["web","matrix"]'
+}
+
+# A library unit releases like a plugin but ships crates, not a binary:
+# prepare.sh on a library that must wait for core, stdout and stderr
+# apart: the status on stdout, the reason on stderr.
+prepare_refused() {
+  local dir=$1 label=$2 out err needle
+  err="$root/${label// /-}.err"
+  # Direct, not through the prepare() helper: that helper always sends
+  # stderr to $log, so a redirect at the call site cannot recapture it.
+  out=$("$dir/scripts/release/prepare.sh" common 2>"$err")
+  cat "$err" >>"$log"
+  expect_eq "$label: status" "$(field status "$out")" none
+  for needle in "${@:3}"; do
+    expect_grep "$label: says why" "$needle" "$err"
+  done
+  expect_eq "$label: working tree untouched" "$(git -C "$dir" status --porcelain)" ""
+}
+
+# common is proposed only once the SDK version its manifest names is
+# tagged, and a core release moves that version.
+scenario_common_ordering() {
+  local dir out sdk
+  dir=$(fixture common)
+  sdk=$(dep_version_of "$dir" plugins/common/Cargo.toml balerix-plugin-sdk)
+  prepare_refused "$dir" "common before core" "no tag balerix-v$sdk yet" "release core $sdk first, then common"
+  release "$dir" core "$sdk"
+  out=$(prepare "$dir" common)
+  expect_eq "common after core: status" "$(field status "$out")" release
+  expect_eq "common after core: tag" "$(field tag "$out")" "balerix-plugin-common-v$(manifest_version "$dir" common)"
+  discard "$dir"
+}
+
+# The SDK tag alone is not enough: common compiles against the core crates
+# at HEAD, so a change to either since that tag waits for the next core
+# release (Spec K §5).
+scenario_common_waits_for_core_changes() {
+  local dir out
+  dir=$(fixture common-core-changes)
+  release "$dir" core 0.4.0
+  release "$dir" common 0.4.0
+  change "$dir" crates/balerix-plugin-sdk/release-test.txt "feat(sdk): a new host call"
+  prepare_refused "$dir" "sdk changed since balerix-v0.4.0" "changed since balerix-v0.4.0; release core first"
+  release "$dir" core 0.5.0
+  out=$(prepare "$dir" common)
+  expect_eq "after core 0.5.0: common status" "$(field status "$out")" release
+  expect_eq "after core 0.5.0: common's manifest names the new SDK" \
+    "$(dep_version_of "$dir" plugins/common/Cargo.toml balerix-plugin-sdk)" 0.5.0
+  discard "$dir"
+}
+
+scenario_core_bump_moves_common() {
+  local dir next
+  dir=$(fixture common-core)
+  release "$dir" core 0.4.0
+  release "$dir" common 0.4.0
+  change "$dir" crates/balerix-server/release-test.txt "feat!: a breaking daemon change"
+  next=$(field version "$(prepare "$dir" core)")
+  expect_eq "core bump: version" "$next" 0.5.0
+  expect_eq "core bump: common's manifest names the new SDK" \
+    "$(dep_version_of "$dir" plugins/common/Cargo.toml balerix-plugin-sdk)" "$next"
+  expect_eq "core bump: common's manifest names the new API" \
+    "$(dep_version_of "$dir" plugins/common/Cargo.toml balerix-api)" "$next"
+  expect_eq "core bump: common's lockfile has the SDK at $next" \
+    "$(lock_version "$dir/plugins/common/Cargo.lock" balerix-plugin-sdk)" "$next"
+}
+
+scenario_common_change_releases_dependents() {
+  local dir unit out version
+  dir=$(fixture common-dependents)
+  release "$dir" core 0.4.0
+  for unit in common flow web matrix; do release "$dir" "$unit" 0.4.0; done
+  change "$dir" plugins/common/src/release-test.rs "fix(common): a shared fix"
+  out=$(prepare "$dir" common)
+  expect_eq "common change: common releases" "$(field status "$out")" release
+  version=$(field version "$out")
+  expect_eq "common change: common's manifest at $version" "$(manifest_version "$dir" common)" "$version"
+  for unit in matrix web; do
+    expect_eq "common change: $unit Cargo.lock has common at $version" \
+      "$(lock_version "$dir/plugins/$unit/Cargo.lock" balerix-plugin-common)" "$version"
+  done
+  discard "$dir"
+  expect_eq "common change: matrix releases" "$(field status "$(prepare "$dir" matrix)")" release
+  discard "$dir"
+  expect_eq "common change: web releases" "$(field status "$(prepare "$dir" web)")" release
+  discard "$dir"
+  expect_eq "common change: flow does not" "$(field status "$(prepare "$dir" flow)")" none
+  expect_eq "common change: core does not" "$(field status "$(prepare "$dir" core)")" none
+}
+
+scenario_plan_crates() {
+  local dir out
+  dir=$(fixture plan-crates)
+  release "$dir" core "$(dep_version_of "$dir" plugins/common/Cargo.toml balerix-plugin-sdk)"
+  prepare "$dir" common >/dev/null
+  gitc "$dir" add -A
+  gitc "$dir" commit -qm "chore(release): common initial"
+  out=$(plan "$dir")
+  expect_eq "plan, merged common PR: units" "$(field units "$out")" '["common"]'
+  expect_eq "plan, merged common PR: plugins" "$(field plugins "$out")" '[]'
+  expect_eq "plan, merged common PR: binaries" "$(field binaries "$out")" '[]'
+  expect_eq "plan, merged common PR: crates" "$(field crates "$out")" '["common"]'
+  expect_eq "plan, merged common PR: core" "$(field core "$out")" false
 }
 
 scenario_initial
@@ -440,6 +557,11 @@ scenario_notes
 scenario_package
 scenario_image_context
 scenario_affected
+scenario_common_ordering
+scenario_common_waits_for_core_changes
+scenario_core_bump_moves_common
+scenario_common_change_releases_dependents
+scenario_plan_crates
 
 if ((failures)); then
   echo "$failures check(s) failed; fixtures and $log kept" >&2

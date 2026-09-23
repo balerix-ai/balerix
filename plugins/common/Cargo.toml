@@ -1,0 +1,48 @@
+# A standalone project, not a workspace member (Spec H, Spec K-6): a
+# plugin's dependency tree stays out of the daemon's feature resolution.
+# Published to crates.io (Spec K-5), so the two core dependencies carry a
+# version beside their path; scripts/release/prepare.sh moves it with the
+# core release.
+[workspace]
+resolver = "3"
+
+[package]
+name = "balerix-plugin-common"
+description = "Shared building blocks for balerix chat plugins: event rendering, the AskUserQuestion answer flow, config helpers, a drop-oldest queue and phase diffing (Spec K)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/balerix-ai/balerix"
+readme = "README.md"
+publish = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+balerix-api = { version = "0.1.0", path = "../../crates/balerix-api" }
+balerix-plugin-sdk = { version = "0.1.0", path = "../../crates/balerix-plugin-sdk" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_path_to_error = "0.1.20"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["sync", "time"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+insta = { version = "1.48.0", features = ["yaml", "json"] }
+# The model-based test of the key plan (Spec J §10) moves here with question.rs.
+proptest = "1.11.0"
+# The tests run on a tokio runtime; the library itself needs only sync and time.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+# A published crate: every pub item documented (Spec K §3).
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"

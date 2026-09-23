@@ -2,25 +2,13 @@
 //! Output is markdown; the adapter turns it into a plain `body` and an
 //! HTML `formatted_body`.
 
-use balerix_api::{AgentPhase, HookEvent};
+use balerix_api::HookEvent;
 use serde_json::Value;
 
 use crate::question::Question;
 
-/// One message holds this much (Spec G §8): comfortably under the 64 KiB
-/// event limit a homeserver enforces, and the limit OpenClaw defaults to.
-/// A longer body is split across messages by `split`, never cut — the
-/// ceiling is readability on a phone, not the protocol's.
-pub const BODY_LIMIT: usize = 4000;
-
 /// One agent's phase transition, from the fleet watch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PhaseChange {
-    pub agent: String,
-    pub from: AgentPhase,
-    pub to: AgentPhase,
-    pub message: String,
-}
+pub use crate::phases::PhaseChange;
 
 /// The first eight characters of a session id: enough to tell two apart
 /// in a room, short enough to read on a phone.
@@ -85,6 +73,8 @@ fn with_message(payload: &Value, heading: &str) -> String {
     }
 }
 
+/// The thread reply for one hook event, by name; an unrecognised event
+/// falls back to its bare name.
 pub fn event_message(event: &HookEvent) -> String {
     let p = &event.payload;
     match event.name.as_str() {
@@ -174,6 +164,7 @@ pub fn question_message(questions: &[Question]) -> String {
     paragraphs.join("\n\n")
 }
 
+/// The thread reply for a `PhaseChange`.
 pub fn phase_message(change: &PhaseChange) -> String {
     let base = format!("phase **{:?}** to **{:?}**", change.from, change.to);
     if change.message.trim().is_empty() {
@@ -185,7 +176,8 @@ pub fn phase_message(change: &PhaseChange) -> String {
 
 /// Room left in every part for its `(n/N)` marker and, inside a code
 /// block, the fence this chunker closes and reopens around the break.
-const PART_OVERHEAD: usize = 64;
+/// A `limit` passed to `split` must exceed it.
+pub const PART_OVERHEAD: usize = 64;
 
 /// An open code fence: its marker (``` or ~~~, however many characters)
 /// and the info string to repeat when reopening it.
@@ -266,16 +258,17 @@ fn chunks(text: &str, budget: usize) -> Vec<String> {
     out
 }
 
-/// `text` as the messages to post, in order. One part when it fits;
-/// otherwise chunks that each fit `BODY_LIMIT`, every part marked
+/// `text` as the messages to post, in order. One part when it fits
+/// `limit`; otherwise chunks that each fit it, every part marked
 /// `(n/N)`. Past `max_parts` the last part says how many were dropped —
-/// the only case that loses text.
-pub fn split(text: &str, max_parts: usize) -> Vec<String> {
-    if text.len() <= BODY_LIMIT {
+/// the only case that loses text. Matrix passes 4000 (a phone's
+/// screen); GitHub passes 65 536 (a comment).
+pub fn split(text: &str, limit: usize, max_parts: usize) -> Vec<String> {
+    if text.len() <= limit {
         return vec![text.to_string()];
     }
     let max_parts = max_parts.max(1);
-    let mut parts = chunks(text, BODY_LIMIT - PART_OVERHEAD);
+    let mut parts = chunks(text, limit.saturating_sub(PART_OVERHEAD).max(1));
     if parts.len() <= 1 {
         return parts;
     }
@@ -299,8 +292,11 @@ pub fn split(text: &str, max_parts: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::question::{self, fixtures};
+    use balerix_api::AgentPhase;
     use balerix_plugin_sdk::testing::event;
     use serde_json::json;
+
+    const BODY_LIMIT: usize = 4000;
 
     #[test]
     fn a_thread_root_names_the_agent_the_session_and_the_source() {
@@ -369,13 +365,16 @@ mod tests {
 
     #[test]
     fn split_returns_one_unchanged_part_when_under_the_limit() {
-        assert_eq!(split("one\ntwo", 10), vec!["one\ntwo".to_string()]);
+        assert_eq!(
+            split("one\ntwo", BODY_LIMIT, 10),
+            vec!["one\ntwo".to_string()]
+        );
     }
 
     #[test]
     fn split_breaks_at_a_line_boundary() {
         let long = "abcd\n".repeat(2000);
-        let parts = split(&long, 10);
+        let parts = split(&long, BODY_LIMIT, 10);
         assert!(parts.len() > 1, "must split");
         for (i, p) in parts.iter().enumerate() {
             assert!(p.len() <= BODY_LIMIT, "part {i} is {} bytes", p.len());
@@ -391,7 +390,7 @@ mod tests {
 
     #[test]
     fn split_marks_each_part_with_its_number() {
-        let parts = split(&"abcd\n".repeat(2000), 10);
+        let parts = split(&"abcd\n".repeat(2000), BODY_LIMIT, 10);
         let n = parts.len();
         assert!(n > 1);
         for (i, p) in parts.iter().enumerate() {
@@ -407,7 +406,7 @@ mod tests {
     #[test]
     fn split_hard_splits_a_single_over_long_line() {
         let long = "x".repeat(BODY_LIMIT * 2);
-        let parts = split(&long, 10);
+        let parts = split(&long, BODY_LIMIT, 10);
         assert!(parts.len() > 1, "must split a line with no breaks");
         for p in &parts {
             assert!(p.len() <= BODY_LIMIT, "part is {} bytes", p.len());
@@ -417,7 +416,7 @@ mod tests {
     #[test]
     fn split_does_not_panic_when_the_limit_lands_inside_a_multi_byte_character() {
         let long = format!("x{}", "é".repeat(BODY_LIMIT));
-        let parts = split(&long, 10);
+        let parts = split(&long, BODY_LIMIT, 10);
         assert!(parts.len() > 1);
         for p in &parts {
             assert!(p.len() <= BODY_LIMIT, "part is {} bytes", p.len());
@@ -428,7 +427,7 @@ mod tests {
     #[test]
     fn split_reopens_a_code_fence_across_parts() {
         let body = format!("```\n{}```\n", "line of code\n".repeat(500));
-        let parts = split(&body, 10);
+        let parts = split(&body, BODY_LIMIT, 10);
         assert!(parts.len() > 1, "must split");
         // Each part must be fence-balanced on its own.
         for (i, p) in parts.iter().enumerate() {
@@ -449,7 +448,7 @@ mod tests {
     #[test]
     fn split_reopens_a_fence_with_its_language_tag() {
         let body = format!("```rust\n{}```\n", "let x = 1;\n".repeat(500));
-        let parts = split(&body, 10);
+        let parts = split(&body, BODY_LIMIT, 10);
         assert!(parts.len() > 1, "must split");
         for p in parts.iter().skip(1) {
             assert!(
@@ -463,7 +462,7 @@ mod tests {
     #[test]
     fn split_caps_at_max_parts_and_says_what_was_dropped() {
         let long = "abcd\n".repeat(20_000);
-        let parts = split(&long, 3);
+        let parts = split(&long, BODY_LIMIT, 3);
         assert_eq!(parts.len(), 3, "capped");
         let last = parts.last().unwrap();
         assert!(

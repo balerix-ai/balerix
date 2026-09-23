@@ -7,12 +7,10 @@ pub mod actor;
 pub mod client;
 pub mod config;
 pub mod matrix;
-pub mod pending;
 pub mod plugin;
-pub mod question;
-pub mod render;
 pub mod routing;
 pub mod session;
 
+pub use balerix_plugin_common::{pending, phases, question, render};
 pub use client::MatrixLauncher;
 pub use plugin::{Launcher, MatrixPlugin};

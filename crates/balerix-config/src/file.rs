@@ -65,20 +65,26 @@ pub fn from_value(value: &Value) -> Result<FleetFile, ConfigError> {
         // path's last segment (`serde_path_to_error` captures it while
         // trying to match it against the struct's fields); the message
         // already names it, so the path we surface is the struct's, one
-        // segment shorter.
+        // segment shorter. This couples to serde's error wording;
+        // `from_value_names_the_offending_key` is the regression guard.
         if message.starts_with("unknown field") {
             path = match path.rfind('.') {
                 Some(i) => path[..i].to_string(),
                 None => String::new(),
             };
         }
-        // A fleet file is always an object at every level of this schema;
-        // a `[0]`-shaped path means the value at that point wasn't the
-        // object/string/etc. we expected, positional access from serde
-        // treating it as a sequence instead, which carries no meaningful
-        // key of its own.
+        // No field in this schema is array-shaped, so a `[N]` segment —
+        // wherever it appears in the path, not only at the start — means
+        // the value there wasn't the object/string/etc. we expected and
+        // serde fell back to positional access instead. Truncate at the
+        // first `[` so the path we surface is the containing struct's
+        // (e.g. `crews.c.git[0]` becomes `crews.c.git`), not a
+        // fabricated index.
+        if let Some(i) = path.find('[') {
+            path.truncate(i);
+        }
         ConfigError::Invalid {
-            path: if path.is_empty() || path == "." || path.starts_with('[') {
+            path: if path.is_empty() || path == "." {
                 "file".to_string()
             } else {
                 path
@@ -279,5 +285,22 @@ crews:
         .unwrap_err()
         .to_string();
         assert!(e.starts_with("crews.c: missing field `repo`"), "{e}");
+        // A `[N]` segment can land mid-path too, not only at the start:
+        // a crew (or one of its nested blocks) given an array instead of
+        // an object.
+        let e = from_value(&json!({
+            "apiVersion": "balerix/v1", "kind": "Fleet",
+            "crews": { "c": [1] }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(e.starts_with("crews.c: "), "{e}");
+        let e = from_value(&json!({
+            "apiVersion": "balerix/v1", "kind": "Fleet",
+            "crews": { "c": { "repo": "o/r", "git": [1] } }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(e.starts_with("crews.c.git: "), "{e}");
     }
 }

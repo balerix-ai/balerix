@@ -73,8 +73,15 @@ fn host_defaults() -> Result<HostDefaults, String> {
 }
 
 impl FleetResolver for HostResolver {
+    /// Reads the host's `settings.json` only: a malformed credential file
+    /// is `CredentialSource::load`'s 500, never a 400 blamed on the file.
     fn resolve(&self, file: &Value, name: &FleetName) -> Result<FleetSpec, String> {
-        resolve_file(file, name, &host_defaults()?)
+        let paths = HostPaths::discover().map_err(|e| e.to_string())?;
+        let defaults = HostDefaults {
+            claude_settings: host::load_settings(&paths).map_err(|e| e.to_string())?,
+            ..HostDefaults::default()
+        };
+        resolve_file(file, name, &defaults)
     }
 }
 

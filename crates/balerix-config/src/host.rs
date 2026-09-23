@@ -57,7 +57,7 @@ pub struct HostDefaults {
 
 /// Reads host defaults from `paths`.
 pub fn load(paths: &HostPaths) -> Result<HostDefaults, ConfigError> {
-    let claude_settings = read_json_if_exists(&paths.claude_dir.join("settings.json"))?;
+    let claude_settings = load_settings(paths)?;
     let claude_credentials = read_json_if_exists(&paths.claude_dir.join(".credentials.json"))?;
     let claude_account = read_json_if_exists(&paths.claude_json)?.map(|v| pick(&v, ACCOUNT_KEYS));
     let gh_token = read_gh_token(&paths.gh_hosts)?;
@@ -69,6 +69,13 @@ pub fn load(paths: &HostPaths) -> Result<HostDefaults, ConfigError> {
             gh_token,
         },
     })
+}
+
+/// The host's Claude `settings.json` alone, the resolver's bottom layer:
+/// what a daemon resolving a plugin's fleet file reads, so that a
+/// malformed credential file is never reported as the file's fault.
+pub fn load_settings(paths: &HostPaths) -> Result<Option<Value>, ConfigError> {
+    read_json_if_exists(&paths.claude_dir.join("settings.json"))
 }
 
 fn read_if_exists(path: &Path) -> Result<Option<String>, ConfigError> {
@@ -236,5 +243,20 @@ mod tests {
         fs::write(p.claude_dir.join("settings.json"), "{not json").unwrap();
         let err = load(&p).unwrap_err().to_string();
         assert!(err.contains("settings.json"), "{err}");
+    }
+
+    /// Spec L (M6): the settings-only read ignores the credential files,
+    /// so a malformed `.credentials.json` fails `load` but not it.
+    #[test]
+    fn load_settings_reads_settings_json_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths_in(tmp.path());
+        assert_eq!(load_settings(&p).unwrap(), None);
+        fs::create_dir_all(&p.claude_dir).unwrap();
+        fs::write(p.claude_dir.join("settings.json"), r#"{"model":"haiku"}"#).unwrap();
+        fs::write(p.claude_dir.join(".credentials.json"), "{not json").unwrap();
+        assert_eq!(load_settings(&p).unwrap(), Some(json!({"model": "haiku"})));
+        let err = load(&p).unwrap_err().to_string();
+        assert!(err.contains(".credentials.json"), "{err}");
     }
 }

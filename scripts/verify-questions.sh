@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # The by-hand check for Spec J: the real pinned `claude`, in tmux, answered
-# with the key plans the matrix plugin's `question.rs` produces, and the
+# with the key plans common's `question.rs` (plugins/common) produces, and the
 # recorded answers read back from the PostToolUse hook.
 #
 # What it settles: that the dialog still behaves as Spec J §2 measured. The
-# property test in plugins/matrix/src/question.rs proves the plans against a
+# property test in plugins/common/src/question.rs proves the plans against a
 # model of the dialog; this proves the model. Run it after bumping `claude`
 # in mise.toml.
 #
@@ -150,6 +150,6 @@ run_case skip "ONE single-select question $COLOR" "skip" declined
 if [ "$fails" -eq 0 ]; then
   say "verify-questions: every dialog shape answered as planned"
 else
-  say "verify-questions: $fails case(s) failed — the dialog no longer matches Spec J §2; fix plugins/matrix/src/question.rs (plan and the test model together)"
+  say "verify-questions: $fails case(s) failed — the dialog no longer matches Spec J §2; fix plugins/common/src/question.rs (plan and the test model together)"
   exit 1
 fi

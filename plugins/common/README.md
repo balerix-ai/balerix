@@ -4,8 +4,9 @@ Shared building blocks for [balerix](https://github.com/balerix-ai/balerix)
 chat plugins: rendering hook events as markdown, splitting long bodies,
 showing and answering Claude's `AskUserQuestion` dialogs, config helpers,
 a drop-oldest command queue, the shared metric families and phase diffing.
-The matrix plugin is built on it; so is the GitHub plugin. This crate pairs
-with the `balerix-plugin-sdk` and `balerix-api` versions its manifest names.
+The matrix plugin is built on it; the GitHub plugin (Spec M) will be. This
+crate pairs with the `balerix-plugin-sdk` and `balerix-api` versions its
+manifest names.
 
 The wire contract a plugin speaks is
 [`docs/plugin-protocol.md`](https://github.com/balerix-ai/balerix/blob/main/docs/plugin-protocol.md).
@@ -126,7 +127,8 @@ fn main() {
 Long bodies: `render::split(text, limit, max_parts)` breaks at line
 boundaries, reopens code fences across parts and marks each part `(n/N)`.
 Reviews: `review::render_message` turns a `review::Review` into the one
-message the web plugin and the GitHub plugin deliver.
+message the web plugin delivers, and the GitHub plugin (Spec M) will
+deliver.
 
 ## Testing your plugin
 

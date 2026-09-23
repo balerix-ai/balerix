@@ -62,6 +62,8 @@ pub enum Matched {
     Answers {
         /// One per question, in question order.
         selections: Vec<Selection>,
+        /// True when every item was a number or a whole label; false when
+        /// any was matched loosely, so the reading needs a `yes` first.
         exact: bool,
     },
     /// The reply declined the dialog.

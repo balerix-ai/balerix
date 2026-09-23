@@ -17,7 +17,9 @@ pub enum Reaction {
     Refused,
     /// The echo or the keys could not be sent.
     Failed,
-    /// A held selection was confirmed and sent.
+    /// The recorded answers matched what was sent: the ✅ an executor
+    /// places on the echo for `Verdict::Confirmed`. `on_reply` never
+    /// produces it (a `yes` reacts `Ack`).
     Confirmed,
 }
 
@@ -181,11 +183,20 @@ pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64) -> Decision
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Recorded answers equal the intended ones: react `Confirmed` on the echo.
-    Confirmed { echo: Option<String> },
+    Confirmed {
+        /// The echo message to react on; `None` when no echo id is known.
+        echo: Option<String>,
+    },
     /// They differ: post this and count `answers_mismatched`.
-    Mismatch { message: String },
+    Mismatch {
+        /// What Claude recorded against what the operator chose.
+        message: String,
+    },
     /// Nobody answered from the channel: post this when the question was shown.
-    AnsweredAtTerminal { message: String },
+    AnsweredAtTerminal {
+        /// What was answered at the terminal.
+        message: String,
+    },
     /// A skip was sent, or nothing to compare.
     Nothing,
 }

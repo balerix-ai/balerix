@@ -22,15 +22,22 @@ pub fn question_key(agent: &str) -> String {
 /// own echo message, kept for the ✅ that follows `PostToolUse`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
+    /// Shown and waiting for a reply; nothing echoed or sent yet.
     Open,
     /// An inexact match was echoed; waiting for `yes`.
     Confirming {
+        /// The reading the echo showed, sent as-is on `yes`.
         selections: Vec<Selection>,
+        /// The echo message's id, once it is known.
         echo: Option<String>,
     },
     /// Keys were sent. `selections` is `None` for a `skip`.
     Sent {
+        /// What the keys answered, compared with the recorded answers at
+        /// `PostToolUse`; `None` for a `skip`.
         selections: Option<Vec<Selection>>,
+        /// The echo message's id, where the ✅ goes once the answer is
+        /// confirmed.
         echo: Option<String>,
     },
 }

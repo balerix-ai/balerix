@@ -157,15 +157,20 @@ fn detached_serve_prints_the_endpoint_logs_to_a_file_and_stops_on_term() {
             .unwrap()
             .success()
     );
+    // The daemon unlinks the endpoint file and then the pid file as two
+    // steps, so poll for both: a loaded runner lands between them.
+    let endpoint = server_dir.join("endpoint");
+    let pid_file = server_dir.join("balerix.pid");
     let start = Instant::now();
-    while server_dir.join("endpoint").exists() {
+    while endpoint.exists() || pid_file.exists() {
         assert!(
             start.elapsed() < Duration::from_secs(10),
-            "endpoint file not removed on SIGTERM"
+            "not removed on SIGTERM: endpoint={} pid={}",
+            endpoint.exists(),
+            pid_file.exists()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(!server_dir.join("balerix.pid").exists());
 }
 
 #[test]

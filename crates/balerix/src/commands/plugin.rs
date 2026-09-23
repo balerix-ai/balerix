@@ -75,6 +75,17 @@ pub fn render_sync(r: &SyncReport) -> String {
     out
 }
 
+/// One line for `plugin remove --purge`'s re-down of a fleet the sync
+/// already downed. A fleet that fails to go down is reported and the
+/// removal continues (spec §5) rather than aborting before
+/// `purge_plugin` runs.
+fn render_purge_result(fleet: &str, result: Result<()>) -> String {
+    match result {
+        Ok(()) => format!("fleet {fleet}: purged\n"),
+        Err(e) => format!("fleet {fleet}: {e} (purge failed)\n"),
+    }
+}
+
 pub fn plugins_file_path() -> Result<PathBuf> {
     Ok(layout_from_env()?.config_root.join("plugins.yaml"))
 }
@@ -243,15 +254,17 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
         // downed them during the sync; a second, forced down with `purge`
         // deletes their records and directories.
         for fleet in &report.downed {
-            client.down(
-                fleet,
-                &DownQuery {
-                    purge: true,
-                    force: true,
-                    ..DownQuery::default()
-                },
-            )?;
-            out.push_str(&format!("fleet {fleet}: purged\n"));
+            let result = client
+                .down(
+                    fleet,
+                    &DownQuery {
+                        purge: true,
+                        force: true,
+                        ..DownQuery::default()
+                    },
+                )
+                .map(|_| ());
+            out.push_str(&render_purge_result(fleet, result));
         }
         client.purge_plugin(&args.name)?;
         return Ok(format!("{out}removed {} and purged its state\n", args.name));
@@ -374,6 +387,22 @@ mod tests {
              fleet gh-acme-api: down\n\
              fleet gh-acme-web: down\n\
              fleet gh-acme-old: fleet task is gone (down failed)\n"
+        );
+    }
+
+    #[test]
+    fn a_failed_purge_reports_and_a_successful_one_reports_too() {
+        // Spec §5: "A fleet that fails to go down is reported and the
+        // removal continues" — `plugin remove --purge`'s re-down loop
+        // must format both outcomes rather than aborting on the first
+        // error (which would skip `purge_plugin` and drop the report).
+        assert_eq!(
+            render_purge_result("gh-acme-api", Ok(())),
+            "fleet gh-acme-api: purged\n"
+        );
+        assert_eq!(
+            render_purge_result("gh-acme-old", Err(anyhow!("fleet task is gone"))),
+            "fleet gh-acme-old: fleet task is gone (purge failed)\n"
         );
     }
 

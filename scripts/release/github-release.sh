@@ -17,15 +17,17 @@ assets=$2
 crate=$(unit_crate "$unit")
 version=$(unit_version "$unit")
 tag=$(unit_tag "$unit" "$version")
-image=$(unit_image "$unit")
+kind=$(unit_kind "$unit")
+image=
+[[ $kind == library ]] || image=$(unit_image "$unit")
 
-[[ -f $assets/SHA256SUMS ]] || die "$unit: no SHA256SUMS in $assets"
+[[ $kind == library || -f $assets/SHA256SUMS ]] || die "$unit: no SHA256SUMS in $assets"
 
 notes=$(mktemp)
 trap 'rm -f "$notes"' EXIT
 scripts/release/notes.sh "$unit" "$version" >"$notes"
 
-if [[ $unit != core ]]; then
+if [[ $kind == plugin ]]; then
   package="$crate-v$version-package.tar.gz"
   [[ -f $assets/$package ]] || die "$unit: no $package in $assets"
   sha=$(sha256sum "$assets/$package" | cut -d' ' -f1)
@@ -44,7 +46,19 @@ plugins:
 EOF
 fi
 
-cat >>"$notes" <<EOF
+if [[ $kind == library ]]; then
+  cat >>"$notes" <<EOF
+
+### Use
+
+\`\`\`sh
+cargo add $crate@$version
+\`\`\`
+EOF
+fi
+
+if [[ $kind != library ]]; then
+  cat >>"$notes" <<EOF
 
 ### Verify
 
@@ -57,6 +71,7 @@ cosign verify $image:$version \\
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 \`\`\`
 EOF
+fi
 
 # Drafts have no tag yet, so they cannot be looked up by tag name.
 gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
@@ -70,10 +85,14 @@ gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
 latest=false
 [[ $unit != core ]] || latest=true
 
+# A library ships no assets: no archives, no SHA256SUMS, no package.
+asset_args=()
+[[ $kind == library ]] || asset_args=("$assets"/*)
+
 gh release create "$tag" --draft \
   --target "$GITHUB_SHA" \
   --title "$crate v$version" \
   --notes-file "$notes" \
-  "$assets"/*
+  "${asset_args[@]}"
 gh release edit "$tag" --draft=false --latest="$latest"
 echo "$unit: published $tag" >&2

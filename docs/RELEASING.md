@@ -8,11 +8,18 @@ Design: `docs/superpowers/specs/2026-09-11-release-pipeline-design.md`
 | Unit | Tag | Ships |
 |---|---|---|
 | core | `balerix-v<ver>` | `balerix` binaries, `ghcr.io/balerix-ai/balerix`, `balerix-api` and `balerix-plugin-sdk` on crates.io |
+| common | `balerix-plugin-common-v<ver>` | `balerix-plugin-common` on crates.io |
 | flow | `balerix-plugin-flow-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-flow`, release package |
 | web | `balerix-plugin-web-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-web`, release package |
 | matrix | `balerix-plugin-matrix-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-matrix`, release package |
 
 Binaries are static musl builds for Linux x86_64 and aarch64.
+
+A library unit ships crates only: no binary, image or package. `common`
+names the SDK and API by version, so its release PR is refused
+(`release-prepare` dies naming the tag) until the core release that
+published that version is tagged; a core release moves those versions in
+`plugins/common/Cargo.toml`.
 
 ## Cutting a release
 
@@ -121,13 +128,17 @@ Nothing releases until all of this is done.
 5. **Fork rehearsal:** on a fork, do steps 1–4, merge one plugin's release
    PR and watch `release.yml` publish, sign, verify and promote. Crates are
    never published from a fork.
-6. **First releases**, in order: flow, then web, then matrix.
+6. **First releases**, in order: flow, then web, then matrix, then common
+   (after core).
 7. **crates.io bootstrap** before merging core's first release PR: from that
    PR's head commit, `mise x -- cargo publish --locked -p balerix-api -p
    balerix-plugin-sdk` with a personal API token; then on crates.io add a
    trusted publisher for each crate: repository `balerix-ai/balerix`,
    workflow `release.yml`, environment `release`. Revoke the token. Merge the
-   PR; `publish-crates` will skip the versions that already exist.
+   PR; `publish-crates` will skip the versions that already exist. And, once
+   core's crates are published, from common's first release PR head: `mise
+   x -- cargo publish --locked --manifest-path plugins/common/Cargo.toml`,
+   plus its trusted publisher.
 8. **ghcr visibility:** after each image's first push, set its package to
    public (ghcr creates packages private).
 

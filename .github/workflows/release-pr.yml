@@ -9,7 +9,7 @@ on:
       unit:
         description: Release unit
         type: choice
-        options: [core, flow, web, matrix]
+        options: [core, common, flow, web, matrix]
         required: true
       version:
         description: Exact version to release; pins the PR until the label is removed
@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        unit: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('["{0}"]', inputs.unit) || '["core","flow","web","matrix"]') }}
+        unit: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('["{0}"]', inputs.unit) || '["core","common","flow","web","matrix"]') }}
     concurrency:
       group: release-pr-${{ matrix.unit }}
       cancel-in-progress: false

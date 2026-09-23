@@ -11,8 +11,9 @@ credentials, hook input, or sandbox rules.
   git/mise/nono/tmux, with `BALERIX_REQUIRE_TOOLS=1` so a missing tool fails
   instead of skipping.
 - `plugin <name>` — lint and test one standalone plugin project
-  (`mise run plugin matrix`). `plugins` does all three. Neither is part of
-  `check`; CI runs them as their own concurrent jobs.
+  (`mise run plugin matrix`). `plugins` does all four (common is the shared
+  library, Spec K). Neither is part of `check`; CI runs them as their own
+  concurrent jobs.
 - `mutants` — nightly tier: mutation-tests `balerix-core` (the reconciler).
 - `e2e` — the Phase 3 journey against a real daemon; needs the same tools as `test-it`.
 - `package-plugins [names…]` — builds the named in-tree plugins inside
@@ -41,9 +42,9 @@ credentials, hook input, or sandbox rules.
   `plugins/web/assets/VENDOR.md` (installing them only when
   every digest matches); `--check` verifies the committed files offline.
 - `release-prepare <unit> [version]` — what `release-pr.yml` runs: works
-  out one release unit's next version (core, flow, web, matrix) and writes
-  it into the manifests, lockfiles, plugin manifest and changelog. Commits
-  nothing. `docs/RELEASING.md` is the release process.
+  out one release unit's next version (core, common, flow, web, matrix) and
+  writes it into the manifests, lockfiles, plugin manifest and changelog.
+  Commits nothing. `docs/RELEASING.md` is the release process.
 - `release-test` — scenario tests for `scripts/release/` against throwaway
   clones under `target/tmp`; CI runs it when the scripts change.
 
@@ -392,6 +393,11 @@ credentials, hook input, or sandbox rules.
   tag exists too, the version was changed outside a release PR:
   `prepare.sh` dies naming it; recover by reverting the edit or, for a
   release version above the last one, forcing it.
+- `plugins/common` is published to crates.io, so its `balerix-api` and
+  `balerix-plugin-sdk` dependencies carry a version beside their path.
+  `release-prepare core` moves them; `release-prepare common` refuses
+  until that core version is tagged. In-tree plugins depend on common by
+  path only (they are `publish = false`).
 - Released `CHANGELOG.md` sections are read back by
   `scripts/release/notes.sh` for the GitHub Release; don't edit them by
   hand.

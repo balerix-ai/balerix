@@ -5,9 +5,15 @@
 # repository root first.
 
 # shellcheck disable=SC2034 # read by the scripts that source this file
-UNITS=(core flow web matrix)
+UNITS=(core common flow web matrix)
 # shellcheck disable=SC2034
 PLUGIN_UNITS=(flow web matrix)
+# Units that ship crates and no binary (Spec K §5).
+# shellcheck disable=SC2034
+LIBRARY_UNITS=(common)
+# Units with a binary, an image and an archive: every unit but the libraries.
+# shellcheck disable=SC2034
+IMAGE_UNITS=(core flow web matrix)
 
 # The arguments as a JSON array of strings: unit names and other bare
 # identifiers, nothing that needs escaping.
@@ -25,8 +31,18 @@ die() {
 
 require_unit() {
   case ${1:-} in
-    core | flow | web | matrix) ;;
+    core | common | flow | web | matrix) ;;
     *) die "unknown release unit: '${1:-}' (expected one of: ${UNITS[*]})" ;;
+  esac
+}
+
+# core, library or plugin.
+unit_kind() {
+  require_unit "$1"
+  case $1 in
+    core) echo core ;;
+    common) echo library ;;
+    *) echo plugin ;;
   esac
 }
 
@@ -58,19 +74,32 @@ unit_changelog() {
 # ghcr repositories must be lowercase; a fork's owner may not be.
 unit_image() {
   require_unit "$1"
+  [[ $(unit_kind "$1") != library ]] || die "$1 is a library and has no image"
   local owner=${GITHUB_REPOSITORY_OWNER:-balerix-ai}
   echo "ghcr.io/${owner,,}/$(unit_crate "$1")"
 }
 
 # The paths whose commits count toward the unit, one per line. The SDK and
-# the api are compiled into every plugin binary, so they count for plugins.
+# the api are compiled into every plugin binary and into common, so they
+# count for all of them; common is compiled into every plugin whose
+# manifest names it, so it counts for those.
 unit_paths() {
   require_unit "$1"
   if [[ $1 == core ]]; then
     printf '%s\n' 'crates/**' Cargo.toml Cargo.lock mise.toml
   else
     printf '%s\n' "plugins/$1/**" 'crates/balerix-api/**' 'crates/balerix-plugin-sdk/**'
+    if [[ $(unit_kind "$1") == plugin ]] && grep -q '^balerix-plugin-common ' "plugins/$1/Cargo.toml"; then
+      printf '%s\n' 'plugins/common/**'
+    fi
   fi
+}
+
+# The version a dependency names in a manifest: the `version = "…"` inside
+# `<crate> = { … }`. Empty when the dependency carries no version.
+dep_version() {
+  local manifest=$1 crate=$2
+  sed -n "s/^$crate = {.*version = \"\([^\"]*\)\".*/\1/p" "$manifest" | head -n 1
 }
 
 # The unit's crate as `cargo metadata` reports it.

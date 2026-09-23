@@ -25,6 +25,17 @@ unit=$1
 forced=${2:-}
 require_unit "$unit"
 
+# A library publishes to crates.io, where its `{ version, path }`
+# dependencies must already exist: refuse until the core release that
+# published that SDK version is tagged (Spec K §5).
+if [[ $(unit_kind "$unit") == library ]]; then
+  sdk=$(dep_version "$(unit_manifest "$unit")" balerix-plugin-sdk)
+  [[ -n $sdk ]] || die "$unit: $(unit_manifest "$unit") names balerix-plugin-sdk without a version"
+  tag_exists "$(unit_tag core "$sdk")" ||
+    die "$unit: its manifest names balerix-plugin-sdk $sdk, which has no tag balerix-v$sdk yet;" \
+      "release core $sdk first, then $unit"
+fi
+
 prefix=$(unit_tag_prefix "$unit")
 changelog=$(unit_changelog "$unit")
 current=$(unit_version "$unit")
@@ -85,6 +96,19 @@ if [[ $next != "$current" ]]; then
   fi
 fi
 if [[ $unit == core ]]; then
+  # A library names the two core crates by version for crates.io; the
+  # version moves with core (Spec K §5). This must run before the plugin
+  # loop below: a plugin whose manifest names common reaches balerix-api
+  # and balerix-plugin-sdk through common's own path dependency, and cargo
+  # refuses to update that plugin's lockfile while common's manifest still
+  # names the old version.
+  for library in "${LIBRARY_UNITS[@]}"; do
+    manifest=$(unit_manifest "$library")
+    for crate in balerix-api balerix-plugin-sdk; do
+      sed -i "s/^\($crate = {.*version = \"\)[^\"]*\(\".*\)$/\1$next\2/" "$manifest"
+    done
+    cargo update --manifest-path "$manifest" -p balerix-api -p balerix-plugin-sdk >&2
+  done
   # Plugins lock the SDK and api versions through their path dependency.
   # Refresh even when $next == $current: a forced version equal to a
   # hand-bumped manifest (§8.2) skips cargo set-version above, but the
@@ -93,7 +117,7 @@ if [[ $unit == core ]]; then
     cargo update --manifest-path "plugins/$plugin/Cargo.toml" -p balerix-api -p balerix-plugin-sdk >&2
   done
 fi
-if [[ $unit != core ]]; then
+if [[ $(unit_kind "$unit") == plugin ]]; then
   sed -i "s/^version: .*/version: $next/" "plugins/$unit/package/balerix-plugin.yaml"
 fi
 

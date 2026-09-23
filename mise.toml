@@ -139,7 +139,7 @@ run = "scripts/verify-matrix.sh"
 [tasks.release-prepare]
 description = "Prepare one release unit's next release in the working tree (what release-pr.yml runs): `mise run release-prepare flow [version]`"
 usage = '''
-arg "<unit>" help="core, flow, web or matrix"
+arg "<unit>" help="core, common, flow, web or matrix"
 arg "[version]" help="an exact version to force"
 '''
 run = 'scripts/release/prepare.sh "$usage_unit" ${usage_version:+"$usage_version"}'

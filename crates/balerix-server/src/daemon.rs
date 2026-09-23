@@ -86,6 +86,42 @@ pub enum DaemonError {
     Unauthorized,
     #[error("{0}")]
     Internal(String),
+    /// The owner rule (Spec L §5): a 409 naming who manages the fleet.
+    #[error("{0}")]
+    Managed(String),
+}
+
+/// Who is applying or downing a fleet (Spec L §5). The admin API and a
+/// plugin with `manage` share `apply_as`/`down_as`; the owner rule reads
+/// the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Caller {
+    /// The admin API. `force` lets `down` take a plugin-managed fleet
+    /// (`balerix down --force`); nothing lets the admin apply one.
+    Admin { force: bool },
+    /// A plugin with `manage`, by name.
+    Plugin(AgentName),
+}
+
+impl Caller {
+    fn owner(&self) -> Option<String> {
+        match self {
+            Caller::Admin { .. } => None,
+            Caller::Plugin(p) => Some(p.to_string()),
+        }
+    }
+}
+
+/// How an apply treats the record it finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyMode {
+    /// `POST /v1/fleets`: 409 unless the fleet is absent or settled `Down`.
+    Create,
+    /// `PUT /v1/fleets/{name}`: 404 when absent.
+    Replace,
+    /// A plugin's `PUT` (Spec L §3.1): create or replace; a settled `Down`
+    /// resumes.
+    Upsert,
 }
 
 impl Daemon {
@@ -299,9 +335,40 @@ impl Daemon {
     }
 
     /// Reconciles the plugin set to `plugins.yaml`; `serve` calls it once
-    /// at start and fails fast on an error, `plugin sync` on demand.
+    /// at start and fails fast on an error, `plugin sync` on demand. A
+    /// plugin the sync stopped cannot down the fleets it owns, and agents
+    /// nobody can talk to are the wrong default (Spec L-6): every such
+    /// fleet still up is downed here, every failure reported, and the
+    /// sync goes on.
     pub async fn sync_plugins(&self) -> Result<SyncReport, PluginError> {
-        let report = self.plugins.sync().await;
+        let mut report = self.plugins.sync().await?;
+        for plugin in &report.stopped {
+            for record in self.plugin_fleets().await {
+                if record.owner.as_deref() != Some(plugin.as_str())
+                    || matches!(record.desired, Desired::Down { .. })
+                {
+                    continue;
+                }
+                let Ok(name) = FleetName::try_from(record.spec.name.clone()) else {
+                    continue;
+                };
+                match self
+                    .down_as(
+                        &name,
+                        Keep::default(),
+                        false,
+                        &Caller::Admin { force: true },
+                    )
+                    .await
+                {
+                    Ok(_) => report.downed.push(name.to_string()),
+                    Err(e) => {
+                        tracing::warn!(fleet = %name, plugin, "downing a removed plugin's fleet failed: {e}");
+                        report.down_failed.push(format!("{name}: {e}"));
+                    }
+                }
+            }
+        }
         // `replace_plugins` drops the activation rows of every plugin the
         // sync removed, and the plugin fleet's own actor snapshot is not
         // forwarded to `changes` — so this registry write ticks like the
@@ -309,10 +376,8 @@ impl Daemon {
         // sync that fails resolving does so before it replaces anything;
         // the failures after `replace_plugins` are the actor being gone,
         // which is shutdown, when no watcher is left to tell.
-        if report.is_ok() {
-            self.bump();
-        }
-        report
+        self.bump();
+        Ok(report)
     }
 
     /// `hello` authenticates with the plugin's token — the hook secret the
@@ -416,22 +481,70 @@ impl Daemon {
         Ok(())
     }
 
-    /// `POST` (`replace == false`): 409 unless the fleet is absent or
-    /// settled `Down`. `PUT` (`replace == true`): 404 when absent. Both
-    /// are answered before any plugin is called, so a refused apply leaves
-    /// no plugin holding a config the fleet never took.
-    ///
-    /// The activation diff's old side is the fleet's `Active` rows only
-    /// (R24): a pair whose row is `Pending` or `Rejected` is offered to the
-    /// plugin again by the next `apply`, even when its config is unchanged
-    /// — a ready plugin gets an `activate` (and a rejection fails the
-    /// apply like any other), a plugin that is not ready leaves it pending.
+    /// Spec L §5: the CLI and a plugin never touch each other's fleets.
+    /// `downing` is the one case an admin may override, with `force`.
+    fn check_owner(
+        name: &FleetName,
+        owner: Option<&str>,
+        caller: &Caller,
+        downing: bool,
+    ) -> Result<(), DaemonError> {
+        match (caller, owner) {
+            (Caller::Admin { force }, Some(p)) if !(downing && *force) => Err(
+                DaemonError::Managed(format!("fleet {name} is managed by plugin {p}")),
+            ),
+            (Caller::Plugin(me), Some(p)) if p != me.as_str() => Err(DaemonError::Managed(
+                format!("fleet {name} is managed by plugin {p}"),
+            )),
+            (Caller::Plugin(_), None) => Err(DaemonError::Managed(format!(
+                "fleet {name} is not managed by a plugin"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// The admin API's apply: `POST` (`replace == false`) or `PUT`.
     pub async fn apply(
         &self,
         name: &FleetName,
         spec: FleetSpec,
         credentials: CredentialBundle,
         replace: bool,
+    ) -> Result<FleetRecord, DaemonError> {
+        let mode = if replace {
+            ApplyMode::Replace
+        } else {
+            ApplyMode::Create
+        };
+        self.apply_as(
+            name,
+            spec,
+            credentials,
+            mode,
+            &Caller::Admin { force: false },
+        )
+        .await
+    }
+
+    /// `Create`: 409 unless the fleet is absent or settled `Down`.
+    /// `Replace`: 404 when absent. `Upsert`: either. Every mode is
+    /// answered before any plugin is called, so a refused apply leaves no
+    /// plugin holding a config the fleet never took; and the owner rule
+    /// (Spec L §5) is answered there too. A record a plugin creates
+    /// carries that plugin as its owner.
+    ///
+    /// The activation diff's old side is the fleet's `Active` rows only
+    /// (R24): a pair whose row is `Pending` or `Rejected` is offered to the
+    /// plugin again by the next `apply`, even when its config is unchanged
+    /// — a ready plugin gets an `activate` (and a rejection fails the
+    /// apply like any other), a plugin that is not ready leaves it pending.
+    pub async fn apply_as(
+        &self,
+        name: &FleetName,
+        spec: FleetSpec,
+        credentials: CredentialBundle,
+        mode: ApplyMode,
+        caller: &Caller,
     ) -> Result<FleetRecord, DaemonError> {
         Self::reject_reserved(name)?;
         if spec.name != name.as_str() {
@@ -473,20 +586,24 @@ impl Daemon {
                 )));
             }
         }
-        // Whether this is a 409 (POST on a live fleet) or a 404 (PUT on an
-        // absent one) is decided *before* any plugin is told anything: a
-        // rejected apply must not leave a plugin holding a config the
-        // fleet never took. The per-fleet lock is held, and it excludes
-        // the only other mutators of this entry, so the write lock below
-        // sees the same answer.
+        // Whether this is a 409 (Create on a live fleet), a 404 (Replace
+        // on an absent one) or the owner's 409 is decided *before* any
+        // plugin is told anything: a rejected apply must not leave a
+        // plugin holding a config the fleet never took. The per-fleet
+        // lock is held, and it excludes the only other mutators of this
+        // entry, so the write lock below sees the same answer.
         {
             let fleets = self.fleets.read().await;
             match fleets.get(name) {
-                Some(h) if !replace && !h.status.borrow().is_down() => {
-                    return Err(DaemonError::Conflict);
+                Some(h) => {
+                    let current = h.status.borrow();
+                    Self::check_owner(name, current.owner.as_deref(), caller, false)?;
+                    if mode == ApplyMode::Create && !current.is_down() {
+                        return Err(DaemonError::Conflict);
+                    }
                 }
-                None if replace => return Err(DaemonError::NotFound),
-                _ => {}
+                None if mode == ApplyMode::Replace => return Err(DaemonError::NotFound),
+                None => {}
             }
         }
         let mut d = activation::diff(&old, &new);
@@ -554,18 +671,18 @@ impl Daemon {
             let mut fleets = self.fleets.write().await;
             match fleets.get(name) {
                 Some(h) => {
-                    if !replace && !h.status.borrow().is_down() {
+                    if mode == ApplyMode::Create && !h.status.borrow().is_down() {
                         return Err(DaemonError::Conflict);
                     }
                     h.clone()
                 }
                 None => {
-                    if replace {
+                    if mode == ApplyMode::Replace {
                         return Err(DaemonError::NotFound);
                     }
                     let h = actor::spawn(
                         name.clone(),
-                        FleetRecord::new(spec.clone()),
+                        FleetRecord::with_owner(spec.clone(), caller.owner()),
                         FleetSecrets::default(),
                         self.ports.clone(),
                         self.shared.clone(),
@@ -613,11 +730,25 @@ impl Daemon {
         Ok(self.overlay(record))
     }
 
+    /// The admin API's down, without `--force`.
     pub async fn down(
         &self,
         name: &FleetName,
         keep: Keep,
         purge: bool,
+    ) -> Result<FleetRecord, DaemonError> {
+        self.down_as(name, keep, purge, &Caller::Admin { force: false })
+            .await
+    }
+
+    /// Owner rule (Spec L §5): a plugin downs only what it owns; the admin
+    /// needs `force` for a managed fleet. The owner survives the down.
+    pub async fn down_as(
+        &self,
+        name: &FleetName,
+        keep: Keep,
+        purge: bool,
+        caller: &Caller,
     ) -> Result<FleetRecord, DaemonError> {
         Self::reject_reserved(name)?;
         let lock = self.fleet_lock(name);
@@ -629,6 +760,7 @@ impl Daemon {
             .get(name)
             .cloned()
             .ok_or(DaemonError::NotFound)?;
+        Self::check_owner(name, handle.status.borrow().owner.as_deref(), caller, true)?;
         let (reply, rx) = oneshot::channel();
         handle
             .tx
@@ -643,6 +775,48 @@ impl Daemon {
         }
         self.bump();
         Ok(self.overlay(record))
+    }
+
+    /// `PUT /v1/plugin-host/fleets/{name}` (Spec L §3.1): a plugin's
+    /// unresolved fleet file becomes a fleet the plugin owns. The name is
+    /// checked first (reserved, and a `name` in the file must equal the
+    /// path's), then the owner (cheaply, so a foreign fleet costs no
+    /// resolve; `apply_as` checks again under the fleet's lock), then the
+    /// file is resolved through the port (400 with the resolver's message,
+    /// config path first), the operator's credentials are read now (500:
+    /// an unreadable host home is the operator's problem, not the
+    /// plugin's), and the spec is applied as an upsert.
+    pub async fn manage_fleet(
+        &self,
+        plugin: &AgentName,
+        name: &FleetName,
+        file: serde_json::Value,
+    ) -> Result<FleetRecord, DaemonError> {
+        Self::reject_reserved(name)?;
+        if let Some(n) = file.get("name").and_then(serde_json::Value::as_str)
+            && n != name.as_str()
+        {
+            return Err(DaemonError::Invalid(format!(
+                "name: {n:?} does not match the fleet {name}"
+            )));
+        }
+        let caller = Caller::Plugin(plugin.clone());
+        if let Some(current) = self.get(name).await {
+            Self::check_owner(name, current.owner.as_deref(), &caller, false)?;
+        }
+        let resolver = self.ports.resolver.clone();
+        let resolve_name = name.clone();
+        let spec = tokio::task::spawn_blocking(move || resolver.resolve(&file, &resolve_name))
+            .await
+            .map_err(|e| DaemonError::Internal(e.to_string()))?
+            .map_err(DaemonError::Invalid)?;
+        let source = self.ports.credentials.clone();
+        let credentials = tokio::task::spawn_blocking(move || source.load())
+            .await
+            .map_err(|e| DaemonError::Internal(e.to_string()))?
+            .map_err(DaemonError::Internal)?;
+        self.apply_as(name, spec, credentials, ApplyMode::Upsert, &caller)
+            .await
     }
 
     pub async fn get(&self, name: &FleetName) -> Option<FleetRecord> {
@@ -993,6 +1167,38 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    async fn wait_down(daemon: &Daemon) {
+        let name: FleetName = "f".parse().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if daemon.get(&name).await.is_some_and(|r| r.is_down()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The Spec L §3.1 path, as the route calls it, for fleet `f`.
+    async fn manage(
+        w: &World,
+        plugin: &str,
+        file: serde_json::Value,
+    ) -> Result<FleetRecord, DaemonError> {
+        let name: FleetName = "f".parse().unwrap();
+        w.daemon
+            .manage_fleet(&plugin.parse().unwrap(), &name, file)
+            .await
+    }
+
+    /// An unresolved fleet file; what the fake resolver answers is set by
+    /// each test, so the crews here are only what the name check reads.
+    fn file() -> serde_json::Value {
+        json!({ "apiVersion": "balerix/v1", "kind": "Fleet", "name": "f", "crews": {} })
     }
 
     /// Polls to a bounded deadline. A bare sleep would be either flaky or
@@ -1700,5 +1906,307 @@ mod tests {
             "hello clears it"
         );
         let _ = &w.dir;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_applies_a_fleet_from_a_file_and_owns_it() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        w.h.resolver.set(Ok(spec(&[("a", &[])])));
+        let rec = manage(&w, "flow", file()).await.unwrap();
+        assert_eq!(rec.owner.as_deref(), Some("flow"));
+        assert_eq!(rec.generation, 1);
+        assert_eq!(rec.spec.name, "f");
+        assert_eq!(w.h.resolver.calls(), vec![("f".to_string(), file())]);
+        assert_eq!(
+            w.h.credentials.calls(),
+            1,
+            "the operator's bundle is read at apply time"
+        );
+        wait_gen(&w.daemon, 1).await;
+        assert!(
+            w.h.materializer.calls().iter().any(|c| c.contains("f/c/a")),
+            "the fleet runs: {:?}",
+            w.h.materializer.calls()
+        );
+
+        // a second apply is an upsert: replaced in place
+        let rec = manage(&w, "flow", file()).await.unwrap();
+        assert_eq!((rec.generation, rec.owner.as_deref()), (2, Some("flow")));
+
+        // the admin routes refuse it, and so does another plugin
+        let managed = DaemonError::Managed("fleet f is managed by plugin flow".into());
+        assert_eq!(
+            w.daemon
+                .apply(&name, spec(&[("a", &[])]), Default::default(), false)
+                .await
+                .unwrap_err(),
+            managed
+        );
+        assert_eq!(
+            w.daemon
+                .apply(&name, spec(&[("a", &[])]), Default::default(), true)
+                .await
+                .unwrap_err(),
+            managed
+        );
+        assert_eq!(
+            w.daemon
+                .down(&name, Keep::default(), false)
+                .await
+                .unwrap_err(),
+            managed
+        );
+        assert_eq!(manage(&w, "web", file()).await.unwrap_err(), managed);
+        let web = Caller::Plugin("web".parse().unwrap());
+        assert_eq!(
+            w.daemon
+                .down_as(&name, Keep::default(), false, &web)
+                .await
+                .unwrap_err(),
+            managed
+        );
+        assert_eq!(
+            w.h.resolver.calls().len(),
+            2,
+            "a foreign plugin's apply is refused before resolving"
+        );
+
+        // the owner downs it; the owner stays; the owner's next apply resumes it
+        let flow = Caller::Plugin("flow".parse().unwrap());
+        let rec = w
+            .daemon
+            .down_as(&name, Keep::default(), false, &flow)
+            .await
+            .unwrap();
+        assert!(matches!(rec.desired, Desired::Down { .. }));
+        assert_eq!(rec.owner.as_deref(), Some("flow"));
+        assert_eq!(w.daemon.list().await[0].managed_by.as_deref(), Some("flow"));
+        wait_down(&w.daemon).await;
+        let rec = manage(&w, "flow", file()).await.unwrap();
+        assert_eq!((rec.generation, rec.desired), (3, Desired::Up));
+        // and the admin can force it down
+        let rec = w
+            .daemon
+            .down_as(
+                &name,
+                Keep::default(),
+                false,
+                &Caller::Admin { force: true },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(rec.desired, Desired::Down { .. }));
+        assert_eq!(
+            rec.owner.as_deref(),
+            Some("flow"),
+            "a forced down keeps the owner"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_cannot_take_a_fleet_the_cli_created() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        w.daemon
+            .apply(&name, spec(&[("a", &[])]), Default::default(), false)
+            .await
+            .unwrap();
+        w.h.resolver.set(Ok(spec(&[("a", &[])])));
+        let not_managed = DaemonError::Managed("fleet f is not managed by a plugin".into());
+        assert_eq!(manage(&w, "flow", file()).await.unwrap_err(), not_managed);
+        let flow = Caller::Plugin("flow".parse().unwrap());
+        assert_eq!(
+            w.daemon
+                .down_as(&name, Keep::default(), false, &flow)
+                .await
+                .unwrap_err(),
+            not_managed
+        );
+        assert!(w.h.resolver.calls().is_empty(), "refused before resolving");
+        // even once it is down: ownership is never transferred (Spec L §9)
+        w.daemon.down(&name, Keep::default(), false).await.unwrap();
+        wait_down(&w.daemon).await;
+        assert_eq!(manage(&w, "flow", file()).await.unwrap_err(), not_managed);
+        // while the CLI still may re-apply it in place
+        assert_eq!(
+            w.daemon
+                .apply(&name, spec(&[("a", &[])]), Default::default(), false)
+                .await
+                .unwrap()
+                .generation,
+            2
+        );
+    }
+
+    /// Review focus 2.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_whose_name_disagrees_with_the_path_is_refused_before_resolving() {
+        let w = world().await;
+        let mut f = file();
+        f["name"] = json!("g");
+        assert_eq!(
+            manage(&w, "flow", f).await.unwrap_err(),
+            DaemonError::Invalid("name: \"g\" does not match the fleet f".into())
+        );
+        assert!(w.h.resolver.calls().is_empty());
+        assert_eq!(w.h.credentials.calls(), 0);
+        // a file without a name resolves under the path's name
+        let mut f = file();
+        f.as_object_mut().unwrap().remove("name");
+        w.h.resolver.set(Ok(spec(&[("a", &[])])));
+        assert_eq!(manage(&w, "flow", f).await.unwrap().spec.name, "f");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resolver_or_credential_failure_lands_nothing() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let bad_version = "crews.c.agents.a.tools.node: expected an exact version, got \"22\" (try: mise latest node@22)";
+        w.h.resolver.set(Err(bad_version.into()));
+        assert_eq!(
+            manage(&w, "flow", file()).await.unwrap_err(),
+            DaemonError::Invalid(bad_version.into())
+        );
+        assert!(w.daemon.get(&name).await.is_none(), "no actor was spawned");
+        assert_eq!(
+            w.h.credentials.calls(),
+            0,
+            "credentials are read only after a successful resolve"
+        );
+        w.h.resolver.set(Ok(spec(&[("a", &[])])));
+        w.h.credentials
+            .set(Err("/home/op/.claude/settings.json: invalid JSON".into()));
+        assert_eq!(
+            manage(&w, "flow", file()).await.unwrap_err(),
+            DaemonError::Internal("/home/op/.claude/settings.json: invalid JSON".into())
+        );
+        assert!(w.daemon.get(&name).await.is_none());
+        // a rejected activation is still a 400 with nothing landed: the
+        // apply's existing rule holds for a plugin's apply too
+        let stub = stub_plugin(StubScript {
+            reject: BTreeMap::from([("f/c/bad".to_string(), "no".to_string())]),
+            health_ok: true,
+            ..StubScript::default()
+        })
+        .await;
+        hello(&w, &stub.listen).await;
+        w.h.credentials.set(Ok(Default::default()));
+        w.h.resolver
+            .set(Ok(spec(&[("bad", &[("flow", json!({}))])])));
+        assert_eq!(
+            manage(&w, "flow", file()).await.unwrap_err(),
+            DaemonError::Invalid("crews.c.agents.bad.plugins.flow: no".into())
+        );
+        assert!(w.daemon.get(&name).await.is_none());
+    }
+
+    /// Review focus 5.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reserved_names_are_refused_by_the_manage_path() {
+        let w = world().await;
+        w.h.resolver.set(Ok(spec(&[("a", &[])])));
+        for reserved in ["balerix", "watch"] {
+            let name: FleetName = reserved.parse().unwrap();
+            let e = w
+                .daemon
+                .manage_fleet(
+                    &"flow".parse().unwrap(),
+                    &name,
+                    json!({ "apiVersion": "balerix/v1", "kind": "Fleet", "crews": {} }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&e, DaemonError::Invalid(m) if m.starts_with("name:")),
+                "{reserved}: {e}"
+            );
+        }
+        assert!(w.h.resolver.calls().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_a_plugin_downs_the_fleets_it_owns() {
+        let w = world().await;
+        let flow: AgentName = "flow".parse().unwrap();
+        w.h.resolver.set(Ok(spec(&[("a", &[])])));
+        manage(&w, "flow", file()).await.unwrap();
+        // beside it: a CLI fleet, and an owned fleet already going down
+        let g: FleetName = "g".parse().unwrap();
+        let mut g_spec = spec(&[("a", &[])]);
+        g_spec.name = "g".into();
+        w.daemon
+            .apply(&g, g_spec, Default::default(), false)
+            .await
+            .unwrap();
+        let h: FleetName = "h".parse().unwrap();
+        let nameless = json!({ "apiVersion": "balerix/v1", "kind": "Fleet", "crews": {} });
+        w.daemon.manage_fleet(&flow, &h, nameless).await.unwrap();
+        w.daemon
+            .down_as(&h, Keep::default(), false, &Caller::Plugin(flow.clone()))
+            .await
+            .unwrap();
+
+        std::fs::write(w.dir.join("plugins.yaml"), "plugins: []\n").unwrap();
+        let report = w.daemon.sync_plugins().await.unwrap();
+        assert_eq!(report.stopped, vec!["flow".to_string()]);
+        assert_eq!(
+            report.downed,
+            vec!["f".to_string()],
+            "only the owned fleet that was up"
+        );
+        assert!(report.down_failed.is_empty());
+        let f = w.daemon.get(&"f".parse().unwrap()).await.unwrap();
+        assert!(matches!(f.desired, Desired::Down { .. }));
+        assert_eq!(
+            f.owner.as_deref(),
+            Some("flow"),
+            "the owner is kept through the down"
+        );
+        assert_eq!(
+            w.daemon.get(&g).await.unwrap().desired,
+            Desired::Up,
+            "the CLI's fleet is untouched"
+        );
+    }
+
+    /// Review focus 4.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_owned_record_keeps_its_owner_after_a_restart() {
+        let stored = FleetRecord::with_owner(spec(&[("a", &[])]), Some("flow".into()));
+        let w = world_with(vec![(stored, FleetSecrets::default())]).await;
+        let name: FleetName = "f".parse().unwrap();
+        assert_eq!(
+            w.daemon.get(&name).await.unwrap().owner.as_deref(),
+            Some("flow")
+        );
+        assert_eq!(w.daemon.list().await[0].managed_by.as_deref(), Some("flow"));
+        let managed = DaemonError::Managed("fleet f is managed by plugin flow".into());
+        assert_eq!(
+            w.daemon
+                .apply(&name, spec(&[("a", &[])]), Default::default(), true)
+                .await
+                .unwrap_err(),
+            managed
+        );
+        assert_eq!(
+            w.daemon
+                .down(&name, Keep::default(), false)
+                .await
+                .unwrap_err(),
+            managed
+        );
+        // the plugin resumes it; the admin can force it down
+        w.h.resolver.set(Ok(spec(&[("a", &[])])));
+        assert_eq!(manage(&w, "flow", file()).await.unwrap().generation, 1);
+        w.daemon
+            .down_as(
+                &name,
+                Keep::default(),
+                false,
+                &Caller::Admin { force: true },
+            )
+            .await
+            .unwrap();
     }
 }

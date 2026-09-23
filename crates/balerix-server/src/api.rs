@@ -72,6 +72,7 @@ impl From<DaemonError> for ApiError {
             DaemonError::Invalid(_) => StatusCode::BAD_REQUEST,
             DaemonError::Unauthorized => StatusCode::UNAUTHORIZED,
             DaemonError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            DaemonError::Managed(_) => StatusCode::CONFLICT,
         };
         Self::new(status, e.to_string())
     }

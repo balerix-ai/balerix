@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use balerix_api::{CredentialBundle, FleetSpec, Timestamp};
 use balerix_core::reconcile::{ReconcileContext, agent_ready, reconcile_pass, set_desired};
 use balerix_core::{
-    AgentId, AgentRunner, Clock, Desired, Fleet, FleetName, FleetRecord, FleetSecrets, FleetStore,
-    HookTarget, Keep, Materializer, ReconcilePolicy, ResolvedAgent, WorkspaceReader,
+    AgentId, AgentRunner, Clock, CredentialSource, Desired, Fleet, FleetName, FleetRecord,
+    FleetResolver, FleetSecrets, FleetStore, HookTarget, Keep, Materializer, ReconcilePolicy,
+    ResolvedAgent, WorkspaceReader,
 };
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
@@ -70,6 +71,12 @@ pub struct Ports {
     /// Read-only worktree access for the plugin host's workspace routes
     /// (Spec C §3.1). Not used by the reconciler.
     pub workspace: Arc<dyn WorkspaceReader>,
+    /// Resolves a plugin's fleet file (Spec L §4). Not used by the
+    /// reconciler.
+    pub resolver: Arc<dyn FleetResolver>,
+    /// The operator's credentials for a plugin-managed fleet (Spec L-3).
+    /// Not used by the reconciler.
+    pub credentials: Arc<dyn CredentialSource>,
     pub policy: ReconcilePolicy,
     /// `http://127.0.0.1:<port>`; every agent's hooks post here.
     pub hook_url: String,

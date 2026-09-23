@@ -20,7 +20,7 @@ use balerix_server::{
 use serde::Deserialize;
 
 use crate::cli::ServeArgs;
-use crate::wiring::{SystemClock, layout_from_env, server_paths, tool_paths};
+use crate::wiring::{HostResolver, SystemClock, layout_from_env, server_paths, tool_paths};
 
 const RESYNC: Duration = Duration::from_secs(30);
 const DETACH_WAIT: Duration = Duration::from_secs(10);
@@ -165,6 +165,8 @@ fn run(
             clock: Arc::new(SystemClock),
             store: Arc::new(store),
             workspace: runtime.clone(),
+            resolver: Arc::new(HostResolver),
+            credentials: Arc::new(HostResolver),
             policy: ReconcilePolicy::default(),
             hook_url: url.clone(),
             resync: RESYNC,

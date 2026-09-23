@@ -206,8 +206,14 @@ pub branch: Option<String>,
   `workspace`; bounded by the owner rule (it cannot touch a fleet it did
   not create, and the CLI cannot silently take over its fleets), by the
   same validation `up` applies, and by every agent still running inside
-  its nono profile. The plugin never sees the credentials: the route
-  takes a file, the daemon reads the bundle.
+  its nono profile. The plugin never sees the credentials on the wire:
+  the route takes a file, the daemon reads the bundle. `manage` is, in
+  effect, equivalent to holding the operator's credentials (the file
+  controls `claude.binary`, `claude.args`, `env`, `sandbox` and
+  `git.auth` of an agent the daemon hands them to, and the `PUT` answer
+  carries the host's `settings.json` folded in), which is why it is the
+  operator's explicit choice in `needs`; a restricted settings surface for
+  plugin-applied files is deferred to Spec M.
 - The fleet file crosses the plugin → daemon boundary as **untrusted
   input** with the same treatment as the CLI's: full validation through
   the resolver, `deny_unknown_fields`, name rules, exact tool versions.
@@ -245,6 +251,10 @@ pub branch: Option<String>,
 - Partial updates (add or remove one agent) instead of a full apply. The
   reconciler already diffs, so a full apply costs a resolve and a pass.
 - Transferring ownership between a plugin and the CLI.
+- A restricted settings surface for plugin-applied fleet files (no
+  `claude.binary`, `claude.args`, `env`, `sandbox` widening or `git.auth`
+  choice), so that `manage` stops being, in effect, equivalent to holding
+  the operator's credentials. Deferred to Spec M.
 
 ## 10. Done when
 

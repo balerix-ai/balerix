@@ -251,11 +251,13 @@ jobs:
   # never publish) must never enter environment `release`.
   # A library-only run has no binaries, so build is skipped: accept that
   # explicitly, or the implicit success() skips publishing while
-  # github-release still tags.
+  # github-release still tags. With !cancelled() a failed plan no longer
+  # skips these jobs by itself, hence needs.plan.result.
   publish-crates-dry-run:
     needs: [plan, build]
     if: >-
-      ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped')
+      ${{ !cancelled() && needs.plan.result == 'success'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
       && needs.plan.outputs.crates != '[]' && (inputs.dry-run || github.repository != 'balerix-ai/balerix') }}
     runs-on: ubuntu-24.04
     permissions:
@@ -279,7 +281,8 @@ jobs:
   publish-crates:
     needs: [plan, build]
     if: >-
-      ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped')
+      ${{ !cancelled() && needs.plan.result == 'success'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
       && needs.plan.outputs.crates != '[]' && !inputs.dry-run && github.repository == 'balerix-ai/balerix' }}
     runs-on: ubuntu-24.04
     environment: release
@@ -311,7 +314,7 @@ jobs:
     # this job back the way the combined job used to.
     needs: [plan, build, merge-images, package, publish-crates-dry-run, publish-crates]
     if: >-
-      ${{ !cancelled() && !inputs.dry-run && needs.plan.outputs.units != '[]'
+      ${{ !cancelled() && !inputs.dry-run && needs.plan.result == 'success' && needs.plan.outputs.units != '[]'
       && (needs.build.result == 'success' || needs.build.result == 'skipped')
       && (needs.merge-images.result == 'success' || needs.merge-images.result == 'skipped')
       && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}

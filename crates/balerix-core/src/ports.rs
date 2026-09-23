@@ -7,7 +7,8 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 use balerix_api::{
-    CredentialBundle, GitSettings, Timestamp, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
+    CredentialBundle, FleetSpec, GitSettings, Timestamp, WorkspaceDiff, WorkspaceTree,
+    WorkspaceVersion,
 };
 
 use crate::agent::{CrewRef, ResolvedAgent};
@@ -270,6 +271,26 @@ pub trait PtyStream: Send {
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> Timestamp;
+}
+
+/// Resolves an unresolved fleet file (Spec L §4): the daemon's half of
+/// what `balerix up` does client-side, so a plugin's file goes through the
+/// one resolver. Implemented by the binary over `balerix-config`;
+/// `balerix-server` never sees that crate. Sync like every port; the
+/// daemon calls it in `spawn_blocking` (it reads the host's defaults).
+pub trait FleetResolver: Send + Sync {
+    /// `file` is the YAML fleet file's structure as JSON, `name` the fleet
+    /// it must resolve to (a `name` inside the file has already been
+    /// checked against it). The host's `claude.settings` are folded in.
+    /// `Err` is the resolver's own message, config path first.
+    fn resolve(&self, file: &serde_json::Value, name: &FleetName) -> Result<FleetSpec, String>;
+}
+
+/// The operator's Claude credentials and gh token, read from the host
+/// home now, as `up` reads them (Spec L-3). A plugin never holds them:
+/// the daemon reads the bundle at apply time.
+pub trait CredentialSource: Send + Sync {
+    fn load(&self) -> Result<CredentialBundle, String>;
 }
 
 #[cfg(test)]

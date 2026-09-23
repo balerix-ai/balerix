@@ -4,22 +4,23 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use balerix_api::{
-    CredentialBundle, EntryKind, GitSettings, Timestamp, TreeEntry, WORKSPACE_FILE_LIMIT,
-    WorkspaceDiff, WorkspaceTree, WorkspaceVersion, check_path,
+    CredentialBundle, EntryKind, FleetSpec, GitSettings, Timestamp, TreeEntry,
+    WORKSPACE_FILE_LIMIT, WorkspaceDiff, WorkspaceTree, WorkspaceVersion, check_path,
 };
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::agent::{CrewRef, ResolvedAgent};
 use crate::name::{AgentId, AgentName, FleetName};
 use crate::plugin::ResolvedPlugin;
 use crate::ports::{
-    AgentRunner, Clock, CrewTools, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
-    ObservedState, ProcessState, PtyStream, RunnerError, SystemToolchain, WorkspaceError,
-    WorkspaceReader,
+    AgentRunner, Clock, CredentialSource, CrewTools, FleetResolver, HookTarget, Keep, LaunchPlan,
+    MaterializeError, Materializer, ObservedState, ProcessState, PtyStream, RunnerError,
+    SystemToolchain, WorkspaceError, WorkspaceReader,
 };
 use crate::repo::RepoRef;
 
@@ -675,9 +676,93 @@ impl SystemToolchain for FakeSystemToolchain {
     }
 }
 
+/// `FleetResolver` for daemon tests: answers a fixed spec, renamed to the
+/// requested fleet so one fake serves several names, or a fixed error;
+/// records every `(fleet, file)` it was asked to resolve.
+#[derive(Default)]
+pub struct FakeResolver {
+    answer: Mutex<Option<Result<FleetSpec, String>>>,
+    calls: Mutex<Vec<(String, Value)>>,
+}
+
+impl FakeResolver {
+    pub fn answering(spec: FleetSpec) -> Self {
+        let r = Self::default();
+        r.set(Ok(spec));
+        r
+    }
+    pub fn failing(message: &str) -> Self {
+        let r = Self::default();
+        r.set(Err(message.to_string()));
+        r
+    }
+    pub fn set(&self, answer: Result<FleetSpec, String>) {
+        *lock(&self.answer) = Some(answer);
+    }
+    /// `(fleet name, file)` per call, in order.
+    pub fn calls(&self) -> Vec<(String, Value)> {
+        lock(&self.calls).clone()
+    }
+}
+
+impl FleetResolver for FakeResolver {
+    fn resolve(&self, file: &Value, name: &FleetName) -> Result<FleetSpec, String> {
+        lock(&self.calls).push((name.to_string(), file.clone()));
+        match lock(&self.answer).clone() {
+            Some(Ok(mut spec)) => {
+                spec.name = name.to_string();
+                Ok(spec)
+            }
+            Some(Err(e)) => Err(e),
+            None => Err("name: no resolver answer configured".to_string()),
+        }
+    }
+}
+
+/// `CredentialSource` for daemon tests: a fixed bundle (empty by default)
+/// or a fixed error, and a count of loads.
+pub struct FakeCredentials {
+    answer: Mutex<Result<CredentialBundle, String>>,
+    calls: AtomicUsize,
+}
+
+impl Default for FakeCredentials {
+    fn default() -> Self {
+        Self::new(CredentialBundle::default())
+    }
+}
+
+impl FakeCredentials {
+    pub fn new(bundle: CredentialBundle) -> Self {
+        Self {
+            answer: Mutex::new(Ok(bundle)),
+            calls: AtomicUsize::new(0),
+        }
+    }
+    pub fn failing(message: &str) -> Self {
+        let c = Self::default();
+        c.set(Err(message.to_string()));
+        c
+    }
+    pub fn set(&self, answer: Result<CredentialBundle, String>) {
+        *lock(&self.answer) = answer;
+    }
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl CredentialSource for FakeCredentials {
+    fn load(&self) -> Result<CredentialBundle, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        lock(&self.answer).clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -1051,5 +1136,61 @@ mod tests {
             Err(WorkspaceError::Missing("f/c/z".into()))
         );
         assert!(w.calls().contains(&"version f/c/a origin/main".to_string()));
+    }
+
+    #[test]
+    fn the_fake_resolver_answers_under_the_requested_name_and_records_files() {
+        let r = FakeResolver::default();
+        let name: FleetName = "f".parse().unwrap();
+        assert_eq!(
+            r.resolve(&json!({}), &name),
+            Err("name: no resolver answer configured".to_string())
+        );
+        r.set(Ok(FleetSpec {
+            name: "other".into(),
+            ..Default::default()
+        }));
+        let spec = r.resolve(&json!({ "kind": "Fleet" }), &name).unwrap();
+        assert_eq!(spec.name, "f", "the fixed spec is renamed to the request");
+        r.set(Err("crews.c.repo: invalid repo".into()));
+        assert_eq!(
+            r.resolve(&json!({}), &name),
+            Err("crews.c.repo: invalid repo".to_string())
+        );
+        assert_eq!(
+            r.calls(),
+            vec![
+                ("f".to_string(), json!({})),
+                ("f".to_string(), json!({ "kind": "Fleet" })),
+                ("f".to_string(), json!({})),
+            ]
+        );
+        assert_eq!(
+            FakeResolver::failing("x").resolve(&json!({}), &name),
+            Err("x".to_string())
+        );
+        assert_eq!(
+            FakeResolver::answering(FleetSpec::default())
+                .resolve(&json!({}), &name)
+                .unwrap()
+                .name,
+            "f"
+        );
+    }
+
+    #[test]
+    fn the_fake_credentials_answer_a_bundle_or_an_error_and_count_calls() {
+        let c = FakeCredentials::default();
+        assert_eq!(c.load(), Ok(CredentialBundle::default()));
+        let bundle = CredentialBundle {
+            gh_token: Some("gho_x".into()),
+            ..CredentialBundle::default()
+        };
+        let c = FakeCredentials::new(bundle.clone());
+        assert_eq!(c.load(), Ok(bundle));
+        c.set(Err("/home/op/.claude/settings.json: invalid JSON".into()));
+        assert!(c.load().is_err());
+        assert_eq!(c.calls(), 2);
+        assert!(FakeCredentials::failing("no").load().is_err());
     }
 }

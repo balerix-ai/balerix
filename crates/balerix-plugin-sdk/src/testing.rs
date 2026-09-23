@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
@@ -17,9 +18,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use balerix_api::{
-    CHAIN_BUDGET_MS, EntryKind, ErrorBody, FleetRecord, HelloRequest, HelloResponse, HookEvent,
-    InterceptRequest, InterceptResponse, KvKeys, PluginAction, ResizeFrame, TextFrame, Timestamp,
-    TreeEntry, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
+    CHAIN_BUDGET_MS, Desired, DownQuery, EntryKind, ErrorBody, FleetPhase, FleetRecord, FleetSpec,
+    HelloRequest, HelloResponse, HookEvent, InterceptRequest, InterceptResponse, Keep, KvKeys,
+    PluginAction, ResizeFrame, TextFrame, Timestamp, TreeEntry, WorkspaceDiff, WorkspaceTree,
+    WorkspaceVersion,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -54,6 +56,12 @@ struct Inner {
     workspaces: Mutex<BTreeMap<String, Workspace>>,
     /// `fail_actions`: while set, `POST agents/…/actions` answers 500.
     action_failure: Mutex<Option<String>>,
+    /// `PUT fleets/{name}`: `(name, file)`, refused calls included.
+    applied: Mutex<Vec<(String, Value)>>,
+    /// `DELETE fleets/{name}`: `(name, flags)`.
+    downed: Mutex<Vec<(String, DownQuery)>>,
+    /// `fail_manage`: while set, both manage routes answer this.
+    manage_failure: Mutex<Option<(u16, String)>>,
 }
 
 /// A fake daemon, started on `127.0.0.1:0`, that a real `Host` can talk to.
@@ -80,6 +88,9 @@ impl FakeHost {
             kv: Mutex::new(BTreeMap::new()),
             workspaces: Mutex::new(BTreeMap::new()),
             action_failure: Mutex::new(None),
+            applied: Mutex::new(Vec::new()),
+            downed: Mutex::new(Vec::new()),
+            manage_failure: Mutex::new(None),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -218,6 +229,33 @@ impl FakeHost {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = message.map(str::to_string);
     }
+
+    pub fn applied_fleets(&self) -> Vec<(String, Value)> {
+        self.inner
+            .applied
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn downed_fleets(&self) -> Vec<(String, DownQuery)> {
+        self.inner
+            .downed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// While `Some((status, message))`, `PUT` and `DELETE fleets/{name}`
+    /// answer that — the daemon refusing a file (400) or a name that is
+    /// someone else's (409). The call is still recorded.
+    pub fn fail_manage(&self, answer: Option<(u16, &str)>) {
+        *self
+            .inner
+            .manage_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = answer.map(|(s, m)| (s, m.to_string()));
+    }
 }
 
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -252,7 +290,10 @@ fn router(inner: Arc<Inner>) -> Router {
         .route("/v1/plugin-host/hello", axum::routing::post(hello))
         .route("/v1/plugin-host/fleets", get(fleets))
         .route("/v1/plugin-host/fleets/watch", get(watch_fleets))
-        .route("/v1/plugin-host/fleets/{name}", get(fleet))
+        .route(
+            "/v1/plugin-host/fleets/{name}",
+            get(fleet).put(put_fleet).delete(delete_fleet),
+        )
         .route(
             "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/actions",
             axum::routing::post(post_action),
@@ -341,6 +382,109 @@ async fn fleet(
         Some(f) => Json(f).into_response(),
         None => error(StatusCode::NOT_FOUND, "fleet not found"),
     }
+}
+
+#[derive(Deserialize)]
+struct FleetFileBody {
+    file: Value,
+}
+
+/// `Some(response)` while `fail_manage` is set.
+fn manage_failure(inner: &Inner) -> Option<Response> {
+    let (status, message) = inner
+        .manage_failure
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    Some(error(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        message,
+    ))
+}
+
+/// Spec L §3.1 as a fake: the record already held under `name` (what
+/// `set_fleets` put there) is the answer, else a fresh one owned by
+/// `plugin`; either way the list goes out to every watch.
+async fn put_fleet(
+    State(inner): State<Arc<Inner>>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    body: Result<Json<FleetFileBody>, JsonRejection>,
+) -> Response {
+    if let Some(resp) = unauthorized(&inner, &headers) {
+        return resp;
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
+    inner
+        .applied
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name.clone(), body.file));
+    if let Some(resp) = manage_failure(&inner) {
+        return resp;
+    }
+    let record = {
+        let mut fleets = inner.fleets.lock().unwrap_or_else(|e| e.into_inner());
+        match fleets.iter().find(|f| f.name() == name) {
+            Some(f) => f.clone(),
+            None => {
+                let r = FleetRecord::with_owner(
+                    FleetSpec {
+                        name: name.clone(),
+                        ..Default::default()
+                    },
+                    Some("plugin".into()),
+                );
+                fleets.push(r.clone());
+                r
+            }
+        }
+    };
+    inner.fleets_changed.send_modify(|n| *n += 1);
+    Json(record).into_response()
+}
+
+/// Spec L §3.2 as a fake: the record goes `Down` (desired and phase at
+/// once) and is answered; a name the fake does not hold is 404.
+async fn delete_fleet(
+    State(inner): State<Arc<Inner>>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    Query(q): Query<DownQuery>,
+) -> Response {
+    if let Some(resp) = unauthorized(&inner, &headers) {
+        return resp;
+    }
+    inner
+        .downed
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name.clone(), q));
+    if let Some(resp) = manage_failure(&inner) {
+        return resp;
+    }
+    let record = {
+        let mut fleets = inner.fleets.lock().unwrap_or_else(|e| e.into_inner());
+        match fleets.iter_mut().find(|f| f.name() == name) {
+            Some(f) => {
+                f.desired = Desired::Down {
+                    keep: Keep {
+                        repos: q.keep_repos,
+                        sessions: q.keep_sessions,
+                    },
+                    purge: q.purge,
+                };
+                f.status.phase = FleetPhase::Down;
+                f.clone()
+            }
+            None => return error(StatusCode::NOT_FOUND, "fleet not found"),
+        }
+    };
+    inner.fleets_changed.send_modify(|n| *n += 1);
+    Json(record).into_response()
 }
 
 /// `GET fleets/watch` (WS): the whole list on connect and on every

@@ -1,0 +1,21 @@
+{
+  "route": "PUT /v1/plugin-host/fleets/gh-acme-api",
+  "direction": "plugin-to-daemon",
+  "request": {
+    "file": {
+      "apiVersion": "balerix/v1",
+      "kind": "Fleet",
+      "name": "gh-acme-api",
+      "crews": {
+        "repo": {
+          "repo": "acme/api",
+          "agents": { "issue-12": { "tools": { "node": "22" } } }
+        }
+      }
+    }
+  },
+  "status": 400,
+  "response": {
+    "error": "crews.repo.agents.issue-12.tools.node: expected an exact version, got \"22\" (try: mise latest node@22)"
+  }
+}

@@ -187,8 +187,12 @@ makes an existing remote branch its worktree branch and start point
 - **Merge is a left fold, not associative.** `null` means "delete relative to the
   layers below me"; that only has meaning in order. Tested by property
   (idempotent, overlay-dominant, never emits null).
-- **Resolution happens client-side.** The daemon only ever sees resolved specs, so
-  merge semantics cannot drift between client and server.
+- **One resolver crate on both sides.** `balerix-config` is the only place a
+  fleet file is merged and validated, so merge semantics cannot drift between
+  client and daemon (Spec L-2): the CLI resolves for `up`/`update` and sends
+  the resolved spec; the daemon resolves a plugin's `PUT
+  /v1/plugin-host/fleets/{name}` through the same crate, behind the
+  `FleetResolver` port the binary wires (`balerix-server` never imports it).
 - **Exact tool versions only.** `tools: { node: "22" }` is rejected; an unpinned
   entry is a reproducibility bug (developer-environment skill).
 - **`claude.settings.hooks` is balerix-owned.** Hook wiring is how the daemon

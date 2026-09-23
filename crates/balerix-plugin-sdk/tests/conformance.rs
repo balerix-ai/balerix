@@ -353,6 +353,22 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
         fx["fleet-put-rejected"]["response"]
     );
     fake.fail_manage(None);
+    // a stray key beside `file` is a 400, as the daemon's
+    // `deny_unknown_fields` body makes it, and records nothing
+    let applied = fake.applied_fleets().len();
+    let resp = c
+        .put(format!("{}/v1/plugin-host/fleets/gh-acme-api", fake.url))
+        .bearer_auth("tok")
+        .json(&serde_json::json!({ "file": file, "credentials": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    assert_eq!(
+        fake.applied_fleets().len(),
+        applied,
+        "the stray key recorded nothing"
+    );
     let q = DownQuery::default();
     assert_eq!(
         fx["fleet-delete"]["route"],

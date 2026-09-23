@@ -58,7 +58,7 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 | `GET fleets/{name}` | `fleets` | — | `FleetRecord` | 200 | (shape as in `fleets.json`'s `response[0]`) |
 | `GET fleets/{name}`, unknown name | `fleets` | — | `{ error }` | 404 | `fleet-missing.json` |
 | `GET fleets/watch` (WebSocket) | `fleets` | — | one text frame per change, each the complete `GET fleets` body | 101 | `fleets-watch.json` (Task 6) |
-| `PUT fleets/{name}` | `manage` | `{ file }` — the fleet file's structure as JSON (`apiVersion`, `kind`, `name`?, `defaults`, `crews`) | `FleetRecord`, `owner` set to this plugin | 200 | `fleet-put.json` |
+| `PUT fleets/{name}` | `manage` | `{ file }` — the fleet file's structure as JSON (`apiVersion`, `kind`, `name`?, `defaults`, `crews`) | `FleetRecord`, `owner` set to this plugin; the answer is the record as applied, so waiting for its agents to turn `Ready` through `fleets/watch` (or `GET fleets/{name}`) needs the `fleets` capability as well | 200 | `fleet-put.json` |
 | `PUT fleets/{name}`, file does not resolve | `manage` | same | `{ error }`, config path first | 400 | `fleet-put-rejected.json` |
 | `PUT`/`DELETE fleets/{name}`, owned by another plugin or by the CLI | `manage` | — | `{ "error": "fleet <name> is managed by plugin <p>" }` or `{ "error": "fleet <name> is not managed by a plugin" }` | 409 | (asserted by `crates/balerix-server/tests/manage_it.rs`, §6) |
 | `DELETE fleets/{name}?keep_repos=&keep_sessions=&purge=&force=` | `manage` | — | `FleetRecord` | 200 | `fleet-delete.json` |

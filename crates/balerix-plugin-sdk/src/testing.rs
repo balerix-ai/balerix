@@ -384,7 +384,10 @@ async fn fleet(
     }
 }
 
+/// `deny_unknown_fields` as in the daemon's handler, so a stray key fails
+/// here as it would against the real route.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FleetFileBody {
     file: Value,
 }

@@ -6,6 +6,7 @@
 /// The `apiVersion` every fleet file and request declares.
 pub const API_VERSION: &str = "balerix/v1";
 
+pub mod branch;
 pub mod credentials;
 pub mod fleet;
 pub mod hook;
@@ -17,6 +18,7 @@ pub mod settings;
 pub mod status;
 pub mod workspace;
 
+pub use branch::check_branch_name;
 pub use credentials::CredentialBundle;
 pub use fleet::{CrewSpec, FleetSpec, GitAuth, GitIdentity, GitSettings};
 pub use hook::{HOOK_EVENTS, HookEvent};

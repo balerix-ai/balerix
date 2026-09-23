@@ -339,6 +339,7 @@ mod tests {
             installed: vec!["a".into(), "b".into()],
             stopped: vec![],
             unchanged: vec!["c".into()],
+            ..SyncReport::default()
         };
         assert_eq!(render_sync(&r), "installed: a, b\nunchanged: c\n");
         assert_eq!(render_sync(&SyncReport::default()), "nothing to do\n");

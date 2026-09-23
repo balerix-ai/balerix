@@ -18,6 +18,12 @@ pub struct Keep {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FleetRecord {
     pub spec: FleetSpec,
+    /// The plugin that applied this fleet through `PUT
+    /// /v1/plugin-host/fleets/{name}` (Spec L §5); `None` for a fleet the
+    /// CLI created. Kept through `down`, so the plugin's next apply
+    /// resumes it. Absent on the wire and in an older `fleet.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub generation: u64,
     pub desired: Desired,
     /// Agents held stopped by a plugin action (plugins spec §16.4): stopped
@@ -38,8 +44,14 @@ pub enum Desired {
 
 impl FleetRecord {
     pub fn new(spec: FleetSpec) -> Self {
+        Self::with_owner(spec, None)
+    }
+    /// A fresh record at generation 0, owned by `owner` when a plugin
+    /// applied it.
+    pub fn with_owner(spec: FleetSpec, owner: Option<String>) -> Self {
         Self {
             spec,
+            owner,
             generation: 0,
             desired: Desired::Up,
             stopped: BTreeSet::new(),
@@ -60,6 +72,7 @@ impl FleetRecord {
             generation: self.generation,
             observed_generation: self.status.observed_generation,
             agents: self.status.agents.len(),
+            managed_by: self.owner.clone(),
         }
     }
 }
@@ -124,6 +137,35 @@ mod tests {
         assert!(!r.is_down(), "still terminating");
         r.status.phase = FleetPhase::Down;
         assert!(r.is_down());
+    }
+
+    /// Spec L §5: the plugin that applied a fleet, absent for the CLI's
+    /// fleets and in every `fleet.json` written before Spec L.
+    #[test]
+    fn owner_is_absent_by_default_and_round_trips_when_set() {
+        let r = FleetRecord::new(spec());
+        assert_eq!(r.owner, None);
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("owner").is_none(), "no key when unowned: {v}");
+        assert_eq!(r.summary().managed_by, None);
+        let older: FleetRecord = serde_json::from_value(json!({
+            "spec": { "name": "payments" }, "generation": 1, "desired": { "state": "up" },
+            "status": { "generation": 1, "observed_generation": 1, "phase": "ready" }
+        }))
+        .unwrap();
+        assert_eq!(older.owner, None, "a pre-Spec-L fleet.json loads");
+        let owned = FleetRecord::with_owner(spec(), Some("github".into()));
+        assert_eq!(owned.owner.as_deref(), Some("github"));
+        assert_eq!(owned.generation, 0);
+        let v = serde_json::to_value(&owned).unwrap();
+        assert_eq!(v["owner"], "github");
+        let back: FleetRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(back, owned);
+        assert_eq!(back.summary().managed_by.as_deref(), Some("github"));
+        assert_eq!(
+            FleetRecord::with_owner(spec(), None),
+            FleetRecord::new(spec())
+        );
     }
 
     #[test]

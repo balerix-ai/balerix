@@ -245,6 +245,7 @@ pub fn down_command(args: &DownArgs) -> Result<String> {
         keep_repos: args.keep || args.keep_repos,
         keep_sessions: args.keep || args.keep_sessions,
         purge: args.purge,
+        force: false,
     };
     let client = Client::connect(args.api_url.as_deref())?;
     client.down(&args.fleet, &q)?;

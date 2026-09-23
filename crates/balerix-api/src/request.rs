@@ -21,13 +21,17 @@ pub struct DownQuery {
     pub keep_repos: bool,
     pub keep_sessions: bool,
     pub purge: bool,
+    /// Down a plugin-managed fleet from the admin API (Spec L §5:
+    /// `balerix down --force`). Ignored on the plugin-host route, where
+    /// ownership is the rule.
+    pub force: bool,
 }
 
 impl DownQuery {
     pub fn to_query_string(&self) -> String {
         format!(
-            "keep_repos={}&keep_sessions={}&purge={}",
-            self.keep_repos, self.keep_sessions, self.purge
+            "keep_repos={}&keep_sessions={}&purge={}&force={}",
+            self.keep_repos, self.keep_sessions, self.purge, self.force
         )
     }
 }
@@ -82,11 +86,20 @@ mod tests {
             DownQuery {
                 keep_repos: true,
                 keep_sessions: false,
-                purge: false
+                purge: false,
+                force: false,
             }
             .to_query_string(),
-            "keep_repos=true&keep_sessions=false&purge=false"
+            "keep_repos=true&keep_sessions=false&purge=false&force=false"
         );
+        // an older CLI sends no `force`: it is not a forced down
+        let q: DownQuery = serde_json::from_value(serde_json::json!({
+            "keep_repos": false, "keep_sessions": false, "purge": true
+        }))
+        .unwrap();
+        assert!(!q.force);
+        let q: DownQuery = serde_json::from_value(serde_json::json!({ "force": true })).unwrap();
+        assert!(q.force && !q.purge);
         assert!(serde_json::from_value::<DownQuery>(serde_json::json!({ "x": 1 })).is_err());
         let e: ErrorBody = serde_json::from_str(r#"{"error":"fleet exists"}"#).unwrap();
         assert_eq!(e.error, "fleet exists");

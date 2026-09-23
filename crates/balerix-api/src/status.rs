@@ -160,6 +160,9 @@ pub struct FleetSummary {
     pub generation: u64,
     pub observed_generation: u64,
     pub agents: usize,
+    /// `FleetRecord::owner` (Spec L §5): the plugin that manages the fleet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<String>,
 }
 
 #[cfg(test)]
@@ -248,8 +251,16 @@ mod tests {
             generation: 3,
             observed_generation: 3,
             agents: 2,
+            managed_by: None,
         };
         let back: FleetSummary = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+        let older: FleetSummary = serde_json::from_value(json!({
+            "name": "p", "phase": "ready", "generation": 1, "observed_generation": 1, "agents": 0
+        }))
+        .unwrap();
+        assert_eq!(older.managed_by, None);
+        let v = serde_json::to_value(&older).unwrap();
+        assert!(v.get("managed_by").is_none(), "omitted when unowned");
     }
 }

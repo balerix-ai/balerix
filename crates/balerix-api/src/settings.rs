@@ -30,6 +30,14 @@ pub struct AgentSettings {
     /// stored by an older daemon must still load after the upgrade.
     #[serde(default, alias = "flow")]
     pub plugins: BTreeMap<String, Value>,
+    /// An existing remote branch this agent works on (Spec L §6). When
+    /// set, the worktree branch is this name, created from
+    /// `origin/<branch>`; the crew `ref` remains the base the workspace
+    /// diff is taken against. Absent: the per-agent branch
+    /// `balerix/<fleet>/<crew>/<agent>` from `origin/<ref>`. Validated by
+    /// `check_branch_name` in the resolver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 impl Default for AgentSettings {
@@ -41,6 +49,7 @@ impl Default for AgentSettings {
             env: BTreeMap::new(),
             runner: RunnerSettings::default(),
             plugins: BTreeMap::new(),
+            branch: None,
         }
     }
 }
@@ -179,6 +188,25 @@ mod tests {
             serde_json::from_value::<AgentSettings>(json!({ "runner": { "type": "docker" } }))
                 .is_err()
         );
+    }
+
+    /// Spec L §6: an optional existing remote branch. Absent and `null`
+    /// are both "no branch"; the wire form omits it when unset.
+    #[test]
+    fn branch_is_optional_and_omitted_when_unset() {
+        let s = AgentSettings::default();
+        assert_eq!(s.branch, None);
+        assert!(serde_json::to_value(&s).unwrap().get("branch").is_none());
+        let s: AgentSettings =
+            serde_json::from_value(json!({ "branch": "feature/issue-12" })).unwrap();
+        assert_eq!(s.branch.as_deref(), Some("feature/issue-12"));
+        assert_eq!(
+            serde_json::to_value(&s).unwrap()["branch"],
+            "feature/issue-12"
+        );
+        let s: AgentSettings = serde_json::from_value(json!({ "branch": null })).unwrap();
+        assert_eq!(s.branch, None);
+        assert!(serde_json::from_value::<AgentSettings>(json!({ "branch": 3 })).is_err());
     }
 
     #[test]

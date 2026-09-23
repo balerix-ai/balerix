@@ -307,14 +307,12 @@ fn check_branch_name_agrees_with_git_check_ref_format() {
         "a/b.lockfile",
         "v1.0",
         "",
-        "refs/heads/main",
         "/main",
         "main/",
         "main.",
         "a//b",
         "a..b",
         "a@{1}",
-        "@",
         "a b",
         "a~1",
         "a^b",
@@ -340,4 +338,30 @@ fn check_branch_name_agrees_with_git_check_ref_format() {
             "{name:?}: git says {git_ok}"
         );
     }
+
+    // Documented divergences (Spec L §6, plan §12): `git check-ref-format
+    // --branch <name>` always validates `refs/heads/<name>`, so it accepts
+    // both of these — a `name` starting with `refs/` becomes a harmless
+    // double-prefixed ref, and a bare `@` is never the *whole* checked
+    // refname, so the HEAD-alias rejection never fires. We refuse both
+    // anyway: unprefixed elsewhere (`origin/<branch>`, revision syntax) they
+    // would be read as a fully-qualified ref or as HEAD.
+    assert!(
+        Command::new(&tools.git)
+            .args(["check-ref-format", "--branch", "refs/heads/main"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(balerix_api::check_branch_name("refs/heads/main").is_err());
+    assert!(
+        Command::new(&tools.git)
+            .args(["check-ref-format", "--branch", "@"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(balerix_api::check_branch_name("@").is_err());
 }

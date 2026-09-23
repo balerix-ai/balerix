@@ -6,6 +6,15 @@
 //! when it reaches `git worktree add -b <branch>` (Spec L §7).
 
 /// `Err` is the reason, for `crews.<c>.agents.<a>.branch: <reason>`.
+///
+/// Two rules here are ours, not git's: `git check-ref-format --branch <name>`
+/// always validates `refs/heads/<name>`, so it happily accepts a `name` that
+/// already starts with `refs/` (double-prefixed, e.g. `refs/heads/refs/heads/x`)
+/// and a bare `@` (never the *whole* checked refname, so the HEAD-alias
+/// rejection never fires). Spec L §6 refuses both explicitly: a branch
+/// literally named `refs/heads/x` or `@` would be read as a fully-qualified
+/// ref or as HEAD wherever we use it unprefixed — `origin/<branch>`, revision
+/// syntax — so the validator is deliberately stricter than git here.
 pub fn check_branch_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("empty".into());
@@ -13,8 +22,14 @@ pub fn check_branch_name(name: &str) -> Result<(), String> {
     if name.len() > 255 {
         return Err("longer than 255 bytes".into());
     }
+    if name == "@" {
+        return Err("is \"@\"".into());
+    }
     if name.starts_with('-') {
         return Err("starts with '-'".into());
+    }
+    if name.starts_with("refs/") {
+        return Err("starts with \"refs/\"".into());
     }
     if name.starts_with('/') {
         return Err("starts with '/'".into());
@@ -73,13 +88,6 @@ mod tests {
             "ünïcode",
             "a/b.lockfile",
             "v1.0",
-            // `check-ref-format --branch` always validates `refs/heads/<name>`,
-            // so a name that already looks fully qualified is just another
-            // slash-separated ref component, not a special case; and a bare
-            // "@" is only the reserved alias for HEAD when it is the *whole*
-            // refname, which `refs/heads/@` never is.
-            "refs/heads/main",
-            "@",
         ] {
             assert_eq!(check_branch_name(ok), Ok(()), "{ok:?}");
         }
@@ -91,12 +99,14 @@ mod tests {
             ("", "empty"),
             ("-x", "starts with '-'"),
             ("--force", "starts with '-'"),
+            ("refs/heads/main", "starts with \"refs/\""),
             ("/main", "starts with '/'"),
             ("main/", "ends with '/'"),
             ("main.", "ends with '.'"),
             ("a//b", "contains \"//\""),
             ("a..b", "contains \"..\""),
             ("a@{1}", "contains \"@{\""),
+            ("@", "is \"@\""),
             ("a b", "contains a space"),
             ("a\tb", "contains a control character"),
             ("a\x7fb", "contains a control character"),

@@ -51,7 +51,7 @@ for unit in "$@"; do
           crates+=(-p "$crate")
         fi
       done
-      ((${#crates[@]})) && publish Cargo.toml "${crates[@]}"
+      if ((${#crates[@]})); then publish Cargo.toml "${crates[@]}"; fi
       ;;
     library)
       crate=$(unit_crate "$unit")

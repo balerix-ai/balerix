@@ -108,6 +108,7 @@ jobs:
 
   images:
     needs: [plan, build]
+    if: needs.plan.outputs.binaries != '[]'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -164,7 +165,7 @@ jobs:
 
   merge-images:
     needs: [plan, images]
-    if: ${{ !inputs.dry-run }}
+    if: ${{ !inputs.dry-run && needs.plan.outputs.binaries != '[]' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -248,9 +249,14 @@ jobs:
 
   # No environment and no OIDC: a dry run (or a fork's real run, which can
   # never publish) must never enter environment `release`.
+  # A library-only run has no binaries, so build is skipped: accept that
+  # explicitly, or the implicit success() skips publishing while
+  # github-release still tags.
   publish-crates-dry-run:
     needs: [plan, build]
-    if: ${{ needs.plan.outputs.crates != '[]' && (inputs.dry-run || github.repository != 'balerix-ai/balerix') }}
+    if: >-
+      ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped')
+      && needs.plan.outputs.crates != '[]' && (inputs.dry-run || github.repository != 'balerix-ai/balerix') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -272,7 +278,9 @@ jobs:
 
   publish-crates:
     needs: [plan, build]
-    if: ${{ needs.plan.outputs.crates != '[]' && !inputs.dry-run && github.repository == 'balerix-ai/balerix' }}
+    if: >-
+      ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped')
+      && needs.plan.outputs.crates != '[]' && !inputs.dry-run && github.repository == 'balerix-ai/balerix' }}
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -387,7 +395,11 @@ jobs:
   # just that plugin's image.
   promote-images:
     needs: [plan, github-release, verify-package]
-    if: ${{ !cancelled() && needs.github-release.result == 'success' && (needs.verify-package.result == 'success' || needs.verify-package.result == 'skipped') }}
+    # A library-only run has no binaries: an empty matrix is an error.
+    if: >-
+      ${{ !cancelled() && needs.github-release.result == 'success'
+      && (needs.verify-package.result == 'success' || needs.verify-package.result == 'skipped')
+      && needs.plan.outputs.binaries != '[]' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read

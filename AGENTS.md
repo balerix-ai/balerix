@@ -339,9 +339,10 @@ credentials, hook input, or sandbox rules.
   /v1/plugin-host/fleets/{name}` and never transferred: `up`/`update`
   on it are 409 `fleet <f> is managed by plugin <p>`, `down` needs
   `--force`, and a forced down keeps the owner so the plugin's next
-  apply resumes it. `plugin remove` downs the plugin's fleets during the
-  sync (`SyncReport.downed`); a plugin that was already undeclared when
-  the daemon started downs nothing — `down --force` by hand. The
+  apply resumes it. Every sync downs the up fleets whose owner
+  `plugins.yaml` does not declare (`SyncReport.downed`): `plugin remove`'s
+  sync, and the first sync at `serve` for a plugin removed while the
+  daemon was stopped. The
   daemon-side rule is `Daemon::check_owner`; `apply`/`down` are the
   admin wrappers of `apply_as`/`down_as`.
 - The resolver a plugin's fleet file goes through lives in the binary

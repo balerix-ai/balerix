@@ -1,7 +1,7 @@
 //! The registry (Phase 3 spec §3.1): fleet name → actor handle, the shared
 //! secret index, and the request-side logic the API calls into.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -336,39 +336,59 @@ impl Daemon {
 
     /// Reconciles the plugin set to `plugins.yaml`; `serve` calls it once
     /// at start and fails fast on an error, `plugin sync` on demand. A
-    /// plugin the sync stopped cannot down the fleets it owns, and agents
-    /// nobody can talk to are the wrong default (Spec L-6): every such
-    /// fleet still up is downed here, every failure reported, and the
-    /// sync goes on.
+    /// plugin that is not declared cannot down the fleets it owns, and
+    /// agents nobody can talk to are the wrong default (Spec L-6): every
+    /// owned fleet still up whose owner the file does not declare is
+    /// downed here, every failure reported, and the sync goes on. That
+    /// covers a plugin this sync stopped and one removed while the daemon
+    /// was stopped (the first sync at start has stopped nothing).
+    ///
+    /// The declared set is the resolved one: `PluginHost::sync` resolves
+    /// every entry or fails whole, before anything here runs, so a
+    /// transient install failure downs nothing.
     pub async fn sync_plugins(&self) -> Result<SyncReport, PluginError> {
         let mut report = self.plugins.sync().await?;
-        for plugin in &report.stopped {
-            for record in self.plugin_fleets().await {
-                if record.owner.as_deref() != Some(plugin.as_str())
-                    || matches!(record.desired, Desired::Down { .. })
-                {
-                    continue;
-                }
-                let Ok(name) = FleetName::try_from(record.spec.name.clone()) else {
-                    continue;
-                };
-                match self
-                    .down_as(
-                        &name,
-                        Keep::default(),
-                        false,
-                        &Caller::Admin { force: true },
-                    )
-                    .await
-                {
-                    Ok(_) => report.downed.push(name.to_string()),
-                    Err(e) => {
-                        tracing::warn!(fleet = %name, plugin, "downing a removed plugin's fleet failed: {e}");
-                        report.down_failed.push(format!("{name}: {e}"));
-                    }
+        let declared: BTreeSet<&str> = report
+            .installed
+            .iter()
+            .chain(&report.unchanged)
+            .map(String::as_str)
+            .collect();
+        let mut downed = Vec::new();
+        let mut down_failed = Vec::new();
+        for record in self.plugin_fleets().await {
+            let Some(plugin) = record.owner.as_deref() else {
+                continue;
+            };
+            if declared.contains(plugin) || matches!(record.desired, Desired::Down { .. }) {
+                continue;
+            }
+            let Ok(name) = FleetName::try_from(record.spec.name.clone()) else {
+                continue;
+            };
+            tracing::warn!(
+                fleet = %name,
+                plugin,
+                "downing fleet {name}: its plugin {plugin} is not declared in plugins.yaml"
+            );
+            match self
+                .down_as(
+                    &name,
+                    Keep::default(),
+                    false,
+                    &Caller::Admin { force: true },
+                )
+                .await
+            {
+                Ok(_) => downed.push(name.to_string()),
+                Err(e) => {
+                    tracing::warn!(fleet = %name, plugin, "downing a removed plugin's fleet failed: {e}");
+                    down_failed.push(format!("{name}: {e}"));
                 }
             }
         }
+        report.downed = downed;
+        report.down_failed = down_failed;
         // `replace_plugins` drops the activation rows of every plugin the
         // sync removed, and the plugin fleet's own actor snapshot is not
         // forwarded to `changes` — so this registry write ticks like the
@@ -2168,6 +2188,36 @@ mod tests {
             Desired::Up,
             "the CLI's fleet is untouched"
         );
+    }
+
+    /// Spec L-6 (F2): a plugin removed from `plugins.yaml` while the
+    /// daemon was stopped is never "stopped" by a sync, so the first sync
+    /// at start downs its fleets by the declared set. A fleet whose owner
+    /// is declared is left alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_sync_downs_the_fleets_of_a_plugin_no_longer_declared() {
+        let orphan = FleetRecord::with_owner(spec(&[("a", &[])]), Some("gone".into()));
+        let mut kept_spec = spec(&[("a", &[])]);
+        kept_spec.name = "k".into();
+        let kept = FleetRecord::with_owner(kept_spec, Some("flow".into()));
+        // `world_with` declares `flow` only and runs the first sync
+        let w = world_with(vec![
+            (orphan, FleetSecrets::default()),
+            (kept, FleetSecrets::default()),
+        ])
+        .await;
+        let f = w.daemon.get(&"f".parse().unwrap()).await.unwrap();
+        assert!(matches!(f.desired, Desired::Down { .. }), "{:?}", f.desired);
+        assert_eq!(f.owner.as_deref(), Some("gone"), "the owner is kept");
+        assert_eq!(
+            w.daemon.get(&"k".parse().unwrap()).await.unwrap().desired,
+            Desired::Up,
+            "a declared plugin's fleet is untouched"
+        );
+        // a later sync finds nothing more to down
+        let report = w.daemon.sync_plugins().await.unwrap();
+        assert!(report.downed.is_empty(), "{:?}", report.downed);
+        assert!(report.down_failed.is_empty());
     }
 
     /// Review focus 4.

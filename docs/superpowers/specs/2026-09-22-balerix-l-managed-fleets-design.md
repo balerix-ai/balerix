@@ -268,12 +268,15 @@ pub branch: Option<String>,
   must create). `Caller::Admin { force }` / `Caller::Plugin(name)`.
 - The owner error is `DaemonError::Managed(String)` → 409; a record
   is created with `FleetRecord::with_owner`.
-- `plugin remove` downs owned fleets inside `Daemon::sync_plugins`, for
-  every plugin the sync stopped; the fleets and failures ride back in
-  `SyncReport.downed` / `SyncReport.down_failed` and the CLI prints one
-  line per fleet from them. `--purge` re-downs each with `purge` +
-  `force` from the CLI. A plugin already undeclared at daemon start
-  downs nothing.
+- `plugin remove` downs owned fleets inside `Daemon::sync_plugins`: after
+  a successful sync, every fleet still up whose owner `plugins.yaml` does
+  not declare is downed (keep defaults, no purge); the fleets and failures
+  ride back in `SyncReport.downed` / `SyncReport.down_failed` and the CLI
+  prints one line per fleet from them. A plugin already undeclared at
+  daemon start is covered by the same rule: the first sync, in `serve`,
+  downs its fleets and logs one warning per fleet. A sync that fails
+  resolving (an install failure) downs nothing. `--purge` re-downs each
+  with `purge` + `force` from the CLI.
 - `balerix_config::from_value` reads the file from JSON with
   `serde_path_to_error`, so a shape error names its key (`file` for the
   root); the daemon checks `file.name` against the path before resolving.

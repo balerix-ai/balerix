@@ -88,6 +88,10 @@ pub struct DownArgs {
     /// Also delete the fleet record and everything under its directory.
     #[arg(long)]
     pub purge: bool,
+    /// Down a fleet a plugin manages (Spec L §5). Without it a managed
+    /// fleet is refused; with it the plugin's next apply resumes it.
+    #[arg(long)]
+    pub force: bool,
     #[arg(long, default_value = "5m")]
     pub timeout: String,
     #[arg(long)]

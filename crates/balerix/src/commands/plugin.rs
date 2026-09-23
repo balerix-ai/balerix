@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use balerix_api::{PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport};
+use balerix_api::{DownQuery, PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport};
 use balerix_runtime::fsutil::write_atomic;
 use balerix_server::plugins::config::NO_TLS;
 use balerix_server::plugins::package::{create, sha256_hex, unpack};
@@ -61,6 +61,13 @@ pub fn render_sync(r: &SyncReport) -> String {
         if !names.is_empty() {
             out.push_str(&format!("{label}: {}\n", names.join(", ")));
         }
+    }
+    // Spec L-6: the fleets a removed plugin owned, one line each
+    for fleet in &r.downed {
+        out.push_str(&format!("fleet {fleet}: down\n"));
+    }
+    for failure in &r.down_failed {
+        out.push_str(&format!("fleet {failure} (down failed)\n"));
     }
     if out.is_empty() {
         out.push_str("nothing to do\n");
@@ -231,12 +238,23 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
         let client = Client::connect(args.api_url.as_deref())
             .map_err(|e| anyhow!("{e}; --purge needs a running daemon (the entry was removed)"))?;
         let report = client.sync_plugins()?;
+        let mut out = render_sync(&report);
+        // Spec L-6: `--purge` purges the plugin's fleets too. The daemon
+        // downed them during the sync; a second, forced down with `purge`
+        // deletes their records and directories.
+        for fleet in &report.downed {
+            client.down(
+                fleet,
+                &DownQuery {
+                    purge: true,
+                    force: true,
+                    ..DownQuery::default()
+                },
+            )?;
+            out.push_str(&format!("fleet {fleet}: purged\n"));
+        }
         client.purge_plugin(&args.name)?;
-        return Ok(format!(
-            "{}removed {} and purged its state\n",
-            render_sync(&report),
-            args.name
-        ));
+        return Ok(format!("{out}removed {} and purged its state\n", args.name));
     }
     Ok(format!(
         "removed {} from plugins.yaml (state kept; --purge deletes it)\n{}",
@@ -343,6 +361,20 @@ mod tests {
         };
         assert_eq!(render_sync(&r), "installed: a, b\nunchanged: c\n");
         assert_eq!(render_sync(&SyncReport::default()), "nothing to do\n");
+        // Spec L-6: the fleets a removed plugin owned, one line each
+        let r = SyncReport {
+            stopped: vec!["gh".into()],
+            downed: vec!["gh-acme-api".into(), "gh-acme-web".into()],
+            down_failed: vec!["gh-acme-old: fleet task is gone".into()],
+            ..SyncReport::default()
+        };
+        assert_eq!(
+            render_sync(&r),
+            "stopped: gh\n\
+             fleet gh-acme-api: down\n\
+             fleet gh-acme-web: down\n\
+             fleet gh-acme-old: fleet task is gone (down failed)\n"
+        );
     }
 
     #[test]

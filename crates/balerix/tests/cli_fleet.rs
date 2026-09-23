@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use balerix_api::AgentPhase;
 use balerix_core::FleetRecord;
 use balerix_core::{AgentId, PassThrough};
 use balerix_server::testing::Harness;
-use balerix_server::{Daemon, router, serve};
+use balerix_server::{ApplyMode, Caller, Daemon, router, serve};
 use predicates::prelude::*;
 
 // Not `examples/payments.yaml`: the example fleet names the `flow` plugin,
@@ -205,6 +206,86 @@ fn up_status_list_update_and_down_through_the_binary() {
         .assert()
         .success()
         .stdout("no fleets\n");
+}
+
+/// Spec L §5: a fleet a plugin applied shows its owner, refuses the
+/// CLI's `up`, `update` and `down`, and goes down with `--force`.
+#[test]
+fn a_managed_fleet_shows_its_owner_and_needs_force_to_go_down() {
+    let s = stub();
+    let home = s.home.path();
+    let fleet = fleet_file(home);
+    let fleet = fleet.to_str().unwrap();
+    // seeded as the daemon's manage path would leave it: owned by `gh`
+    let spec = balerix_api::FleetSpec {
+        name: "payments".into(),
+        crews: BTreeMap::from([(
+            "backend".to_string(),
+            balerix_api::CrewSpec {
+                repo: "acme/payments-api".into(),
+                git_ref: "main".into(),
+                git: balerix_api::GitSettings::default(),
+                agents: BTreeMap::from([(
+                    "alice".to_string(),
+                    balerix_api::AgentSettings::default(),
+                )]),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    s._rt
+        .block_on(s.daemon.apply_as(
+            &"payments".parse().unwrap(),
+            spec,
+            Default::default(),
+            ApplyMode::Create,
+            &Caller::Plugin("gh".parse().unwrap()),
+        ))
+        .unwrap();
+
+    balerix(home)
+        .args(["status", "payments"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("  managed by gh\n"));
+    balerix(home)
+        .args(["list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MANAGED BY"))
+        .stdout(predicate::str::contains("  gh\n"));
+    let out = balerix(home)
+        .args(["status", "payments", "--json"])
+        .assert()
+        .success();
+    let rec: FleetRecord = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(rec.owner.as_deref(), Some("gh"));
+
+    for cmd in [["up", fleet], ["update", fleet]] {
+        balerix(home)
+            .args(cmd)
+            .args(["--no-host-defaults", "--no-wait"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "fleet payments is managed by plugin gh (HTTP 409)",
+            ));
+    }
+    balerix(home)
+        .args(["down", "payments", "--timeout", "30s"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "fleet payments is managed by plugin gh (HTTP 409)",
+        ));
+    balerix(home)
+        .args(["down", "payments", "--force", "--timeout", "30s"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "payments  down  generation 1 (observed 1)  managed by gh",
+        ));
 }
 
 #[test]

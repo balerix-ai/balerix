@@ -212,6 +212,9 @@ fn run(
         }
         serve(listener, router(daemon), shutdown_signal()).await?;
         tracing::info!("shutting down; agents keep running in tmux");
+        // Endpoint first, so clients and a new `serve` stop resolving this
+        // daemon; pid last, so the file names the process for as long as it
+        // exists. `cli_serve` polls for both to be gone.
         remove_if_exists(&paths.endpoint())?;
         remove_if_exists(&paths.pid())?;
         Ok::<(), anyhow::Error>(())

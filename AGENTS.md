@@ -396,8 +396,10 @@ credentials, hook input, or sandbox rules.
   release version above the last one, forcing it.
 - `plugins/common` is published to crates.io, so its `balerix-api` and
   `balerix-plugin-sdk` dependencies carry a version beside their path.
-  `release-prepare core` moves them; `release-prepare common` refuses
-  until that core version is tagged. In-tree plugins depend on common by
+  `release-prepare core` moves them; `release-prepare common` answers
+  `status=none` (the reason on stderr) until that core version is tagged,
+  and while `crates/balerix-api` or `crates/balerix-plugin-sdk` has changed
+  since that tag. In-tree plugins depend on common by
   path only (they are `publish = false`).
 - Released `CHANGELOG.md` sections are read back by
   `scripts/release/notes.sh` for the GitHub Release; don't edit them by

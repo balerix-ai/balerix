@@ -9,7 +9,9 @@
 #
 # Prints key=value lines on stdout; progress goes to stderr.
 #   status=release       files changed; version=, tag= and notes= follow
-#   status=none          no releasable commit since the last tag
+#   status=none          no releasable commit since the last tag, or a
+#                        library whose core release has not happened yet
+#                        (the reason is on stderr)
 #   status=in-progress   the manifest version is already awaiting its tag
 #
 # Dies (no status line) if an older tag exists and the manifest version has
@@ -25,17 +27,6 @@ unit=$1
 forced=${2:-}
 require_unit "$unit"
 
-# A library publishes to crates.io, where its `{ version, path }`
-# dependencies must already exist: refuse until the core release that
-# published that SDK version is tagged (Spec K §5).
-if [[ $(unit_kind "$unit") == library ]]; then
-  sdk=$(dep_version "$(unit_manifest "$unit")" balerix-plugin-sdk)
-  [[ -n $sdk ]] || die "$unit: $(unit_manifest "$unit") names balerix-plugin-sdk without a version"
-  tag_exists "$(unit_tag core "$sdk")" ||
-    die "$unit: its manifest names balerix-plugin-sdk $sdk, which has no tag balerix-v$sdk yet;" \
-      "release core $sdk first, then $unit"
-fi
-
 prefix=$(unit_tag_prefix "$unit")
 changelog=$(unit_changelog "$unit")
 current=$(unit_version "$unit")
@@ -45,6 +36,28 @@ notes="$notes_dir/$unit.md"
 
 emit() { printf '%s=%s\n' "$@"; }
 
+# A library publishes to crates.io, where its `{ version, path }`
+# dependencies must already exist at the code it compiles against: until
+# the core release that published that SDK version is tagged, and while
+# either core crate has changed since that tag, there is nothing to
+# propose (Spec K §5). A status, not a failure: release-pr runs for every
+# unit on the push that merges a core release PR, before release.yml has
+# tagged it.
+library_blocked() {
+  local sdk
+  sdk=$(dep_version "$(unit_manifest "$unit")" balerix-plugin-sdk)
+  [[ -n $sdk ]] || die "$unit: $(unit_manifest "$unit") names balerix-plugin-sdk without a version"
+  if ! tag_exists "$(unit_tag core "$sdk")"; then
+    echo "$unit: its manifest names balerix-plugin-sdk $sdk, which has no tag balerix-v$sdk yet;" \
+      "release core $sdk first, then $unit" >&2
+  elif ! git diff --quiet "$(unit_tag core "$sdk")" HEAD -- crates/balerix-api crates/balerix-plugin-sdk; then
+    echo "$unit: crates/balerix-api or crates/balerix-plugin-sdk changed since balerix-v$sdk;" \
+      "release core first, then $unit" >&2
+  else
+    return 1
+  fi
+}
+
 if ! tag_exists "$(unit_tag "$unit" "$current")" && has_section "$unit" "$current"; then
   # A release PR was merged and release.yml has not tagged it yet, or failed
   # (Spec I §8.2): prepare.sh always writes the section, so this also covers
@@ -52,6 +65,9 @@ if ! tag_exists "$(unit_tag "$unit" "$current")" && has_section "$unit" "$curren
   # so this wins even over a forced version.
   echo "$unit: $current is awaiting its tag; release in progress" >&2
   emit status in-progress version "$current"
+  exit 0
+elif [[ $(unit_kind "$unit") == library ]] && library_blocked; then
+  emit status none
   exit 0
 elif [[ -n $forced ]]; then
   [[ $forced =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "$unit: not a release version: $forced"
@@ -115,6 +131,16 @@ if [[ $unit == core ]]; then
   # plugin lockfiles were never updated for that hand edit either.
   for plugin in "${PLUGIN_UNITS[@]}"; do
     cargo update --manifest-path "plugins/$plugin/Cargo.toml" -p balerix-api -p balerix-plugin-sdk >&2
+  done
+fi
+if [[ $(unit_kind "$unit") == library ]]; then
+  # Plugins built on the library lock it through their path dependency, and
+  # build.sh builds them --locked. Refresh even when $next == $current, for
+  # the same reason as the core loop above.
+  for plugin in "${PLUGIN_UNITS[@]}"; do
+    if grep -q "^$(unit_crate "$unit") " "plugins/$plugin/Cargo.toml"; then
+      cargo update --manifest-path "plugins/$plugin/Cargo.toml" -p "$(unit_crate "$unit")" >&2
+    fi
   done
 fi
 if [[ $(unit_kind "$unit") == plugin ]]; then

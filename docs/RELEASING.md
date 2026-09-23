@@ -16,10 +16,22 @@ Design: `docs/superpowers/specs/2026-09-11-release-pipeline-design.md`
 Binaries are static musl builds for Linux x86_64 and aarch64.
 
 A library unit ships crates only: no binary, image or package. `common`
-names the SDK and API by version, so its release PR is refused
-(`release-prepare` dies naming the tag) until the core release that
-published that version is tagged; a core release moves those versions in
-`plugins/common/Cargo.toml`.
+names the SDK and API by version, and crates.io builds it against exactly
+those versions. So `prepare.sh` proposes nothing for it (it answers
+`status=none` and says why, naming the core release) until the core
+release that published that version is tagged, and again whenever
+`crates/balerix-api` or `crates/balerix-plugin-sdk` has changed since that
+tag; a core release moves those versions in `plugins/common/Cargo.toml`.
+While refused, an open common release PR is closed like any unit with
+nothing to release, and opened again on the first push to `main` after
+core's tag exists.
+
+**Common's first release waits for the next core release.** Its manifest
+names SDK and API 0.1.0, but its code needs SDK and API changes made
+after `balerix-v0.1.0`; publishing it against 0.1.0 would fail. The
+refusal above keeps the bot from proposing it; if a bot-opened common
+release PR is open anyway, do not merge it before the core release that
+moves those versions has landed (its tag exists).
 
 ## Cutting a release
 
@@ -129,7 +141,7 @@ Nothing releases until all of this is done.
    PR and watch `release.yml` publish, sign, verify and promote. Crates are
    never published from a fork.
 6. **First releases**, in order: flow, then web, then matrix, then common
-   (after core).
+   (after the next core release, not `balerix-v0.1.0`; see above).
 7. **crates.io bootstrap** before merging core's first release PR: from that
    PR's head commit, `mise x -- cargo publish --locked -p balerix-api -p
    balerix-plugin-sdk` with a personal API token; then on crates.io add a

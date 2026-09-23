@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use balerix_api::{DownQuery, PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport};
+use balerix_api::{
+    DownQuery, FleetSummary, PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport,
+};
 use balerix_runtime::fsutil::write_atomic;
 use balerix_server::plugins::config::NO_TLS;
 use balerix_server::plugins::package::{create, sha256_hex, unpack};
@@ -84,6 +86,14 @@ fn render_purge_result(fleet: &str, result: Result<()>) -> String {
         Ok(()) => format!("fleet {fleet}: purged\n"),
         Err(e) => format!("fleet {fleet}: {e} (purge failed)\n"),
     }
+}
+
+/// The fleets `plugin` manages, in list order.
+fn owned_fleets(rows: &[FleetSummary], plugin: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.managed_by.as_deref() == Some(plugin))
+        .map(|r| r.name.clone())
+        .collect()
 }
 
 pub fn plugins_file_path() -> Result<PathBuf> {
@@ -248,12 +258,14 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
     if args.purge {
         let client = Client::connect(args.api_url.as_deref())
             .map_err(|e| anyhow!("{e}; --purge needs a running daemon (the entry was removed)"))?;
+        // Spec L-6: `--purge` purges every fleet the plugin owns, the
+        // ones already down included, so they are listed before the sync.
+        // The daemon downs the up ones during the sync; a second, forced
+        // down with `purge` deletes their records and directories.
+        let owned = owned_fleets(&client.list()?, &args.name);
         let report = client.sync_plugins()?;
         let mut out = render_sync(&report);
-        // Spec L-6: `--purge` purges the plugin's fleets too. The daemon
-        // downed them during the sync; a second, forced down with `purge`
-        // deletes their records and directories.
-        for fleet in &report.downed {
+        for fleet in &owned {
             let result = client
                 .down(
                     fleet,
@@ -483,5 +495,27 @@ mod tests {
         assert!(!should_bail(false, true));
         assert!(!should_bail(true, false));
         assert!(!should_bail(true, true));
+    }
+
+    /// Spec L-6 (F3): `--purge` purges every fleet the plugin owns, up or
+    /// already down, and nothing another owner or the CLI holds.
+    #[test]
+    fn purge_selects_every_fleet_the_plugin_owns_whatever_its_phase() {
+        let row = |name: &str, phase, owner: Option<&str>| FleetSummary {
+            name: name.into(),
+            phase,
+            generation: 1,
+            observed_generation: 1,
+            agents: 1,
+            managed_by: owner.map(Into::into),
+        };
+        let rows = [
+            row("up", balerix_api::FleetPhase::Ready, Some("gh")),
+            row("cli", balerix_api::FleetPhase::Ready, None),
+            row("down", balerix_api::FleetPhase::Down, Some("gh")),
+            row("other", balerix_api::FleetPhase::Ready, Some("ghx")),
+        ];
+        assert_eq!(owned_fleets(&rows, "gh"), ["up", "down"]);
+        assert!(owned_fleets(&rows, "web").is_empty());
     }
 }

@@ -275,8 +275,10 @@ pub branch: Option<String>,
   prints one line per fleet from them. A plugin already undeclared at
   daemon start is covered by the same rule: the first sync, in `serve`,
   downs its fleets and logs one warning per fleet. A sync that fails
-  resolving (an install failure) downs nothing. `--purge` re-downs each
-  with `purge` + `force` from the CLI.
+  resolving (an install failure) downs nothing. `--purge` lists the
+  plugin's fleets (`managed_by`) before the sync and purges each after it
+  with `purge` + `force` from the CLI, so a fleet that was already down
+  is purged too.
 - `balerix_config::from_value` reads the file from JSON with
   `serde_path_to_error`, so a shape error names its key (`file` for the
   root); the daemon checks `file.name` against the path before resolving.

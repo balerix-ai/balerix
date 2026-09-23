@@ -288,6 +288,83 @@ fn a_managed_fleet_shows_its_owner_and_needs_force_to_go_down() {
         ));
 }
 
+/// Spec L-6 (F3): `plugin remove --purge` purges every fleet the plugin
+/// owns — the one the sync downs and the one that was already down —
+/// and leaves the CLI's fleets alone.
+#[test]
+fn plugin_remove_purge_purges_every_fleet_the_plugin_owns() {
+    let s = stub();
+    let home = s.home.path();
+    let spec = |name: &str| balerix_api::FleetSpec {
+        name: name.into(),
+        crews: BTreeMap::from([(
+            "backend".to_string(),
+            balerix_api::CrewSpec {
+                repo: "acme/payments-api".into(),
+                git_ref: "main".into(),
+                git: balerix_api::GitSettings::default(),
+                agents: BTreeMap::from([(
+                    "alice".to_string(),
+                    balerix_api::AgentSettings::default(),
+                )]),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let gh = Caller::Plugin("gh".parse().unwrap());
+    s._rt.block_on(async {
+        for (name, caller) in [
+            ("up", &gh),
+            ("down", &gh),
+            ("mine", &Caller::Admin { force: false }),
+        ] {
+            s.daemon
+                .apply_as(
+                    &name.parse().unwrap(),
+                    spec(name),
+                    Default::default(),
+                    ApplyMode::Create,
+                    caller,
+                )
+                .await
+                .unwrap();
+        }
+        s.daemon
+            .down_as(&"down".parse().unwrap(), Default::default(), false, &gh)
+            .await
+            .unwrap();
+    });
+    // declared on the CLI's side; the stub daemon's own plugins.yaml is
+    // empty, so its sync reads `gh` as removed either way
+    let config = home.join(".config/balerix");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("plugins.yaml"),
+        "plugins:\n  - name: gh\n    source: /nowhere\n",
+    )
+    .unwrap();
+
+    balerix(home)
+        .args(["plugin", "remove", "gh", "--purge"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fleet up: down\n"))
+        .stdout(predicate::str::contains("fleet up: purged\n"))
+        .stdout(predicate::str::contains("fleet down: purged\n"))
+        .stdout(predicate::str::contains(
+            "removed gh and purged its state\n",
+        ))
+        .stdout(predicate::str::contains("fleet down: down").not());
+    let names: Vec<String> = s
+        ._rt
+        .block_on(s.daemon.list())
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    assert_eq!(names, ["mine"], "both owned fleets purged, the CLI's kept");
+}
+
 #[test]
 fn without_a_daemon_the_client_says_how_to_start_one() {
     let home = tempfile::tempdir().unwrap();

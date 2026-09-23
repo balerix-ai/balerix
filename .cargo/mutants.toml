@@ -1,0 +1,6 @@
+# `mise run mutants` (the nightly tier) mutation-tests balerix-core, the
+# reconciler. The fakes are test doubles: the code paths in them are
+# exercised by balerix-server's tests, which a `-p balerix-core` run never
+# executes, so a mutant there measures nothing about the reconciler and
+# every miss the tier ever reported was one of them (#54).
+exclude_globs = ["crates/balerix-core/src/fakes.rs"]

@@ -15,6 +15,8 @@ credentials, hook input, or sandbox rules.
   library, Spec K). Neither is part of `check`; CI runs them as their own
   concurrent jobs.
 - `mutants` — nightly tier: mutation-tests `balerix-core` (the reconciler).
+  `.cargo/mutants.toml` excludes `fakes.rs`: the fakes are exercised by
+  `balerix-server`'s tests, which that run never executes.
 - `e2e` — the Phase 3 journey against a real daemon; needs the same tools as `test-it`.
 - `package-plugins [names…]` — builds the named in-tree plugins inside
   their own projects and assembles each as a directory source under

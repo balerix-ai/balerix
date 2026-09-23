@@ -258,3 +258,28 @@ pub branch: Option<String>,
    `workspace_it` and by hand with `mise run verify-claude` on a branch).
 5. `docs/THREAT-MODEL.md` and `ARCHITECTURE.md` describe the capability,
    the owner rule and the ports.
+
+## 12. Recorded at implementation (2026-09-23)
+
+- `Daemon::apply`/`down` stay the admin wrappers; the shared forms are
+  `apply_as(name, spec, credentials, ApplyMode, &Caller)` and
+  `down_as(name, keep, purge, &Caller)`, with `ApplyMode::Upsert` for
+  the plugin's `PUT` (§3.1 step 5 said `replace = true`; an absent name
+  must create). `Caller::Admin { force }` / `Caller::Plugin(name)`.
+- The owner error is `DaemonError::Managed(String)` → 409; a record
+  is created with `FleetRecord::with_owner`.
+- `plugin remove` downs owned fleets inside `Daemon::sync_plugins`, for
+  every plugin the sync stopped; the fleets and failures ride back in
+  `SyncReport.downed` / `SyncReport.down_failed` and the CLI prints one
+  line per fleet from them. `--purge` re-downs each with `purge` +
+  `force` from the CLI. A plugin already undeclared at daemon start
+  downs nothing.
+- `balerix_config::from_value` reads the file from JSON with
+  `serde_path_to_error`, so a shape error names its key (`file` for the
+  root); the daemon checks `file.name` against the path before resolving.
+- The plugin `DELETE` accepts `force` and ignores it.
+- `dev fake-plugin`'s manage mode is driven by `config.manage` in
+  `plugins.yaml`, not a flag: the package's `start` task takes no args.
+- `FakeHost` records refused calls too (`applied_fleets`, `downed_fleets`)
+  and fails both routes with `fail_manage(Some((status, message)))`.
+- `check_branch_name` also refuses the bare `@`, as git does.

@@ -335,6 +335,31 @@ credentials, hook input, or sandbox rules.
   so never go back to deriving it.
 - Rotating a file named in `secrets` changes `ResolvedPlugin::hash` and so
   restarts the plugin on the next sync. That is intended.
+- A fleet record's `owner` (Spec L) is set by the first `PUT
+  /v1/plugin-host/fleets/{name}` and never transferred: `up`/`update`
+  on it are 409 `fleet <f> is managed by plugin <p>`, `down` needs
+  `--force`, and a forced down keeps the owner so the plugin's next
+  apply resumes it. `plugin remove` downs the plugin's fleets during the
+  sync (`SyncReport.downed`); a plugin that was already undeclared when
+  the daemon started downs nothing — `down --force` by hand. The
+  daemon-side rule is `Daemon::check_owner`; `apply`/`down` are the
+  admin wrappers of `apply_as`/`down_as`.
+- The resolver a plugin's fleet file goes through lives in the binary
+  (`crates/balerix/src/wiring.rs::HostResolver`, both ports): it reads
+  `HostPaths::discover()` at call time, so the daemon's `HOME` is the
+  operator whose credentials every managed fleet gets. `balerix-server`
+  sees only the `FleetResolver`/`CredentialSource` ports;
+  `Harness` answers them with `FakeResolver` (no answer → `name: no
+  resolver answer configured`; set it per test) and `FakeCredentials`.
+- `AgentSettings.branch` makes the *remote* branch the worktree branch
+  and its start point (`ResolvedAgent::start_ref`); a branch the remote
+  lacks fails the materialize step with git's message and retries at the
+  resync cadence. The workspace diff base is still `origin/<crew ref>`.
+- `dev fake-plugin` applies a fleet when its `plugins.yaml` entry has
+  `config: { manage: { fleet, file } }` (the e2e's managed journey) and
+  writes the outcome to `scratch/fake-plugin.manage`. The SDK's
+  `FakeHost` answers `PUT fleets/{name}` with the record it already holds
+  under that name (`set_fleets`), else a fresh one owned by `plugin`.
 - `matrix-sdk` is a large tree, isolated in the standalone `plugins/matrix`
   project and out of the core workspace's resolution entirely; run
   `cargo deny` there when bumping it.

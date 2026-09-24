@@ -55,12 +55,16 @@ fn plugins_cell(a: &AgentStatus) -> String {
 
 pub fn render_status(r: &FleetRecord) -> String {
     let mut out = format!(
-        "{}  {}  generation {} (observed {})\n",
+        "{}  {}  generation {} (observed {})",
         r.name(),
         label(r.status.phase),
         r.generation,
         r.status.observed_generation
     );
+    if let Some(plugin) = &r.owner {
+        out.push_str(&format!("  managed by {plugin}"));
+    }
+    out.push('\n');
     let rows: Vec<[String; 5]> = r
         .status
         .agents
@@ -86,7 +90,7 @@ pub fn render_list(rows: &[FleetSummary]) -> String {
     if rows.is_empty() {
         return "no fleets\n".to_string();
     }
-    let rows: Vec<[String; 5]> = rows
+    let rows: Vec<[String; 6]> = rows
         .iter()
         .map(|s| {
             [
@@ -95,10 +99,14 @@ pub fn render_list(rows: &[FleetSummary]) -> String {
                 s.generation.to_string(),
                 s.observed_generation.to_string(),
                 s.agents.to_string(),
+                s.managed_by.clone().unwrap_or_else(|| "-".to_string()),
             ]
         })
         .collect();
-    table(&["NAME", "PHASE", "GEN", "OBSERVED", "AGENTS"], &rows)
+    table(
+        &["NAME", "PHASE", "GEN", "OBSERVED", "AGENTS", "MANAGED BY"],
+        &rows,
+    )
 }
 
 /// `up`/`update` are done when the fleet is Ready and every plugin
@@ -245,6 +253,7 @@ pub fn down_command(args: &DownArgs) -> Result<String> {
         keep_repos: args.keep || args.keep_repos,
         keep_sessions: args.keep || args.keep_sessions,
         purge: args.purge,
+        force: args.force,
     };
     let client = Client::connect(args.api_url.as_deref())?;
     client.down(&args.fleet, &q)?;
@@ -338,10 +347,23 @@ mod tests {
         let rows = vec![r.summary()];
         assert_eq!(
             render_list(&rows),
-            "NAME      PHASE     GEN  OBSERVED  AGENTS\n\
-             payments  degraded  3    3         2\n"
+            "NAME      PHASE     GEN  OBSERVED  AGENTS  MANAGED BY\n\
+             payments  degraded  3    3         2       -\n"
         );
         assert_eq!(render_list(&[]), "no fleets\n");
+        // Spec L §5: an owned fleet says so on its first line and in its row
+        r.owner = Some("github".into());
+        assert!(
+            render_status(&r)
+                .starts_with("payments  degraded  generation 3 (observed 3)  managed by github\n"),
+            "{}",
+            render_status(&r)
+        );
+        assert_eq!(
+            render_list(&[r.summary()]),
+            "NAME      PHASE     GEN  OBSERVED  AGENTS  MANAGED BY\n\
+             payments  degraded  3    3         2       github\n"
+        );
     }
 
     #[test]

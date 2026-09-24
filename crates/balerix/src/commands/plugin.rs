@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use balerix_api::{PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport};
+use balerix_api::{
+    DownQuery, FleetSummary, PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport,
+};
 use balerix_runtime::fsutil::write_atomic;
 use balerix_server::plugins::config::NO_TLS;
 use balerix_server::plugins::package::{create, sha256_hex, unpack};
@@ -62,10 +64,36 @@ pub fn render_sync(r: &SyncReport) -> String {
             out.push_str(&format!("{label}: {}\n", names.join(", ")));
         }
     }
+    // Spec L-6: the fleets a removed plugin owned, one line each
+    for fleet in &r.downed {
+        out.push_str(&format!("fleet {fleet}: down\n"));
+    }
+    for failure in &r.down_failed {
+        out.push_str(&format!("fleet {failure} (down failed)\n"));
+    }
     if out.is_empty() {
         out.push_str("nothing to do\n");
     }
     out
+}
+
+/// One line for `plugin remove --purge`'s re-down of a fleet the sync
+/// already downed. A fleet that fails to go down is reported and the
+/// removal continues (spec §5) rather than aborting before
+/// `purge_plugin` runs.
+fn render_purge_result(fleet: &str, result: Result<()>) -> String {
+    match result {
+        Ok(()) => format!("fleet {fleet}: purged\n"),
+        Err(e) => format!("fleet {fleet}: {e} (purge failed)\n"),
+    }
+}
+
+/// The fleets `plugin` manages, in list order.
+fn owned_fleets(rows: &[FleetSummary], plugin: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.managed_by.as_deref() == Some(plugin))
+        .map(|r| r.name.clone())
+        .collect()
 }
 
 pub fn plugins_file_path() -> Result<PathBuf> {
@@ -230,13 +258,28 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
     if args.purge {
         let client = Client::connect(args.api_url.as_deref())
             .map_err(|e| anyhow!("{e}; --purge needs a running daemon (the entry was removed)"))?;
+        // Spec L-6: `--purge` purges every fleet the plugin owns, the
+        // ones already down included, so they are listed before the sync.
+        // The daemon downs the up ones during the sync; a second, forced
+        // down with `purge` deletes their records and directories.
+        let owned = owned_fleets(&client.list()?, &args.name);
         let report = client.sync_plugins()?;
+        let mut out = render_sync(&report);
+        for fleet in &owned {
+            let result = client
+                .down(
+                    fleet,
+                    &DownQuery {
+                        purge: true,
+                        force: true,
+                        ..DownQuery::default()
+                    },
+                )
+                .map(|_| ());
+            out.push_str(&render_purge_result(fleet, result));
+        }
         client.purge_plugin(&args.name)?;
-        return Ok(format!(
-            "{}removed {} and purged its state\n",
-            render_sync(&report),
-            args.name
-        ));
+        return Ok(format!("{out}removed {} and purged its state\n", args.name));
     }
     Ok(format!(
         "removed {} from plugins.yaml (state kept; --purge deletes it)\n{}",
@@ -339,9 +382,40 @@ mod tests {
             installed: vec!["a".into(), "b".into()],
             stopped: vec![],
             unchanged: vec!["c".into()],
+            ..SyncReport::default()
         };
         assert_eq!(render_sync(&r), "installed: a, b\nunchanged: c\n");
         assert_eq!(render_sync(&SyncReport::default()), "nothing to do\n");
+        // Spec L-6: the fleets a removed plugin owned, one line each
+        let r = SyncReport {
+            stopped: vec!["gh".into()],
+            downed: vec!["gh-acme-api".into(), "gh-acme-web".into()],
+            down_failed: vec!["gh-acme-old: fleet task is gone".into()],
+            ..SyncReport::default()
+        };
+        assert_eq!(
+            render_sync(&r),
+            "stopped: gh\n\
+             fleet gh-acme-api: down\n\
+             fleet gh-acme-web: down\n\
+             fleet gh-acme-old: fleet task is gone (down failed)\n"
+        );
+    }
+
+    #[test]
+    fn a_failed_purge_reports_and_a_successful_one_reports_too() {
+        // Spec §5: "A fleet that fails to go down is reported and the
+        // removal continues" — `plugin remove --purge`'s re-down loop
+        // must format both outcomes rather than aborting on the first
+        // error (which would skip `purge_plugin` and drop the report).
+        assert_eq!(
+            render_purge_result("gh-acme-api", Ok(())),
+            "fleet gh-acme-api: purged\n"
+        );
+        assert_eq!(
+            render_purge_result("gh-acme-old", Err(anyhow!("fleet task is gone"))),
+            "fleet gh-acme-old: fleet task is gone (purge failed)\n"
+        );
     }
 
     #[test]
@@ -421,5 +495,27 @@ mod tests {
         assert!(!should_bail(false, true));
         assert!(!should_bail(true, false));
         assert!(!should_bail(true, true));
+    }
+
+    /// Spec L-6 (F3): `--purge` purges every fleet the plugin owns, up or
+    /// already down, and nothing another owner or the CLI holds.
+    #[test]
+    fn purge_selects_every_fleet_the_plugin_owns_whatever_its_phase() {
+        let row = |name: &str, phase, owner: Option<&str>| FleetSummary {
+            name: name.into(),
+            phase,
+            generation: 1,
+            observed_generation: 1,
+            agents: 1,
+            managed_by: owner.map(Into::into),
+        };
+        let rows = [
+            row("up", balerix_api::FleetPhase::Ready, Some("gh")),
+            row("cli", balerix_api::FleetPhase::Ready, None),
+            row("down", balerix_api::FleetPhase::Down, Some("gh")),
+            row("other", balerix_api::FleetPhase::Ready, Some("ghx")),
+        ];
+        assert_eq!(owned_fleets(&rows, "gh"), ["up", "down"]);
+        assert!(owned_fleets(&rows, "web").is_empty());
     }
 }

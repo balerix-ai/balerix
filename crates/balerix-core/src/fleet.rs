@@ -42,6 +42,10 @@ pub enum FleetError {
     ReservedAgentName { path: String },
     #[error("{path}: must not be empty")]
     EmptyIdentity { path: String },
+    /// Spec L §6: re-checked here so the admin `POST /v1/fleets`, which
+    /// receives a resolved spec, never trusts its caller with a git argv.
+    #[error("{path}: {reason}")]
+    InvalidBranch { path: String, reason: String },
 }
 
 /// The tmux anchor window that keeps a crew's session alive is named
@@ -98,9 +102,15 @@ fn convert_crew(path: &str, crew: CrewSpec) -> Result<Crew, FleetError> {
         }
         let agent_name =
             AgentName::try_from(agent_name).map_err(|source| FleetError::InvalidName {
-                path: agent_path,
+                path: agent_path.clone(),
                 source,
             })?;
+        if let Some(branch) = &settings.branch {
+            balerix_api::check_branch_name(branch).map_err(|reason| FleetError::InvalidBranch {
+                path: format!("{agent_path}.branch"),
+                reason,
+            })?;
+        }
         agents.insert(agent_name, settings);
     }
     Ok(Crew {
@@ -215,6 +225,22 @@ mod tests {
                 .starts_with("crews.backend.agents.Bob: invalid agent name"),
             "{err}"
         );
+    }
+
+    /// M7: a resolved spec that reaches the daemon without the config
+    /// crate (the admin `POST`) still has its `branch` checked.
+    #[test]
+    fn an_invalid_branch_reports_its_path() {
+        let mut s = spec("payments", "backend", "acme/api", "main", &["alice"]);
+        let crew = s.crews.get_mut("backend").unwrap();
+        crew.agents.get_mut("alice").unwrap().branch = Some("-x".into());
+        assert_eq!(
+            Fleet::try_from(s.clone()).unwrap_err().to_string(),
+            "crews.backend.agents.alice.branch: starts with '-'"
+        );
+        let crew = s.crews.get_mut("backend").unwrap();
+        crew.agents.get_mut("alice").unwrap().branch = Some("feature/x".into());
+        assert!(Fleet::try_from(s).is_ok());
     }
 
     #[test]

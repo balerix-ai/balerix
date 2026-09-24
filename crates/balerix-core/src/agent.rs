@@ -99,9 +99,22 @@ impl ResolvedAgent {
         out
     }
 
-    /// The per-agent branch, `balerix/<fleet>/<crew>/<agent>` (spec D3).
+    /// The worktree branch: `settings.branch` when set (an existing remote
+    /// branch, Spec L §6), else the per-agent
+    /// `balerix/<fleet>/<crew>/<agent>` (spec D3).
     pub fn branch(&self) -> String {
-        format!("balerix/{}", self.id)
+        match &self.settings.branch {
+            Some(b) => b.clone(),
+            None => format!("balerix/{}", self.id),
+        }
+    }
+
+    /// The remote ref the worktree branch is created from when it does
+    /// not exist locally: the branch itself when `settings.branch` is set,
+    /// else the crew's `ref`. The workspace diff base is the crew's `ref`
+    /// either way (`Daemon::base_ref`).
+    pub fn start_ref(&self) -> &str {
+        self.settings.branch.as_deref().unwrap_or(&self.git_ref)
     }
 
     /// SHA-256 over canonical JSON. `serde_json` writes maps in key order
@@ -189,5 +202,24 @@ mod tests {
         let mut b = a.clone();
         b.git_ref = "develop".into();
         assert_ne!(a.hash(), b.hash());
+    }
+
+    /// Spec L §6: `branch` names an existing remote branch; it is both the
+    /// worktree branch and the start point. Without it, the per-agent
+    /// branch starts from the crew's ref.
+    #[test]
+    fn branch_and_start_ref_follow_the_setting() {
+        let mut a = ResolvedAgent::from_fleet(&fleet()).remove(0);
+        assert_eq!(a.branch(), "balerix/payments/backend/alice");
+        assert_eq!(a.start_ref(), "main");
+        let before = a.hash();
+        a.settings.branch = Some("feature/issue-12".into());
+        assert_eq!(a.branch(), "feature/issue-12");
+        assert_eq!(a.start_ref(), "feature/issue-12");
+        assert_ne!(
+            a.hash(),
+            before,
+            "a changed branch re-materializes the agent"
+        );
     }
 }

@@ -46,7 +46,8 @@ pub struct HookSubscriptions {
     pub intercept: BTreeSet<String>,
 }
 
-/// Host capabilities a plugin may declare (plugins spec §4.1).
+/// Host capabilities a plugin may declare (plugins spec §4.1; `manage` is
+/// Spec L-1: apply and down a fleet from an unresolved fleet file).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Capability {
@@ -55,6 +56,7 @@ pub enum Capability {
     Attach,
     Kv,
     Workspace,
+    Manage,
 }
 
 /// `$XDG_CONFIG_HOME/balerix/plugins.yaml` (plugins spec §2.1). Order is
@@ -124,6 +126,14 @@ pub struct SyncReport {
     pub installed: Vec<String>,
     pub stopped: Vec<String>,
     pub unchanged: Vec<String>,
+    /// Fleets downed because the plugin that owned them was stopped
+    /// (Spec L-6). Absent from a report by an older daemon.
+    #[serde(default)]
+    pub downed: Vec<String>,
+    /// `<fleet>: <error>` for each owned fleet the daemon could not down;
+    /// the removal went on regardless.
+    #[serde(default)]
+    pub down_failed: Vec<String>,
 }
 
 fn empty_object() -> Value {
@@ -191,6 +201,32 @@ mod tests {
             serde_json::from_value::<Capability>(json!("workspace")).unwrap(),
             Capability::Workspace
         );
+        assert_eq!(
+            serde_json::from_value::<Capability>(json!("manage")).unwrap(),
+            Capability::Manage,
+            "Spec L-1: the capability that gates the two fleet routes"
+        );
+        assert_eq!(
+            serde_json::to_value(Capability::Manage).unwrap(),
+            json!("manage")
+        );
+    }
+
+    /// A report from a daemon that predates Spec L has no `downed` lists.
+    #[test]
+    fn a_sync_report_without_the_downed_lists_still_loads() {
+        let older: SyncReport = serde_json::from_value(json!({
+            "installed": [], "stopped": ["x"], "unchanged": []
+        }))
+        .unwrap();
+        assert!(older.downed.is_empty() && older.down_failed.is_empty());
+        let r = SyncReport {
+            downed: vec!["f".into()],
+            down_failed: vec!["g: fleet task is gone".into()],
+            ..SyncReport::default()
+        };
+        let back: SyncReport = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
     }
 
     #[test]

@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use axum::http::HeaderValue;
 use balerix_api::{
-    ErrorBody, FleetRecord, HelloRequest, HelloResponse, KvKeys, PLUGIN_PROTOCOL, PluginAction,
-    ResizeFrame, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
+    DownQuery, ErrorBody, FleetRecord, HelloRequest, HelloResponse, KvKeys, PLUGIN_PROTOCOL,
+    PluginAction, ResizeFrame, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
@@ -22,6 +23,10 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// `workspace_diff` alone: a first diff of a large repository can outlast
 /// the client's 10 s.
 const DIFF_TIMEOUT: Duration = Duration::from_secs(30);
+/// `apply_fleet` alone: the daemon resolves the file and then queues the
+/// apply behind the fleet actor's current pass, which may be cloning a
+/// repository or installing tools.
+const APPLY_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct Host {
@@ -147,6 +152,35 @@ impl Host {
             404 => Ok(None),
             _ => Err(Self::status_error(status, &bytes)),
         }
+    }
+
+    /// `PUT fleets/{name}` (Spec L §3.1): applies an unresolved fleet
+    /// file — the YAML fleet file's structure as JSON — as a fleet this
+    /// plugin owns, and answers the record. Needs `manage`. 400 with the
+    /// resolver's message (config path first) when the file does not
+    /// resolve; 409 `fleet <name> is managed by plugin <p>` or `… is not
+    /// managed by a plugin` when the name belongs to someone else. The
+    /// call returns before the fleet is ready: watch `fleets/watch` or
+    /// poll `fleet` for that.
+    pub async fn apply_fleet(&self, name: &str, file: &Value) -> Result<FleetRecord, SdkError> {
+        self.json(
+            self.http
+                .put(self.url(&format!("fleets/{name}")))
+                .timeout(APPLY_TIMEOUT)
+                .json(&json!({ "file": file })),
+        )
+        .await
+    }
+
+    /// `DELETE fleets/{name}?…` (Spec L §3.2): downs a fleet this plugin
+    /// applied, with the admin `DELETE`'s flags (`force` is ignored
+    /// there). 409 for a fleet it does not own, 404 for none.
+    pub async fn down_fleet(&self, name: &str, query: &DownQuery) -> Result<FleetRecord, SdkError> {
+        self.json(
+            self.http
+                .delete(self.url(&format!("fleets/{name}?{}", query.to_query_string()))),
+        )
+        .await
     }
 
     pub async fn action(&self, agent: &str, action: &PluginAction) -> Result<(), SdkError> {
@@ -642,6 +676,37 @@ mod tests {
         assert_eq!(host.kv_list("").await.unwrap().len(), 2);
         host.kv_delete("state/x").await.unwrap();
         assert_eq!(host.kv_get("state/x").await.unwrap(), None);
+
+        // Spec L: a fleet the plugin applies is watched like any other
+        let file = json!({ "apiVersion": "balerix/v1", "kind": "Fleet", "crews": {} });
+        let rec = host.apply_fleet("billing", &file).await.unwrap();
+        assert_eq!(
+            (rec.name(), rec.owner.as_deref()),
+            ("billing", Some("plugin"))
+        );
+        assert_eq!(
+            host.fleets().await.unwrap().len(),
+            2,
+            "the fake holds it now"
+        );
+        assert_eq!(fake.applied_fleets(), vec![("billing".to_string(), file)]);
+        let rec = host
+            .down_fleet("billing", &balerix_api::DownQuery::default())
+            .await
+            .unwrap();
+        assert!(rec.is_down());
+        assert_eq!(fake.downed_fleets().len(), 1);
+        fake.fail_manage(Some((409, "fleet billing is managed by plugin other")));
+        let e = host.apply_fleet("billing", &json!({})).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "daemon: HTTP 409: fleet billing is managed by plugin other"
+        );
+        assert_eq!(
+            fake.applied_fleets().len(),
+            2,
+            "a refused apply is still recorded"
+        );
     }
 
     #[tokio::test]

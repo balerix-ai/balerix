@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use balerix_api::Timestamp;
 use balerix_core::fakes::{
-    FakeClock, FakeMaterializer, FakeRunner, FakeSystemToolchain, FakeWorkspace,
+    FakeClock, FakeCredentials, FakeMaterializer, FakeResolver, FakeRunner, FakeSystemToolchain,
+    FakeWorkspace,
 };
 use balerix_core::{
     FleetName, FleetRecord, FleetSecrets, FleetStore, ReconcilePolicy, StoreError, SystemToolchain,
@@ -62,6 +63,8 @@ pub struct Harness {
     pub clock: Arc<FakeClock>,
     pub store: Arc<MemoryStore>,
     pub workspace: Arc<FakeWorkspace>,
+    pub resolver: Arc<FakeResolver>,
+    pub credentials: Arc<FakeCredentials>,
     pub ports: Arc<Ports>,
     pub registry: Arc<PluginRegistry>,
     pub client: PluginClient,
@@ -81,12 +84,16 @@ impl Harness {
         let clock = Arc::new(FakeClock::new(Timestamp(1_000)));
         let store = Arc::new(MemoryStore::new());
         let workspace = Arc::new(FakeWorkspace::default());
+        let resolver = Arc::new(FakeResolver::default());
+        let credentials = Arc::new(FakeCredentials::default());
         let ports = Arc::new(Ports {
             materializer: materializer.clone(),
             runner: runner.clone(),
             clock: clock.clone(),
             store: store.clone(),
             workspace: workspace.clone(),
+            resolver: resolver.clone(),
+            credentials: credentials.clone(),
             policy,
             hook_url: "http://127.0.0.1:1".to_string(),
             resync,
@@ -102,6 +109,8 @@ impl Harness {
             clock,
             store,
             workspace,
+            resolver,
+            credentials,
             ports,
             registry: PluginRegistry::new(),
             client: PluginClient::new().unwrap_or_else(|e| panic!("http client: {e}")),
@@ -187,6 +196,8 @@ impl Harness {
             clock: self.clock.clone(),
             store: self.store.clone(),
             workspace: self.workspace.clone(),
+            resolver: self.resolver.clone(),
+            credentials: self.credentials.clone(),
             policy: self.ports.policy.clone(),
             hook_url: self.ports.hook_url.clone(),
             resync: self.ports.resync,

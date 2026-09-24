@@ -22,9 +22,12 @@ against what was declared.
 - `balerix-core` — the domain: validated names (`FleetName`, …), `RepoRef`, the
   `Fleet` that `FleetSpec` converts into with `TryFrom`, the pure reconciler
   (`reconcile::plan`/`execute`/`apply`), and the ports adapters implement —
-  `Materializer`, `AgentRunner`, `Clock`, `WorkspaceReader` today; `FleetStore`
-  and `EventHandler` arrive with the server. Never does I/O, so it tests with
-  fakes (`balerix_core::fakes`).
+  `Materializer`, `AgentRunner`, `Clock`, `WorkspaceReader`, `FleetResolver`,
+  `CredentialSource` today; `FleetStore` and `EventHandler` arrive with the
+  server. Never does I/O, so it tests with fakes (`balerix_core::fakes`).
+  `FleetResolver` and `CredentialSource` (Spec L) are implemented by the
+  binary over `balerix-config`, the one crate that resolves a fleet file, so
+  the daemon resolves a plugin's file without depending on it.
 - `balerix-config` — YAML → resolved `FleetSpec`. Parses the three-level file,
   deep-merges settings layers as JSON values, types and validates each agent.
 - `balerix-server` — the daemon: one actor task per fleet over the reconciler,
@@ -168,12 +171,28 @@ activity column, and a submit that renders one message and sends it
 through `send_text`, which tmux delivers as a bracketed paste when the
 text has newlines.
 
+**Plugin-managed fleets (Spec L):** a plugin declaring `manage` applies
+a fleet from an unresolved fleet file — `PUT
+/v1/plugin-host/fleets/{name}` takes what `balerix up -f` reads, as JSON
+— and the daemon does what `up` does: resolves it through the
+`FleetResolver` port, reads the operator's credentials through
+`CredentialSource`, and applies. The record carries the plugin as its
+`owner`; the admin routes refuse an owned fleet (409) except `down
+--force`, and a plugin may only apply or down what it owns. `plugin
+remove` downs the fleets the plugin owned. An agent's `branch` setting
+makes an existing remote branch its worktree branch and start point
+(a PR's head); the diff base stays the crew's `ref`.
+
 ## Non-obvious decisions
 - **Merge is a left fold, not associative.** `null` means "delete relative to the
   layers below me"; that only has meaning in order. Tested by property
   (idempotent, overlay-dominant, never emits null).
-- **Resolution happens client-side.** The daemon only ever sees resolved specs, so
-  merge semantics cannot drift between client and server.
+- **One resolver crate on both sides.** `balerix-config` is the only place a
+  fleet file is merged and validated, so merge semantics cannot drift between
+  client and daemon (Spec L-2): the CLI resolves for `up`/`update` and sends
+  the resolved spec; the daemon resolves a plugin's `PUT
+  /v1/plugin-host/fleets/{name}` through the same crate, behind the
+  `FleetResolver` port the binary wires (`balerix-server` never imports it).
 - **Exact tool versions only.** `tools: { node: "22" }` is rejected; an unpinned
   entry is a reproducibility bug (developer-environment skill).
 - **`claude.settings.hooks` is balerix-owned.** Hook wiring is how the daemon
@@ -244,6 +263,10 @@ text has newlines.
 - **`balerix` is a reserved fleet name.** Rejected client-side (`config
   resolve`) and by `POST`/`DELETE /v1/fleets`; readable through `GET
   /v1/fleets/balerix` and `balerix status balerix`; never a fleet-list row.
+- **A fleet has at most one writer.** A record's `owner` is set by the first
+  plugin apply and never transferred; the CLI's override is `down --force`,
+  which keeps the owner so the plugin's next apply resumes the fleet (Spec L
+  §5).
 - **`plugins.yaml` is the record.** The plugin actor persists nothing
   (`NullStore`); state survives removal under `plugins/<name>/` until
   `--purge`.

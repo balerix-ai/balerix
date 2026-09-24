@@ -21,9 +21,9 @@ pub use plugin::{
     plugin_id, reserved_fleet_reason, validate_manifest,
 };
 pub use ports::{
-    AgentRunner, Clock, CrewTools, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
-    ObservedState, ProcessState, PtyStream, RunnerError, SystemToolchain, WorkspaceError,
-    WorkspaceReader, first_line,
+    AgentRunner, Clock, CredentialSource, CrewTools, FleetResolver, HookTarget, Keep, LaunchPlan,
+    MaterializeError, Materializer, ObservedState, ProcessState, PtyStream, RunnerError,
+    SystemToolchain, WorkspaceError, WorkspaceReader, first_line,
 };
 pub use reconcile::{Plan, ReconcilePolicy, Step};
 pub use repo::{RepoError, RepoRef};

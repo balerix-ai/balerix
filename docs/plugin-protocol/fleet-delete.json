@@ -1,0 +1,34 @@
+{
+  "route": "DELETE /v1/plugin-host/fleets/gh-acme-api?keep_repos=false&keep_sessions=false&purge=false&force=false",
+  "direction": "plugin-to-daemon",
+  "request": null,
+  "status": 200,
+  "response": {
+    "spec": {
+      "name": "gh-acme-api",
+      "crews": {
+        "repo": {
+          "repo": "acme/api",
+          "ref": "main",
+          "git": { "push": true, "auth": "gh" },
+          "agents": {
+            "issue-12": {
+              "claude": { "settings": {}, "args": [], "resume": false, "binary": "claude" },
+              "sandbox": {},
+              "tools": {},
+              "env": {},
+              "runner": { "type": "tmux" },
+              "plugins": {},
+              "branch": "feature/issue-12"
+            }
+          }
+        }
+      }
+    },
+    "owner": "github",
+    "generation": 1,
+    "desired": { "state": "down", "keep": { "repos": false, "sessions": false }, "purge": false },
+    "stopped": [],
+    "status": { "generation": 1, "observed_generation": 0, "phase": "down", "agents": {} }
+  }
+}

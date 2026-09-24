@@ -43,4 +43,6 @@ crews:
                   - event: Stop
                     goto: done
               done: {}
-      bob: { claude: { settings: { model: opus } } }
+      bob:
+        claude: { settings: { model: opus } }
+        # branch: feature/issue-12   # work on an existing remote branch instead of balerix/<fleet>/<crew>/<agent> (Spec L)

@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use balerix_config::{HostPaths, ResolveOptions, host, read, resolve};
 use balerix_core::{Fleet, HookTarget, ResolvedAgent};
+use balerix_plugin_sdk::Host;
 use balerix_runtime::{RenderOptions, Runtime, StateLayout};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -295,7 +296,7 @@ fn hooks_of(settings: &Value, event: &str) -> Vec<Value> {
 /// Binding a loopback listener under nono is plugins spec §11.1 row 1: if
 /// it is refused, the verdict is left in scratch instead of hanging.
 pub fn fake_plugin_command() -> Result<String> {
-    use balerix_plugin_sdk::{Env, Host, bind, run};
+    use balerix_plugin_sdk::{Env, bind, run};
     let env = Env::from_process()?;
     let scratch = env.scratch.clone();
     std::fs::create_dir_all(&scratch)?;
@@ -320,9 +321,34 @@ pub fn fake_plugin_command() -> Result<String> {
             serde_json::to_string_pretty(&resp.config)?,
         )?;
         eprintln!("fake-plugin: hello acknowledged; listening on {listen}");
+        manage_from_config(&host, &resp.config, &scratch).await?;
         server.await??;
         Ok::<String, anyhow::Error>(String::new())
     })
+}
+
+/// Spec L: `config.manage = { fleet, file }` in the plugin's `plugins.yaml`
+/// entry makes the fake apply that fleet file once it is up — how the e2e
+/// exercises a plugin-managed fleet. The outcome, the record or
+/// `{ "error" }`, lands in `scratch/fake-plugin.manage`; a refusal is not
+/// fatal, the journey reads it.
+async fn manage_from_config(host: &Host, config: &Value, scratch: &Path) -> Result<()> {
+    let Some(manage) = config.get("manage") else {
+        return Ok(());
+    };
+    let outcome = match (manage["fleet"].as_str(), manage.get("file")) {
+        (Some(fleet), Some(file)) => match host.apply_fleet(fleet, file).await {
+            Ok(record) => serde_json::to_value(record)?,
+            Err(e) => json!({ "error": e.to_string() }),
+        },
+        _ => json!({ "error": "config.manage needs `fleet` and `file`" }),
+    };
+    std::fs::write(
+        scratch.join("fake-plugin.manage"),
+        serde_json::to_string_pretty(&outcome)?,
+    )?;
+    eprintln!("fake-plugin: manage outcome written");
+    Ok(())
 }
 
 struct FakePlugin {
@@ -397,6 +423,59 @@ mod tests {
     use super::*;
     use crate::testutil::stub_server_n;
     use serde_json::json;
+
+    /// Spec L: `config.manage` in the fake's `plugins.yaml` entry is what
+    /// the e2e uses to make a plugin apply a fleet; the outcome lands in
+    /// scratch for the journey to read.
+    #[test]
+    fn the_fake_plugin_applies_the_fleet_its_config_names() {
+        use balerix_plugin_sdk::testing::FakeHost;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let fake = FakeHost::start("tok", json!({}), vec![]).await;
+            let host = balerix_plugin_sdk::Host::new(fake.env("fake", Path::new("/s"))).unwrap();
+            let scratch = tempfile::tempdir().unwrap();
+            // no `manage`: nothing happens, no file
+            manage_from_config(&host, &json!({ "greeting": "hi" }), scratch.path())
+                .await
+                .unwrap();
+            assert!(!scratch.path().join("fake-plugin.manage").exists());
+            assert!(fake.applied_fleets().is_empty());
+            // `manage`: the file is applied and the record recorded
+            let file = json!({ "apiVersion": "balerix/v1", "kind": "Fleet", "crews": {} });
+            manage_from_config(
+                &host,
+                &json!({ "manage": { "fleet": "managed", "file": file } }),
+                scratch.path(),
+            )
+            .await
+            .unwrap();
+            let outcome: Value = serde_json::from_str(
+                &std::fs::read_to_string(scratch.path().join("fake-plugin.manage")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(outcome["spec"]["name"], "managed");
+            assert_eq!(outcome["owner"], "plugin");
+            assert_eq!(fake.applied_fleets(), vec![("managed".to_string(), file)]);
+            // a refusal is recorded too, not fatal
+            fake.fail_manage(Some((400, "name: \"x\" does not match the fleet managed")));
+            manage_from_config(
+                &host,
+                &json!({ "manage": { "fleet": "managed", "file": {} } }),
+                scratch.path(),
+            )
+            .await
+            .unwrap();
+            let outcome: Value = serde_json::from_str(
+                &std::fs::read_to_string(scratch.path().join("fake-plugin.manage")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                outcome["error"],
+                "daemon: HTTP 400: name: \"x\" does not match the fleet managed"
+            );
+        });
+    }
 
     #[test]
     fn fake_claude_runs_command_hooks_posts_three_http_hooks_records_replies_and_reads_stdin() {

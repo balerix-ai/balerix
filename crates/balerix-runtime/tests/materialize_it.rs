@@ -154,6 +154,38 @@ fn materialize_then_remove_round_trip() {
         "no creds in the bundle → no file"
     );
     assert_eq!(plan.cwd, paths.workspace);
+
+    // Spec L §6: an agent with `branch` works on that remote branch. Push
+    // one to the bare repo through the working copy, then resolve a
+    // second agent that names it.
+    git(&work, &["checkout", "-q", "-b", "feature/issue-12"]);
+    std::fs::write(work.join("FEATURE"), "wip\n").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "feature work"]);
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            &bare.display().to_string(),
+            "feature/issue-12",
+        ],
+    );
+    let mut pr = agent.clone();
+    pr.id = "f/c/pr".parse().unwrap();
+    pr.settings.branch = Some("feature/issue-12".into());
+    rt.materialize(&pr, &creds, &hooks).unwrap();
+    let pr_paths = layout.agent(&pr.id);
+    assert_eq!(
+        git(&pr_paths.workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "feature/issue-12",
+        "the worktree is on the remote branch, not on balerix/f/c/pr"
+    );
+    assert!(pr_paths.workspace.join("FEATURE").exists());
+    assert!(
+        !paths.workspace.join("FEATURE").exists(),
+        "the first agent's worktree is still on its own branch from main"
+    );
     // idempotent
     rt.ensure_crew(
         &crew,

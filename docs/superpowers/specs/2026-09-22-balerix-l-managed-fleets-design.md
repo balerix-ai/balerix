@@ -206,8 +206,14 @@ pub branch: Option<String>,
   `workspace`; bounded by the owner rule (it cannot touch a fleet it did
   not create, and the CLI cannot silently take over its fleets), by the
   same validation `up` applies, and by every agent still running inside
-  its nono profile. The plugin never sees the credentials: the route
-  takes a file, the daemon reads the bundle.
+  its nono profile. The plugin never sees the credentials on the wire:
+  the route takes a file, the daemon reads the bundle. `manage` is, in
+  effect, equivalent to holding the operator's credentials (the file
+  controls `claude.binary`, `claude.args`, `env`, `sandbox` and
+  `git.auth` of an agent the daemon hands them to, and the `PUT` answer
+  carries the host's `settings.json` folded in), which is why it is the
+  operator's explicit choice in `needs`; a restricted settings surface for
+  plugin-applied files is deferred to Spec M.
 - The fleet file crosses the plugin → daemon boundary as **untrusted
   input** with the same treatment as the CLI's: full validation through
   the resolver, `deny_unknown_fields`, name rules, exact tool versions.
@@ -245,6 +251,10 @@ pub branch: Option<String>,
 - Partial updates (add or remove one agent) instead of a full apply. The
   reconciler already diffs, so a full apply costs a resolve and a pass.
 - Transferring ownership between a plugin and the CLI.
+- A restricted settings surface for plugin-applied fleet files (no
+  `claude.binary`, `claude.args`, `env`, `sandbox` widening or `git.auth`
+  choice), so that `manage` stops being, in effect, equivalent to holding
+  the operator's credentials. Deferred to Spec M.
 
 ## 10. Done when
 
@@ -258,3 +268,40 @@ pub branch: Option<String>,
    `workspace_it` and by hand with `mise run verify-claude` on a branch).
 5. `docs/THREAT-MODEL.md` and `ARCHITECTURE.md` describe the capability,
    the owner rule and the ports.
+
+## 12. Recorded at implementation (2026-09-23)
+
+- `Daemon::apply`/`down` stay the admin wrappers; the shared forms are
+  `apply_as(name, spec, credentials, ApplyMode, &Caller)` and
+  `down_as(name, keep, purge, &Caller)`, with `ApplyMode::Upsert` for
+  the plugin's `PUT` (§3.1 step 5 said `replace = true`; an absent name
+  must create). `Caller::Admin { force }` / `Caller::Plugin(name)`.
+- The owner error is `DaemonError::Managed(String)` → 409; a record
+  is created with `FleetRecord::with_owner`.
+- `plugin remove` downs owned fleets inside `Daemon::sync_plugins`: after
+  a successful sync, every fleet still up whose owner `plugins.yaml` does
+  not declare is downed (keep defaults, no purge); the fleets and failures
+  ride back in `SyncReport.downed` / `SyncReport.down_failed` and the CLI
+  prints one line per fleet from them. A plugin already undeclared at
+  daemon start is covered by the same rule: the first sync, in `serve`,
+  downs its fleets and logs one warning per fleet. A sync that fails
+  resolving (an install failure) downs nothing. `--purge` lists the
+  plugin's fleets (`managed_by`) before the sync and purges each after it
+  with `purge` + `force` from the CLI, so a fleet that was already down
+  is purged too.
+- `balerix_config::from_value` reads the file from JSON with
+  `serde_path_to_error`, so a shape error names its key (`file` for the
+  root); the daemon checks `file.name` against the path before resolving.
+- The plugin `DELETE` accepts `force` and ignores it.
+- `dev fake-plugin`'s manage mode is driven by `config.manage` in
+  `plugins.yaml`, not a flag: the package's `start` task takes no args.
+- `FakeHost` records refused calls too (`applied_fleets`, `downed_fleets`)
+  and fails both routes with `fail_manage(Some((status, message)))`.
+- `check_branch_name` also refuses the bare `@`, as git does.
+- Adding, changing or removing `branch` on a live agent re-materializes
+  it (`Stop, Materialize, Start`), and `ensure_worktree` reads the
+  registered worktree's HEAD: on `branch`, reused; on another branch with
+  a clean tree, the worktree is removed and re-created on `branch` (the
+  old branch stays in the crew clone); with local changes, the step fails
+  naming both branches and the agent is `Failed` with it. A detached HEAD
+  is reused as is, since its commits may be on no branch.

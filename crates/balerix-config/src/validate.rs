@@ -73,6 +73,14 @@ pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), Config
         }
     }
 
+    // Spec L §6: the name reaches `git worktree add -b <branch>` as an argv
+    // word; git's own rule, checked here, is what keeps it a name.
+    if let Some(branch) = &settings.branch
+        && let Err(reason) = balerix_api::check_branch_name(branch)
+    {
+        return Err(invalid("branch", reason));
+    }
+
     for key in settings.env.keys() {
         if key.is_empty() {
             return Err(invalid("env", "empty variable name".to_string()));
@@ -189,6 +197,27 @@ mod tests {
             err.to_string(),
             "crews.c.agents.a.claude.settings.hooks: balerix owns this key; configure hook behaviour via `plugins` instead"
         );
+    }
+
+    /// Spec L §6: a branch name is checked with git's own rule before it
+    /// can reach a git argv; the error carries the agent's path.
+    #[test]
+    fn a_bad_branch_name_names_its_path_and_the_reason() {
+        let s = AgentSettings {
+            branch: Some("-x".into()),
+            ..AgentSettings::default()
+        };
+        assert_eq!(
+            validate_agent("crews.c.agents.a", &s)
+                .unwrap_err()
+                .to_string(),
+            "crews.c.agents.a.branch: starts with '-'"
+        );
+        let s = AgentSettings {
+            branch: Some("feature/issue-12".into()),
+            ..AgentSettings::default()
+        };
+        validate_agent("crews.c.agents.a", &s).unwrap();
     }
 
     #[test]

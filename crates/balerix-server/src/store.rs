@@ -230,4 +230,23 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].1, FleetSecrets::default());
     }
+
+    /// Spec L §5: the owner is in `fleet.json`, and only when there is one.
+    #[test]
+    fn the_owner_survives_the_file_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut owned = record("a");
+        owned.owner = Some("github".into());
+        s.put(&owned, &FleetSecrets::default()).unwrap();
+        let text = std::fs::read_to_string(s.fleet_dir(&name("a")).join("fleet.json")).unwrap();
+        assert!(text.contains("\"owner\": \"github\""), "{text}");
+        assert_eq!(s.load_all().unwrap()[0].0.owner.as_deref(), Some("github"));
+        s.put(&record("b"), &FleetSecrets::default()).unwrap();
+        let text = std::fs::read_to_string(s.fleet_dir(&name("b")).join("fleet.json")).unwrap();
+        assert!(
+            !text.contains("owner"),
+            "an unowned record has no key: {text}"
+        );
+    }
 }

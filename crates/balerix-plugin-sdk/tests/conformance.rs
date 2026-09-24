@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use balerix_api::{FleetRecord, HookEvent, InterceptResponse, PluginAction, WorkspaceDiff};
+use balerix_api::{
+    DownQuery, FleetRecord, HookEvent, InterceptResponse, PluginAction, WorkspaceDiff,
+};
 use balerix_plugin_sdk::testing::FakeHost;
 use balerix_plugin_sdk::{Host, Plugin, bind, run};
 use serde_json::{Value, json};
@@ -24,7 +26,7 @@ fn fixtures() -> BTreeMap<String, Value> {
     }
     assert_eq!(
         out.len(),
-        23,
+        26,
         "every fixture accounted for: {:?}",
         out.keys()
     );
@@ -311,6 +313,78 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
         .await
         .unwrap_err();
     assert!(e.to_string().contains("no workspace"), "{e}");
+
+    // Spec L: the manage routes. The fake answers the record it holds
+    // under the name, so `set_fleets` shapes the answer to the fixture.
+    let put_record: FleetRecord =
+        serde_json::from_value(fx["fleet-put"]["response"].clone()).unwrap();
+    fake.set_fleets(vec![put_record]);
+    let file = fx["fleet-put"]["request"]["file"].clone();
+    assert_eq!(
+        serde_json::to_value(host.apply_fleet("gh-acme-api", &file).await.unwrap()).unwrap(),
+        fx["fleet-put"]["response"]
+    );
+    assert_eq!(
+        fake.applied_fleets(),
+        vec![("gh-acme-api".to_string(), file.clone())]
+    );
+    let rejected = fx["fleet-put-rejected"]["response"]["error"]
+        .as_str()
+        .unwrap();
+    fake.fail_manage(Some((400, rejected)));
+    let e = host
+        .apply_fleet("gh-acme-api", &fx["fleet-put-rejected"]["request"]["file"])
+        .await
+        .unwrap_err();
+    assert_eq!(e.to_string(), format!("daemon: HTTP 400: {rejected}"));
+    let resp = c
+        .put(format!("{}/v1/plugin-host/fleets/gh-acme-api", fake.url))
+        .bearer_auth("tok")
+        .json(&fx["fleet-put-rejected"]["request"])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        fx["fleet-put-rejected"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        fx["fleet-put-rejected"]["response"]
+    );
+    fake.fail_manage(None);
+    // a stray key beside `file` is a 400, as the daemon's
+    // `deny_unknown_fields` body makes it, and records nothing
+    let applied = fake.applied_fleets().len();
+    let resp = c
+        .put(format!("{}/v1/plugin-host/fleets/gh-acme-api", fake.url))
+        .bearer_auth("tok")
+        .json(&serde_json::json!({ "file": file, "credentials": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    assert_eq!(
+        fake.applied_fleets().len(),
+        applied,
+        "the stray key recorded nothing"
+    );
+    let q = DownQuery::default();
+    assert_eq!(
+        fx["fleet-delete"]["route"],
+        format!(
+            "DELETE /v1/plugin-host/fleets/gh-acme-api?{}",
+            q.to_query_string()
+        ),
+        "the fixture's route carries every flag, as the SDK sends them"
+    );
+    assert_eq!(
+        serde_json::to_value(host.down_fleet("gh-acme-api", &q).await.unwrap()).unwrap(),
+        fx["fleet-delete"]["response"]
+    );
+    assert_eq!(fake.downed_fleets(), vec![("gh-acme-api".to_string(), q)]);
+    let e = host.down_fleet("nope", &q).await.unwrap_err();
+    assert_eq!(e.to_string(), "daemon: HTTP 404: fleet not found");
 }
 
 /// The two WebSocket fixtures: one frame each, asserted against `FakeHost`

@@ -120,8 +120,14 @@ impl Workspace<'_> {
             .any(|l| l.strip_prefix("worktree ").map(Path::new) == Some(workspace)))
     }
 
-    /// Reuses a registered worktree; reuses an existing branch; otherwise
-    /// creates the branch from `origin/<git_ref>`.
+    /// Reuses a registered worktree that is on `branch`; reuses an existing
+    /// branch; otherwise creates the branch from `origin/<git_ref>`.
+    ///
+    /// Spec L §6: a registered worktree on another branch (the agent's
+    /// `branch` was added, changed or removed) is re-created on `branch`
+    /// when its tree is clean; a dirty tree fails rather than lose the
+    /// agent's uncommitted work. The old branch stays in the crew clone.
+    /// A detached HEAD is reused as is: its commits may be on no branch.
     pub fn ensure_worktree(
         &self,
         id: &str,
@@ -133,7 +139,31 @@ impl Workspace<'_> {
         let repo = crew.repo.display().to_string();
         let registered = self.is_registered(id, crew, workspace)?;
         if registered && workspace.join(".git").exists() {
-            return Ok(());
+            let ws = workspace.display().to_string();
+            let Ok(head) = self.git(id, crew, &["-C", &ws, "symbolic-ref", "--short", "HEAD"])
+            else {
+                return Ok(()); // detached
+            };
+            let head = head.trim();
+            if head == branch {
+                return Ok(());
+            }
+            let status = self.git(id, crew, &["-C", &ws, "status", "--porcelain"])?;
+            if !status.trim().is_empty() {
+                return Err(MaterializeError::Invalid {
+                    id: id.to_string(),
+                    message: format!(
+                        "the worktree is on branch {head:?} but the agent's branch is \
+                         {branch:?}, and the worktree has local changes; commit or \
+                         discard them in {ws} first"
+                    ),
+                });
+            }
+            self.git(
+                id,
+                crew,
+                &["-C", &repo, "worktree", "remove", "--force", &ws],
+            )?;
         }
         self.git(id, crew, &["-C", &repo, "worktree", "prune"])?;
         let ws = workspace.display().to_string();

@@ -337,13 +337,16 @@ impl Materializer for Runtime {
         let id = agent.id.to_string();
         let crew = self.layout.crew(&agent.id.crew_ref());
         let paths = self.layout.agent(&agent.id);
+        // Spec L §6: with `branch` set, the worktree branch is the remote
+        // branch itself and is created from `origin/<branch>`; without it
+        // the per-agent branch starts from the crew's ref.
         self.workspace(&agent.id.fleet, &agent.git)
             .ensure_worktree(
                 &id,
                 &crew,
                 &paths.workspace,
                 &agent.branch(),
-                &agent.git_ref,
+                agent.start_ref(),
             )?;
         let out = self.render_agent(agent, creds, hooks, &RenderOptions::default())?;
         self.install_and_validate(agent)?;

@@ -15,7 +15,8 @@ plain HTTP/1.1 on loopback — no TLS, no proxies. Every request and response
 body is a JSON object, except the routes stated to carry a raw byte body
 (`GET`/`PUT /v1/plugin-host/kv/{key}`, `GET /v1/health`, `GET /v1/metrics`).
 Every non-2xx response is `{ "error": "<message>" }`
-(`hello-bad-token.json`, `fleet-missing.json`, `activate-rejected.json`).
+(`hello-bad-token.json`, `fleet-missing.json`, `activate-rejected.json`,
+`fleet-put-rejected.json`).
 Body size caps differ by direction and route: plugin → daemon bodies are
 capped at 1 MiB, except `hello`, capped at 64 KiB
 (`balerix-server/src/api.rs`'s `plugins`/`plugin_host` router layers);
@@ -42,7 +43,7 @@ profile environment (plugins spec §5.1):
 Base `BALERIX_API_URL`, path prefix `/v1/plugin-host/`, bearer
 `BALERIX_PLUGIN_TOKEN` on every call. Each route beyond `hello` is gated by
 a capability the manifest's `needs` must declare (`fleets`, `actions`,
-`attach`, `kv`, `workspace`); a call outside what is declared is rejected
+`attach`, `kv`, `workspace`, `manage`); a call outside what is declared is rejected
 before the route runs, 403 `{ "error": "capability \"<cap>\" not declared
 in balerix-plugin.yaml" }`. No fixture carries this status: `FakeHost` (the
 SDK's test double, §6) does not gate capabilities, so it cannot be
@@ -57,6 +58,10 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 | `GET fleets/{name}` | `fleets` | — | `FleetRecord` | 200 | (shape as in `fleets.json`'s `response[0]`) |
 | `GET fleets/{name}`, unknown name | `fleets` | — | `{ error }` | 404 | `fleet-missing.json` |
 | `GET fleets/watch` (WebSocket) | `fleets` | — | one text frame per change, each the complete `GET fleets` body | 101 | `fleets-watch.json` (Task 6) |
+| `PUT fleets/{name}` | `manage` | `{ file }` — the fleet file's structure as JSON (`apiVersion`, `kind`, `name`?, `defaults`, `crews`) | `FleetRecord`, `owner` set to this plugin; the answer is the record as applied, so waiting for its agents to turn `Ready` through `fleets/watch` (or `GET fleets/{name}`) needs the `fleets` capability as well | 200 | `fleet-put.json` |
+| `PUT fleets/{name}`, file does not resolve | `manage` | same | `{ error }`, config path first | 400 | `fleet-put-rejected.json` |
+| `PUT`/`DELETE fleets/{name}`, owned by another plugin or by the CLI | `manage` | — | `{ "error": "fleet <name> is managed by plugin <p>" }` or `{ "error": "fleet <name> is not managed by a plugin" }` | 409 | (asserted by `crates/balerix-server/tests/manage_it.rs`, §6) |
+| `DELETE fleets/{name}?keep_repos=&keep_sessions=&purge=&force=` | `manage` | — | `FleetRecord` | 200 | `fleet-delete.json` |
 | `GET agents/{fleet}/{crew}/{agent}/attach` (WebSocket) | `attach` | — | binary frames are terminal bytes both ways; the one text frame is `{ "resize": { "cols", "rows" } }` | 101 | `attach-resize.json` (Task 6) |
 | `GET agents/…/attach`, agent not active for this plugin | `attach` | — | `{ "error": "plugin is not active for agent <id>" }` | 404 | (as for actions) |
 | `GET agents/{fleet}/{crew}/{agent}/workspace/diff` | `workspace` | — | `WorkspaceDiff` | 200 | `workspace-diff.json` |
@@ -73,10 +78,11 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 | `PUT kv/{key}?secret=<bool>` | `kv` | raw bytes | `{}` | 200 | `kv-put.json` |
 | `DELETE kv/{key}` | `kv` | — | `{}` | 200 | (same success shape as `PUT`) |
 
-A `FleetRecord` is `{ spec: { name, crews }, generation, desired: { state },
+A `FleetRecord` is `{ spec: { name, crews }, owner?, generation, desired: { state },
 stopped, status: { generation, observed_generation, phase, agents } }`
 (`fleets.json`); secrets are excluded. `fleets/{name}` answers the same
-shape for one fleet.
+shape for one fleet. `owner` is present when a plugin manages the fleet
+(Spec L §5) and is the plugin's name.
 
 **Actions** (`POST agents/{fleet}/{crew}/{agent}/actions`) are one of:
 
@@ -131,6 +137,23 @@ texts: `no workspace for agent <id>` (no worktree) and `no such path`.
 worktree's `HEAD`, `fingerprint` 64 hex chars over `HEAD`, the merge-base
 and the size and mtime of every changed or untracked path — equal values
 mean `diff` would answer the same; compare, never parse.
+
+**Managed fleets** (Spec L). `PUT fleets/{name}` takes the unresolved
+fleet file — exactly what `balerix up -f` reads, as JSON — and does what
+`up` does on the daemon: folds the host's `claude.settings` in, resolves
+every agent, reads the operator's Claude credentials and gh token from
+the daemon's host home, and applies. The plugin never sees credentials.
+A `name` in the file must equal the path's (400 otherwise); `balerix`
+and `watch` are refused. The first `PUT` of a name creates the record
+with this plugin as its `owner`; every later `PUT` is a full replace and
+must come from the same plugin; the CLI's `up`/`update`/`down` refuse an
+owned fleet (409; `balerix down --force` is the operator's override).
+The call returns once the spec is applied, not when the fleet is ready:
+watch `fleets/watch`. `DELETE` takes the admin `DELETE`'s flags; `force`
+is ignored here. `plugin remove` downs every fleet the plugin owned. An
+agent's `branch` setting names an existing remote branch to work on
+(`crews.<c>.agents.<a>.branch`, validated as `git check-ref-format
+--branch` would); the diff base stays the crew's `ref`.
 
 ## 4. Daemon → plugin
 
@@ -242,7 +265,7 @@ never activates simply never runs for that agent.
 
 ## 6. Conformance
 
-`docs/plugin-protocol/*.json` holds twenty-three fixtures, one JSON object
+`docs/plugin-protocol/*.json` holds twenty-six fixtures, one JSON object
 each: `{ route, direction, request, status, response }` for
 `daemon-to-plugin` and most `plugin-to-daemon` routes; `raw` (base64)
 replaces `request`/`response` for the kv byte bodies, `health.json` and
@@ -277,7 +300,8 @@ does not gate capabilities or activation the way the real daemon does — the
 `agents/…/actions` (§3) — are asserted against the real daemon by
 `crates/balerix-server/tests/events_it.rs`, and
 `crates/balerix-server/tests/workspace_it.rs` the workspace routes' 403,
-404s, 413 and 400.
+404s, 413 and 400; `crates/balerix-server/tests/manage_it.rs` the manage
+routes' 403 and 409s.
 
 ## 7. Packaging and distribution
 

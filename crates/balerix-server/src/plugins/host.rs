@@ -89,6 +89,8 @@ impl PluginHost {
             clock: agent_ports.clock.clone(),
             store: Arc::new(NullStore),
             workspace: agent_ports.workspace.clone(),
+            resolver: agent_ports.resolver.clone(),
+            credentials: agent_ports.credentials.clone(),
             policy: agent_ports.policy.clone(),
             hook_url: agent_ports.hook_url.clone(),
             resync: agent_ports.resync,

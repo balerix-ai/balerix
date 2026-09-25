@@ -345,6 +345,7 @@ impl Materializer for Runtime {
                 &id,
                 &crew,
                 &paths.workspace,
+                &paths.branch_marker(),
                 &agent.branch(),
                 agent.start_ref(),
             )?;

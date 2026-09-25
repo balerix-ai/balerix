@@ -235,6 +235,14 @@ impl AgentPaths {
     pub fn installed_marker(&self) -> PathBuf {
         self.root.join(".installed")
     }
+    /// Holds the branch the worktree was last created on by balerix. A
+    /// changed agent `branch` is detected against this, never against the
+    /// worktree's HEAD, so an agent that checked out a branch of its own is
+    /// left on it across restarts (#60). Daemon-owned: the agent root is
+    /// outside every sandbox grant.
+    pub fn branch_marker(&self) -> PathBuf {
+        self.root.join(".branch")
+    }
 
     pub fn claude_dir(&self) -> PathBuf {
         self.home.join(".claude")

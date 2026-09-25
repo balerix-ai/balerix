@@ -90,8 +90,15 @@ fn clone_worktree_reuse_and_remove() {
         "a second ensure_repo must not fetch"
     );
 
-    ws.ensure_worktree("f/c/a", &crew, &paths.workspace, "balerix/f/c/a", "main")
-        .unwrap();
+    ws.ensure_worktree(
+        "f/c/a",
+        &crew,
+        &paths.workspace,
+        &paths.branch_marker(),
+        "balerix/f/c/a",
+        "main",
+    )
+    .unwrap();
     assert_eq!(fetches(&git_log()), 1, "creating a branch fetches first");
     assert_eq!(
         std::fs::read_to_string(paths.workspace.join("README")).unwrap(),
@@ -101,8 +108,15 @@ fn clone_worktree_reuse_and_remove() {
         git(&paths.workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
         "balerix/f/c/a"
     );
-    ws.ensure_worktree("f/c/a", &crew, &paths.workspace, "balerix/f/c/a", "main")
-        .unwrap(); // idempotent
+    ws.ensure_worktree(
+        "f/c/a",
+        &crew,
+        &paths.workspace,
+        &paths.branch_marker(),
+        "balerix/f/c/a",
+        "main",
+    )
+    .unwrap(); // idempotent
     assert_eq!(
         fetches(&git_log()),
         1,
@@ -117,8 +131,15 @@ fn clone_worktree_reuse_and_remove() {
     ws.remove_worktree("f/c/a", &crew, &paths.workspace)
         .unwrap();
     assert!(!paths.workspace.exists());
-    ws.ensure_worktree("f/c/a", &crew, &paths.workspace, "balerix/f/c/a", "main")
-        .unwrap();
+    ws.ensure_worktree(
+        "f/c/a",
+        &crew,
+        &paths.workspace,
+        &paths.branch_marker(),
+        "balerix/f/c/a",
+        "main",
+    )
+    .unwrap();
     assert_eq!(
         git(&paths.workspace, &["rev-parse", "HEAD"]),
         sha,
@@ -128,8 +149,15 @@ fn clone_worktree_reuse_and_remove() {
 
     // a second agent gets its own branch from origin/main, not from alice's
     let b = layout.agent(&"f/c/b".parse().unwrap());
-    ws.ensure_worktree("f/c/b", &crew, &b.workspace, "balerix/f/c/b", "main")
-        .unwrap();
+    ws.ensure_worktree(
+        "f/c/b",
+        &crew,
+        &b.workspace,
+        &b.branch_marker(),
+        "balerix/f/c/b",
+        "main",
+    )
+    .unwrap();
     assert!(!b.workspace.join("work.txt").exists());
     assert!(crew.root.join("logs").join("git.log").exists());
 
@@ -216,6 +244,7 @@ fn a_worktree_on_an_existing_remote_branch_is_created_from_it_and_reused() {
         "f/c/pr",
         &crew,
         &paths.workspace,
+        &paths.branch_marker(),
         "feature/issue-12",
         "feature/issue-12",
     )
@@ -247,6 +276,7 @@ fn a_worktree_on_an_existing_remote_branch_is_created_from_it_and_reused() {
         "f/c/pr",
         &crew,
         &paths.workspace,
+        &paths.branch_marker(),
         "feature/issue-12",
         "feature/issue-12",
     )
@@ -281,8 +311,15 @@ fn a_changed_branch_moves_a_clean_worktree_and_keeps_the_old_branch() {
             .to_string()
     };
 
-    ws.ensure_worktree("f/c/a", &crew, &paths.workspace, "balerix/f/c/a", "main")
-        .unwrap();
+    ws.ensure_worktree(
+        "f/c/a",
+        &crew,
+        &paths.workspace,
+        &paths.branch_marker(),
+        "balerix/f/c/a",
+        "main",
+    )
+    .unwrap();
     assert_eq!(head(), "balerix/f/c/a");
     std::fs::write(paths.workspace.join("work.txt"), "committed\n").unwrap();
     git(&paths.workspace, &["add", "."]);
@@ -294,6 +331,7 @@ fn a_changed_branch_moves_a_clean_worktree_and_keeps_the_old_branch() {
         "f/c/a",
         &crew,
         &paths.workspace,
+        &paths.branch_marker(),
         "feature/issue-12",
         "feature/issue-12",
     )
@@ -303,8 +341,15 @@ fn a_changed_branch_moves_a_clean_worktree_and_keeps_the_old_branch() {
     assert!(!paths.workspace.join("work.txt").exists());
 
     // `branch` removed: back on the per-agent branch, its commit intact
-    ws.ensure_worktree("f/c/a", &crew, &paths.workspace, "balerix/f/c/a", "main")
-        .unwrap();
+    ws.ensure_worktree(
+        "f/c/a",
+        &crew,
+        &paths.workspace,
+        &paths.branch_marker(),
+        "balerix/f/c/a",
+        "main",
+    )
+    .unwrap();
     assert_eq!(head(), "balerix/f/c/a");
     assert_eq!(git(&paths.workspace, &["rev-parse", "HEAD"]), sha);
 }
@@ -329,8 +374,15 @@ fn a_changed_branch_on_a_dirty_worktree_fails_and_keeps_the_tree() {
         gh_config_dir: None,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
-    ws.ensure_worktree("f/c/a", &crew, &paths.workspace, "balerix/f/c/a", "main")
-        .unwrap();
+    ws.ensure_worktree(
+        "f/c/a",
+        &crew,
+        &paths.workspace,
+        &paths.branch_marker(),
+        "balerix/f/c/a",
+        "main",
+    )
+    .unwrap();
     std::fs::write(paths.workspace.join("README"), "edited\n").unwrap();
 
     let e = ws
@@ -338,6 +390,7 @@ fn a_changed_branch_on_a_dirty_worktree_fails_and_keeps_the_tree() {
             "f/c/a",
             &crew,
             &paths.workspace,
+            &paths.branch_marker(),
             "feature/issue-12",
             "feature/issue-12",
         )
@@ -377,7 +430,14 @@ fn a_missing_remote_branch_fails_the_worktree() {
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let e = ws
-        .ensure_worktree("f/c/pr", &crew, &paths.workspace, "nope", "nope")
+        .ensure_worktree(
+            "f/c/pr",
+            &crew,
+            &paths.workspace,
+            &paths.branch_marker(),
+            "nope",
+            "nope",
+        )
         .unwrap_err()
         .to_string();
     assert!(e.starts_with("f/c/pr: git worktree:"), "{e}");
@@ -467,4 +527,186 @@ fn check_branch_name_agrees_with_git_check_ref_format() {
             .success()
     );
     assert!(balerix_api::check_branch_name("@").is_err());
+}
+
+/// #60: a restart re-materializes with the *same* setting. An agent that
+/// checked out a branch of its own is neither moved back nor failed for it,
+/// whether its tree is clean or dirty.
+#[test]
+fn an_agent_switching_branches_itself_is_left_alone_on_an_unchanged_setting() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-self-switch");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    let head = || {
+        git(&paths.workspace, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .trim()
+            .to_string()
+    };
+
+    ws.ensure_worktree(
+        "f/c/a",
+        &crew,
+        &paths.workspace,
+        &paths.branch_marker(),
+        "balerix/f/c/a",
+        "main",
+    )
+    .unwrap();
+    git(&paths.workspace, &["checkout", "-q", "-b", "my-fix"]);
+
+    // clean tree: not moved back
+    ws.ensure_worktree(
+        "f/c/a",
+        &crew,
+        &paths.workspace,
+        &paths.branch_marker(),
+        "balerix/f/c/a",
+        "main",
+    )
+    .unwrap();
+    assert_eq!(head(), "my-fix");
+
+    // dirty tree: not failed, and the change is kept
+    std::fs::write(paths.workspace.join("README"), "edited\n").unwrap();
+    ws.ensure_worktree(
+        "f/c/a",
+        &crew,
+        &paths.workspace,
+        &paths.branch_marker(),
+        "balerix/f/c/a",
+        "main",
+    )
+    .unwrap();
+    assert_eq!(head(), "my-fix");
+    assert_eq!(
+        std::fs::read_to_string(paths.workspace.join("README")).unwrap(),
+        "edited\n"
+    );
+}
+
+/// A worktree from before the marker existed is judged by its HEAD once
+/// (the pre-#60 rule, so a `branch` set before the upgrade still applies)
+/// and the marker is written then; from there on HEAD no longer counts.
+#[test]
+fn a_worktree_without_a_marker_is_judged_by_head_once_then_recorded() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-no-marker");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    let head = || {
+        git(&paths.workspace, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .trim()
+            .to_string()
+    };
+    let ensure = |branch: &str| {
+        ws.ensure_worktree(
+            "f/c/a",
+            &crew,
+            &paths.workspace,
+            &paths.branch_marker(),
+            branch,
+            "main",
+        )
+    };
+
+    ensure("balerix/f/c/a").unwrap();
+    std::fs::remove_file(paths.branch_marker()).unwrap();
+    git(&paths.workspace, &["checkout", "-q", "-b", "my-fix"]);
+
+    // no marker: HEAD decides, as before, and the marker appears
+    ensure("balerix/f/c/a").unwrap();
+    assert_eq!(head(), "balerix/f/c/a");
+    assert_eq!(
+        std::fs::read_to_string(paths.branch_marker()).unwrap(),
+        "balerix/f/c/a"
+    );
+
+    // with the marker: the same self-switch is left alone
+    git(&paths.workspace, &["checkout", "-q", "my-fix"]);
+    ensure("balerix/f/c/a").unwrap();
+    assert_eq!(head(), "my-fix");
+}
+
+/// The agent checked out the very branch the operator then configures:
+/// nothing to move, even with local changes, and the record follows.
+#[test]
+fn a_changed_branch_the_worktree_already_sits_on_is_recorded_without_a_move() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-already-there");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    push_branch(&root, "feature/issue-12");
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    let head = || {
+        git(&paths.workspace, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .trim()
+            .to_string()
+    };
+    let ensure = |branch: &str, git_ref: &str| {
+        ws.ensure_worktree(
+            "f/c/a",
+            &crew,
+            &paths.workspace,
+            &paths.branch_marker(),
+            branch,
+            git_ref,
+        )
+    };
+
+    ensure("balerix/f/c/a", "main").unwrap();
+    git(
+        &paths.workspace,
+        &["checkout", "-q", "-b", "feature/issue-12"],
+    );
+    std::fs::write(paths.workspace.join("README"), "edited\n").unwrap();
+
+    ensure("feature/issue-12", "feature/issue-12").unwrap();
+    assert_eq!(head(), "feature/issue-12");
+    assert_eq!(
+        std::fs::read_to_string(paths.workspace.join("README")).unwrap(),
+        "edited\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(paths.branch_marker()).unwrap(),
+        "feature/issue-12"
+    );
+
+    // recorded: a later self-switch is left alone under this setting too
+    git(&paths.workspace, &["stash", "-q"]);
+    git(&paths.workspace, &["checkout", "-q", "-b", "my-fix"]);
+    ensure("feature/issue-12", "feature/issue-12").unwrap();
+    assert_eq!(head(), "my-fix");
 }

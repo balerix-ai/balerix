@@ -3,7 +3,7 @@
 //! leaf crate so `balerix-config` validates a fleet file with it and a
 //! plugin that builds a fleet file can check a name before sending it.
 //! The leading-`-` refusal is what keeps a name from being read as a flag
-//! when it reaches `git worktree add -b <branch>` (Spec L §7).
+//! when it reaches `git checkout -b <branch>` (Spec L §7, Spec N §4).
 
 /// `Err` is the reason, for `crews.<c>.agents.<a>.branch: <reason>`.
 ///

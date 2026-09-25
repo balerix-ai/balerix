@@ -51,6 +51,12 @@ Bump rules follow cargo semver: in `0.x` a breaking change bumps minor and
 anything else bumps patch; from `1.0` a breaking change bumps major, `feat`
 minor and `fix` patch.
 
+A change that needs operator action gets a hand-written `### Upgrading`
+block at the top of `CHANGELOG.md`, directly under the `# Changelog`
+header, in the PR that makes the change. `prepare.sh` prepends the next
+version's generated lists above it, so it ends that version's section and
+ships in the GitHub Release notes.
+
 ## Forcing a version
 
 Run the `release-pr` workflow by hand with `unit` and `version` (for

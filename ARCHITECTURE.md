@@ -41,8 +41,8 @@ against what was declared.
   adapters; it does the wiring.
 - `balerix-runtime` — driven adapters over git, gh, mise, nono, tmux. One
   module per materialization step; every path from StateLayout, every binary
-  from ToolPaths; never reads the process environment. `inspect.rs` reads a
-  worktree for the plugin host's workspace routes.
+  from ToolPaths; never reads the process environment. `inspect.rs` reads an
+  agent's clone for the plugin host's workspace routes.
 - `balerix-plugin-sdk` — the plugin side of the host protocol; depends on
   `api` only. `Host` (async, one method per route, including
   `Host::attach`/`watch_fleets`), the `Plugin` trait (`Plugin::routes`) and
@@ -87,7 +87,8 @@ then `Fleet::try_from` for names and repos.
 **Runtime (Phase 2):** `reconcile::plan` (core) turns desired `Fleet` + last
 `FleetStatus` + `ObservedState` into an ordered step list; `execute` walks it
 through two ports. `Materializer` (`balerix-runtime::Runtime`) makes files:
-clone/worktree → `home/` (settings.json with balerix's hooks, credentials,
+cache fetch + private clone (`--reference` to the crew's object cache) →
+`home/` (settings.json with balerix's hooks, credentials,
 hosts.yml) → `mise.toml` + `mise install` → `nono-profile.json` + validate →
 `launch.sh`. `AgentRunner` (`TmuxRunner`) makes processes: session per crew,
 window per agent, `remain-on-exit`, `respawn-window`. `balerix dev
@@ -156,14 +157,14 @@ lists the agents whose `plugins.web` block enables it, with phases from a
 `fleets/watch`-fed cache, and bridges each browser tab to one attach.
 
 **Workspace reads and review (Spec C):** a plugin declaring `workspace`
-reads an agent's worktree through the daemon — `GET
+reads an agent's clone through the daemon — `GET
 /v1/plugin-host/agents/{id}/workspace/{diff,file,tree}`, gated like
 `attach` by the capability and an active pair — and the daemon answers
 through the `WorkspaceReader` port, which the runtime implements over
-`git` in the worktree with the repository's config escape hatches
-closed. The diff is the worktree against the merge-base with
+`git` in the clone with the repository's config escape hatches
+closed. The diff is the clone against the merge-base with
 `origin/<crew ref>`, committed, uncommitted and untracked alike. A
-fourth route, `version`, answers a cheap fingerprint of the worktree
+fourth route, `version`, answers a cheap fingerprint of the clone
 (Spec D) that the review page polls through `events.json` to refresh
 the diff live. `web` observes every hook event into a per-agent buffer
 and serves a review page: the diff with line comments, a collapsible
@@ -180,7 +181,7 @@ a fleet from an unresolved fleet file — `PUT
 `owner`; the admin routes refuse an owned fleet (409) except `down
 --force`, and a plugin may only apply or down what it owns. `plugin
 remove` downs the fleets the plugin owned. An agent's `branch` setting
-makes an existing remote branch its worktree branch and start point
+makes an existing remote branch its clone's branch and start point
 (a PR's head); the diff base stays the crew's `ref`.
 
 ## Non-obvious decisions
@@ -218,8 +219,23 @@ makes an existing remote branch its worktree branch and start point
   localhost TCP on that port only, leaves other egress at nono's default
   (allowed) for the fleet's `sandbox.network` to tighten, and still holds under
   a user `block: true`, so hooks keep flowing when egress is cut off.
-- **Worktree branches are reused, never reset.** `-B … origin/<ref>` would drop
-  unpushed agent commits on every re-`up` after `down --keep-repos`.
+- **A private clone per agent, over a shared object cache (Spec N).** An
+  agent's `workspace/` is a full `git clone --reference crews/<c>/repo`,
+  so refs, index, config, hooks and HEAD are its own and the sandbox
+  grants nothing under `repo/` but `.git/objects`, read-only. The cache is
+  daemon-written and append-only (`gc.auto=0`, every fetch `--no-auto-gc`,
+  never pruned): a borrower is only safe while the reference never loses
+  an object. Branches are reused, never reset — `-B … origin/<ref>` would
+  drop unpushed agent commits on every re-`up` after `down --keep-repos`.
+- **Harvest is a fetch from the cache, not a push from the clone.** Before
+  a clone is deleted its assigned branch (the `.branch` marker's) is
+  fetched into the cache, `+`-forced, by a git run *in the cache*,
+  `--update-head-ok` because the cache's HEAD names the default branch; a
+  push run in the clone would honour the clone's own config, and an
+  `url.<x>.insteadOf` there could aim the daemon's push at another crew's
+  cache. A new clone for a branch the cache holds seeds from it, so
+  unpushed work survives `down --keep-repos` and agent removal. Only the
+  assigned branch is harvested.
 - **The planner is pure; the executor is dumb.** Every decision is in
   `reconcile::plan` (a total function) so the model-based test compares plans
   structurally and `cargo mutants` has something to bite.
@@ -331,9 +347,8 @@ makes an existing remote branch its worktree branch and start point
 - **The web plugin never calls `GET fleets`.** Its index comes from the
   watch-fed cache alone, so a correct index is the watch's test (§18.5).
 - **Git is run by the daemon, never granted to a plugin.** A read-only
-  nono grant on `workspace/` would be fixed at plugin start, would need
-  the crew repo too (a worktree's `.git` is a file pointing there) and
-  would sit beside `home/`; the typed routes keep one audited set of git
+  nono grant on `workspace/` would be fixed at plugin start and would sit
+  beside `home/`; the typed routes keep one audited set of git
   invocations, in a repository an agent can write to (Spec C PC-1, PC-2).
 - **A review is a paste.** The review reaches the agent as one
   `send_text`; `TmuxRunner` fills a named buffer with `load-buffer -`

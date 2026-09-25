@@ -248,3 +248,38 @@ directory, not a repository.
 5. `CHANGELOG.md` carries the Upgrading note and the `[breaking]` entry;
    `ARCHITECTURE.md`, `AGENTS.md`, `docs/THREAT-MODEL.md` and Spec M-10
    read as §7 and §9 say.
+
+## 12. Recorded at implementation (2026-09-25)
+
+- `ensure_clone` takes `&AgentPaths` and `&RepoRef` beside the arguments
+  `ensure_worktree` took: the clone needs the remote URL, and the marker
+  and root come from the paths. `harvest_and_remove` takes `&AgentPaths`
+  too and deletes `workspace/` itself; the caller still deletes the root.
+- The harvested branch is the marker's; with no marker (a crash between
+  clone and marker) it is the branch HEAD is on, and a detached HEAD
+  harvests nothing. `remove_crew` harvests only when `keep.repos`: plain
+  `down` and `--purge` delete the cache too, so there is nothing to
+  harvest into and a broken clone cannot wedge a purge.
+- The harvest fetch carries `--update-head-ok`: the cache's HEAD is the
+  symbolic ref of the default branch (`clone --no-checkout`), and git
+  refuses to fetch into the branch HEAD names without it. The cache has
+  no checkout or index for the flag to disturb; N-4 (every assigned
+  branch is harvested) outranks §5's exact argv. `workspace_it` proves a
+  harvest of `main` by both routes (marker, and HEAD with no marker).
+- A seeded branch is given `origin/<branch>` as its upstream when the
+  remote has it, as `checkout -b <branch> origin/<branch>` gives a fresh
+  one (the Spec L PR case after a removal).
+- A failure after `git clone` removes the half-made clone: a
+  `--no-checkout` clone left behind reads as an existing, dirty clone on
+  the next pass. A `workspace/` with no `.git` is replaced.
+- The 0.1.x message names the fleet: `run \`balerix down <fleet> --purge\``.
+  `down --keep-repos` and `up` also migrates: the old crew clone serves
+  as the cache (every daemon fetch is `--no-auto-gc` whether or not
+  `gc.auto` is pinned) and the branches it holds seed the new clones;
+  `workspace_it` proves it. The user-facing remedy stays `--purge`.
+- The hardening is one builder, `harden_agent_git`, shared by the
+  workspace reader and the clone step; `inspect.rs` lost its own copy.
+- The Upgrading note sits under the `# Changelog` header and ends the
+  0.2.0 section once `prepare.sh` prepends the generated lists, rather
+  than above them (§9): that is what the release script does without a
+  change to it, and `notes.sh` carries the block into the Release notes.

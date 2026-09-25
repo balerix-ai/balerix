@@ -357,6 +357,11 @@ credentials, hook input, or sandbox rules.
   and its start point (`ResolvedAgent::start_ref`); a branch the remote
   lacks fails the materialize step with git's message and retries at the
   resync cadence. The workspace diff base is still `origin/<crew ref>`.
+  `branch: <default branch>` works: a fresh `--no-checkout` clone already
+  has that branch with HEAD on it, hence `checkout -B` and the seed
+  fetch's `--update-head-ok` and `+` in `create_clone`; and the cache's
+  own copy of it (stale since the cache was cloned) seeds nothing, since
+  only a cache copy holding commits `origin/<branch>` lacks is a seed.
 - Every agent's `workspace/` is a private clone (Spec N); the crew's
   `repo/` is an object cache the daemon alone writes (`gc.auto=0`, every
   daemon fetch `--no-auto-gc`, never pruned) and agents read through

@@ -369,7 +369,9 @@ impl Workspace<'_> {
     /// A new clone starts with a fetch in the cache — the one moment
     /// `origin/<start_ref>` must be current, and what makes the clone
     /// cheap — then seeds `branch` from the cache's harvested copy when
-    /// there is one, else creates it from `origin/<start_ref>`. A seeded
+    /// there is one holding commits `origin/<branch>` lacks, else creates
+    /// it from `origin/<branch>` (a copy origin contains) or
+    /// `origin/<start_ref>` (no copy). A seeded
     /// branch tracks `origin/<branch>` when the remote has it, as a branch
     /// created from it would. Whatever fails after `git clone` removes the
     /// half-made clone: a `--no-checkout` clone left behind would be
@@ -439,6 +441,20 @@ impl Workspace<'_> {
     /// Spec N §4 step 3. These calls run in a clone the agent has never
     /// touched, so they need no hardening; they go through `git` for the
     /// credential helper the clone needs.
+    ///
+    /// A `--no-checkout` clone already has the remote's default branch as
+    /// a local branch with HEAD on it, so an agent assigned that branch
+    /// needs three things another branch does not. The seed fetch carries
+    /// `--update-head-ok`, since git refuses to fetch into the branch HEAD
+    /// names and the fresh clone has no checkout or index to disturb. Its
+    /// refspec is forced (`+`), since the fresh clone's copy is origin's
+    /// tip and the harvested one may have diverged from it; the fresh copy
+    /// is worth nothing. The create path is `checkout -B`, since `-b` fails
+    /// on the branch that exists, for the same reason.
+    ///
+    /// A cache copy of `branch` that `origin/<branch>` already contains is
+    /// not a seed: the branch is created from `origin/<branch>` instead,
+    /// which is newer and carries everything the copy did.
     fn create_clone(
         &self,
         id: &str,
@@ -469,14 +485,35 @@ impl Workspace<'_> {
             ],
         )?;
         let refname = format!("refs/heads/{branch}");
-        let harvested = self
+        let remote = format!("refs/remotes/origin/{branch}");
+        let cached = self
             .git(
                 id,
                 crew,
                 &["-C", &cache, "rev-parse", "--verify", "--quiet", &refname],
             )
             .is_ok();
-        if harvested {
+        // The cache's copy is worth seeding from only while it holds
+        // commits `origin/<branch>` lacks. The cache's own default branch
+        // is the tip at the time the cache was cloned (fetch never moves
+        // it), and a harvested branch the agent pushed is behind origin's
+        // once someone else pushes on top of it.
+        let contained = cached
+            && self
+                .git(
+                    id,
+                    crew,
+                    &[
+                        "-C",
+                        &cache,
+                        "merge-base",
+                        "--is-ancestor",
+                        &refname,
+                        &remote,
+                    ],
+                )
+                .is_ok();
+        if cached && !contained {
             self.git(
                 id,
                 crew,
@@ -486,12 +523,12 @@ impl Workspace<'_> {
                     "fetch",
                     "--quiet",
                     "--no-auto-gc",
+                    "--update-head-ok",
                     &cache,
-                    &format!("{refname}:{refname}"),
+                    &format!("+{refname}:{refname}"),
                 ],
             )?;
             self.git(id, crew, &["-C", &ws, "checkout", "--quiet", branch])?;
-            let remote = format!("refs/remotes/origin/{branch}");
             if self
                 .git(
                     id,
@@ -514,6 +551,8 @@ impl Workspace<'_> {
                 )?;
             }
         } else {
+            // a cache copy origin already contains: origin's is newer
+            let start = if contained { branch } else { start_ref };
             self.git(
                 id,
                 crew,
@@ -522,9 +561,9 @@ impl Workspace<'_> {
                     &ws,
                     "checkout",
                     "--quiet",
-                    "-b",
+                    "-B",
                     branch,
-                    &format!("origin/{start_ref}"),
+                    &format!("origin/{start}"),
                 ],
             )?;
         }

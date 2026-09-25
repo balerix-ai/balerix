@@ -300,3 +300,17 @@ directory, not a repository.
   left for a follow-up: serve the harvest fetch under the agent's own
   nono profile (`fetch --upload-pack` wrapping nono), so upload-pack can
   read no more than the agent can.
+- `branch: <default branch>` materializes (review finding 3). A fresh
+  `--no-checkout` clone already has the remote's default branch with HEAD
+  on it, so the create path is `checkout -B` and the seed fetch carries
+  `--update-head-ok` and a forced refspec (the fresh clone's copy is only
+  origin's tip; the harvested one may have diverged from it). The review
+  prescribed the first two; implementation found the cache's own
+  `refs/heads/<default>` — the tip when the cache was cloned, never moved
+  by `fetch` — would then seed every such clone with a stale or
+  non-fast-forward branch. §4 step 3 is refined: a cache copy that
+  `origin/<branch>` already contains is no seed, and the branch is created
+  from `origin/<branch>`, newer and carrying everything the copy did;
+  only a copy holding commits origin lacks seeds. `workspace_it`
+  (`an_agent_on_the_default_branch_materializes`) proves create, seed
+  after origin moved on, and a pushed copy superseded by origin.

@@ -1392,3 +1392,108 @@ fn a_clone_pointed_at_another_repository_is_refused_and_nothing_is_harvested() {
         ]
     ));
 }
+
+/// Review finding 3: `branch: <default branch>`. A fresh `--no-checkout`
+/// clone already has `main` with HEAD on it, so the create path needs
+/// `checkout -B` and the seed fetch `--update-head-ok`; without them the
+/// agent could never materialize, before or after a harvest.
+#[test]
+fn an_agent_on_the_default_branch_materializes() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-default-branch");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    // origin moves on after the cache was cloned
+    let work = root.join("upstream-work");
+    std::fs::write(work.join("LATER"), "later\n").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "later on main"]);
+    let upstream = root.join("upstream.git").display().to_string();
+    git(&work, &["push", "-q", &upstream, "main"]);
+    let origin_tip = git(&work, &["rev-parse", "HEAD"]);
+
+    // created: HEAD on `main` at origin's tip — not the cache's own
+    // `main`, which is the tip when the cache was cloned — tracking
+    // `origin/main`
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "main", "main")
+        .unwrap();
+    assert_eq!(
+        git(&paths.workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "main"
+    );
+    assert_eq!(git(&paths.workspace, &["rev-parse", "HEAD"]), origin_tip);
+    assert_eq!(
+        git(
+            &paths.workspace,
+            &["rev-parse", "--abbrev-ref", "main@{upstream}"]
+        )
+        .trim(),
+        "origin/main"
+    );
+    assert!(paths.workspace.join("README").exists());
+
+    // harvested, then seeded from the cache: the exact commit, even
+    // after origin moved on again (the harvested copy has diverged from
+    // the fresh clone's `main`: the seed fetch is forced)
+    std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();
+    git(&paths.workspace, &["add", "."]);
+    git(
+        &paths.workspace,
+        &["commit", "-q", "-m", "agent work on main"],
+    );
+    let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
+    ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap();
+    assert!(!paths.workspace.exists());
+    std::fs::write(work.join("LATEST"), "latest\n").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "latest on main"]);
+    git(&work, &["push", "-q", &upstream, "main"]);
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "main", "main")
+        .unwrap();
+    assert_eq!(git(&paths.workspace, &["rev-parse", "HEAD"]), sha);
+    assert!(paths.workspace.join("work.txt").exists());
+    assert!(
+        git(&paths.workspace, &["status", "--porcelain"])
+            .trim()
+            .is_empty(),
+        "the seeded checkout is clean"
+    );
+    assert_eq!(
+        git(
+            &paths.workspace,
+            &["rev-parse", "--abbrev-ref", "main@{upstream}"]
+        )
+        .trim(),
+        "origin/main"
+    );
+
+    // the agent's work reaches origin; a copy origin contains is no seed
+    git(&paths.workspace, &["pull", "-q", "--rebase"]);
+    git(&paths.workspace, &["push", "-q"]);
+    ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap();
+    std::fs::write(work.join("NEWEST"), "newest\n").unwrap();
+    git(&work, &["pull", "-q", "--rebase", &upstream, "main"]);
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "newest on main"]);
+    git(&work, &["push", "-q", &upstream, "main"]);
+    let newest = git(&work, &["rev-parse", "HEAD"]);
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "main", "main")
+        .unwrap();
+    assert_eq!(
+        git(&paths.workspace, &["rev-parse", "HEAD"]),
+        newest,
+        "origin's newer tip, not the cache's older copy"
+    );
+    assert_no_auto_gc(&crew);
+}

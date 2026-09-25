@@ -7,7 +7,7 @@ use balerix_core::{MaterializeError, RepoRef};
 
 use crate::fsutil::write_atomic;
 use crate::home::render_hosts_yml;
-use crate::layout::CrewPaths;
+use crate::layout::{AgentPaths, CrewPaths};
 use crate::tools::{Cmd, ToolPaths};
 
 /// `git` honours `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_PREFIX`
@@ -98,6 +98,21 @@ pub fn decide_clone<E>(
     })
 }
 
+/// `remove_dir_all` that treats a missing path as done. Not `Runtime::rm_rf`:
+/// that one waits out nono's ledger writes, and no process writes a clone
+/// while the daemon materializes or removes it.
+fn remove_tree(id: &str, path: &Path) -> Result<(), MaterializeError> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(MaterializeError::Io {
+            id: id.to_string(),
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        }),
+    }
+}
+
 pub struct Workspace<'a> {
     pub tools: &'a ToolPaths,
     /// `GH_CONFIG_DIR` for the daemon's git calls when `git.auth: gh`.
@@ -152,9 +167,12 @@ impl Workspace<'_> {
             })
     }
 
-    /// Clone without a checkout if absent; otherwise nothing (Phase 3 spec
-    /// §6.1: a steady-state pass costs no git call). `ensure_worktree`
-    /// fetches when it actually needs `origin/<ref>`.
+    /// The crew's object cache (Spec N §3): a `--no-checkout` clone, made
+    /// when absent, with `gc.auto=0` so that git never gcs it on its own —
+    /// a clone borrowing objects from it is only safe while the cache
+    /// never loses one. A cache that exists is left alone, so a
+    /// steady-state pass costs no git call (Phase 3 spec §6.1);
+    /// `ensure_clone` fetches when it actually needs `origin/<ref>`.
     pub fn ensure_repo(
         &self,
         id: &str,
@@ -171,6 +189,7 @@ impl Workspace<'_> {
             path: crew.root.clone(),
             message: e.to_string(),
         })?;
+        let cache = crew.repo.display().to_string();
         self.git(
             id,
             crew,
@@ -179,9 +198,10 @@ impl Workspace<'_> {
                 "--quiet",
                 "--no-checkout",
                 &repo.clone_url(),
-                &crew.repo.display().to_string(),
+                &cache,
             ],
         )?;
+        self.git(id, crew, &["-C", &cache, "config", "gc.auto", "0"])?;
         Ok(())
     }
 
@@ -199,110 +219,263 @@ impl Workspace<'_> {
             .any(|l| l.strip_prefix("worktree ").map(Path::new) == Some(workspace)))
     }
 
-    /// Reuses a registered worktree created on `branch`; reuses an existing
-    /// branch; otherwise creates the branch from `origin/<git_ref>`.
-    ///
-    /// `marker` records the branch balerix last created the worktree on.
-    /// Spec L §6: when it differs from `branch` (the agent's `branch` was
-    /// added, changed or removed) the worktree is re-created on `branch`
-    /// if its tree is clean; a dirty tree fails rather than lose the
-    /// agent's uncommitted work. The old branch stays in the crew clone.
-    /// A matching marker reuses the worktree whatever its HEAD: an agent
-    /// that checked out a branch of its own keeps it across restarts
-    /// (#60). A worktree without a marker (from before the marker existed)
-    /// is judged by its HEAD once, and the marker written then. A detached
-    /// HEAD is reused as is: its commits may be on no branch.
-    pub fn ensure_worktree(
+    /// One git call inside the agent's clone, hardened by
+    /// `harden_agent_git` because the clone is agent-writable. `accepted`
+    /// are the exit codes that count as success (0 included).
+    fn agent_git(
         &self,
         id: &str,
         crew: &CrewPaths,
-        workspace: &Path,
-        marker: &Path,
+        agent: &AgentPaths,
+        args: &[&str],
+        accepted: &[i32],
+    ) -> Result<String, MaterializeError> {
+        let cmd = harden_agent_git(
+            Cmd::new(&self.tools.git).log(&crew.root.join("logs").join("git.log")),
+            crew,
+            &agent.root,
+        )
+        .args(["-C".to_string(), agent.workspace.display().to_string()])
+        .args(args.iter().copied());
+        cmd.run_with_exit_codes(accepted)
+            .map(|o| o.stdout)
+            .map_err(|f| MaterializeError::Tool {
+                id: id.to_string(),
+                tool: f.tool,
+                subcommand: f.subcommand,
+                args: f.args,
+                stderr: f.stderr,
+            })
+    }
+
+    /// The agent's private clone on `branch` (Spec N §4): a clone of
+    /// `repo` made with `--reference` to the crew cache, so objects the
+    /// cache holds are neither transferred nor duplicated.
+    ///
+    /// An existing clone (`workspace/.git` a directory) is judged by
+    /// `decide_clone`, Spec L §12's marker rule unchanged: a matching
+    /// marker reuses the clone whatever its HEAD (#60); a clone without a
+    /// marker is judged by HEAD once; a detached HEAD is reused as is; a
+    /// changed `branch` re-creates a clean clone after harvesting the old
+    /// branch into the cache (§5), and fails a dirty one naming both
+    /// branches. Every git call on an existing clone is `agent_git` (#62).
+    ///
+    /// A `workspace/.git` *file* is a worktree from balerix 0.1, refused
+    /// with the remedy (N-6). A `workspace/` with no `.git` at all (a
+    /// clone that crashed half-way) is replaced.
+    ///
+    /// A new clone starts with a fetch in the cache — the one moment
+    /// `origin/<start_ref>` must be current, and what makes the clone
+    /// cheap — then seeds `branch` from the cache's harvested copy when
+    /// there is one, else creates it from `origin/<start_ref>`. A seeded
+    /// branch tracks `origin/<branch>` when the remote has it, as a branch
+    /// created from it would. Whatever fails after `git clone` removes the
+    /// half-made clone: a `--no-checkout` clone left behind would be
+    /// judged an existing, dirty clone on the next pass.
+    pub fn ensure_clone(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        agent: &AgentPaths,
+        repo: &RepoRef,
         branch: &str,
-        git_ref: &str,
+        start_ref: &str,
     ) -> Result<(), MaterializeError> {
-        let repo = crew.repo.display().to_string();
-        let registered = self.is_registered(id, crew, workspace)?;
-        if registered && workspace.join(".git").exists() {
-            let recorded = std::fs::read_to_string(marker).ok();
-            if recorded.as_deref().map(str::trim) == Some(branch) {
-                return Ok(());
+        let dot_git = agent.workspace.join(".git");
+        if dot_git.is_dir() {
+            let marker = std::fs::read_to_string(agent.branch_marker()).ok();
+            // Err is a detached HEAD (`ref HEAD is not a symbolic ref`),
+            // reused as is: its commits may be on no branch.
+            let head = self
+                .agent_git(id, crew, agent, &["symbolic-ref", "--short", "HEAD"], &[0])
+                .ok();
+            let decision = decide_clone(marker.as_deref(), head.as_deref(), branch, || {
+                self.agent_git(id, crew, agent, &["status", "--porcelain"], &[0])
+                    .map(|s| !s.trim().is_empty())
+            })?;
+            match decision {
+                CloneDecision::Reuse => return Ok(()),
+                CloneDecision::Record => return Self::record_branch(id, agent, branch),
+                CloneDecision::Dirty { old } => {
+                    return Err(MaterializeError::Invalid {
+                        id: id.to_string(),
+                        message: format!(
+                            "the clone was created on branch {old:?} but the agent's \
+                             branch is {branch:?}, and the clone has local changes; \
+                             commit or discard them in {} first",
+                            agent.workspace.display()
+                        ),
+                    });
+                }
+                CloneDecision::Recreate { old } => {
+                    self.harvest(id, crew, agent, &old)?;
+                    remove_tree(id, &agent.workspace)?;
+                }
             }
-            let ws = workspace.display().to_string();
-            let Ok(head) = self.git(id, crew, &["-C", &ws, "symbolic-ref", "--short", "HEAD"])
-            else {
-                return Ok(()); // detached
-            };
-            let head = head.trim();
-            if head == branch {
-                return Self::record_branch(id, marker, branch);
-            }
-            let was = recorded.as_deref().map_or(head, str::trim);
-            let status = self.git(id, crew, &["-C", &ws, "status", "--porcelain"])?;
-            if !status.trim().is_empty() {
-                return Err(MaterializeError::Invalid {
-                    id: id.to_string(),
-                    message: format!(
-                        "the worktree was created on branch {was:?} but the agent's \
-                         branch is {branch:?}, and the worktree has local changes; \
-                         commit or discard them in {ws} first"
-                    ),
-                });
-            }
-            self.git(
-                id,
-                crew,
-                &["-C", &repo, "worktree", "remove", "--force", &ws],
-            )?;
+        } else if dot_git.exists() {
+            // `id` is `<fleet>/<crew>/<agent>`
+            let fleet = id.split('/').next().unwrap_or(id);
+            return Err(MaterializeError::Invalid {
+                id: id.to_string(),
+                message: format!(
+                    "{}: created by balerix 0.1 as a worktree; run `balerix down {fleet} \
+                     --purge` and `up` again (push unpushed work first)",
+                    agent.workspace.display()
+                ),
+            });
+        } else {
+            remove_tree(id, &agent.workspace)?;
         }
-        self.git(id, crew, &["-C", &repo, "worktree", "prune"])?;
-        let ws = workspace.display().to_string();
-        let branch_exists = self
+        if let Err(e) = self.create_clone(id, crew, agent, repo, branch, start_ref) {
+            let _ = std::fs::remove_dir_all(&agent.workspace);
+            return Err(e);
+        }
+        Self::record_branch(id, agent, branch)
+    }
+
+    /// Spec N §4 step 3. These calls run in a clone the agent has never
+    /// touched, so they need no hardening; they go through `git` for the
+    /// credential helper the clone needs.
+    fn create_clone(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        agent: &AgentPaths,
+        repo: &RepoRef,
+        branch: &str,
+        start_ref: &str,
+    ) -> Result<(), MaterializeError> {
+        let cache = crew.repo.display().to_string();
+        let ws = agent.workspace.display().to_string();
+        self.git(
+            id,
+            crew,
+            &["-C", &cache, "fetch", "--quiet", "--no-auto-gc", "origin"],
+        )?;
+        self.git(
+            id,
+            crew,
+            &[
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                "--reference",
+                &cache,
+                &repo.clone_url(),
+                &ws,
+            ],
+        )?;
+        let refname = format!("refs/heads/{branch}");
+        let harvested = self
             .git(
                 id,
                 crew,
-                &[
-                    "-C",
-                    &repo,
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{branch}"),
-                ],
+                &["-C", &cache, "rev-parse", "--verify", "--quiet", &refname],
             )
             .is_ok();
-        if branch_exists {
-            self.git(
-                id,
-                crew,
-                &["-C", &repo, "worktree", "add", "--quiet", &ws, branch],
-            )?;
-        } else {
-            // the only moment `origin/<ref>` must be current
-            self.git(id, crew, &["-C", &repo, "fetch", "--quiet", "origin"])?;
+        if harvested {
             self.git(
                 id,
                 crew,
                 &[
                     "-C",
-                    &repo,
-                    "worktree",
-                    "add",
+                    &ws,
+                    "fetch",
+                    "--quiet",
+                    "--no-auto-gc",
+                    &cache,
+                    &format!("{refname}:{refname}"),
+                ],
+            )?;
+            self.git(id, crew, &["-C", &ws, "checkout", "--quiet", branch])?;
+            let remote = format!("refs/remotes/origin/{branch}");
+            if self
+                .git(
+                    id,
+                    crew,
+                    &["-C", &ws, "rev-parse", "--verify", "--quiet", &remote],
+                )
+                .is_ok()
+            {
+                self.git(
+                    id,
+                    crew,
+                    &[
+                        "-C",
+                        &ws,
+                        "branch",
+                        "--quiet",
+                        &format!("--set-upstream-to=origin/{branch}"),
+                        branch,
+                    ],
+                )?;
+            }
+        } else {
+            self.git(
+                id,
+                crew,
+                &[
+                    "-C",
+                    &ws,
+                    "checkout",
                     "--quiet",
                     "-b",
                     branch,
-                    &ws,
-                    &format!("origin/{git_ref}"),
+                    &format!("origin/{start_ref}"),
                 ],
             )?;
         }
-        Self::record_branch(id, marker, branch)
+        Ok(())
     }
 
-    fn record_branch(id: &str, marker: &Path, branch: &str) -> Result<(), MaterializeError> {
-        write_atomic(marker, branch.as_bytes(), 0o644).map_err(|e| MaterializeError::Io {
+    /// Spec N §5: the clone's `refs/heads/<branch>` into the cache, by a
+    /// fetch run *in the cache*. A push run in the clone would honour the
+    /// clone's config (an `url.<x>.insteadOf` there could aim it at
+    /// another crew's cache); `upload-pack` in the clone takes no
+    /// repo-local hook or program config, and the only write is into the
+    /// daemon-owned cache. The `+` is intended: the clone was seeded from
+    /// the cache's copy, so the clone's is the newer state even after a
+    /// rebase. A branch the clone does not have (deleted by the agent) is
+    /// skipped.
+    fn harvest(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        agent: &AgentPaths,
+        branch: &str,
+    ) -> Result<(), MaterializeError> {
+        let refname = format!("refs/heads/{branch}");
+        let present = self.agent_git(
+            id,
+            crew,
+            agent,
+            &["rev-parse", "--verify", "--quiet", &refname],
+            &[0, 1],
+        )?;
+        if present.trim().is_empty() {
+            return Ok(());
+        }
+        self.git(
+            id,
+            crew,
+            &[
+                "-C",
+                &crew.repo.display().to_string(),
+                "fetch",
+                "--quiet",
+                "--no-auto-gc",
+                &agent.workspace.display().to_string(),
+                &format!("+{refname}:{refname}"),
+            ],
+        )
+        .map(|_| ())
+    }
+
+    fn record_branch(id: &str, agent: &AgentPaths, branch: &str) -> Result<(), MaterializeError> {
+        let marker = agent.branch_marker();
+        write_atomic(&marker, branch.as_bytes(), 0o644).map_err(|e| MaterializeError::Io {
             id: id.to_string(),
-            path: marker.to_path_buf(),
+            path: marker,
             message: e.to_string(),
         })
     }

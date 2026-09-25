@@ -56,8 +56,11 @@ fn bare_repo(root: &Path) -> RepoRef {
     RepoRef::parse(&format!("file://{}", bare.display())).unwrap()
 }
 
+/// Spec N §3–4: the cache is a `--no-checkout` clone with `gc.auto=0`;
+/// the agent's workspace is a full clone borrowing objects from it, on
+/// the agent's branch, with `origin` the real remote.
 #[test]
-fn clone_worktree_reuse_and_remove() {
+fn a_private_clone_borrows_from_the_cache_and_pushes_to_origin() {
     let Some(tools) = support::tools() else {
         assert!(!support::require_or_skip("git", false));
         return;
@@ -76,30 +79,30 @@ fn clone_worktree_reuse_and_remove() {
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     assert!(crew.repo.join(".git").is_dir());
     assert!(!crew.repo.join("README").exists(), "--no-checkout");
-    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap(); // present → no git call
-    let git_log =
-        || std::fs::read_to_string(crew.root.join("logs").join("git.log")).unwrap_or_default();
-    let fetches = |log: &str| {
-        log.lines()
-            .filter(|l| l.starts_with("$ git") && l.contains(" fetch "))
-            .count()
-    };
     assert_eq!(
-        fetches(&git_log()),
+        git(&crew.repo, &["config", "gc.auto"]).trim(),
+        "0",
+        "N-2: the cache never gcs on its own"
+    );
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap(); // present → no git call
+    assert_eq!(
+        fetch_lines(&crew).len(),
         0,
         "a second ensure_repo must not fetch"
     );
 
-    ws.ensure_worktree(
-        "f/c/a",
-        &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
-        "balerix/f/c/a",
-        "main",
-    )
-    .unwrap();
-    assert_eq!(fetches(&git_log()), 1, "creating a branch fetches first");
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    assert_eq!(
+        fetch_lines(&crew).len(),
+        1,
+        "creating a branch fetches the cache first"
+    );
+    assert_no_auto_gc(&crew);
+    assert!(
+        paths.workspace.join(".git").is_dir(),
+        "a clone, not a worktree"
+    );
     assert_eq!(
         std::fs::read_to_string(paths.workspace.join("README")).unwrap(),
         "hi\n"
@@ -108,71 +111,50 @@ fn clone_worktree_reuse_and_remove() {
         git(&paths.workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
         "balerix/f/c/a"
     );
-    ws.ensure_worktree(
-        "f/c/a",
-        &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
-        "balerix/f/c/a",
-        "main",
-    )
-    .unwrap(); // idempotent
+    let alternates =
+        std::fs::read_to_string(paths.workspace.join(".git/objects/info/alternates")).unwrap();
     assert_eq!(
-        fetches(&git_log()),
-        1,
-        "a registered worktree costs no fetch"
+        alternates.trim(),
+        crew.cache_objects()
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string(),
+        "N-1: objects come from the cache"
+    );
+    assert_eq!(
+        git(&paths.workspace, &["remote", "get-url", "origin"]).trim(),
+        repo.clone_url(),
+        "origin is the real remote, not the cache"
+    );
+    assert_eq!(
+        std::fs::read_to_string(paths.branch_marker()).unwrap(),
+        "balerix/f/c/a"
     );
 
-    // agent commits; remove the worktree; re-adding must keep the commit (P2-6)
-    std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap(); // idempotent
+    assert_eq!(
+        fetch_lines(&crew).len(),
+        1,
+        "an existing clone costs no fetch"
+    );
+
+    // a push from the clone reaches origin
+    std::fs::write(paths.workspace.join("work.txt"), "pushed\n").unwrap();
     git(&paths.workspace, &["add", "."]);
     git(&paths.workspace, &["commit", "-q", "-m", "agent work"]);
     let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
-    ws.remove_worktree("f/c/a", &crew, &paths.workspace)
-        .unwrap();
-    assert!(!paths.workspace.exists());
-    ws.ensure_worktree(
-        "f/c/a",
-        &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
-        "balerix/f/c/a",
-        "main",
-    )
-    .unwrap();
-    assert_eq!(
-        git(&paths.workspace, &["rev-parse", "HEAD"]),
-        sha,
-        "branch reused, commit preserved"
-    );
-    assert!(paths.workspace.join("work.txt").exists());
+    git(&paths.workspace, &["push", "-q", "origin", "balerix/f/c/a"]);
+    let bare = root.join("upstream.git");
+    assert_eq!(git(&bare, &["rev-parse", "refs/heads/balerix/f/c/a"]), sha);
 
-    // a second agent gets its own branch from origin/main, not from alice's
+    // a second agent gets its own clone and branch from origin/main
     let b = layout.agent(&"f/c/b".parse().unwrap());
-    ws.ensure_worktree(
-        "f/c/b",
-        &crew,
-        &b.workspace,
-        &b.branch_marker(),
-        "balerix/f/c/b",
-        "main",
-    )
-    .unwrap();
+    ws.ensure_clone("f/c/b", &crew, &b, &repo, "balerix/f/c/b", "main")
+        .unwrap();
     assert!(!b.workspace.join("work.txt").exists());
-    assert!(crew.root.join("logs").join("git.log").exists());
-
-    // An unregistered plain directory where a worktree used to be (a crashed
-    // pass, or a `.git` file removed by hand): `git worktree remove` would
-    // fail with "is not a working tree", so it is not called at all. Removal
-    // succeeds and leaves the directory for the caller's rm -rf to take.
-    let c = layout.agent(&"f/c/c".parse().unwrap());
-    std::fs::create_dir_all(&c.workspace).unwrap();
-    std::fs::write(c.workspace.join("stray.txt"), "not a worktree\n").unwrap();
-    ws.remove_worktree("f/c/c", &crew, &c.workspace).unwrap();
-    assert!(
-        c.workspace.join("stray.txt").exists(),
-        "an unregistered directory is left for remove_agent's rm -rf"
-    );
+    assert!(b.workspace.join(".git/objects/info/alternates").exists());
 }
 
 #[test]
@@ -218,11 +200,31 @@ fn push_branch(root: &Path, branch: &str) -> String {
     git(&work, &["rev-parse", branch]).trim().to_string()
 }
 
-/// Spec L §6: an agent with `branch` works on that remote branch — created
-/// from `origin/<branch>`, tracking it, reused across passes — never on a
-/// fresh `balerix/…` branch.
+/// The `$ git …` lines of the crew's git.log that run a `fetch`.
+fn fetch_lines(crew: &balerix_runtime::CrewPaths) -> Vec<String> {
+    std::fs::read_to_string(crew.root.join("logs").join("git.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("$ git") && l.contains(" fetch "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Spec N-2: every fetch the daemon runs into the cache must refuse to gc.
+fn assert_no_auto_gc(crew: &balerix_runtime::CrewPaths) {
+    for l in fetch_lines(crew) {
+        assert!(
+            l.contains("--no-auto-gc"),
+            "a daemon fetch without --no-auto-gc: {l}"
+        );
+    }
+}
+
+/// Spec L §6 over the clone: an agent with `branch` works on that remote
+/// branch — created from `origin/<branch>`, tracking it, reused across
+/// passes — never on a fresh `balerix/…` branch.
 #[test]
-fn a_worktree_on_an_existing_remote_branch_is_created_from_it_and_reused() {
+fn a_clone_on_an_existing_remote_branch_is_created_from_it_and_reused() {
     let Some(tools) = support::tools() else {
         assert!(!support::require_or_skip("git", false));
         return;
@@ -240,11 +242,11 @@ fn a_worktree_on_an_existing_remote_branch_is_created_from_it_and_reused() {
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
-    ws.ensure_worktree(
+    ws.ensure_clone(
         "f/c/pr",
         &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
+        &paths,
+        &repo,
         "feature/issue-12",
         "feature/issue-12",
     )
@@ -262,33 +264,30 @@ fn a_worktree_on_an_existing_remote_branch_is_created_from_it_and_reused() {
         )
         .trim(),
         "origin/feature/issue-12",
-        "a push from the worktree reaches the PR's branch"
+        "a push from the clone reaches the PR's branch"
     );
-
-    // the agent commits; a removed and re-added worktree keeps the branch
-    std::fs::write(paths.workspace.join("more"), "x\n").unwrap();
-    git(&paths.workspace, &["add", "."]);
-    git(&paths.workspace, &["commit", "-q", "-m", "agent work"]);
-    let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
-    ws.remove_worktree("f/c/pr", &crew, &paths.workspace)
-        .unwrap();
-    ws.ensure_worktree(
+    ws.ensure_clone(
         "f/c/pr",
         &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
+        &paths,
+        &repo,
         "feature/issue-12",
         "feature/issue-12",
     )
     .unwrap();
-    assert_eq!(git(&paths.workspace, &["rev-parse", "HEAD"]), sha);
+    assert_eq!(
+        git(&paths.workspace, &["rev-parse", "HEAD"]).trim(),
+        tip,
+        "reused"
+    );
 }
 
-/// Spec L §6 (F1): adding, changing or removing `branch` on a live agent
-/// re-creates its clean worktree on the new branch; the reconciler only
-/// re-materializes, so a registered worktree must not pin the old one.
+/// Spec L §6 (F1) over the clone: adding, changing or removing `branch`
+/// on a live agent re-creates its clean clone on the new branch; the old
+/// branch is harvested into the cache (Spec N §5) and seeds the clone
+/// when the setting comes back.
 #[test]
-fn a_changed_branch_moves_a_clean_worktree_and_keeps_the_old_branch() {
+fn a_changed_branch_moves_a_clean_clone_and_keeps_the_old_branch() {
     let Some(tools) = support::tools() else {
         assert!(!support::require_or_skip("git", false));
         return;
@@ -311,27 +310,20 @@ fn a_changed_branch_moves_a_clean_worktree_and_keeps_the_old_branch() {
             .to_string()
     };
 
-    ws.ensure_worktree(
-        "f/c/a",
-        &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
-        "balerix/f/c/a",
-        "main",
-    )
-    .unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
     assert_eq!(head(), "balerix/f/c/a");
     std::fs::write(paths.workspace.join("work.txt"), "committed\n").unwrap();
     git(&paths.workspace, &["add", "."]);
     git(&paths.workspace, &["commit", "-q", "-m", "agent work"]);
     let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
 
-    // `branch` added
-    ws.ensure_worktree(
+    // `branch` added: the old branch is harvested, the clone re-created
+    ws.ensure_clone(
         "f/c/a",
         &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
+        &paths,
+        &repo,
         "feature/issue-12",
         "feature/issue-12",
     )
@@ -339,25 +331,30 @@ fn a_changed_branch_moves_a_clean_worktree_and_keeps_the_old_branch() {
     assert_eq!(head(), "feature/issue-12");
     assert_eq!(git(&paths.workspace, &["rev-parse", "HEAD"]).trim(), tip);
     assert!(!paths.workspace.join("work.txt").exists());
+    assert_eq!(
+        git(&crew.repo, &["rev-parse", "refs/heads/balerix/f/c/a"]),
+        sha,
+        "N-4: the old branch lives on in the cache"
+    );
+    assert_no_auto_gc(&crew);
 
-    // `branch` removed: back on the per-agent branch, its commit intact
-    ws.ensure_worktree(
-        "f/c/a",
-        &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
-        "balerix/f/c/a",
-        "main",
-    )
-    .unwrap();
+    // `branch` removed: back on the per-agent branch, seeded from the cache
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
     assert_eq!(head(), "balerix/f/c/a");
     assert_eq!(git(&paths.workspace, &["rev-parse", "HEAD"]), sha);
+    assert!(paths.workspace.join("work.txt").exists());
+    assert_eq!(
+        git(&crew.repo, &["rev-parse", "refs/heads/feature/issue-12"]).trim(),
+        tip,
+        "the branch the clone left is harvested too"
+    );
 }
 
-/// F1: a dirty tree on the old branch fails the materialize step, naming
+/// F1: a dirty clone on the old branch fails the materialize step, naming
 /// both branches, and is left exactly as it was.
 #[test]
-fn a_changed_branch_on_a_dirty_worktree_fails_and_keeps_the_tree() {
+fn a_changed_branch_on_a_dirty_clone_fails_and_keeps_the_tree() {
     let Some(tools) = support::tools() else {
         assert!(!support::require_or_skip("git", false));
         return;
@@ -374,23 +371,16 @@ fn a_changed_branch_on_a_dirty_worktree_fails_and_keeps_the_tree() {
         gh_config_dir: None,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
-    ws.ensure_worktree(
-        "f/c/a",
-        &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
-        "balerix/f/c/a",
-        "main",
-    )
-    .unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
     std::fs::write(paths.workspace.join("README"), "edited\n").unwrap();
 
     let e = ws
-        .ensure_worktree(
+        .ensure_clone(
             "f/c/a",
             &crew,
-            &paths.workspace,
-            &paths.branch_marker(),
+            &paths,
+            &repo,
             "feature/issue-12",
             "feature/issue-12",
         )
@@ -408,12 +398,20 @@ fn a_changed_branch_on_a_dirty_worktree_fails_and_keeps_the_tree() {
         std::fs::read_to_string(paths.workspace.join("README")).unwrap(),
         "edited\n"
     );
+    assert!(
+        git(&crew.repo, &["branch", "--list", "balerix/f/c/a"])
+            .trim()
+            .is_empty(),
+        "nothing was harvested from a clone that stays"
+    );
 }
 
 /// Review focus 1: a `branch` the remote does not have fails the
-/// materialize step with git's message; nothing is created from `main`.
+/// materialize step with git's message, and the half-made clone is
+/// removed — a `--no-checkout` clone left behind would read as an
+/// existing, dirty clone on the next pass.
 #[test]
-fn a_missing_remote_branch_fails_the_worktree() {
+fn a_missing_remote_branch_fails_the_clone_and_leaves_nothing() {
     let Some(tools) = support::tools() else {
         assert!(!support::require_or_skip("git", false));
         return;
@@ -430,25 +428,25 @@ fn a_missing_remote_branch_fails_the_worktree() {
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let e = ws
-        .ensure_worktree(
-            "f/c/pr",
-            &crew,
-            &paths.workspace,
-            &paths.branch_marker(),
-            "nope",
-            "nope",
-        )
+        .ensure_clone("f/c/pr", &crew, &paths, &repo, "nope", "nope")
         .unwrap_err()
         .to_string();
-    assert!(e.starts_with("f/c/pr: git worktree:"), "{e}");
+    assert!(e.starts_with("f/c/pr: git checkout:"), "{e}");
     assert!(e.contains("origin/nope"), "{e}");
-    assert!(!paths.workspace.join(".git").exists());
+    assert!(!paths.workspace.exists(), "the half-made clone is gone");
+    assert!(!paths.branch_marker().exists());
     assert!(
         git(&crew.repo, &["branch", "--list", "nope"])
             .trim()
             .is_empty(),
-        "no local branch was created"
+        "no branch was created in the cache"
     );
+    // the next pass fails the same way, not with "local changes"
+    let again = ws
+        .ensure_clone("f/c/pr", &crew, &paths, &repo, "nope", "nope")
+        .unwrap_err()
+        .to_string();
+    assert!(again.starts_with("f/c/pr: git checkout:"), "{again}");
 }
 
 /// `check_branch_name` is a model of `git check-ref-format --branch`;
@@ -529,9 +527,9 @@ fn check_branch_name_agrees_with_git_check_ref_format() {
     assert!(balerix_api::check_branch_name("@").is_err());
 }
 
-/// #60: a restart re-materializes with the *same* setting. An agent that
-/// checked out a branch of its own is neither moved back nor failed for it,
-/// whether its tree is clean or dirty.
+/// #60 over the clone: a restart re-materializes with the *same* setting.
+/// An agent that checked out a branch of its own is neither moved back
+/// nor failed for it, whether its tree is clean or dirty.
 #[test]
 fn an_agent_switching_branches_itself_is_left_alone_on_an_unchanged_setting() {
     let Some(tools) = support::tools() else {
@@ -555,40 +553,19 @@ fn an_agent_switching_branches_itself_is_left_alone_on_an_unchanged_setting() {
             .to_string()
     };
 
-    ws.ensure_worktree(
-        "f/c/a",
-        &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
-        "balerix/f/c/a",
-        "main",
-    )
-    .unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
     git(&paths.workspace, &["checkout", "-q", "-b", "my-fix"]);
 
     // clean tree: not moved back
-    ws.ensure_worktree(
-        "f/c/a",
-        &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
-        "balerix/f/c/a",
-        "main",
-    )
-    .unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
     assert_eq!(head(), "my-fix");
 
     // dirty tree: not failed, and the change is kept
     std::fs::write(paths.workspace.join("README"), "edited\n").unwrap();
-    ws.ensure_worktree(
-        "f/c/a",
-        &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
-        "balerix/f/c/a",
-        "main",
-    )
-    .unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
     assert_eq!(head(), "my-fix");
     assert_eq!(
         std::fs::read_to_string(paths.workspace.join("README")).unwrap(),
@@ -596,11 +573,10 @@ fn an_agent_switching_branches_itself_is_left_alone_on_an_unchanged_setting() {
     );
 }
 
-/// A worktree from before the marker existed is judged by its HEAD once
-/// (the pre-#60 rule, so a `branch` set before the upgrade still applies)
+/// A clone from before the marker existed is judged by its HEAD once
 /// and the marker is written then; from there on HEAD no longer counts.
 #[test]
-fn a_worktree_without_a_marker_is_judged_by_head_once_then_recorded() {
+fn a_clone_without_a_marker_is_judged_by_head_once_then_recorded() {
     let Some(tools) = support::tools() else {
         assert!(!support::require_or_skip("git", false));
         return;
@@ -621,31 +597,29 @@ fn a_worktree_without_a_marker_is_judged_by_head_once_then_recorded() {
             .trim()
             .to_string()
     };
-    let ensure = |branch: &str| {
-        ws.ensure_worktree(
-            "f/c/a",
-            &crew,
-            &paths.workspace,
-            &paths.branch_marker(),
-            branch,
-            "main",
-        )
-    };
+    let ensure = |branch: &str| ws.ensure_clone("f/c/a", &crew, &paths, &repo, branch, "main");
 
     ensure("balerix/f/c/a").unwrap();
     std::fs::remove_file(paths.branch_marker()).unwrap();
     git(&paths.workspace, &["checkout", "-q", "-b", "my-fix"]);
 
-    // no marker: HEAD decides, as before, and the marker appears
+    // no marker: HEAD decides, the clone is re-created, the marker appears
     ensure("balerix/f/c/a").unwrap();
     assert_eq!(head(), "balerix/f/c/a");
     assert_eq!(
         std::fs::read_to_string(paths.branch_marker()).unwrap(),
         "balerix/f/c/a"
     );
+    assert!(
+        git(&crew.repo, &["rev-parse", "--verify", "refs/heads/my-fix"])
+            .trim()
+            .len()
+            == 40,
+        "the branch HEAD was on is what got harvested"
+    );
 
     // with the marker: the same self-switch is left alone
-    git(&paths.workspace, &["checkout", "-q", "my-fix"]);
+    git(&paths.workspace, &["checkout", "-q", "-b", "my-fix"]);
     ensure("balerix/f/c/a").unwrap();
     assert_eq!(head(), "my-fix");
 }
@@ -653,7 +627,7 @@ fn a_worktree_without_a_marker_is_judged_by_head_once_then_recorded() {
 /// The agent checked out the very branch the operator then configures:
 /// nothing to move, even with local changes, and the record follows.
 #[test]
-fn a_changed_branch_the_worktree_already_sits_on_is_recorded_without_a_move() {
+fn a_changed_branch_the_clone_already_sits_on_is_recorded_without_a_move() {
     let Some(tools) = support::tools() else {
         assert!(!support::require_or_skip("git", false));
         return;
@@ -675,15 +649,8 @@ fn a_changed_branch_the_worktree_already_sits_on_is_recorded_without_a_move() {
             .trim()
             .to_string()
     };
-    let ensure = |branch: &str, git_ref: &str| {
-        ws.ensure_worktree(
-            "f/c/a",
-            &crew,
-            &paths.workspace,
-            &paths.branch_marker(),
-            branch,
-            git_ref,
-        )
+    let ensure = |branch: &str, start_ref: &str| {
+        ws.ensure_clone("f/c/a", &crew, &paths, &repo, branch, start_ref)
     };
 
     ensure("balerix/f/c/a", "main").unwrap();
@@ -709,4 +676,183 @@ fn a_changed_branch_the_worktree_already_sits_on_is_recorded_without_a_move() {
     git(&paths.workspace, &["checkout", "-q", "-b", "my-fix"]);
     ensure("feature/issue-12", "feature/issue-12").unwrap();
     assert_eq!(head(), "my-fix");
+}
+
+/// N-7 (#63): two agents on one `branch` both materialize; with private
+/// clones there is no checkout to collide on.
+#[test]
+fn two_agents_on_one_branch_both_materialize() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-shared-branch");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let tip = push_branch(&root, "feature/issue-12");
+    let crew = layout.crew(&"f/c".parse().unwrap());
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    for name in ["a", "b"] {
+        let id: balerix_core::AgentId = format!("f/c/{name}").parse().unwrap();
+        let paths = layout.agent(&id);
+        ws.ensure_clone(
+            &id.to_string(),
+            &crew,
+            &paths,
+            &repo,
+            "feature/issue-12",
+            "feature/issue-12",
+        )
+        .unwrap();
+        assert_eq!(
+            git(&paths.workspace, &["rev-parse", "HEAD"]).trim(),
+            tip,
+            "{id}"
+        );
+        assert!(paths.workspace.join("FEATURE").exists(), "{id}");
+    }
+}
+
+/// N-6: a workspace whose `.git` is a file is a 0.1.x worktree. Refused
+/// with the remedy; nothing touched.
+#[test]
+fn a_worktree_from_0_1_is_refused_with_the_purge_message() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-0-1");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    // what 0.1.x's ensure_worktree made
+    git(&crew.repo, &["fetch", "-q", "origin"]);
+    git(
+        &crew.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "balerix/f/c/a",
+            &paths.workspace.display().to_string(),
+            "origin/main",
+        ],
+    );
+    assert!(paths.workspace.join(".git").is_file());
+
+    let e = ws
+        .ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("f/c/a: "), "{e}");
+    assert!(e.contains("created by balerix 0.1 as a worktree"), "{e}");
+    assert!(e.contains("balerix down f --purge"), "{e}");
+    assert!(paths.workspace.join(".git").is_file(), "left as it was");
+    assert!(!paths.branch_marker().exists());
+}
+
+/// A `workspace/` with no `.git` at all — a clone that crashed half-way —
+/// holds nothing balerix values; it is replaced rather than failing
+/// `git clone` (`already exists and is not an empty directory`) on every
+/// pass until a purge.
+#[test]
+fn a_crashed_clone_directory_without_git_is_replaced() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-stray");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    std::fs::create_dir_all(&paths.workspace).unwrap();
+    std::fs::write(paths.workspace.join("stray.txt"), "not a clone\n").unwrap();
+
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    assert!(paths.workspace.join(".git").is_dir());
+    assert!(paths.workspace.join("README").exists());
+    assert!(!paths.workspace.join("stray.txt").exists());
+}
+
+/// Review focus 5 (#62, first bullet): the clone step's `status` on a
+/// branch change runs in an agent-writable repository; config the agent
+/// wrote there must not run a program as the daemon.
+#[test]
+fn the_clone_step_runs_no_program_from_the_clone_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-hardened");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    push_branch(&root, "feature/issue-12");
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+
+    let ran = root.join("fsmonitor-ran");
+    let hook = root.join("fsmonitor.sh");
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\necho\n", ran.display())).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &paths.workspace,
+        &["config", "core.fsmonitor", &hook.display().to_string()],
+    );
+    // the fixture bites: a plain status runs it
+    git(&paths.workspace, &["status", "--porcelain"]);
+    assert!(
+        ran.exists(),
+        "the fixture's fsmonitor hook must run under plain git"
+    );
+    std::fs::remove_file(&ran).unwrap();
+
+    // a branch change on a clean clone: `symbolic-ref` and `status` run
+    // in the clone, then it is harvested and re-created
+    ws.ensure_clone(
+        "f/c/a",
+        &crew,
+        &paths,
+        &repo,
+        "feature/issue-12",
+        "feature/issue-12",
+    )
+    .unwrap();
+    assert!(
+        !ran.exists(),
+        "core.fsmonitor from the clone's config ran under the daemon"
+    );
+    assert_eq!(
+        git(&paths.workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "feature/issue-12"
+    );
 }

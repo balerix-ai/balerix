@@ -1022,6 +1022,62 @@ fn removal_harvests_head_without_a_marker_and_skips_what_is_not_there() {
     assert!(!d.workspace.exists());
 }
 
+/// The cache is a `--no-checkout` clone: its HEAD still sits on
+/// `refs/heads/<default>`. A branch the agent is assigned that happens to
+/// be the cache's default branch must be harvestable too — by HEAD (no
+/// marker) and by the marker — not wedge the removal (`--update-head-ok`).
+#[test]
+fn a_branch_the_cache_has_checked_out_is_harvested_too() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-harvest-default-branch");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let crew = layout.crew(&"f/c".parse().unwrap());
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+
+    // route 1: no marker, HEAD decides
+    let id_a: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let a = layout.agent(&id_a);
+    ws.ensure_clone("f/c/a", &crew, &a, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    git(&a.workspace, &["checkout", "-q", "main"]);
+    std::fs::write(a.workspace.join("a.txt"), "a\n").unwrap();
+    git(&a.workspace, &["add", "."]);
+    git(&a.workspace, &["commit", "-q", "-m", "a on main"]);
+    let sha_a = git(&a.workspace, &["rev-parse", "HEAD"]);
+    std::fs::remove_file(a.branch_marker()).unwrap();
+    ws.harvest_and_remove("f/c/a", &crew, &a).unwrap();
+    assert_eq!(git(&crew.repo, &["rev-parse", "refs/heads/main"]), sha_a);
+
+    // route 2: a marker naming the default branch
+    let id_b: balerix_core::AgentId = "f/c/b".parse().unwrap();
+    let b = layout.agent(&id_b);
+    ws.ensure_clone("f/c/b", &crew, &b, &repo, "balerix/f/c/b", "main")
+        .unwrap();
+    git(&b.workspace, &["checkout", "-q", "main"]);
+    std::fs::write(b.workspace.join("b.txt"), "b\n").unwrap();
+    git(&b.workspace, &["add", "."]);
+    git(&b.workspace, &["commit", "-q", "-m", "b on main"]);
+    let sha_b = git(&b.workspace, &["rev-parse", "HEAD"]);
+    std::fs::write(b.branch_marker(), "main").unwrap();
+    ws.harvest_and_remove("f/c/b", &crew, &b).unwrap();
+    assert_eq!(git(&crew.repo, &["rev-parse", "refs/heads/main"]), sha_b);
+
+    assert_no_auto_gc(&crew);
+    assert_eq!(
+        git(&crew.repo, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/main",
+        "the fix updated the ref under HEAD rather than detaching it"
+    );
+}
+
 /// A clone git cannot read fails the removal — the operator sees it
 /// rather than losing work (Spec N §5).
 #[test]

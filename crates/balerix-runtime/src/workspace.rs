@@ -423,6 +423,15 @@ impl Workspace<'_> {
     /// the cache's copy, so the clone's is the newer state even after a
     /// rebase. A branch the clone does not have (deleted by the agent) is
     /// skipped.
+    ///
+    /// `--update-head-ok`: the cache is a `--no-checkout` clone, so its
+    /// HEAD sits on the default branch with no checkout to disturb — an
+    /// empty index and tree that nobody runs `status` over. Without the
+    /// flag, a fetch into the ref HEAD points at is refused outright
+    /// (`refusing to fetch into branch … checked out`), which would wedge
+    /// every removal of an agent assigned the default branch. Spec N-4
+    /// (every assigned branch is harvested, or the removal fails loudly)
+    /// outranks the spec text's exact argv here.
     fn harvest(
         &self,
         id: &str,
@@ -450,6 +459,7 @@ impl Workspace<'_> {
                 "fetch",
                 "--quiet",
                 "--no-auto-gc",
+                "--update-head-ok",
                 &agent.workspace.display().to_string(),
                 &format!("+{refname}:{refname}"),
             ],

@@ -120,25 +120,35 @@ impl Workspace<'_> {
             .any(|l| l.strip_prefix("worktree ").map(Path::new) == Some(workspace)))
     }
 
-    /// Reuses a registered worktree that is on `branch`; reuses an existing
+    /// Reuses a registered worktree created on `branch`; reuses an existing
     /// branch; otherwise creates the branch from `origin/<git_ref>`.
     ///
-    /// Spec L §6: a registered worktree on another branch (the agent's
-    /// `branch` was added, changed or removed) is re-created on `branch`
-    /// when its tree is clean; a dirty tree fails rather than lose the
+    /// `marker` records the branch balerix last created the worktree on.
+    /// Spec L §6: when it differs from `branch` (the agent's `branch` was
+    /// added, changed or removed) the worktree is re-created on `branch`
+    /// if its tree is clean; a dirty tree fails rather than lose the
     /// agent's uncommitted work. The old branch stays in the crew clone.
-    /// A detached HEAD is reused as is: its commits may be on no branch.
+    /// A matching marker reuses the worktree whatever its HEAD: an agent
+    /// that checked out a branch of its own keeps it across restarts
+    /// (#60). A worktree without a marker (from before the marker existed)
+    /// is judged by its HEAD once, and the marker written then. A detached
+    /// HEAD is reused as is: its commits may be on no branch.
     pub fn ensure_worktree(
         &self,
         id: &str,
         crew: &CrewPaths,
         workspace: &Path,
+        marker: &Path,
         branch: &str,
         git_ref: &str,
     ) -> Result<(), MaterializeError> {
         let repo = crew.repo.display().to_string();
         let registered = self.is_registered(id, crew, workspace)?;
         if registered && workspace.join(".git").exists() {
+            let recorded = std::fs::read_to_string(marker).ok();
+            if recorded.as_deref().map(str::trim) == Some(branch) {
+                return Ok(());
+            }
             let ws = workspace.display().to_string();
             let Ok(head) = self.git(id, crew, &["-C", &ws, "symbolic-ref", "--short", "HEAD"])
             else {
@@ -146,16 +156,17 @@ impl Workspace<'_> {
             };
             let head = head.trim();
             if head == branch {
-                return Ok(());
+                return Self::record_branch(id, marker, branch);
             }
+            let was = recorded.as_deref().map_or(head, str::trim);
             let status = self.git(id, crew, &["-C", &ws, "status", "--porcelain"])?;
             if !status.trim().is_empty() {
                 return Err(MaterializeError::Invalid {
                     id: id.to_string(),
                     message: format!(
-                        "the worktree is on branch {head:?} but the agent's branch is \
-                         {branch:?}, and the worktree has local changes; commit or \
-                         discard them in {ws} first"
+                        "the worktree was created on branch {was:?} but the agent's \
+                         branch is {branch:?}, and the worktree has local changes; \
+                         commit or discard them in {ws} first"
                     ),
                 });
             }
@@ -206,7 +217,15 @@ impl Workspace<'_> {
                 ],
             )?;
         }
-        Ok(())
+        Self::record_branch(id, marker, branch)
+    }
+
+    fn record_branch(id: &str, marker: &Path, branch: &str) -> Result<(), MaterializeError> {
+        write_atomic(marker, branch.as_bytes(), 0o644).map_err(|e| MaterializeError::Io {
+            id: id.to_string(),
+            path: marker.to_path_buf(),
+            message: e.to_string(),
+        })
     }
 
     pub fn remove_worktree(

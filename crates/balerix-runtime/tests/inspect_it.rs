@@ -86,8 +86,15 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
     );
 
     ws.ensure_repo("f/c/a", &crew, &repo, "main").unwrap();
-    ws.ensure_worktree("f/c/a", &crew, &paths.workspace, "balerix/f/c/a", "main")
-        .unwrap();
+    ws.ensure_worktree(
+        "f/c/a",
+        &crew,
+        &paths.workspace,
+        &paths.branch_marker(),
+        "balerix/f/c/a",
+        "main",
+    )
+    .unwrap();
     let w = &paths.workspace;
     let base = git(w, &["rev-parse", "origin/main"]).trim().to_string();
 

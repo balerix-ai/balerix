@@ -299,9 +299,16 @@ pub branch: Option<String>,
   and fails both routes with `fail_manage(Some((status, message)))`.
 - `check_branch_name` also refuses the bare `@`, as git does.
 - Adding, changing or removing `branch` on a live agent re-materializes
-  it (`Stop, Materialize, Start`), and `ensure_worktree` reads the
-  registered worktree's HEAD: on `branch`, reused; on another branch with
-  a clean tree, the worktree is removed and re-created on `branch` (the
-  old branch stays in the crew clone); with local changes, the step fails
-  naming both branches and the agent is `Failed` with it. A detached HEAD
-  is reused as is, since its commits may be on no branch.
+  it (`Stop, Materialize, Start`), and `ensure_worktree` compares the
+  setting with the branch it last created the worktree on, recorded in
+  the agent root's `.branch` marker (#60: a restart after a crash or
+  reboot materializes too, so HEAD cannot be the evidence, or an agent
+  that checked out a branch of its own would be moved or failed). A
+  matching marker reuses the worktree whatever its HEAD. A differing
+  marker with a clean tree removes the worktree and re-creates it on
+  `branch` (the old branch stays in the crew clone); with local changes,
+  the step fails naming both branches and the agent is `Failed` with it;
+  a HEAD already on the new `branch` is kept and the marker refreshed. A
+  worktree without a marker, from before it existed, is judged by its
+  HEAD once, and the marker written then. A detached HEAD is reused as
+  is, since its commits may be on no branch.

@@ -386,7 +386,12 @@ credentials, hook input, or sandbox rules.
   cache. `agent_git` passes `--git-dir=<ws>/.git` and the harvest fetches
   `<ws>/.git` with `upload-pack --strict`: without them a `.git` git
   rejects (no `HEAD`) makes git serve `workspace/` itself as a bare
-  repository. Keep all three when touching either call.
+  repository. Keep all three when touching either call. It also refuses
+  an `alternates` file in the *cache's* `objects/info/` (never legitimate).
+  `harden_agent_git` sets `GIT_NO_LAZY_FETCH=1`: a promisor remote the
+  agent writes into its clone's config (`extensions.partialClone`) would
+  otherwise make `status`/`diff` fetch foreign objects into the clone as
+  the daemon, and run `remote.<x>.uploadpack`.
 - `dev fake-plugin` applies a fleet when its `plugins.yaml` entry has
   `config: { manage: { fleet, file } }` (the e2e's managed journey) and
   writes the outcome to `scratch/fake-plugin.manage`. The SDK's

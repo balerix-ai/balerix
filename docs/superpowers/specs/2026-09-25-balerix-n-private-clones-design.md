@@ -314,3 +314,16 @@ directory, not a repository.
   only a copy holding commits origin lacks seeds. `workspace_it`
   (`an_agent_on_the_default_branch_materializes`) proves create, seed
   after origin moved on, and a pushed copy superseded by origin.
+- Re-review of finding 1: the clone's `.git/config` can declare a
+  promisor remote (`core.repositoryformatversion=1`,
+  `extensions.partialClone`, `remote.<x>.promisor`, `remote.<x>.url` =
+  another repository) and point its branch at a commit it lacks; the
+  daemon's hardened `status` then lazy-fetched that commit into the
+  clone's real object store, past `check_clone`, and ran
+  `remote.<x>.uploadpack` as the daemon. `harden_agent_git` sets
+  `GIT_NO_LAZY_FETCH=1`, which closes it for `agent_git` and for
+  `inspect.rs`'s `diff`; `check_clone` also refuses an `alternates` file
+  in the cache, which is cloned without `--reference`. `workspace_it`
+  (`a_promisor_remote_in_the_clone_fetches_nothing_and_runs_nothing`)
+  proves neither the fetch nor the program happens and the harvest brings
+  nothing foreign into the cache.

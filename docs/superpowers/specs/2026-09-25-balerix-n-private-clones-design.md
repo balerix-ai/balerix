@@ -283,3 +283,20 @@ directory, not a repository.
   0.2.0 section once `prepare.sh` prepends the generated lists, rather
   than above them (§9): that is what the release script does without a
   change to it, and `notes.sh` carries the block into the Release notes.
+- Before any git runs in an existing clone, `check_clone` (filesystem
+  only) refuses a `.git` that is not a real directory, a symlink anywhere
+  under `.git/objects`, a `.git/commondir` and an `objects/info/alternates`
+  that is not exactly the crew cache's canonical objects path; the
+  message names the path and the `--purge` remedy, and a refused harvest
+  fails the removal as §5 says. The whole-branch review proved the
+  alternates and symlinked-`.git` vectors (the harvest copied a foreign
+  repository into the cache); implementation found two more the review's
+  list missed, `.git/commondir` and a `.git` without `HEAD` that leaves
+  `workspace/` to pass for a bare repository, closed by `--git-dir` on
+  every `agent_git` call and `upload-pack --strict` on a harvest from
+  `workspace/.git`. `workspace_it` proves all five refused with the
+  foreign commit absent from the cache. The session is stopped before
+  both call sites, so nothing races the check. The durable alternative,
+  left for a follow-up: serve the harvest fetch under the agent's own
+  nono profile (`fetch --upload-pack` wrapping nono), so upload-pack can
+  read no more than the agent can.

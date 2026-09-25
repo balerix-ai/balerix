@@ -372,6 +372,16 @@ credentials, hook input, or sandbox rules.
   refused with the purge message; `down --keep-repos` + `up` also works
   (the old crew clone becomes the cache and its branches seed the new
   clones).
+- The daemon can read every repository under its uid, so the harvest is a
+  confused deputy unless the clone's objects are the clone's own. Before
+  any git runs in an existing clone (`ensure_clone`, `harvest_and_remove`)
+  `check_clone` refuses, with the `--purge` remedy, a `.git` that is not a
+  real directory, any symlink under `.git/objects`, a `.git/commondir`, and
+  an `objects/info/alternates` other than the one line naming the crew
+  cache. `agent_git` passes `--git-dir=<ws>/.git` and the harvest fetches
+  `<ws>/.git` with `upload-pack --strict`: without them a `.git` git
+  rejects (no `HEAD`) makes git serve `workspace/` itself as a bare
+  repository. Keep all three when touching either call.
 - `dev fake-plugin` applies a fleet when its `plugins.yaml` entry has
   `config: { manage: { fleet, file } }` (the e2e's managed journey) and
   writes the outcome to `scratch/fake-plugin.manage`. The SDK's

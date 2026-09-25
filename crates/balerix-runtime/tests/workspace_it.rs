@@ -1175,3 +1175,220 @@ fn a_worktree_from_0_1_is_refused_and_keep_repos_migrates_it() {
     assert!(paths.workspace.join("work.txt").exists());
     assert_no_auto_gc(&crew);
 }
+
+/// `git` in `dir` without the fixture's success assertion: whether it
+/// exited 0.
+fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_PREFIX")
+        .env_remove("GIT_COMMON_DIR")
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// Review finding 1 (Critical): the harvest must not be a confused
+/// deputy. The daemon can read every repository under its uid; an agent
+/// that points its clone's object store at one — through `alternates`, a
+/// symlinked `.git`, a symlinked pack, `.git/commondir`, or a broken
+/// `.git` that leaves `workspace/` to pass for a bare repository — must
+/// not get the daemon to copy it into the crew cache its siblings read.
+/// Every vector is refused before a git call, the clone stays, and the
+/// foreign commit is nowhere in the cache.
+#[test]
+fn a_clone_pointed_at_another_repository_is_refused_and_nothing_is_harvested() {
+    use std::os::unix::fs::symlink;
+
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-foreign");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let crew = layout.crew(&"f/c".parse().unwrap());
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+
+    // what the agent cannot read but the daemon can: another repository,
+    // packed so that its objects live in one `.pack`/`.idx` pair
+    let foreign = root.join("foreign");
+    std::fs::create_dir_all(&foreign).unwrap();
+    git(&foreign, &["init", "-q", "-b", "main"]);
+    std::fs::write(foreign.join("SECRET"), "another crew's code\n").unwrap();
+    git(&foreign, &["add", "."]);
+    git(&foreign, &["commit", "-q", "-m", "foreign"]);
+    git(&foreign, &["repack", "-q", "-a", "-d"]);
+    let foreign_sha = git(&foreign, &["rev-parse", "HEAD"]).trim().to_string();
+    let foreign_git = foreign.join(".git");
+
+    let clone = |name: &str| {
+        let id = format!("f/c/{name}");
+        let paths = layout.agent(&id.parse().unwrap());
+        ws.ensure_clone(&id, &crew, &paths, &repo, &format!("balerix/{id}"), "main")
+            .unwrap();
+        (id, paths)
+    };
+    let refused = |id: &str, paths: &balerix_runtime::AgentPaths, names: &str| {
+        let e = ws
+            .harvest_and_remove(id, &crew, paths)
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with(&format!("{id}: ")), "{e}");
+        assert!(e.contains(names), "the message names {names}: {e}");
+        assert!(e.contains("--purge"), "{e}");
+        assert!(
+            paths.workspace.exists(),
+            "a refused removal deletes nothing"
+        );
+        assert!(
+            !git_ok(&crew.repo, &["cat-file", "-e", &foreign_sha]),
+            "{id}: the foreign commit reached the cache"
+        );
+        assert!(
+            !git_ok(
+                &crew.repo,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/balerix/{id}")
+                ]
+            ),
+            "{id}: the assigned branch reached the cache"
+        );
+        e
+    };
+
+    // (A) alternates appended, the assigned ref written by hand
+    let (id, a) = clone("a");
+    let alternates = a.workspace.join(".git/objects/info/alternates");
+    let mut lines = std::fs::read_to_string(&alternates).unwrap();
+    lines.push_str(&format!("{}\n", foreign_git.join("objects").display()));
+    std::fs::write(&alternates, lines).unwrap();
+    std::fs::write(
+        a.workspace.join(".git/refs/heads/balerix/f/c/a"),
+        format!("{foreign_sha}\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        git(&a.workspace, &["cat-file", "-t", &foreign_sha]).trim(),
+        "commit",
+        "the fixture bites: the clone now reads the foreign commit"
+    );
+    refused(&id, &a, "objects/info/alternates");
+    let e = ws
+        .ensure_clone(&id, &crew, &a, &repo, "balerix/f/c/a", "main")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("objects/info/alternates"), "{e}");
+
+    // (B) `.git` a symlink to the foreign repository's
+    let (id, b) = clone("b");
+    std::fs::remove_dir_all(b.workspace.join(".git")).unwrap();
+    symlink(&foreign_git, b.workspace.join(".git")).unwrap();
+    refused(
+        &id,
+        &b,
+        &format!(
+            "{}: not a real directory",
+            b.workspace.join(".git").display()
+        ),
+    );
+    for branch in ["balerix/f/c/b", "main"] {
+        let e = ws
+            .ensure_clone(&id, &crew, &b, &repo, branch, "main")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("/.git: not a real directory"), "{e}");
+    }
+    assert!(
+        std::fs::symlink_metadata(b.workspace.join(".git"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "ensure_clone left the refused clone as it was"
+    );
+
+    // (B') a single pack symlinked to the foreign pack
+    let (id, c) = clone("c");
+    let pack_dir = foreign_git.join("objects/pack");
+    for entry in std::fs::read_dir(&pack_dir).unwrap() {
+        let path = entry.unwrap().path();
+        symlink(
+            &path,
+            c.workspace
+                .join(".git/objects/pack")
+                .join(path.file_name().unwrap()),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        c.workspace.join(".git/refs/heads/balerix/f/c/c"),
+        format!("{foreign_sha}\n"),
+    )
+    .unwrap();
+    refused(&id, &c, "a symlink");
+
+    // (C) `.git/commondir`: objects and refs read from the directory it names
+    let (id, d) = clone("d");
+    std::fs::write(
+        d.workspace.join(".git/commondir"),
+        foreign_git.display().to_string(),
+    )
+    .unwrap();
+    refused(&id, &d, "commondir");
+
+    // (D) a `.git` git rejects, and `workspace/` dressed as a bare
+    // repository borrowing the foreign objects: git must not fall back
+    // to it (`--git-dir`, `upload-pack --strict`)
+    let (id, broken) = clone("e");
+    std::fs::remove_file(broken.workspace.join(".git/HEAD")).unwrap();
+    std::fs::create_dir_all(broken.workspace.join("objects/info")).unwrap();
+    std::fs::create_dir_all(broken.workspace.join("refs/heads/balerix/f/c")).unwrap();
+    std::fs::write(
+        broken.workspace.join("HEAD"),
+        "ref: refs/heads/balerix/f/c/e\n",
+    )
+    .unwrap();
+    std::fs::write(
+        broken.workspace.join("objects/info/alternates"),
+        format!("{}\n", foreign_git.join("objects").display()),
+    )
+    .unwrap();
+    std::fs::write(
+        broken.workspace.join("refs/heads/balerix/f/c/e"),
+        format!("{foreign_sha}\n"),
+    )
+    .unwrap();
+    let err = ws
+        .harvest_and_remove(&id, &crew, &broken)
+        .unwrap_err()
+        .to_string();
+    assert!(err.starts_with("f/c/e: git "), "{err}");
+    assert!(broken.workspace.exists());
+    assert!(!git_ok(&crew.repo, &["cat-file", "-e", &foreign_sha]));
+
+    // the happy path passes the check: an untouched clone is harvested
+    let (id, f) = clone("f");
+    ws.harvest_and_remove(&id, &crew, &f).unwrap();
+    assert!(!f.workspace.exists());
+    assert!(git_ok(
+        &crew.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/balerix/f/c/f"
+        ]
+    ));
+}

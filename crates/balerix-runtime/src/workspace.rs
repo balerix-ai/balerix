@@ -113,6 +113,111 @@ fn remove_tree(id: &str, path: &Path) -> Result<(), MaterializeError> {
     }
 }
 
+/// Refuses an agent's clone whose object store could be another
+/// repository's, before the daemon runs any git in it or fetches from it
+/// (Spec N §5, §12). The daemon reads every repository its uid can; the
+/// agent reads only its own clone and the crew cache. A harvest is a
+/// fetch the daemon runs, served by `upload-pack` in the clone, and it
+/// writes whatever that serves into the crew cache, which every sibling
+/// then reads: a confused deputy unless the clone's objects and refs are
+/// the clone's own. The ways the agent could point them elsewhere, all
+/// of them paths the daemon follows but the agent's sandbox never checks:
+///
+/// - `objects/info/alternates` naming another repository's objects (say
+///   another crew's cache), with a hand-written `refs/heads/<assigned>`
+///   holding a commit from it; so `alternates` must be exactly the one
+///   line `clone --reference` wrote, the crew cache's canonical path;
+/// - `.git` itself, `.git/objects`, a pack directory or a single pack
+///   replaced by a symlink into another repository; so `.git` must be a
+///   real directory and nothing under `.git/objects` may be a symlink;
+/// - `.git/commondir`, which makes git read objects and refs from the
+///   directory it names (the linked-worktree mechanism): a clone has none.
+///
+/// A `.git` git no longer accepts as a repository is not checked here:
+/// `agent_git` names it with `--git-dir` and the harvest fetches with
+/// `upload-pack --strict`, so neither falls back to `workspace/` itself.
+/// `GIT_CEILING_DIRECTORIES` bounds upward discovery only and helps with
+/// none of this. The session is stopped before both callers run
+/// (`reconcile::plan` orders stops before removals and before a
+/// changed-hash materialize), so no live writer races this check and the
+/// git calls after it. Filesystem only: no git call.
+fn check_clone(id: &str, crew: &CrewPaths, agent: &AgentPaths) -> Result<(), MaterializeError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let refuse = |path: &Path, found: &str| {
+        // `id` is `<fleet>/<crew>/<agent>`
+        let fleet = id.split('/').next().unwrap_or(id);
+        MaterializeError::Invalid {
+            id: id.to_string(),
+            message: format!(
+                "{}: {found}, so the clone's objects may be another repository's; \
+                 balerix runs no git in it and harvests nothing from it. Run \
+                 `balerix down {fleet} --purge` to delete it (push unpushed work first)",
+                path.display()
+            ),
+        }
+    };
+    let dot_git = agent.workspace.join(".git");
+    match std::fs::symlink_metadata(&dot_git) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return Err(refuse(&dot_git, "not a real directory")),
+        Err(e) => return Err(refuse(&dot_git, &format!("unreadable ({e})"))),
+    }
+    let commondir = dot_git.join("commondir");
+    if std::fs::symlink_metadata(&commondir).is_ok() {
+        return Err(refuse(&commondir, "present (a clone has none)"));
+    }
+    let objects = dot_git.join("objects");
+    match first_symlink(&objects) {
+        Ok(None) => {}
+        Ok(Some(link)) => return Err(refuse(&link, "a symlink")),
+        Err((path, e)) => return Err(refuse(&path, &format!("unreadable ({e})"))),
+    }
+    let alternates = objects.join("info").join("alternates");
+    let cache = crew
+        .cache_objects()
+        .canonicalize()
+        .map_err(|e| MaterializeError::Io {
+            id: id.to_string(),
+            path: crew.cache_objects(),
+            message: e.to_string(),
+        })?;
+    match std::fs::read(&alternates) {
+        Ok(bytes) => {
+            let line = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+            if line != cache.as_os_str().as_bytes() {
+                return Err(refuse(
+                    &alternates,
+                    &format!(
+                        "names something other than the crew cache {}",
+                        cache.display()
+                    ),
+                ));
+            }
+        }
+        Err(e) => return Err(refuse(&alternates, &format!("unreadable ({e})"))),
+    }
+    Ok(())
+}
+
+/// The first symlink at or under `root`, found without following any.
+/// A work list, not recursion: the agent decides how deep the tree goes.
+fn first_symlink(root: &Path) -> Result<Option<PathBuf>, (PathBuf, std::io::Error)> {
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(path) = todo.pop() {
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| (path.clone(), e))?;
+        if meta.file_type().is_symlink() {
+            return Ok(Some(path));
+        }
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(&path).map_err(|e| (path.clone(), e))? {
+                todo.push(entry.map_err(|e| (path.clone(), e))?.path());
+            }
+        }
+    }
+    Ok(None)
+}
+
 pub struct Workspace<'a> {
     pub tools: &'a ToolPaths,
     /// `GH_CONFIG_DIR` for the daemon's git calls when `git.auth: gh`.
@@ -206,8 +311,13 @@ impl Workspace<'_> {
     }
 
     /// One git call inside the agent's clone, hardened by
-    /// `harden_agent_git` because the clone is agent-writable. `accepted`
-    /// are the exit codes that count as success (0 included).
+    /// `harden_agent_git` because the clone is agent-writable, and made
+    /// only after `check_clone`. `--git-dir` names `workspace/.git`
+    /// exactly: with `-C` alone, a `.git` git rejects (say, its `HEAD`
+    /// deleted) makes git take `workspace/` itself for a bare repository,
+    /// which the agent can fill with any `objects/info/alternates` it
+    /// likes. `accepted` are the exit codes that count as success (0
+    /// included).
     fn agent_git(
         &self,
         id: &str,
@@ -221,7 +331,12 @@ impl Workspace<'_> {
             crew,
             &agent.root,
         )
-        .args(["-C".to_string(), agent.workspace.display().to_string()])
+        .args([
+            "-C".to_string(),
+            agent.workspace.display().to_string(),
+            format!("--git-dir={}", agent.workspace.join(".git").display()),
+            format!("--work-tree={}", agent.workspace.display()),
+        ])
         .args(args.iter().copied());
         cmd.run_with_exit_codes(accepted)
             .map(|o| o.stdout)
@@ -244,7 +359,8 @@ impl Workspace<'_> {
     /// marker is judged by HEAD once; a detached HEAD is reused as is; a
     /// changed `branch` re-creates a clean clone after harvesting the old
     /// branch into the cache (§5), and fails a dirty one naming both
-    /// branches. Every git call on an existing clone is `agent_git` (#62).
+    /// branches. Every git call on an existing clone is `agent_git` (#62),
+    /// and none is made before `check_clone` has passed it.
     ///
     /// A `workspace/.git` *file* is a worktree from balerix 0.1, refused
     /// with the remedy (N-6). A `workspace/` with no `.git` at all (a
@@ -269,6 +385,7 @@ impl Workspace<'_> {
     ) -> Result<(), MaterializeError> {
         let dot_git = agent.workspace.join(".git");
         if dot_git.is_dir() {
+            check_clone(id, crew, agent)?;
             let marker = std::fs::read_to_string(agent.branch_marker()).ok();
             // Err is a detached HEAD (`ref HEAD is not a symbolic ref`),
             // reused as is: its commits may be on no branch.
@@ -432,6 +549,12 @@ impl Workspace<'_> {
     /// every removal of an agent assigned the default branch. Spec N-4
     /// (every assigned branch is harvested, or the removal fails loudly)
     /// outranks the spec text's exact argv here.
+    ///
+    /// The remote is `workspace/.git`, served by `upload-pack --strict`:
+    /// without `--strict`, upload-pack tries `<path>/.git` before `<path>`,
+    /// and falls back to `workspace/` itself when `.git` is not a
+    /// repository — either way a repository the agent assembled rather
+    /// than the one `check_clone` inspected.
     fn harvest(
         &self,
         id: &str,
@@ -460,7 +583,11 @@ impl Workspace<'_> {
                 "--quiet",
                 "--no-auto-gc",
                 "--update-head-ok",
-                &agent.workspace.display().to_string(),
+                &format!(
+                    "--upload-pack='{}' upload-pack --strict",
+                    self.tools.git.display().to_string().replace('\'', "'\\''")
+                ),
+                &agent.workspace.join(".git").display().to_string(),
                 &format!("+{refname}:{refname}"),
             ],
         )
@@ -486,18 +613,19 @@ impl Workspace<'_> {
     /// nothing to harvest and is deleted as it is. A failed harvest fails
     /// the removal, so the operator sees it rather than losing work;
     /// `--purge` is the way past a clone too broken to read (`remove_crew`
-    /// harvests only when the cache stays).
+    /// harvests only when the cache stays), and past one `check_clone`
+    /// refuses: a purge deletes it without a harvest or a check.
     pub fn harvest_and_remove(
         &self,
         id: &str,
         crew: &CrewPaths,
         agent: &AgentPaths,
     ) -> Result<(), MaterializeError> {
-        if crew.repo.join(".git").is_dir()
-            && agent.workspace.join(".git").is_dir()
-            && let Some(branch) = self.assigned_branch(id, crew, agent)
-        {
-            self.harvest(id, crew, agent, &branch)?;
+        if crew.repo.join(".git").is_dir() && agent.workspace.join(".git").is_dir() {
+            check_clone(id, crew, agent)?;
+            if let Some(branch) = self.assigned_branch(id, crew, agent) {
+                self.harvest(id, crew, agent, &branch)?;
+            }
         }
         remove_tree(id, &agent.workspace)
     }

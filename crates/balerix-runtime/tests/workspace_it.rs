@@ -349,6 +349,50 @@ fn a_changed_branch_moves_a_clean_clone_and_keeps_the_old_branch() {
         tip,
         "the branch the clone left is harvested too"
     );
+
+    // `branch` back on the PR's branch: the cache's copy is origin's own
+    // tip, so the branch comes from `origin/…` and tracks it
+    let upstream = |b: &str| {
+        git(
+            &paths.workspace,
+            &["rev-parse", "--abbrev-ref", &format!("{b}@{{upstream}}")],
+        )
+        .trim()
+        .to_string()
+    };
+    ws.ensure_clone(
+        "f/c/a",
+        &crew,
+        &paths,
+        &repo,
+        "feature/issue-12",
+        "feature/issue-12",
+    )
+    .unwrap();
+    assert_eq!(head(), "feature/issue-12");
+    assert_eq!(git(&paths.workspace, &["rev-parse", "HEAD"]).trim(), tip);
+    assert_eq!(upstream("feature/issue-12"), "origin/feature/issue-12");
+
+    // an unpushed commit on it, then away and back: seeded from the
+    // cache's copy, which origin lacks, and still tracking origin's
+    // branch (the seeded path's `--set-upstream-to`)
+    std::fs::write(paths.workspace.join("pr.txt"), "unpushed\n").unwrap();
+    git(&paths.workspace, &["add", "."]);
+    git(&paths.workspace, &["commit", "-q", "-m", "pr work"]);
+    let pr_sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    ws.ensure_clone(
+        "f/c/a",
+        &crew,
+        &paths,
+        &repo,
+        "feature/issue-12",
+        "feature/issue-12",
+    )
+    .unwrap();
+    assert_eq!(git(&paths.workspace, &["rev-parse", "HEAD"]), pr_sha);
+    assert_eq!(upstream("feature/issue-12"), "origin/feature/issue-12");
 }
 
 /// F1: a dirty clone on the old branch fails the materialize step, naming
@@ -556,11 +600,24 @@ fn an_agent_switching_branches_itself_is_left_alone_on_an_unchanged_setting() {
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
         .unwrap();
     git(&paths.workspace, &["checkout", "-q", "-b", "my-fix"]);
+    let git_calls = || {
+        std::fs::read_to_string(crew.root.join("logs").join("git.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("$ git"))
+            .count()
+    };
+    let before = git_calls();
 
     // clean tree: not moved back
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
         .unwrap();
     assert_eq!(head(), "my-fix");
+    assert_eq!(
+        git_calls(),
+        before,
+        "Spec L §12: a matching marker costs no git call"
+    );
 
     // dirty tree: not failed, and the change is kept
     std::fs::write(paths.workspace.join("README"), "edited\n").unwrap();

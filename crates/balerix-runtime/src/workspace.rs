@@ -389,6 +389,11 @@ impl Workspace<'_> {
         if dot_git.is_dir() {
             check_clone(id, crew, agent)?;
             let marker = std::fs::read_to_string(agent.branch_marker()).ok();
+            if marker.as_deref().map(str::trim) == Some(branch) {
+                // Spec L §12: marker equals `branch` → done, with no git
+                // call; `decide_clone` agrees (`Reuse`)
+                return Ok(());
+            }
             // Err is a detached HEAD (`ref HEAD is not a symbolic ref`),
             // reused as is: its commits may be on no branch.
             let head = self

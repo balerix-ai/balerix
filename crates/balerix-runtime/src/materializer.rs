@@ -362,7 +362,7 @@ impl Materializer for Runtime {
             tools: &self.tools,
             gh_config_dir: None,
         }
-        .remove_worktree(&id, &crew, &paths.workspace)?;
+        .harvest_and_remove(&id, &crew, &paths)?;
         Self::rm_rf(&id, &paths.root)
     }
 
@@ -371,17 +371,26 @@ impl Materializer for Runtime {
         let paths = self.layout.crew(crew);
         if !keep.sessions {
             let agents_dir = paths.root.join("agents");
-            if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+            // Spec N §5: with the cache staying, each clone's branch is
+            // harvested into it first. Without `keep.repos` the cache goes
+            // too — nothing to harvest into, and no harvest to fail a
+            // `--purge` over a clone git cannot read.
+            if keep.repos
+                && let Ok(entries) = std::fs::read_dir(&agents_dir)
+            {
                 for e in entries.flatten() {
-                    let agent_id = format!("{id}/{}", e.file_name().to_string_lossy());
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let Ok(agent_id) = format!("{id}/{name}").parse::<AgentId>() else {
+                        continue; // not an agent directory
+                    };
                     Workspace {
                         tools: &self.tools,
                         gh_config_dir: None,
                     }
-                    .remove_worktree(
-                        &agent_id,
+                    .harvest_and_remove(
+                        &agent_id.to_string(),
                         &paths,
-                        &e.path().join("workspace"),
+                        &self.layout.agent(&agent_id),
                     )?;
                 }
             }

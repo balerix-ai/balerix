@@ -205,20 +205,6 @@ impl Workspace<'_> {
         Ok(())
     }
 
-    /// Whether git knows `workspace` as a worktree of `crew.repo`.
-    fn is_registered(
-        &self,
-        id: &str,
-        crew: &CrewPaths,
-        workspace: &Path,
-    ) -> Result<bool, MaterializeError> {
-        let repo = crew.repo.display().to_string();
-        let list = self.git(id, crew, &["-C", &repo, "worktree", "list", "--porcelain"])?;
-        Ok(list
-            .lines()
-            .any(|l| l.strip_prefix("worktree ").map(Path::new) == Some(workspace)))
-    }
-
     /// One git call inside the agent's clone, hardened by
     /// `harden_agent_git` because the clone is agent-writable. `accepted`
     /// are the exit codes that count as success (0 included).
@@ -480,37 +466,41 @@ impl Workspace<'_> {
         })
     }
 
-    pub fn remove_worktree(
+    /// Deletes the agent's clone after harvesting its assigned branch into
+    /// the cache (Spec N §5): the branch the marker recorded — the one
+    /// balerix created the clone on — or, with no marker, the branch HEAD
+    /// is on. Only that branch survives: other local branches the agent
+    /// created, and every file in the tree, ignored files included, go
+    /// with the clone (#62). A detached HEAD with no marker, a 0.1.x
+    /// worktree (`.git` a file), a bare directory or a missing cache has
+    /// nothing to harvest and is deleted as it is. A failed harvest fails
+    /// the removal, so the operator sees it rather than losing work;
+    /// `--purge` is the way past a clone too broken to read (`remove_crew`
+    /// harvests only when the cache stays).
+    pub fn harvest_and_remove(
         &self,
         id: &str,
         crew: &CrewPaths,
-        workspace: &Path,
+        agent: &AgentPaths,
     ) -> Result<(), MaterializeError> {
-        if !crew.repo.join(".git").is_dir() {
-            return Ok(());
+        if crew.repo.join(".git").is_dir()
+            && agent.workspace.join(".git").is_dir()
+            && let Some(branch) = self.assigned_branch(id, crew, agent)
+        {
+            self.harvest(id, crew, agent, &branch)?;
         }
-        let repo = crew.repo.display().to_string();
-        // `git worktree remove` errors on a path git does not know as a
-        // worktree ("is not a working tree"), which would fail the whole
-        // removal over a leftover plain directory. Only ask git to remove
-        // what git registered; `prune` and the caller's `rm -rf` clean up
-        // anything else.
-        if workspace.exists() && self.is_registered(id, crew, workspace)? {
-            self.git(
-                id,
-                crew,
-                &[
-                    "-C",
-                    &repo,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    &workspace.display().to_string(),
-                ],
-            )?;
+        remove_tree(id, &agent.workspace)
+    }
+
+    /// The marker's branch, else HEAD's; `None` for a detached HEAD.
+    fn assigned_branch(&self, id: &str, crew: &CrewPaths, agent: &AgentPaths) -> Option<String> {
+        match std::fs::read_to_string(agent.branch_marker()) {
+            Ok(m) if !m.trim().is_empty() => Some(m.trim().to_string()),
+            _ => self
+                .agent_git(id, crew, agent, &["symbolic-ref", "--short", "HEAD"], &[0])
+                .ok()
+                .map(|h| h.trim().to_string()),
         }
-        self.git(id, crew, &["-C", &repo, "worktree", "prune"])
-            .map(|_| ())
     }
 }
 

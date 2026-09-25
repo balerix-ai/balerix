@@ -856,3 +856,266 @@ fn the_clone_step_runs_no_program_from_the_clone_config() {
         "feature/issue-12"
     );
 }
+
+/// N-4: an unpushed commit survives `remove_agent` and the next
+/// materialize, seeded from the cache — the exact commit — and a rebase
+/// after the seed is harvested over the cache's older copy (the `+`).
+#[test]
+fn an_unpushed_commit_survives_removal_and_seeds_the_next_clone() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-harvest");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();
+    git(&paths.workspace, &["add", "."]);
+    git(&paths.workspace, &["commit", "-q", "-m", "agent work"]);
+    let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
+    // a second local branch, and an ignored file: both go with the clone
+    git(&paths.workspace, &["branch", "scratch"]);
+    std::fs::write(paths.workspace.join(".gitignore"), "ignored\n").unwrap();
+    std::fs::write(paths.workspace.join("ignored"), "x\n").unwrap();
+
+    ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap();
+    assert!(!paths.workspace.exists());
+    assert_eq!(
+        git(&crew.repo, &["rev-parse", "refs/heads/balerix/f/c/a"]),
+        sha
+    );
+    assert!(
+        git(&crew.repo, &["branch", "--list", "scratch"])
+            .trim()
+            .is_empty(),
+        "only the assigned branch is harvested"
+    );
+    assert_no_auto_gc(&crew);
+
+    // the marker survives in the agent root (remove_agent deletes that);
+    // a re-created clone is seeded from the cache
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    assert_eq!(
+        git(&paths.workspace, &["rev-parse", "HEAD"]),
+        sha,
+        "the exact commit"
+    );
+    assert!(paths.workspace.join("work.txt").exists());
+    assert!(!paths.workspace.join("ignored").exists());
+
+    // the agent rewrites history: the cache's copy is no ancestor of the
+    // clone's, and the harvest must win anyway (`+`)
+    git(
+        &paths.workspace,
+        &["commit", "-q", "--amend", "-m", "agent work, amended"],
+    );
+    let amended = git(&paths.workspace, &["rev-parse", "HEAD"]);
+    assert_ne!(amended, sha);
+    ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap();
+    assert_eq!(
+        git(&crew.repo, &["rev-parse", "refs/heads/balerix/f/c/a"]),
+        amended,
+        "N-5: the clone's state is the newer one, fast-forward or not"
+    );
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    assert_eq!(git(&paths.workspace, &["rev-parse", "HEAD"]), amended);
+
+    // a plain directory where a clone used to be is removed as well
+    ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap();
+    std::fs::create_dir_all(&paths.workspace).unwrap();
+    std::fs::write(paths.workspace.join("stray.txt"), "x\n").unwrap();
+    ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap();
+    assert!(!paths.workspace.exists());
+    ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap(); // already gone
+}
+
+/// Review focus 3: without a marker the branch HEAD is on is harvested;
+/// a detached HEAD, or a branch the agent deleted, harvests nothing and
+/// the removal still succeeds.
+#[test]
+fn removal_harvests_head_without_a_marker_and_skips_what_is_not_there() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-harvest-edge");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let crew = layout.crew(&"f/c".parse().unwrap());
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    let make = |name: &str| {
+        let id: balerix_core::AgentId = format!("f/c/{name}").parse().unwrap();
+        let paths = layout.agent(&id);
+        ws.ensure_clone(
+            &id.to_string(),
+            &crew,
+            &paths,
+            &repo,
+            &format!("balerix/f/c/{name}"),
+            "main",
+        )
+        .unwrap();
+        std::fs::write(paths.workspace.join("w"), name).unwrap();
+        git(&paths.workspace, &["add", "."]);
+        git(&paths.workspace, &["commit", "-q", "-m", name]);
+        (id, paths)
+    };
+
+    // no marker (a crash between clone and marker): HEAD's branch
+    let (_, a) = make("a");
+    git(&a.workspace, &["checkout", "-q", "-b", "my-fix"]);
+    std::fs::remove_file(a.branch_marker()).unwrap();
+    let sha = git(&a.workspace, &["rev-parse", "HEAD"]);
+    ws.harvest_and_remove("f/c/a", &crew, &a).unwrap();
+    assert_eq!(git(&crew.repo, &["rev-parse", "refs/heads/my-fix"]), sha);
+    assert!(
+        git(&crew.repo, &["branch", "--list", "balerix/f/c/a"])
+            .trim()
+            .is_empty(),
+        "the marker was gone, HEAD decided"
+    );
+
+    // detached HEAD, no marker: nothing to name, nothing harvested
+    let (_, b) = make("b");
+    git(&b.workspace, &["checkout", "-q", "--detach"]);
+    std::fs::remove_file(b.branch_marker()).unwrap();
+    ws.harvest_and_remove("f/c/b", &crew, &b).unwrap();
+    assert!(!b.workspace.exists());
+    assert!(
+        git(&crew.repo, &["branch", "--list", "balerix/f/c/b"])
+            .trim()
+            .is_empty()
+    );
+
+    // the agent deleted its assigned branch: skipped, not failed
+    let (_, c) = make("c");
+    git(&c.workspace, &["checkout", "-q", "-b", "elsewhere"]);
+    git(&c.workspace, &["branch", "-D", "balerix/f/c/c"]);
+    ws.harvest_and_remove("f/c/c", &crew, &c).unwrap();
+    assert!(!c.workspace.exists());
+    assert!(
+        git(&crew.repo, &["branch", "--list", "balerix/f/c/c"])
+            .trim()
+            .is_empty()
+    );
+
+    // no cache at all: nothing to harvest into, the clone is still removed
+    let (_, d) = make("d");
+    std::fs::remove_dir_all(&crew.repo).unwrap();
+    ws.harvest_and_remove("f/c/d", &crew, &d).unwrap();
+    assert!(!d.workspace.exists());
+}
+
+/// A clone git cannot read fails the removal — the operator sees it
+/// rather than losing work (Spec N §5).
+#[test]
+fn a_broken_clone_fails_the_removal_and_stays() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-harvest-broken");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    // `.git/HEAD` gone: git no longer sees a repository there
+    std::fs::remove_file(paths.workspace.join(".git/HEAD")).unwrap();
+    let e = ws
+        .harvest_and_remove("f/c/a", &crew, &paths)
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("f/c/a: git "), "{e}");
+    assert!(
+        paths.workspace.exists(),
+        "nothing deleted on a failed harvest"
+    );
+}
+
+/// Review focus 2: a 0.1.x fleet is refused with the purge message; after
+/// `down --keep-repos` the old crew clone — no `gc.auto=0`, a stale
+/// worktree registration — serves as the cache, and the branch it holds
+/// seeds the new clone, so the unpushed work in it is not lost.
+#[test]
+fn a_worktree_from_0_1_is_refused_and_keep_repos_migrates_it() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-0-1-migrate");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    // what 0.1.x left behind: a clone without the gc pin, a worktree, an
+    // unpushed commit on the worktree's branch, and no marker
+    std::fs::create_dir_all(&crew.root).unwrap();
+    git(
+        &crew.root,
+        &["clone", "-q", "--no-checkout", &repo.clone_url(), "repo"],
+    );
+    git(
+        &crew.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "balerix/f/c/a",
+            &paths.workspace.display().to_string(),
+            "origin/main",
+        ],
+    );
+    std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();
+    git(&paths.workspace, &["add", "."]);
+    git(&paths.workspace, &["commit", "-q", "-m", "0.1 work"]);
+    let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
+
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap(); // present: left alone
+    let e = ws
+        .ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("created by balerix 0.1 as a worktree"), "{e}");
+
+    // `down --keep-repos`: the worktree goes (nothing to harvest from a
+    // `.git` file — its branch already lives in the old clone)
+    ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap();
+    assert!(!paths.workspace.exists());
+    // `up`: a clone seeded from the old clone's branch
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    assert!(paths.workspace.join(".git").is_dir());
+    assert_eq!(git(&paths.workspace, &["rev-parse", "HEAD"]), sha);
+    assert!(paths.workspace.join("work.txt").exists());
+    assert_no_auto_gc(&crew);
+}

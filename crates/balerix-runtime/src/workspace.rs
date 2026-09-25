@@ -40,6 +40,14 @@ pub(crate) fn scrub_git_env(mut cmd: Cmd) -> Cmd {
 /// repository discovery would then walk up and run the command in whatever
 /// repository contains the state root. git only honours a ceiling that
 /// matches the resolved path, so it is canonical.
+/// `GIT_NO_LAZY_FETCH=1`: a promisor remote in the clone's config
+/// (`extensions.partialClone` plus `remote.<x>.promisor`) would otherwise
+/// make any call that reads a missing object (`status`, `diff`) fetch it
+/// from `remote.<x>.url` as the daemon, into the clone's own object store
+/// where the next harvest carries it into the cache, and run
+/// `remote.<x>.uploadpack` as the daemon on the way. Every call built here
+/// gets it: the clone step's `agent_git` and `inspect.rs`'s `inspect_git`
+/// alike, which closes the same route for the workspace reader's `diff`.
 pub(crate) fn harden_agent_git(cmd: Cmd, crew: &CrewPaths, agent_root: &Path) -> Cmd {
     let no_hooks = crew.root.join("no-hooks");
     let _ = std::fs::create_dir_all(&no_hooks);
@@ -48,6 +56,7 @@ pub(crate) fn harden_agent_git(cmd: Cmd, crew: &CrewPaths, agent_root: &Path) ->
         .unwrap_or_else(|_| agent_root.to_path_buf());
     scrub_git_env(cmd)
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CEILING_DIRECTORIES", ceiling.display().to_string())
         .args(["-c", "core.fsmonitor=false"])
@@ -131,7 +140,15 @@ fn remove_tree(id: &str, path: &Path) -> Result<(), MaterializeError> {
 ///   replaced by a symlink into another repository; so `.git` must be a
 ///   real directory and nothing under `.git/objects` may be a symlink;
 /// - `.git/commondir`, which makes git read objects and refs from the
-///   directory it names (the linked-worktree mechanism): a clone has none.
+///   directory it names (the linked-worktree mechanism): a clone has none;
+/// - an `objects/info/alternates` in the *cache*, which is cloned without
+///   `--reference` and so never legitimately has one (a 0.1.x agent,
+///   adopted under its old sandbox, could write the crew clone's).
+///
+/// The object store is pinned by this check, and every git call in the
+/// clone runs with `GIT_NO_LAZY_FETCH=1` (`harden_agent_git`), so a
+/// promisor remote the agent writes into the clone's config cannot fetch
+/// another repository's objects into it, or run a program, as the daemon.
 ///
 /// A `.git` git no longer accepts as a repository is not checked here:
 /// `agent_git` names it with `--git-dir` and the harvest fetches with
@@ -166,6 +183,13 @@ fn check_clone(id: &str, crew: &CrewPaths, agent: &AgentPaths) -> Result<(), Mat
     let commondir = dot_git.join("commondir");
     if std::fs::symlink_metadata(&commondir).is_ok() {
         return Err(refuse(&commondir, "present (a clone has none)"));
+    }
+    let cache_alternates = crew.cache_objects().join("info").join("alternates");
+    if std::fs::symlink_metadata(&cache_alternates).is_ok() {
+        return Err(refuse(
+            &cache_alternates,
+            "present (the cache is cloned without --reference)",
+        ));
     }
     let objects = dot_git.join("objects");
     match first_symlink(&objects) {

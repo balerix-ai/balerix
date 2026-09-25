@@ -1234,11 +1234,13 @@ fn a_worktree_from_0_1_is_refused_and_keep_repos_migrates_it() {
 }
 
 /// `git` in `dir` without the fixture's success assertion: whether it
-/// exited 0.
+/// exited 0. Never lazy-fetches: an object probe in a clone with a
+/// promisor remote would otherwise fetch the very object it looks for.
 fn git_ok(dir: &Path, args: &[&str]) -> bool {
     Command::new("git")
         .args(args)
         .current_dir(dir)
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -1553,4 +1555,118 @@ fn an_agent_on_the_default_branch_materializes() {
         "origin's newer tip, not the cache's older copy"
     );
     assert_no_auto_gc(&crew);
+}
+
+/// Re-review of finding 1: a promisor remote the agent writes into its
+/// clone's config (`extensions.partialClone`) must not make the daemon's
+/// `status` lazy-fetch another repository's objects into the clone — the
+/// next harvest would carry them into the cache — nor run the remote's
+/// `uploadpack` program (`GIT_NO_LAZY_FETCH=1` in `harden_agent_git`).
+/// And an `alternates` file in the cache itself, never legitimate, is
+/// refused.
+#[test]
+fn a_promisor_remote_in_the_clone_fetches_nothing_and_runs_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-promisor");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/p".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+
+    let foreign = root.join("foreign");
+    std::fs::create_dir_all(&foreign).unwrap();
+    git(&foreign, &["init", "-q", "-b", "main"]);
+    std::fs::write(foreign.join("SECRET"), "another crew's code\n").unwrap();
+    git(&foreign, &["add", "."]);
+    git(&foreign, &["commit", "-q", "-m", "foreign"]);
+    let foreign_sha = git(&foreign, &["rev-parse", "HEAD"]).trim().to_string();
+
+    ws.ensure_clone("f/c/p", &crew, &paths, &repo, "balerix/f/c/p", "main")
+        .unwrap();
+    let ran = root.join("uploadpack-ran");
+    let script = root.join("uploadpack.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ntouch {}\nexec git-upload-pack \"$@\"\n",
+            ran.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (k, v) in [
+        ("core.repositoryformatversion", "1"),
+        ("extensions.partialClone", "evil"),
+        ("remote.evil.promisor", "true"),
+        ("remote.evil.url", &foreign.display().to_string()),
+        ("remote.evil.uploadpack", &script.display().to_string()),
+    ] {
+        git(&paths.workspace, &["config", k, v]);
+    }
+    std::fs::write(
+        paths.workspace.join(".git/refs/heads/balerix/f/c/p"),
+        format!("{foreign_sha}\n"),
+    )
+    .unwrap();
+
+    // (a) a changed `branch`: `symbolic-ref`, then `status` over a HEAD
+    // whose commit is missing. It fails (`bad object HEAD`) rather than
+    // fetch it, and no program runs.
+    let outcome = ws.ensure_clone("f/c/p", &crew, &paths, &repo, "other", "main");
+    assert!(
+        !git_ok(&paths.workspace, &["cat-file", "-e", &foreign_sha]),
+        "the daemon's status lazy-fetched the foreign commit into the clone"
+    );
+    assert!(!ran.exists(), "remote.evil.uploadpack ran as the daemon");
+    let e = outcome.unwrap_err().to_string();
+    assert!(e.starts_with("f/c/p: git "), "{e}");
+
+    // (b) the harvest: the clone cannot serve a commit it does not have,
+    // so the fetch fails and nothing foreign reaches the cache
+    let e = ws
+        .harvest_and_remove("f/c/p", &crew, &paths)
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("f/c/p: git "), "{e}");
+    assert!(paths.workspace.exists());
+    assert!(!ran.exists(), "remote.evil.uploadpack ran as the daemon");
+    assert!(!git_ok(&crew.repo, &["cat-file", "-e", &foreign_sha]));
+    assert!(!git_ok(
+        &crew.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/balerix/f/c/p"
+        ]
+    ));
+
+    // an `alternates` file in the cache itself is refused, by name
+    let cache_alternates = crew.cache_objects().join("info/alternates");
+    std::fs::write(
+        &cache_alternates,
+        format!("{}\n", foreign.join(".git/objects").display()),
+    )
+    .unwrap();
+    let e = ws
+        .harvest_and_remove("f/c/p", &crew, &paths)
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("f/c/p: "), "{e}");
+    assert!(
+        e.contains(&cache_alternates.display().to_string()) && e.contains("--purge"),
+        "{e}"
+    );
+    assert!(paths.workspace.exists());
 }

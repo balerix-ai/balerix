@@ -25,12 +25,15 @@ fn generated_profile_validates_and_enforces_isolation() {
         paths.workspace.clone(),
         paths.nono_home.clone(),
         paths.logs.clone(),
-        crew.repo.join(".git"),
+        crew.cache_objects(),
     ];
     dirs.extend(layout.agent_pools(&id));
     for d in &dirs {
         std::fs::create_dir_all(d).unwrap();
     }
+    // Spec N-3: the cache is readable and not writable from inside.
+    let objects = crew.cache_objects();
+    std::fs::write(objects.join("probe"), "probe-ok\n").unwrap();
     let env = agent_env(
         &id,
         &paths,
@@ -53,8 +56,12 @@ fn generated_profile_validates_and_enforces_isolation() {
     let outside = root.join("outside");
     std::fs::create_dir_all(&outside).unwrap();
     let script = format!(
-        "echo in > \"$HOME/ok\" && echo HOME=$HOME && echo FOO=$FOO && (echo x > {}/nope 2>/dev/null && echo ESCAPED || echo denied)",
-        outside.display()
+        "echo in > \"$HOME/ok\" && echo HOME=$HOME && echo FOO=$FOO \
+         && (echo x > {outside}/nope 2>/dev/null && echo ESCAPED || echo denied) \
+         && (cat {objects}/probe 2>/dev/null || echo CACHE_UNREADABLE) \
+         && (echo x > {objects}/nope 2>/dev/null && echo CACHE_WRITABLE || echo cache-denied)",
+        outside = outside.display(),
+        objects = objects.display()
     );
     let out = Command::new(&tools.nono)
         .args([
@@ -94,6 +101,15 @@ fn generated_profile_validates_and_enforces_isolation() {
     );
     assert!(paths.home.join("ok").exists(), "write inside home succeeds");
     assert!(!outside.join("nope").exists());
+    assert!(
+        stdout.contains("probe-ok"),
+        "an object under the cache reads from inside the profile: {stdout}"
+    );
+    assert!(
+        stdout.contains("cache-denied") && !stdout.contains("CACHE_WRITABLE"),
+        "a write into the cache must be denied: {stdout}"
+    );
+    assert!(!objects.join("nope").exists());
 }
 
 /// The user's `sandbox:` block is merged into the profile verbatim, so its

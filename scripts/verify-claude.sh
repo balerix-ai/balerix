@@ -19,6 +19,12 @@
 #
 # BALERIX_VERIFY_FAKE=1 swaps in `balerix dev fake-claude`, an empty tool table
 # and no host defaults — the maintainers' self-test of this script.
+#
+# BALERIX_VERIFY_BRANCH=<name> is Spec L §10's by-hand check: the scratch
+# repo gets that branch (one commit ahead of main), the agent runs with
+# `branch: <name>`, and the sandbox lets it push to the scratch bare, so
+# a `git push` typed into the session should move origin's branch. Section
+# F of the report shows the clone's HEAD and origin's tip.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -30,6 +36,7 @@ AGENT=a
 SOCKET="balerix-verify-$$"
 UP_TIMEOUT="${BALERIX_VERIFY_TIMEOUT:-10m}"
 FAKE="${BALERIX_VERIFY_FAKE:-0}"
+BRANCH="${BALERIX_VERIFY_BRANCH:-}"
 
 export XDG_CONFIG_HOME="$ROOT/xdg/config"
 export XDG_STATE_HOME="$ROOT/xdg/state"
@@ -113,7 +120,20 @@ git_q "$WORK" init -q -b main
 printf 'hello from balerix verify\n' > "$WORK/README"
 git_q "$WORK" add README
 git -C "$WORK" -c user.name=verify -c user.email=verify@balerix.invalid commit -q -m init >/dev/null 2>&1
+if [ -n "$BRANCH" ]; then
+  git_q "$WORK" switch -q -c "$BRANCH"
+  printf 'this branch is %s\n' "$BRANCH" > "$WORK/BRANCH"
+  git_q "$WORK" add BRANCH
+  git -C "$WORK" -c user.name=verify -c user.email=verify@balerix.invalid commit -q -m "one commit on $BRANCH" >/dev/null 2>&1
+  git_q "$WORK" switch -q main
+fi
 git clone -q --bare "$WORK" "$BARE"
+# The agent's clone has the scratch bare as `origin`; a push from inside
+# the sandbox needs write on it.
+SANDBOX_BLOCK=""
+[ -n "$BRANCH" ] && SANDBOX_BLOCK="  sandbox: { filesystem: { allow: [\"$BARE\"] } }"
+AGENT_EXTRA=""
+[ -n "$BRANCH" ] && AGENT_EXTRA=", branch: \"$BRANCH\""
 if [ "$FAKE" = 1 ]; then
   CLAUDE_BLOCK="    binary: \"$BALERIX\"
     args: [dev, fake-claude, \"--verbose\"]
@@ -131,15 +151,16 @@ defaults:
   claude:
 $CLAUDE_BLOCK
   tools: {}
+$SANDBOX_BLOCK
 crews:
   $CREW:
     repo: "file://$BARE"
     ref: main
     git: { push: false, auth: none }
     agents:
-      $AGENT: { plugins: { $( [ "$WEB" = 1 ] && printf 'web: {}' ) } }
+      $AGENT: { plugins: { $( [ "$WEB" = 1 ] && printf 'web: {}' ) }$AGENT_EXTRA }
 EOF
-say "fleet file: $ROOT/fleet.yaml (repo: file://$BARE)"
+say "fleet file: $ROOT/fleet.yaml (repo: file://$BARE; agent branch: ${BRANCH:-<default>})"
 
 hr "serve -d"
 "$BALERIX" serve -d --bind 127.0.0.1:0 --tmux-socket "$SOCKET" || { say "serve -d failed"; tail_file server.log "$SERVER/server.log" 40; exit 1; }
@@ -208,6 +229,10 @@ else
   if [ "$WEB" = 1 ]; then say ">>> or click $AGENT on the browser page above and type there."; fi
   say ">>> Wait for Claude's prompt, type one message (e.g. \"say hi\"), wait for the reply,"
   say ">>> detach with Ctrl-b then d, and come back here."
+  if [ -n "$BRANCH" ]; then
+    say ">>> Spec L: also ask Claude to commit a change and run git push; section F below"
+    say ">>> shows whether origin's $BRANCH moved."
+  fi
   ONBOARD=""
   while [ -z "$ONBOARD" ]; do
     printf '>>> Did Claude show a login, onboarding, trust or "auto mode as default" prompt before its normal prompt? [y/n] '
@@ -231,5 +256,13 @@ hr "E. status and logs"
 "$BALERIX" status "$FLEET" || true
 tail_file "agent nono.log" "$AGENT_DIR/logs/nono.log" 10
 tail_file "server.log" "$SERVER/server.log" 15
+if [ -n "$BRANCH" ]; then
+  hr "F. Spec L §10: an agent on branch $BRANCH (clone HEAD should be it; a push should move origin)"
+  say "clone HEAD:        $(git -C "$AGENT_DIR/workspace" symbolic-ref --short HEAD 2>&1)"
+  say "clone tip:         $(git -C "$AGENT_DIR/workspace" rev-parse --short HEAD 2>&1)"
+  say "origin $BRANCH tip: $(git -C "$BARE" rev-parse --short "$BRANCH" 2>&1)"
+  say "origin main tip:   $(git -C "$BARE" rev-parse --short main 2>&1)"
+  say "origin log of $BRANCH:"; git -C "$BARE" log --oneline "$BRANCH" 2>&1 | sed 's/^/  /'
+fi
 say "=============================== END REPORT ==============================="
 exit 0

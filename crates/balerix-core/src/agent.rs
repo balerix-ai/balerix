@@ -68,9 +68,17 @@ pub struct ResolvedAgent {
     pub settings: AgentSettings,
 }
 
+/// The version of the on-disk agent layout the runtime materializes
+/// (Spec N §3: 2 is the private clone; 1 was the 0.1.x worktree). Part of
+/// the spec hash, so an agent left over from an earlier layout is stopped
+/// and re-materialized at the first pass of a daemon that no longer
+/// supports it, instead of adopted under its old sandbox (#71).
+pub const WORKSPACE_LAYOUT: u8 = 2;
+
 /// Exactly the fields that, when changed, must restart the agent.
 #[derive(Serialize)]
 struct HashInput<'a> {
+    layout: u8,
     repo: String,
     git_ref: &'a str,
     git: &'a GitSettings,
@@ -121,7 +129,12 @@ impl ResolvedAgent {
     /// (every map here is a `BTreeMap` or a `serde_json::Map` without
     /// `preserve_order`), so equal inputs hash equal regardless of source order.
     pub fn hash(&self) -> SpecHash {
+        self.hash_for_layout(WORKSPACE_LAYOUT)
+    }
+
+    pub(crate) fn hash_for_layout(&self, layout: u8) -> SpecHash {
         let input = HashInput {
+            layout,
             repo: self.repo.clone_url(),
             git_ref: &self.git_ref,
             git: &self.git,
@@ -194,6 +207,17 @@ mod tests {
         b.settings.claude.settings = json!({ "model": "sonnet" });
         assert_ne!(a.hash(), b.hash());
         assert_eq!(a.hash().as_str().len(), 64);
+    }
+
+    /// A 0.1.x agent's recorded hash was computed without a layout
+    /// version; the daemon must see it as changed so the agent is stopped
+    /// and re-materialized (which refuses its worktree) instead of adopted
+    /// under its old sandbox.
+    #[test]
+    fn hash_covers_the_workspace_layout_version() {
+        let a = ResolvedAgent::from_fleet(&fleet()).remove(0);
+        assert_eq!(a.hash(), a.hash_for_layout(WORKSPACE_LAYOUT));
+        assert_ne!(a.hash(), a.hash_for_layout(WORKSPACE_LAYOUT - 1));
     }
 
     #[test]

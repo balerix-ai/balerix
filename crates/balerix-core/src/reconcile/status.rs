@@ -71,14 +71,12 @@ pub fn apply(
                 a.next_restart_at = Some(now.plus_secs(backoff_secs(policy, a.restarts)));
             }
         }
-        (
-            Step::Stop(id)
-            | Step::RemoveAgent(id)
-            | Step::Materialize(id)
-            | Step::Start(id, _)
-            | Step::NoteExit(id, _),
-            Err(e),
-        ) => {
+        (Step::Materialize(id) | Step::Start(id, _), Err(e)) => {
+            let a = status.entry(&id.to_string());
+            a.phase = AgentPhase::Failed;
+            a.message.clone_from(e);
+        }
+        (Step::Stop(id) | Step::RemoveAgent(id) | Step::NoteExit(id, _), Err(e)) => {
             status.entry(&id.to_string()).message.clone_from(e);
         }
     }
@@ -121,7 +119,7 @@ fn derive_fleet_phase(status: &FleetStatus, terminating: bool, all_ok: bool) -> 
         };
     }
     let phases = || status.agents.values().map(|a| a.phase);
-    if !all_ok || phases().any(|p| p == AgentPhase::Dead) {
+    if !all_ok || phases().any(|p| matches!(p, AgentPhase::Dead | AgentPhase::Failed)) {
         FleetPhase::Degraded
     } else if phases().any(|p| {
         matches!(
@@ -184,9 +182,12 @@ mod tests {
         assert_eq!(a.next_restart_at, None);
     }
 
+    /// A failed `Materialize` or `Start` is visible in the phase, not only
+    /// the message (#72); the next success clears both.
     #[test]
-    fn failures_set_the_message_and_keep_the_phase() {
+    fn a_failed_materialize_or_start_moves_the_agent_to_failed() {
         let mut s = FleetStatus::default();
+        s.entry("f/c/a").phase = AgentPhase::Ready;
         apply(
             &mut s,
             &Step::Materialize(id("f/c/a")),
@@ -194,7 +195,7 @@ mod tests {
             &policy(),
             Timestamp(0),
         );
-        assert_eq!(s.agents["f/c/a"].phase, AgentPhase::Pending);
+        assert_eq!(s.agents["f/c/a"].phase, AgentPhase::Failed);
         assert_eq!(s.agents["f/c/a"].message, "f/c/a: git worktree: boom");
         apply(
             &mut s,
@@ -203,7 +204,45 @@ mod tests {
             &policy(),
             Timestamp(0),
         );
+        assert_eq!(s.agents["f/c/a"].phase, AgentPhase::Materializing);
         assert_eq!(s.agents["f/c/a"].message, "", "success clears the message");
+        apply(
+            &mut s,
+            &Step::Start(id("f/c/a"), SpecHash::new("h".into())),
+            &Err("f/c/a: tmux: no server".into()),
+            &policy(),
+            Timestamp(0),
+        );
+        assert_eq!(s.agents["f/c/a"].phase, AgentPhase::Failed);
+    }
+
+    /// Other failed steps only set the message: a failed `Stop` leaves the
+    /// session running, so the phase still describes it.
+    #[test]
+    fn a_failed_stop_sets_the_message_and_keeps_the_phase() {
+        let mut s = FleetStatus::default();
+        s.entry("f/c/a").phase = AgentPhase::Ready;
+        apply(
+            &mut s,
+            &Step::Stop(id("f/c/a")),
+            &Err("f/c/a: tmux kill-window: boom".into()),
+            &policy(),
+            Timestamp(0),
+        );
+        assert_eq!(s.agents["f/c/a"].phase, AgentPhase::Ready);
+        assert_eq!(s.agents["f/c/a"].message, "f/c/a: tmux kill-window: boom");
+    }
+
+    /// A failed agent degrades the fleet even on a pass that ran clean for
+    /// everyone else (a sibling's `SessionStart`, say).
+    #[test]
+    fn a_failed_agent_degrades_the_fleet() {
+        let mut s = FleetStatus::default();
+        s.entry("f/c/a").phase = AgentPhase::Failed;
+        s.entry("f/c/b").phase = AgentPhase::Starting;
+        agent_ready(&mut s, &id("f/c/b"), Timestamp(5));
+        assert_eq!(s.agents["f/c/b"].phase, AgentPhase::Ready);
+        assert_eq!(s.phase, FleetPhase::Degraded);
     }
 
     #[test]

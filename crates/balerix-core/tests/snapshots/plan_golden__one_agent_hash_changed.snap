@@ -1,8 +1,8 @@
 ---
 source: crates/balerix-core/tests/plan_golden.rs
-expression: "go(Some(&after), Keep::default(), &st, &running(&before))"
+expression: "go(Some(&after), Keep::default(), &[], &st, &running(&before))"
 ---
 stop payments/backend/bob
 ensure-crew payments/backend
 materialize payments/backend/bob
-start payments/backend/bob b931f32a
+start payments/backend/bob 50766e11

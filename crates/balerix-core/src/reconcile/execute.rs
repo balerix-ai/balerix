@@ -322,7 +322,7 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(st.agents["f/c/a"].phase, AgentPhase::Pending);
+        assert_eq!(st.agents["f/c/a"].phase, AgentPhase::Failed);
         assert_eq!(
             st.agents["f/c/a"].message,
             "f/c/a: mise materialize: no space left"

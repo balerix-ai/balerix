@@ -1,9 +1,9 @@
 ---
 source: crates/balerix-core/tests/plan_golden.rs
-expression: "go(Some(&f), Keep::default(), &FleetStatus::default(),\n&ObservedState::default())"
+expression: "go(Some(&f), Keep::default(), &[], &FleetStatus::default(),\n&ObservedState::default())"
 ---
 ensure-crew payments/backend
 materialize payments/backend/alice
-start payments/backend/alice 2c957fd3
+start payments/backend/alice 3b0fa593
 materialize payments/backend/bob
-start payments/backend/bob 89cf4262
+start payments/backend/bob b94c9047

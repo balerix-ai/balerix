@@ -356,6 +356,31 @@ mod tests {
         );
     }
 
+    /// Upgrade (#71): an agent materialized under the previous workspace
+    /// layout is stopped and rebuilt even though its fleet file is
+    /// unchanged, both at daemon start and on `up`.
+    #[test]
+    fn an_agent_from_the_previous_layout_is_stopped_and_rebuilt() {
+        let f = fleet(&[("a", 1)]);
+        let old_hash = ResolvedAgent::from_fleet(&f)
+            .remove(0)
+            .hash_for_layout(crate::agent::WORKSPACE_LAYOUT - 1);
+        let mut st = FleetStatus::default();
+        st.entry("f/c/a").applied_hash = Some(old_hash);
+        st.entry("f/c/a").phase = AgentPhase::Ready;
+        let mut obs = ObservedState::default();
+        obs.set(&id("f/c/a"), ProcessState::Running { pid: 1 });
+        assert_eq!(
+            plan_for(Some(&f), &[], &st, &obs, 0),
+            vec![
+                "stop f/c/a".to_string(),
+                "ensure-crew f/c".into(),
+                "materialize f/c/a".into(),
+                format!("start f/c/a {}", short(&hash_of(&f, "a"))),
+            ]
+        );
+    }
+
     #[test]
     fn changed_hash_on_a_running_agent_stops_then_restarts_it() {
         let old = fleet(&[("a", 1)]);

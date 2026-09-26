@@ -86,15 +86,8 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
     );
 
     ws.ensure_repo("f/c/a", &crew, &repo, "main").unwrap();
-    ws.ensure_worktree(
-        "f/c/a",
-        &crew,
-        &paths.workspace,
-        &paths.branch_marker(),
-        "balerix/f/c/a",
-        "main",
-    )
-    .unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
     let w = &paths.workspace;
     let base = git(w, &["rev-parse", "origin/main"]).trim().to_string();
 
@@ -214,7 +207,7 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
     assert_eq!(
         rt.read_file(&id, ".git"),
         Err(WorkspaceError::InvalidPath(".git segment".into())),
-        "the worktree's .git file is refused before any I/O"
+        "the clone's .git is refused before any I/O"
     );
     assert_eq!(
         rt.read_file(&id, "../../repo/HEAD"),
@@ -389,8 +382,8 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
     assert!(rt.diff(&id, "origin/main").is_ok(), "unset: diffs again");
 
     // extensions.worktreeConfig would let an agent write a filter into
-    // <gitdir>/worktrees/<id>/config.worktree, a file `--local` cannot
-    // see; refused on the extension key itself instead.
+    // .git/config.worktree, a file `--local` cannot see; refused on the
+    // extension key itself instead.
     git(w, &["config", "extensions.worktreeConfig", "true"]);
     git(
         w,
@@ -423,12 +416,12 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         "{e}"
     );
 
-    // Last, because it breaks the worktree: with its `.git` file deleted —
-    // the agent owns the worktree — git discovery would walk up and run
-    // every command below in whatever repository contains the state root
-    // (under `target/tmp`, this checkout). `GIT_CEILING_DIRECTORIES` stops
-    // it at the agent's root, so the first call fails instead.
-    std::fs::remove_file(w.join(".git")).unwrap();
+    // Last, because it breaks the worktree: with its `.git` directory
+    // deleted — the agent owns the clone — git discovery would walk up and
+    // run every command below in whatever repository contains the state
+    // root (under `target/tmp`, this checkout). `GIT_CEILING_DIRECTORIES`
+    // stops it at the agent's root, so the first call fails instead.
+    std::fs::remove_dir_all(w.join(".git")).unwrap();
     let e = rt.diff(&id, "origin/main").unwrap_err();
     assert!(
         matches!(&e, WorkspaceError::Tool { subcommand, .. } if subcommand == "config"),

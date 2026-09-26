@@ -337,18 +337,18 @@ impl Materializer for Runtime {
         let id = agent.id.to_string();
         let crew = self.layout.crew(&agent.id.crew_ref());
         let paths = self.layout.agent(&agent.id);
-        // Spec L §6: with `branch` set, the worktree branch is the remote
-        // branch itself and is created from `origin/<branch>`; without it
-        // the per-agent branch starts from the crew's ref.
-        self.workspace(&agent.id.fleet, &agent.git)
-            .ensure_worktree(
-                &id,
-                &crew,
-                &paths.workspace,
-                &paths.branch_marker(),
-                &agent.branch(),
-                agent.start_ref(),
-            )?;
+        // Spec N §4: a private clone on the agent's branch. Spec L §6: with
+        // `branch` set, that branch is the remote branch itself, created
+        // from `origin/<branch>`; without it the per-agent branch starts
+        // from the crew's ref.
+        self.workspace(&agent.id.fleet, &agent.git).ensure_clone(
+            &id,
+            &crew,
+            &paths,
+            &agent.repo,
+            &agent.branch(),
+            agent.start_ref(),
+        )?;
         let out = self.render_agent(agent, creds, hooks, &RenderOptions::default())?;
         self.install_and_validate(agent)?;
         Ok(out.plan)
@@ -362,7 +362,7 @@ impl Materializer for Runtime {
             tools: &self.tools,
             gh_config_dir: None,
         }
-        .remove_worktree(&id, &crew, &paths.workspace)?;
+        .harvest_and_remove(&id, &crew, &paths)?;
         Self::rm_rf(&id, &paths.root)
     }
 
@@ -371,17 +371,26 @@ impl Materializer for Runtime {
         let paths = self.layout.crew(crew);
         if !keep.sessions {
             let agents_dir = paths.root.join("agents");
-            if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+            // Spec N §5: with the cache staying, each clone's branch is
+            // harvested into it first. Without `keep.repos` the cache goes
+            // too — nothing to harvest into, and no harvest to fail a
+            // `--purge` over a clone git cannot read.
+            if keep.repos
+                && let Ok(entries) = std::fs::read_dir(&agents_dir)
+            {
                 for e in entries.flatten() {
-                    let agent_id = format!("{id}/{}", e.file_name().to_string_lossy());
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let Ok(agent_id) = format!("{id}/{name}").parse::<AgentId>() else {
+                        continue; // not an agent directory
+                    };
                     Workspace {
                         tools: &self.tools,
                         gh_config_dir: None,
                     }
-                    .remove_worktree(
-                        &agent_id,
+                    .harvest_and_remove(
+                        &agent_id.to_string(),
                         &paths,
-                        &e.path().join("workspace"),
+                        &self.layout.agent(&agent_id),
                     )?;
                 }
             }

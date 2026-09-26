@@ -73,7 +73,7 @@ pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), Config
         }
     }
 
-    // Spec L §6: the name reaches `git worktree add -b <branch>` as an argv
+    // Spec L §6: the name reaches `git checkout -B <branch>` as an argv
     // word; git's own rule, checked here, is what keeps it a name.
     if let Some(branch) = &settings.branch
         && let Err(reason) = balerix_api::check_branch_name(branch)

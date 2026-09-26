@@ -211,9 +211,14 @@ fn materialize_then_remove_round_trip() {
         "unchanged table → install skipped on the second pass"
     );
 
-    // Exercise remove_crew's per-agent worktree-removal loop while the
-    // agent's worktree still exists: removing the agent first would empty
-    // `agents/` and this loop would never run.
+    // Exercise remove_crew's per-agent harvest loop while the agent's
+    // clone still exists: removing the agent first would empty `agents/`
+    // and this loop would never run. An unpushed commit on the assigned
+    // branch must reach the cache (Spec N §5).
+    std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();
+    git(&paths.workspace, &["add", "."]);
+    git(&paths.workspace, &["commit", "-q", "-m", "agent work"]);
+    let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
     let crew_paths = layout.crew(&crew);
     rt.remove_crew(
         &crew,
@@ -225,12 +230,10 @@ fn materialize_then_remove_round_trip() {
     .unwrap();
     assert!(!paths.root.exists());
     assert!(crew_paths.repo.exists());
-    let worktrees = git(&crew_paths.repo, &["worktree", "list", "--porcelain"]);
-    assert!(
-        !worktrees
-            .lines()
-            .any(|l| l.strip_prefix("worktree ").map(Path::new) == Some(paths.workspace.as_path())),
-        "worktree still registered: {worktrees}"
+    assert_eq!(
+        git(&crew_paths.repo, &["rev-parse", "refs/heads/balerix/f/c/a"]),
+        sha,
+        "harvested before the clone went"
     );
 
     rt.remove_agent(&agent.id).unwrap(); // already gone: must be a no-op
@@ -315,4 +318,86 @@ fn pool_snapshot(dir: &std::path::Path) -> Vec<String> {
     }
     out.sort();
     out
+}
+
+/// Review focus 4: `down --purge` over a clone git cannot read must
+/// succeed — the cache goes too, so there is nothing to harvest into.
+#[test]
+fn a_purge_deletes_a_broken_clone_without_harvesting() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("materialize-purge-broken");
+    let layout = support::layout(&root);
+    std::fs::create_dir_all(&layout.config_root).unwrap();
+    std::fs::write(layout.system_mise_toml(), "[tools]\n").unwrap();
+    let work = root.join("up");
+    std::fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    std::fs::write(work.join("README"), "x").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "init"]);
+    let bare = root.join("up.git");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &work.display().to_string(),
+            &bare.display().to_string(),
+        ],
+    );
+    let f = fleet(&format!("file://{}", bare.display()));
+    let rt = Runtime::new(layout.clone(), tools);
+    let agent = ResolvedAgent::from_fleet(&f).remove(0);
+    let crew = agent.id.crew_ref();
+    let creds = CredentialBundle::default();
+    let (f_tools, c_tools) = (no_tools(), no_tools());
+    rt.ensure_crew(
+        &crew,
+        &agent.repo,
+        &agent.git_ref,
+        &agent.git,
+        &creds,
+        CrewTools {
+            fleet: &f_tools,
+            crew: &c_tools,
+        },
+    )
+    .unwrap();
+    let paths = layout.agent(&agent.id);
+    let ws = balerix_runtime::Workspace {
+        tools: &rt.tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_clone(
+        &agent.id.to_string(),
+        &layout.crew(&crew),
+        &paths,
+        &agent.repo,
+        &agent.branch(),
+        agent.start_ref(),
+    )
+    .unwrap();
+    std::fs::remove_file(paths.workspace.join(".git/HEAD")).unwrap();
+
+    // keep-repos: the harvest runs and fails, and says so
+    let e = rt
+        .remove_crew(
+            &crew,
+            Keep {
+                repos: true,
+                sessions: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("f/c/a: git "), "{e}");
+    assert!(paths.workspace.exists());
+
+    // purge: nothing to harvest into, everything goes
+    rt.remove_crew(&crew, Keep::default()).unwrap();
+    assert!(!layout.crew(&crew).root.exists());
 }

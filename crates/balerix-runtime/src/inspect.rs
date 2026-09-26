@@ -1,8 +1,7 @@
-//! `WorkspaceReader` over real git (Spec C §3.2): the agent's worktree
+//! `WorkspaceReader` over real git (Spec C §3.2): the agent's clone
 //! against the crew's base, one file, one listing. Reads only, with the
-//! repository's config escape hatches closed — an agent can write the
-//! shared `.git/config` and `.gitattributes`, and this code runs as the
-//! daemon.
+//! repository's config escape hatches closed — an agent can write its clone's
+//! `.git/config` and `.gitattributes`, and this code runs as the daemon.
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -22,15 +21,9 @@ use crate::materializer::Runtime;
 use crate::tools::Cmd;
 
 /// Command-line config beats every config file: whatever an agent wrote
-/// into the shared `.git/config`, no program runs from it here.
-const CONFIG: &[&str] = &[
-    "-c",
-    "core.fsmonitor=false",
-    "-c",
-    "core.quotePath=true",
-    "-c",
-    "diff.noprefix=false",
-];
+/// into its clone's `.git/config`, no program runs from it here (the rest
+/// of the hardening is `harden_agent_git`).
+const CONFIG: &[&str] = &["-c", "core.quotePath=true", "-c", "diff.noprefix=false"];
 /// On every `diff`: no external diff driver, no textconv, no colour, and no
 /// descent into a nested repository. An explicit `--submodule=short` beats a
 /// `diff.submodule = diff` an agent wrote into the shared config, so a
@@ -74,19 +67,11 @@ impl Runtime {
     }
 
     /// One git call in the worktree, logged to the crew's `git.log` with
-    /// the same `GIT_*` scrub as `Workspace::git`, no optional locks,
-    /// fsmonitor off and hooks pointed at an empty directory. The log
-    /// keeps the argv, stderr and the exit status but not the stdout:
-    /// a review page's `diff.json` runs one `diff -U3` per file, up to
-    /// 500 of them at 256 KiB each, and `Workspace::git`'s full-output
-    /// logging would grow `git.log` by the whole diff on every fetch.
-    ///
-    /// `GIT_CEILING_DIRECTORIES` is the agent's own root, the parent of
-    /// `workspace/`: the agent owns the worktree and can delete its `.git`
-    /// file, and repository discovery would then walk up and run every
-    /// command here in whatever repository contains the state root. git
-    /// only honours a ceiling that matches the resolved path, so it is
-    /// canonical.
+    /// hardened config. The log keeps the argv, stderr and the exit status
+    /// but not the stdout: a review page's `diff.json` runs one `diff -U3`
+    /// per file, up to 500 of them at 256 KiB each, and full-output logging
+    /// would grow `git.log` by the whole diff on every fetch. Hardening is
+    /// `harden_agent_git`.
     fn inspect_git(
         &self,
         id: &str,
@@ -95,34 +80,14 @@ impl Runtime {
         args: &[&str],
         accepted: &[i32],
     ) -> Result<String, WorkspaceError> {
-        let no_hooks = crew.root.join("no-hooks");
-        let _ = std::fs::create_dir_all(&no_hooks);
-        let mut cmd =
-            Cmd::new(&self.tools.git).log_argv_only(&crew.root.join("logs").join("git.log"));
-        for var in [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-            "GIT_PREFIX",
-            "GIT_COMMON_DIR",
-        ] {
-            cmd = cmd.env_remove(var);
-        }
-        let ceiling = paths
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| paths.root.clone());
-        cmd = cmd
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CEILING_DIRECTORIES", ceiling.display().to_string())
-            .args(CONFIG.iter().copied())
-            .args([
-                "-c".to_string(),
-                format!("core.hooksPath={}", no_hooks.display()),
-            ])
-            .args(["-C".to_string(), paths.workspace.display().to_string()])
-            .args(args.iter().copied());
+        let cmd = crate::workspace::harden_agent_git(
+            Cmd::new(&self.tools.git).log_argv_only(&crew.root.join("logs").join("git.log")),
+            crew,
+            &paths.root,
+        )
+        .args(CONFIG.iter().copied())
+        .args(["-C".to_string(), paths.workspace.display().to_string()])
+        .args(args.iter().copied());
         cmd.run_with_exit_codes(accepted)
             .map(|o| o.stdout)
             .map_err(|f| WorkspaceError::Tool {

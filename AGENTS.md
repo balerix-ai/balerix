@@ -128,9 +128,10 @@ credentials, hook input, or sandbox rules.
   failed its first pass and waited out the 30 s resync before `up` could
   proceed. The actor logs `agent ready (SessionStart received)`, the only
   line that dates readiness; the tick after it logs the phase.
-- `Workspace::git` (`crates/balerix-runtime/src/workspace.rs`) scrubs
-  `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_PREFIX`/`GIT_COMMON_DIR` from
-  every git call via `Cmd::env_remove`, and the integration-test `git`
+- `Workspace::git` (`crates/balerix-runtime/src/workspace.rs`) (`scrub_git_env`)
+  scrubs `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_PREFIX`/`GIT_COMMON_DIR`
+  from every git call; `harden_agent_git` adds the rest of the hardening for a
+  call in an agent's clone. The integration-test `git`
   fixtures do the same — the pre-commit hook exports them, and a git
   subprocess that inherits them operates on this repository instead of the
   test's.
@@ -293,17 +294,17 @@ credentials, hook input, or sandbox rules.
 - Workspace git calls (`balerix-runtime/src/inspect.rs`) set
   `GIT_OPTIONAL_LOCKS=0` and `-c core.fsmonitor=false -c core.hooksPath=<empty>`
   and pass `--no-ext-diff --no-textconv --no-color --submodule=short
-  --ignore-submodules=dirty` to every `diff`: the crew's `.git/config` is
+  --ignore-submodules=dirty` to every `diff`: the clone's `.git/config` is
   agent-writable, and the last two keep git out of a nested repository the
   agent committed as a gitlink, whose own config (its `diff.external`) the
   `-c` overrides reach but the argv flags do not. They also set
   `GIT_CEILING_DIRECTORIES` to the agent's own root (canonical — git ignores
   a ceiling that does not match the resolved path), so that deleting the
-  worktree's `.git` file makes git refuse instead of discovering the
+  clone's `.git` directory makes git refuse instead of discovering the
   repository that holds the state root. Keep those when adding a git call
   there.
 - A workspace `diff` refuses with `repository config sets <key>; workspace
-  diff refused` when the crew's `.git/config` declares a
+  diff refused` when the clone's `.git/config` declares a
   `filter.<x>.<clean|smudge|process>`, or when it sets
   `extensions.worktreeconfig` (a `config.worktree` file could then hold a
   filter the check's `--local` read cannot see, so the extension alone is
@@ -352,10 +353,45 @@ credentials, hook input, or sandbox rules.
   sees only the `FleetResolver`/`CredentialSource` ports;
   `Harness` answers them with `FakeResolver` (no answer → `name: no
   resolver answer configured`; set it per test) and `FakeCredentials`.
-- `AgentSettings.branch` makes the *remote* branch the worktree branch
+- `AgentSettings.branch` makes the *remote* branch the clone's branch
   and its start point (`ResolvedAgent::start_ref`); a branch the remote
   lacks fails the materialize step with git's message and retries at the
   resync cadence. The workspace diff base is still `origin/<crew ref>`.
+  `branch: <default branch>` works: a fresh `--no-checkout` clone already
+  has that branch with HEAD on it, hence `checkout -B` and the seed
+  fetch's `--update-head-ok` and `+` in `create_clone`; and the cache's
+  own copy of it (stale since the cache was cloned) seeds nothing, since
+  only a cache copy holding commits `origin/<branch>` lacks is a seed.
+- Every agent's `workspace/` is a private clone (Spec N); the crew's
+  `repo/` is an object cache the daemon alone writes (`gc.auto=0`, every
+  daemon fetch `--no-auto-gc`, never pruned) and agents read through
+  `objects/info/alternates`. The sandbox grants `repo/.git/objects`
+  read-only and nothing else under `repo/`. Before a clone is deleted
+  (`remove_agent`, `down --keep-repos`, a changed `branch`) its marker's
+  branch is fetched into the cache from inside the cache — never pushed
+  from the clone — and a new clone for a branch the cache holds seeds
+  from it. Only that branch survives: other local branches and every
+  file in the tree go with the clone. Plain `down` and `--purge` delete
+  the cache too and harvest nothing, so a broken clone cannot wedge a
+  purge. A `workspace/.git` that is a *file* is a 0.1.x worktree and is
+  refused with the purge message; `down --keep-repos` + `up` also works
+  (the old crew clone becomes the cache and its branches seed the new
+  clones).
+- The daemon can read every repository under its uid, so the harvest is a
+  confused deputy unless the clone's objects are the clone's own. Before
+  any git runs in an existing clone (`ensure_clone`, `harvest_and_remove`)
+  `check_clone` refuses, with the `--purge` remedy, a `.git` that is not a
+  real directory, any symlink under `.git/objects`, a `.git/commondir`, and
+  an `objects/info/alternates` other than the one line naming the crew
+  cache. `agent_git` passes `--git-dir=<ws>/.git` and the harvest fetches
+  `<ws>/.git` with `upload-pack --strict`: without them a `.git` git
+  rejects (no `HEAD`) makes git serve `workspace/` itself as a bare
+  repository. Keep all three when touching either call. It also refuses
+  an `alternates` file in the *cache's* `objects/info/` (never legitimate).
+  `harden_agent_git` sets `GIT_NO_LAZY_FETCH=1`: a promisor remote the
+  agent writes into its clone's config (`extensions.partialClone`) would
+  otherwise make `status`/`diff` fetch foreign objects into the clone as
+  the daemon, and run `remote.<x>.uploadpack`.
 - `dev fake-plugin` applies a fleet when its `plugins.yaml` entry has
   `config: { manage: { fleet, file } }` (the e2e's managed journey) and
   writes the outcome to `scratch/fake-plugin.manage`. The SDK's

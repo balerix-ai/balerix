@@ -50,13 +50,15 @@ pub fn balerix_grants(
     // in case PATH found a symlink, since Landlock rules bind to the file
     // the path resolves to.
     read.push(std::fs::canonicalize(mise).unwrap_or_else(|_| mise.to_path_buf()));
+    // Spec N-3: the crew's object cache, read-only. The agent's private
+    // clone borrows objects from it through `objects/info/alternates`; a
+    // Landlock read rule on the directory covers the tree beneath it. No
+    // path under `repo/` is ever in `allow` — that is the isolation between
+    // the agents of one crew (docs/THREAT-MODEL.md).
+    read.push(crew.cache_objects());
     Grants {
         read,
-        allow: vec![
-            paths.home.clone(),
-            paths.workspace.clone(),
-            crew.repo.join(".git"),
-        ],
+        allow: vec![paths.home.clone(), paths.workspace.clone()],
     }
 }
 
@@ -329,10 +331,19 @@ mod tests {
             p["filesystem"]["read"][10], "/opt/mise",
             "mise may live outside /usr (CI installs it under $HOME)"
         );
-        assert_eq!(p["filesystem"]["read"].as_array().unwrap().len(), 11);
         assert_eq!(
-            p["filesystem"]["allow"][2],
-            "/h/.local/state/balerix/fleets/f/crews/c/repo/.git"
+            p["filesystem"]["read"][11],
+            "/h/.local/state/balerix/fleets/f/crews/c/repo/.git/objects",
+            "Spec N-3: the crew's object cache, read-only"
+        );
+        assert_eq!(p["filesystem"]["read"].as_array().unwrap().len(), 12);
+        assert_eq!(
+            p["filesystem"]["allow"],
+            json!([
+                "/h/.local/state/balerix/fleets/f/crews/c/agents/a/home",
+                "/h/.local/state/balerix/fleets/f/crews/c/agents/a/workspace",
+            ]),
+            "nothing under crews/c/repo is ever writable (Spec N §6)"
         );
         assert_eq!(p["workdir"]["access"], "none");
         assert_eq!(

@@ -37,4 +37,4 @@ pub use toolchain::{
     system_tools,
 };
 pub use tools::{MissingTool, ToolPaths};
-pub use workspace::Workspace;
+pub use workspace::{CloneDecision, Workspace, decide_clone};

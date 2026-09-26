@@ -218,7 +218,7 @@ pub branch: Option<String>,
   input** with the same treatment as the CLI's: full validation through
   the resolver, `deny_unknown_fields`, name rules, exact tool versions.
   `branch` is validated as a ref name before it reaches a git argv
-  (`worktree add -b <branch> <path> origin/<branch>`); the leading-`-`
+  (`checkout -b <branch> origin/<branch>`, since Spec N); the leading-`-`
   refusal is what keeps a name from being read as a flag.
 
 ## 8. Testing

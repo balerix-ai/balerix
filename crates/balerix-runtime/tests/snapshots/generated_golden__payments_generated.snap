@@ -183,8 +183,7 @@ python = "3.12.8"
   "filesystem": {
     "allow": [
       "<root>/state/fleets/payments/crews/backend/agents/alice/home",
-      "<root>/state/fleets/payments/crews/backend/agents/alice/workspace",
-      "<root>/state/fleets/payments/crews/backend/repo/.git"
+      "<root>/state/fleets/payments/crews/backend/agents/alice/workspace"
     ],
     "read": [
       "/usr",
@@ -197,7 +196,8 @@ python = "3.12.8"
       "<root>/data/mise",
       "<root>/state/fleets/payments/crews/backend/agents/alice/mise.toml",
       "/tools/balerix",
-      "/tools/mise"
+      "/tools/mise",
+      "<root>/state/fleets/payments/crews/backend/repo/.git/objects"
     ]
   },
   "meta": {
@@ -401,8 +401,7 @@ python = "3.12.8"
   "filesystem": {
     "allow": [
       "<root>/state/fleets/payments/crews/backend/agents/bob/home",
-      "<root>/state/fleets/payments/crews/backend/agents/bob/workspace",
-      "<root>/state/fleets/payments/crews/backend/repo/.git"
+      "<root>/state/fleets/payments/crews/backend/agents/bob/workspace"
     ],
     "read": [
       "/usr",
@@ -415,7 +414,8 @@ python = "3.12.8"
       "<root>/data/mise",
       "<root>/state/fleets/payments/crews/backend/agents/bob/mise.toml",
       "/tools/balerix",
-      "/tools/mise"
+      "/tools/mise",
+      "<root>/state/fleets/payments/crews/backend/repo/.git/objects"
     ]
   },
   "meta": {

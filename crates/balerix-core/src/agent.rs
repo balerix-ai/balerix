@@ -109,10 +109,10 @@ impl ResolvedAgent {
         }
     }
 
-    /// The remote ref the worktree branch is created from when it does
-    /// not exist locally: the branch itself when `settings.branch` is set,
-    /// else the crew's `ref`. The workspace diff base is the crew's `ref`
-    /// either way (`Daemon::base_ref`).
+    /// The remote ref the clone's branch is created from when the cache
+    /// holds no harvested copy of it: the branch itself when
+    /// `settings.branch` is set, else the crew's `ref`. The workspace diff
+    /// base is the crew's `ref` either way (`Daemon::base_ref`).
     pub fn start_ref(&self) -> &str {
         self.settings.branch.as_deref().unwrap_or(&self.git_ref)
     }

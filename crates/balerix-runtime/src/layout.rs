@@ -78,6 +78,13 @@ impl CrewPaths {
     pub fn installed_marker(&self) -> PathBuf {
         self.root.join("mise.installed")
     }
+    /// The object cache the agents' private clones borrow from (Spec N-3):
+    /// the only path under `repo/` an agent's sandbox sees, read-only. An
+    /// `objects/info/alternates` names an `objects/` directory, not a
+    /// repository, so nothing else in the cache is needed by the agent's git.
+    pub fn cache_objects(&self) -> PathBuf {
+        self.repo.join(".git").join("objects")
+    }
 }
 
 impl StateLayout {
@@ -235,11 +242,12 @@ impl AgentPaths {
     pub fn installed_marker(&self) -> PathBuf {
         self.root.join(".installed")
     }
-    /// Holds the branch the worktree was last created on by balerix. A
-    /// changed agent `branch` is detected against this, never against the
-    /// worktree's HEAD, so an agent that checked out a branch of its own is
-    /// left on it across restarts (#60). Daemon-owned: the agent root is
-    /// outside every sandbox grant.
+    /// Holds the branch balerix last created the clone on. A changed agent
+    /// `branch` is detected against this, never against the clone's HEAD,
+    /// so an agent that checked out a branch of its own is left on it
+    /// across restarts (#60); at removal it names the branch to harvest
+    /// into the cache (Spec N §5). Daemon-owned: the agent root is outside
+    /// every sandbox grant.
     pub fn branch_marker(&self) -> PathBuf {
         self.root.join(".branch")
     }
@@ -347,6 +355,13 @@ mod tests {
         assert_eq!(
             l.crew(&"payments/backend".parse().unwrap()).repo,
             PathBuf::from("/h/.local/state/balerix/fleets/payments/crews/backend/repo")
+        );
+        assert_eq!(
+            l.crew(&"payments/backend".parse().unwrap()).cache_objects(),
+            PathBuf::from(
+                "/h/.local/state/balerix/fleets/payments/crews/backend/repo/.git/objects"
+            ),
+            "Spec N-3: the one path under repo/ an agent can see"
         );
         assert_eq!(
             l.fleet_gh_dir(&"payments".parse().unwrap()),

@@ -82,9 +82,20 @@ pub fn render_hosts_yml(token: &str) -> String {
 /// 2.1.263 keys the decision on the worktree's common git dir, not on the
 /// cwd it asked about (verified by hand, Phase 3 spec §8.1). Without it a
 /// fresh agent parks on that dialog and never sends `SessionStart`.
+///
+/// `hasSeenAutoDefaultNudge` is the "No" to the one-time "Make auto mode
+/// your default permission mode?" dialog claude 2.1.282 added, shown when
+/// the user `settings.json` sets a `permissions.defaultMode` other than
+/// `auto` (the host layer usually does) and no other settings file sets
+/// `auto`. Declining it by hand under claude 2.1.283 wrote exactly this key
+/// and nothing to `settings.json`; accepting writes `defaultMode: auto`
+/// there instead. Like `hasCompletedOnboarding` it is an undocumented key
+/// of claude's global config, so a `claude` bump re-checks it with
+/// `mise run verify-claude` (#73).
 pub fn render_claude_json(account: Option<&Value>, trusted: &[&Path]) -> Value {
     let mut m = Map::new();
     m.insert("hasCompletedOnboarding".to_string(), json!(true));
+    m.insert("hasSeenAutoDefaultNudge".to_string(), json!(true));
     let projects: Map<String, Value> = trusted
         .iter()
         .map(|p| {
@@ -320,8 +331,22 @@ mod tests {
         );
         assert_eq!(
             render_claude_json(None, &[]),
-            json!({ "hasCompletedOnboarding": true, "projects": {} })
+            json!({
+                "hasCompletedOnboarding": true,
+                "hasSeenAutoDefaultNudge": true,
+                "projects": {}
+            })
         );
+    }
+
+    #[test]
+    fn claude_json_declines_the_auto_mode_default_nudge() {
+        // claude 2.1.282+ asks once whether to make auto mode the default
+        // when settings.json sets another defaultMode (#73). An unattended
+        // agent has nobody to answer, so the seed carries the "No": the key
+        // a by-hand decline wrote to .claude.json under claude 2.1.283.
+        let v = render_claude_json(None, &[]);
+        assert_eq!(v["hasSeenAutoDefaultNudge"], true);
     }
 
     fn creds() -> CredentialBundle {

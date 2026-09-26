@@ -12,6 +12,14 @@
   (or `--keep-repos`) and `up`. From 0.2.0 only an agent's assigned branch
   survives `down --keep-repos`, a removal or a `branch` change; other local
   branches and the working tree go with the clone.
+- The pinned `claude` is now 2.1.283. From that version an interactive
+  session starts in auto mode unless a settings file sets
+  `permissions.defaultMode`, so an agent whose fleet and host settings set
+  none now runs under the auto-mode classifier rather than in manual mode.
+  Set `permissions.defaultMode` in the fleet's `settings` (or your host
+  `~/.claude/settings.json`, which every agent inherits) to choose. The
+  one-time "Make auto mode your default permission mode?" offer that
+  2.1.282 added is declined in the agent's seeded `.claude.json` (#73).
 
 ## 0.1.1 - 2026-09-23
 

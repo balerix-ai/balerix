@@ -5,7 +5,9 @@
 # What it settles (spec §8.1 rows): SessionStart command hook with the profile
 # environment (relay → Ready), HTTP hooks to loopback http:// with the literal
 # header (event counts after one prompt), which `.claude.json` copy Claude
-# read, whether onboarding appeared, and HOME relocation (nono's own $HOME).
+# read, whether any first-start dialog appeared (login, onboarding, folder
+# trust, or the "Make auto mode your default permission mode?" offer that
+# claude 2.1.282 added; #73), and HOME relocation (nono's own $HOME).
 #
 # Your real $HOME stays: the client needs ~/.claude for credentials and the
 # host settings layer. Only the three XDG roots move: config and state to
@@ -208,7 +210,7 @@ else
   say ">>> detach with Ctrl-b then d, and come back here."
   ONBOARD=""
   while [ -z "$ONBOARD" ]; do
-    printf '>>> Did Claude show a login, onboarding or trust prompt before its normal prompt? [y/n] '
+    printf '>>> Did Claude show a login, onboarding, trust or "auto mode as default" prompt before its normal prompt? [y/n] '
     read -r ONBOARD < /dev/tty
     case "$ONBOARD" in y|Y|n|N) ;; *) ONBOARD="" ;; esac
   done
@@ -217,7 +219,7 @@ fi
 
 hr "B. HTTP hooks to loopback http:// with the literal header (counts after one prompt)"
 metrics
-hr "C. which .claude.json copy Claude read (newest mtime wins); onboarding seen: $ONBOARD"
+hr "C. which .claude.json copy Claude read (newest mtime wins); first-start dialog seen: $ONBOARD"
 stat_mtime "$AGENT_DIR/home/.claude.json"
 stat_mtime "$AGENT_DIR/home/.claude/.claude.json"
 say "home/.claude contents:"; ls -la "$AGENT_DIR/home/.claude" 2>/dev/null | sed 's/^/  /'

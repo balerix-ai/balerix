@@ -98,7 +98,11 @@ credentials, hook input, or sandbox rules.
   (nono grants `/tmp` by default, which would make escape assertions vacuous).
 - The embedded default tool table is `include_str!("../../../mise.toml")` in
   `balerix-runtime/src/toolchain.rs`; bumping `claude` or `gh` in `mise.toml`
-  changes what agents get.
+  changes what agents get. Bump `claude` and run `mise run verify-claude`:
+  every first-start dialog it suppresses (`render_claude_json` in
+  `home.rs`: onboarding, folder trust, the auto-mode default offer) is an
+  undocumented `.claude.json` key that a new version can rename or re-arm,
+  and `dev fake-claude` models none of them, so the e2e cannot catch it.
 - The matrix plugin answers `AskUserQuestion` by counting rows and pressing
   Down and Enter (`plugins/common/src/question.rs::plan`). That encodes
   Claude Code's dialog layout, which no API promises. The property test

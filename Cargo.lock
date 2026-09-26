@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "balerix"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-api"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-config"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "balerix-api",
  "balerix-core",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "balerix-api",
  "hex",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-plugin-sdk"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "axum",
  "balerix-api",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-runtime"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "balerix-api",
  "balerix-core",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-server"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "axum",
  "balerix-api",

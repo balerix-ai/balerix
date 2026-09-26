@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0 - 2026-09-26
+
+### Features
+
+- **core:** Plugin-managed fleets, owned records and a per-agent branch (Spec L)
+- **runtime:** [**breaking**] A private clone per agent (Spec N) (#66)
+
+### Bug fixes
+
+- **cli_serve:** Poll for the pid file as well as the endpoint on SIGTERM (#55)
+- **runtime:** Detect a changed agent branch against a marker, not HEAD (#65)
+- **runtime:** Decline claude's auto-mode default offer in the seeded .claude.json (#75)
+- **core:** Stop and refuse a 0.1.x agent at the first pass; a failed step gets the phase `failed` (#76)
+
 ### Upgrading
 
 - 0.2.0 gives every agent a private clone (Spec N). Before upgrading,

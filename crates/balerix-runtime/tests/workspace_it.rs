@@ -1079,10 +1079,10 @@ fn removal_harvests_head_without_a_marker_and_skips_what_is_not_there() {
     assert!(!d.workspace.exists());
 }
 
-/// The cache is a `--no-checkout` clone: its HEAD still sits on
-/// `refs/heads/<default>`. A branch the agent is assigned that happens to
-/// be the cache's default branch must be harvestable too — by HEAD (no
-/// marker) and by the marker — not wedge the removal (`--update-head-ok`).
+/// A branch the agent is assigned that happens to be the remote's default
+/// branch must be harvestable too — by HEAD (no marker) and by the marker —
+/// not wedge the removal: the cache's HEAD is detached, so no fetch into
+/// the cache meets the branch HEAD names.
 #[test]
 fn a_branch_the_cache_has_checked_out_is_harvested_too() {
     let Some(tools) = support::tools() else {
@@ -1128,10 +1128,9 @@ fn a_branch_the_cache_has_checked_out_is_harvested_too() {
     assert_eq!(git(&crew.repo, &["rev-parse", "refs/heads/main"]), sha_b);
 
     assert_no_auto_gc(&crew);
-    assert_eq!(
-        git(&crew.repo, &["symbolic-ref", "HEAD"]).trim(),
-        "refs/heads/main",
-        "the fix updated the ref under HEAD rather than detaching it"
+    assert!(
+        !git_ok(&crew.repo, &["symbolic-ref", "-q", "HEAD"]),
+        "the cache's HEAD stays detached: nothing names the harvested branch"
     );
 }
 
@@ -1553,6 +1552,57 @@ fn an_agent_on_the_default_branch_materializes() {
         git(&paths.workspace, &["rev-parse", "HEAD"]),
         newest,
         "origin's newer tip, not the cache's older copy"
+    );
+    assert_no_auto_gc(&crew);
+}
+
+/// #69: the cache's own `refs/heads/<default>` is the tip when the cache
+/// was cloned, never a harvest. Once origin force-pushes its default
+/// branch past it, that copy is no ancestor of `origin/main` and, read as
+/// a harvest, seeds every clone on `branch: main` with history origin
+/// abandoned. So the cache is made with a detached HEAD and no local
+/// default branch: everything under its `refs/heads` is a harvest.
+#[test]
+fn a_force_pushed_default_branch_does_not_seed_from_the_cache() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-force-pushed-default");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+
+    // origin rewrites `main` past the clone-time tip
+    let work = root.join("upstream-work");
+    git(&work, &["commit", "-q", "--amend", "-m", "init, rewritten"]);
+    let upstream = root.join("upstream.git").display().to_string();
+    git(&work, &["push", "-q", "--force", &upstream, "main"]);
+    let rewritten = git(&work, &["rev-parse", "HEAD"]);
+
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "main", "main")
+        .unwrap();
+    assert_eq!(
+        git(&paths.workspace, &["rev-parse", "HEAD"]),
+        rewritten,
+        "the new origin/main, not the cache's clone-time copy"
+    );
+    assert!(
+        git(&crew.repo, &["branch", "--list", "main"])
+            .trim()
+            .is_empty(),
+        "the cache keeps no clone-time default branch"
+    );
+    assert!(
+        !git_ok(&crew.repo, &["symbolic-ref", "-q", "HEAD"]),
+        "the cache's HEAD is detached"
     );
     assert_no_auto_gc(&crew);
 }

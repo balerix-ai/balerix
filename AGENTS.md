@@ -363,9 +363,11 @@ credentials, hook input, or sandbox rules.
   resync cadence. The workspace diff base is still `origin/<crew ref>`.
   `branch: <default branch>` works: a fresh `--no-checkout` clone already
   has that branch with HEAD on it, hence `checkout -B` and the seed
-  fetch's `--update-head-ok` and `+` in `create_clone`; and the cache's
-  own copy of it (stale since the cache was cloned) seeds nothing, since
-  only a cache copy holding commits `origin/<branch>` lacks is a seed.
+  fetch's `--update-head-ok` and `+` in `create_clone`. The cache keeps
+  no copy of its own: `ensure_repo` detaches the cache's HEAD and deletes
+  the clone-time default branch, so every branch in the cache is a
+  harvest (#69), and a harvest seeds only while it holds commits
+  `origin/<branch>` lacks.
 - Every agent's `workspace/` is a private clone (Spec N); the crew's
   `repo/` is an object cache the daemon alone writes (`gc.auto=0`, every
   daemon fetch `--no-auto-gc`, never pruned) and agents read through

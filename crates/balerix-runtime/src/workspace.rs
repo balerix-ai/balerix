@@ -299,9 +299,11 @@ impl Workspace<'_> {
     /// The crew's object cache (Spec N §3): a `--no-checkout` clone, made
     /// when absent, with `gc.auto=0` so that git never gcs it on its own —
     /// a clone borrowing objects from it is only safe while the cache
-    /// never loses one. A cache that exists is left alone, so a
-    /// steady-state pass costs no git call (Phase 3 spec §6.1);
-    /// `ensure_clone` fetches when it actually needs `origin/<ref>`.
+    /// never loses one — and with its HEAD detached and the clone-time
+    /// default branch deleted (`detach_cache_head`). A cache that exists
+    /// is left alone, so a steady-state pass costs no git call (Phase 3
+    /// spec §6.1); `ensure_clone` fetches when it actually needs
+    /// `origin/<ref>`.
     pub fn ensure_repo(
         &self,
         id: &str,
@@ -331,6 +333,37 @@ impl Workspace<'_> {
             ],
         )?;
         self.git(id, crew, &["-C", &cache, "config", "gc.auto", "0"])?;
+        self.detach_cache_head(id, crew)
+    }
+
+    /// A `--no-checkout` clone still has the remote's default branch under
+    /// `refs/heads`, with HEAD on it. That copy is the tip at clone time,
+    /// which `fetch` never moves, so once origin force-pushes past it the
+    /// seed in `create_clone` would take it for a harvest holding commits
+    /// origin lacks (#69). The cache has no working tree for HEAD to
+    /// serve: detach it and delete the branch, so that everything under
+    /// the cache's `refs/heads` is a harvest, and no fetch into the cache
+    /// ever meets the branch HEAD names. An unborn HEAD (an empty remote)
+    /// has no branch to delete.
+    fn detach_cache_head(&self, id: &str, crew: &CrewPaths) -> Result<(), MaterializeError> {
+        let cache = crew.repo.display().to_string();
+        let head = self.git(id, crew, &["-C", &cache, "symbolic-ref", "HEAD"])?;
+        let head = head.trim();
+        let sha = self.git(
+            id,
+            crew,
+            &["-C", &cache, "for-each-ref", "--format=%(objectname)", head],
+        )?;
+        let sha = sha.trim();
+        if sha.is_empty() {
+            return Ok(());
+        }
+        self.git(
+            id,
+            crew,
+            &["-C", &cache, "update-ref", "--no-deref", "HEAD", sha],
+        )?;
+        self.git(id, crew, &["-C", &cache, "update-ref", "-d", head])?;
         Ok(())
     }
 
@@ -522,10 +555,9 @@ impl Workspace<'_> {
                 &["-C", &cache, "rev-parse", "--verify", "--quiet", &refname],
             )
             .is_ok();
-        // The cache's copy is worth seeding from only while it holds
-        // commits `origin/<branch>` lacks. The cache's own default branch
-        // is the tip at the time the cache was cloned (fetch never moves
-        // it), and a harvested branch the agent pushed is behind origin's
+        // The cache's copy is a harvest (`ensure_repo` keeps no other
+        // branch there), worth seeding from only while it holds commits
+        // `origin/<branch>` lacks: one the agent pushed is behind origin's
         // once someone else pushes on top of it.
         let contained = cached
             && self
@@ -609,14 +641,9 @@ impl Workspace<'_> {
     /// rebase. A branch the clone does not have (deleted by the agent) is
     /// skipped.
     ///
-    /// `--update-head-ok`: the cache is a `--no-checkout` clone, so its
-    /// HEAD sits on the default branch with no checkout to disturb — an
-    /// empty index and tree that nobody runs `status` over. Without the
-    /// flag, a fetch into the ref HEAD points at is refused outright
-    /// (`refusing to fetch into branch … checked out`), which would wedge
-    /// every removal of an agent assigned the default branch. Spec N-4
-    /// (every assigned branch is harvested, or the removal fails loudly)
-    /// outranks the spec text's exact argv here.
+    /// The cache's HEAD is detached (`ensure_repo`), so a harvest of the
+    /// default branch is a fetch like any other: git refuses to fetch into
+    /// the branch HEAD names, and there is none.
     ///
     /// The remote is `workspace/.git`, served by `upload-pack --strict`:
     /// without `--strict`, upload-pack tries `<path>/.git` before `<path>`,
@@ -650,7 +677,6 @@ impl Workspace<'_> {
                 "fetch",
                 "--quiet",
                 "--no-auto-gc",
-                "--update-head-ok",
                 &format!(
                     "--upload-pack='{}' upload-pack --strict",
                     self.tools.git.display().to_string().replace('\'', "'\\''")

@@ -260,12 +260,12 @@ directory, not a repository.
   harvests nothing. `remove_crew` harvests only when `keep.repos`: plain
   `down` and `--purge` delete the cache too, so there is nothing to
   harvest into and a broken clone cannot wedge a purge.
-- The harvest fetch carries `--update-head-ok`: the cache's HEAD is the
-  symbolic ref of the default branch (`clone --no-checkout`), and git
-  refuses to fetch into the branch HEAD names without it. The cache has
-  no checkout or index for the flag to disturb; N-4 (every assigned
-  branch is harvested) outranks §5's exact argv. `workspace_it` proves a
-  harvest of `main` by both routes (marker, and HEAD with no marker).
+- The harvest fetch carried `--update-head-ok` at first: the cache's HEAD
+  was the symbolic ref of the default branch (`clone --no-checkout`), and
+  git refuses to fetch into the branch HEAD names without it. Superseded
+  by the 2026-09-26 bullet below: the cache's HEAD is detached, and the
+  flag is gone from the harvest. `workspace_it` proves a harvest of
+  `main` by both routes (marker, and HEAD with no marker).
 - A seeded branch is given `origin/<branch>` as its upstream when the
   remote has it, as `checkout -b <branch> origin/<branch>` gives a fresh
   one (the Spec L PR case after a removal).
@@ -327,3 +327,19 @@ directory, not a repository.
   (`a_promisor_remote_in_the_clone_fetches_nothing_and_runs_nothing`)
   proves neither the fetch nor the program happens and the harvest brings
   nothing foreign into the cache.
+- 2026-09-26 (#69): the cache's own `refs/heads/<default>` — the tip when
+  the cache was cloned, never moved by `fetch` — passed the refined seed
+  rule above once origin force-pushed its default branch past it: no
+  longer an ancestor of `origin/<default>`, it read as a harvest holding
+  commits origin lacks, and seeded every new clone on `branch: <default>`
+  with history origin had abandoned. `ensure_repo` now detaches the
+  cache's HEAD and deletes that branch right after the clone
+  (`detach_cache_head`), so everything under the cache's `refs/heads` is
+  a harvest and the seed rule needs no special case for the cache's own
+  copy; the harvest fetch no longer needs `--update-head-ok` (the seed
+  fetch keeps it: that one runs in the fresh clone, whose HEAD is on the
+  default branch). A cache that already exists is left as it is: there
+  is no released cache to convert. `workspace_it`
+  (`a_force_pushed_default_branch_does_not_seed_from_the_cache`) proves
+  the new clone sits on the rewritten `origin/main` with no `main` and a
+  detached HEAD in the cache.

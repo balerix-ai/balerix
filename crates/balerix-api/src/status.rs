@@ -47,6 +47,9 @@ pub enum AgentPhase {
     Materializing,
     Starting,
     Ready,
+    /// The last `Materialize` or `Start` step errored (the message says
+    /// why); retried every pass, and cleared by the next success.
+    Failed,
     Dead,
     Stopped,
 }

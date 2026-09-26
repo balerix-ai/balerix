@@ -229,8 +229,9 @@ makes an existing remote branch its clone's branch and start point
   drop unpushed agent commits on every re-`up` after `down --keep-repos`.
 - **Harvest is a fetch from the cache, not a push from the clone.** Before
   a clone is deleted its assigned branch (the `.branch` marker's) is
-  fetched into the cache, `+`-forced, by a git run *in the cache*,
-  `--update-head-ok` because the cache's HEAD names the default branch; a
+  fetched into the cache, `+`-forced, by a git run *in the cache* (whose
+  HEAD is detached, so no branch there is the one git refuses to fetch
+  into, and whose `refs/heads` hold harvests and nothing else); a
   push run in the clone would honour the clone's own config, and an
   `url.<x>.insteadOf` there could aim the daemon's push at another crew's
   cache. A new clone for a branch the cache holds seeds from it, so

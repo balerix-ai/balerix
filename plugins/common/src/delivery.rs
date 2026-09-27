@@ -315,7 +315,6 @@ mod tests {
         let mut d = Deliveries::default();
         d.on_event(&submit("earlier work"), now); // mid-turn (nothing pending yet)
         d.sent("f/c/a", "x", 1, now, W);
-        d.on_event(&submit("earlier work"), now);
         assert!(
             d.expire(now + Duration::from_secs(600)).is_empty(),
             "mid-turn"
@@ -324,6 +323,24 @@ mod tests {
         d.on_event(&stop(), stopped);
         assert!(d.expire(stopped + Duration::from_secs(29)).is_empty());
         assert_eq!(d.expire(stopped + Duration::from_secs(30)), vec![1]);
+    }
+
+    #[test]
+    fn a_turn_that_began_before_the_first_send_still_holds_the_window() {
+        // The agent was never sent to, so the tracker has no state for it
+        // when its `UserPromptSubmit` arrives; the turn must be recorded
+        // anyway, or a prompt routed mid-turn expires while Claude works.
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.on_event(&submit("earlier work"), now);
+        d.sent("f/c/a", "x", 1, now, W);
+        assert!(
+            d.expire(now + Duration::from_secs(600)).is_empty(),
+            "mid-turn"
+        );
+        let stopped = now + Duration::from_secs(600);
+        d.on_event(&stop(), stopped);
+        assert_eq!(d.expire(stopped + W), vec![1]);
     }
 
     #[test]

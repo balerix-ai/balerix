@@ -820,8 +820,10 @@ impl Daemon {
     /// checked first (reserved, and a `name` in the file must equal the
     /// path's), then the owner (cheaply, so a foreign fleet costs no
     /// resolve; `apply_as` checks again under the fleet's lock), then the
-    /// file is resolved through the port beneath the plugin's
-    /// `fleetDefaults` and held to the restricted surface (Spec M §12.1)
+    /// plugin's `fleetDefaults` are read from the registry (a plugin it no
+    /// longer lists is refused, 409, rather than resolved without them),
+    /// then the file is resolved through the port beneath that layer and
+    /// held to the restricted surface (Spec M §12.1)
     /// (400 with the resolver's message, config path first), the
     /// operator's credentials are read now (500: an unreadable host home
     /// is the operator's problem, not the plugin's), and the spec is
@@ -844,11 +846,17 @@ impl Daemon {
         if let Some(current) = self.get(name).await {
             Self::check_owner(name, current.owner.as_deref(), &caller, false)?;
         }
+        // Fail closed: a plugin the registry no longer lists (a race with
+        // `plugin remove` or a sync) has no `fleetDefaults` to resolve
+        // beneath, and resolving without them would drop the operator's
+        // sandbox and binary. `apply_as` refuses it too, under the lock.
         let layer = self
             .registry()
             .plugin(plugin)
             .map(|p| p.fleet_defaults)
-            .unwrap_or_else(|| serde_json::json!({}));
+            .ok_or_else(|| {
+                DaemonError::Managed(format!("fleet {name}: plugin {plugin} is not installed"))
+            })?;
         let resolver = self.ports.resolver.clone();
         let resolve_name = name.clone();
         let spec =
@@ -2301,9 +2309,16 @@ mod tests {
         let report = w.daemon.sync_plugins().await.unwrap();
         assert_eq!(report.downed, vec!["f".to_string()]);
 
-        // the fleet the sync downed: not re-raised
+        // the fleet the sync downed: not re-raised, and never resolved
+        // without the plugin's `fleetDefaults` (fail closed, not `{}`)
+        let resolved = w.h.resolver.layers().len();
         let refused = DaemonError::Managed("fleet f: plugin flow is not installed".into());
         assert_eq!(manage(&w, "flow", file()).await.unwrap_err(), refused);
+        assert_eq!(
+            w.h.resolver.layers().len(),
+            resolved,
+            "an unlisted plugin's file never reaches the resolver"
+        );
         let f = w.daemon.get(&"f".parse().unwrap()).await.unwrap();
         assert!(matches!(f.desired, Desired::Down { .. }), "{:?}", f.desired);
         assert_eq!(f.owner.as_deref(), Some("flow"));

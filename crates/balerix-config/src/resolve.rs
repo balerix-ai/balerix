@@ -406,32 +406,45 @@ crews:
     }
 
     #[test]
-    fn restricted_mode_refuses_a_null_ancestor_that_would_delete_the_hosts_keys() {
-        let yaml = "apiVersion: balerix/v1\nkind: Fleet\nname: f\ndefaults:\n  claude: null\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a: {}\n";
-        let operator = json!({ "claude": { "binary": "/opt/balerix" } });
-        assert_eq!(
-            resolve(
-                &file(yaml),
+    fn restricted_mode_refuses_a_non_mapping_ancestor_that_would_replace_the_hosts_keys() {
+        // a null deletes the operator's binary; a sequence replaces the
+        // operator's `claude` and deserializes by position, so the file
+        // chooses the binary
+        for (claude, unrestricted_binary) in [
+            ("null", "claude"),
+            ("[{}, [], false, /tmp/evil]", "/tmp/evil"),
+        ] {
+            let yaml = format!(
+                "apiVersion: balerix/v1\nkind: Fleet\nname: f\ndefaults:\n  claude: {claude}\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a: {{}}\n"
+            );
+            let operator = json!({ "claude": { "binary": "/opt/balerix", "args": ["--safe"] } });
+            assert_eq!(
+                resolve(
+                    &file(&yaml),
+                    &ResolveOptions {
+                        operator_layer: Some(operator.clone()),
+                        ..restricted()
+                    }
+                )
+                .unwrap_err()
+                .to_string(),
+                "defaults.claude: not allowed in a plugin-applied fleet file; the host's default applies",
+                "{claude}"
+            );
+            // unrestricted, the same file resolves, overriding the operator
+            let spec = resolve(
+                &file(&yaml),
                 &ResolveOptions {
-                    operator_layer: Some(operator.clone()),
-                    ..restricted()
-                }
+                    operator_layer: Some(operator),
+                    ..opts()
+                },
             )
-            .unwrap_err()
-            .to_string(),
-            "defaults.claude: not allowed in a plugin-applied fleet file; the host's default applies"
-        );
-        // unrestricted, the same file resolves, the null deleting the
-        // operator's binary
-        let spec = resolve(
-            &file(yaml),
-            &ResolveOptions {
-                operator_layer: Some(operator),
-                ..opts()
-            },
-        )
-        .unwrap();
-        assert_eq!(spec.crews["c"].agents["a"].claude.binary, "claude");
+            .unwrap();
+            assert_eq!(
+                spec.crews["c"].agents["a"].claude.binary, unrestricted_binary,
+                "{claude}"
+            );
+        }
     }
 
     #[test]

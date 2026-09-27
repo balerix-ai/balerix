@@ -354,4 +354,7 @@ the resolved plugin's hash, so the daemon restarts the plugin on its next
 sync to pick up the new value. An entry may also carry `fleetDefaults`,
 the settings layer beneath every fleet the plugin applies (§3, `PUT
 fleets/{name}`); unlike `secrets` it is not part of the plugin's restart
-hash, so an edit takes effect at the plugin's next apply. The sync checks its shape (a mapping, or null for none, shaped like an agent settings block) and fails with the entry's path, so a typo there is not blamed on the plugin's file.
+hash, so an edit takes effect at the plugin's next apply. The sync
+checks its shape (a mapping, or null for none, shaped like an agent
+settings block) and fails with the entry's path, so a typo there is not
+blamed on the plugin's file.

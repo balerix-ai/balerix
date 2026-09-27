@@ -2,10 +2,12 @@
 //! M §12.1): the file cannot choose what its agents run as. Checked on
 //! each raw layer before merging, so the host's own `settings.json` and
 //! the operator's `fleetDefaults`, which may carry these keys, are never
-//! read here. A present ancestor of a refused key set to null (`claude:
-//! null`) is refused too: merging treats null as "delete this subtree",
-//! so it would strip the keys beneath from the host's and operator's
-//! layers.
+//! read here. A present ancestor of a refused key that is not a mapping
+//! (null, a sequence, a scalar: `claude: null`, `claude: []`) is refused
+//! too: merging treats null as "delete this subtree" and lets any other
+//! non-mapping replace the lower layers' mapping (and serde reads a
+//! struct from a sequence by position), so it would strip or choose the
+//! keys beneath.
 
 use serde_json::Value;
 
@@ -26,9 +28,10 @@ const WHY: &str = "not allowed in a plugin-applied fleet file; the host's defaul
 /// Refuses `layer` (a `defaults`, crew `defaults` or agent block, already
 /// known to be a mapping or null) when it carries a refused key,
 /// present with any value including null, or a present ancestor of one
-/// set to null (`claude`, `claude.settings`), which would delete the
-/// lower layers' keys beneath it. The message names `<path>.<key>`, the
-/// ancestor's key for a null ancestor.
+/// (`claude`, `claude.settings`) that is not a mapping (null, a
+/// sequence, a scalar), which would delete or replace the lower layers'
+/// keys beneath it. The message names `<path>.<key>`, the ancestor's key
+/// for a non-mapping ancestor.
 pub fn check_layer(path: &str, layer: &Value) -> Result<(), ConfigError> {
     let refused = |key: &str| ConfigError::Invalid {
         path: format!("{path}.{key}"),
@@ -46,7 +49,7 @@ pub fn check_layer(path: &str, layer: &Value) -> Result<(), ConfigError> {
             let Some(found) = layer.pointer(&format!("/{}", prefix.join("/"))) else {
                 break;
             };
-            if depth == segments.len() || found.is_null() {
+            if depth == segments.len() || !found.is_object() {
                 return Err(refused(&prefix.join(".")));
             }
         }
@@ -124,6 +127,40 @@ mod tests {
         );
         // a present ancestor that is a mapping is how allowed keys get set
         check_layer("defaults", &json!({ "claude": { "settings": {} } })).unwrap();
+        check_layer("defaults", &json!({ "claude": { "resume": null } })).unwrap();
+    }
+
+    #[test]
+    fn a_non_mapping_ancestor_of_a_refused_key_is_refused_at_the_ancestor() {
+        // merge replaces the lower layers' mapping with a sequence or a
+        // scalar, and serde reads a struct from a sequence by position, so
+        // `claude: [{}, [], false, "/tmp/evil"]` would choose the binary
+        let cases = [
+            (json!({ "claude": [] }), "defaults.claude"),
+            (
+                json!({ "claude": [{}, [], false, "/tmp/evil"] }),
+                "defaults.claude",
+            ),
+            (json!({ "claude": 3 }), "defaults.claude"),
+            (
+                json!({ "claude": { "settings": [] } }),
+                "defaults.claude.settings",
+            ),
+        ];
+        for (layer, at) in cases {
+            let e = check_layer("defaults", &layer).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "{at}: not allowed in a plugin-applied fleet file; the host's default applies"
+                )
+            );
+        }
+        check_layer(
+            "defaults",
+            &json!({ "claude": { "settings": { "model": "opus" }, "resume": true } }),
+        )
+        .unwrap();
         check_layer("defaults", &json!({ "claude": { "resume": null } })).unwrap();
     }
 

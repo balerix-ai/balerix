@@ -28,7 +28,8 @@ credentials, hook input, or sandbox rules.
   (`HOME` is overridden, so it never touches your real state).
 - `verify-claude` — the interactive spec §8.1 check with a real `claude`
   (`scripts/verify-claude.sh`); `BALERIX_VERIFY_FAKE=1` self-tests it with
-  `dev fake-claude`. Its data root (`target/tmp/verify-data`, the daemon
+  `dev fake-claude`. Its last section sends `/exit` the way `send_text`
+  does and reports whether the session ended (#41). Its data root (`target/tmp/verify-data`, the daemon
   pool) is kept across runs so claude downloads once per version; config and
   state under `target/tmp/verify-claude` are wiped.
 - `verify-matrix` — Spec G's manual check against a real Matrix homeserver

@@ -361,3 +361,56 @@ async fn a_non_mapping_fleet_defaults_fails_the_sync_with_its_path() {
         "plugins.yaml: plugins[2].fleetDefaults: expected a mapping"
     );
 }
+
+/// Spec M §12.2 (M-14): the record carries the resolved spec with the
+/// host's settings folded in, so it goes only to a plugin that may read
+/// records; a manage-only plugin gets 204 and nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manage_only_plugin_gets_204_and_a_fleets_plugin_the_record() {
+    let w = world_with(&[
+        ("silent", "needs: [manage]\n"),
+        ("gh", "needs: [fleets, manage]\n"),
+    ])
+    .await;
+    let _silent = start_silent(&w, "silent").await;
+    let _gh = start_silent(&w, "gh").await;
+    w.h.resolver.set(Ok(spec("f")));
+    let (s, v) = w.api.plugin(
+        &token(&w, "silent").await,
+        "PUT",
+        "/v1/plugin-host/fleets/f",
+        Some(&json!({ "file": file("f") })),
+    );
+    assert_eq!((s, v), (204, Value::String(String::new())));
+    assert_eq!(
+        w.daemon.get(&"f".parse().unwrap()).await.map(|r| r.owner),
+        Some(Some("silent".into())),
+        "applied all the same"
+    );
+    w.h.resolver.set(Ok(spec("g")));
+    let (s, v) = w.api.plugin(
+        &token(&w, "gh").await,
+        "PUT",
+        "/v1/plugin-host/fleets/g",
+        Some(&json!({ "file": file("g") })),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["owner"], "gh");
+    assert_eq!(v["spec"]["name"], "g");
+}
+
+/// Review focus 4: the gate is on the success answer only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manage_only_plugin_still_gets_the_400_with_its_message() {
+    let w = world_with(&[("silent", "needs: [manage]\n")]).await;
+    let _silent = start_silent(&w, "silent").await;
+    let bad = "crews.c.defaults.sandbox: not allowed in a plugin-applied fleet file; the host's default applies";
+    w.h.resolver.set(Err(bad.into()));
+    let (s, v) = w.api.plugin(
+        &token(&w, "silent").await,
+        "PUT",
+        "/v1/plugin-host/fleets/f",
+        Some(&json!({ "file": file("f") })),
+    );
+    assert_eq!((s, v["error"].as_str()), (400, Some(bad)));
+}

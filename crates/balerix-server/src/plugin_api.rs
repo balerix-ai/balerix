@@ -128,14 +128,14 @@ fn manage_name(name: Result<Path<String>, PathRejection>) -> Result<FleetName, A
 }
 
 /// `PUT fleets/{name}` (Spec L §3.1): an unresolved fleet file becomes a
-/// fleet this plugin owns. `manage` gates it; the name, the owner and
-/// the file's resolution are `Daemon::manage_fleet`'s.
+/// fleet this plugin owns. `manage` gates it; the answer is the record for
+/// a caller with `fleets`, 204 otherwise (Spec M §12.2).
 async fn put_fleet(
     State(state): State<AppState>,
     headers: HeaderMap,
     name: Result<Path<String>, PathRejection>,
     body: Result<Json<FleetFileBody>, JsonRejection>,
-) -> Result<Json<FleetRecord>, ApiError> {
+) -> Result<Response, ApiError> {
     let plugin = caller(&state, &headers, Capability::Manage).await?;
     let name = manage_name(name)?;
     let Json(body) = body.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
@@ -145,9 +145,14 @@ async fn put_fleet(
             "file: expected a mapping",
         ));
     }
-    Ok(Json(
-        state.daemon.manage_fleet(&plugin, &name, body.file).await?,
-    ))
+    let record = state.daemon.manage_fleet(&plugin, &name, body.file).await?;
+    // Spec M §12.2: the record carries the resolved spec, host settings
+    // folded in; reading records is what `fleets` means.
+    if state.daemon.registry().has(&plugin, Capability::Fleets) {
+        Ok(Json(record).into_response())
+    } else {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    }
 }
 
 /// `DELETE fleets/{name}?…` (Spec L §3.2): the admin `DELETE`'s flags,

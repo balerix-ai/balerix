@@ -704,6 +704,9 @@ credentials or the gh token (Spec L-3).
   this subtree", so it would strip the operator's and the host's
   `binary`, `args` and `settings` from beneath. A mapping ancestor is
   fine.
+- `disableAllHooks` joined the inner list at implementation: a plugin's
+  file could otherwise silence balerix's hooks. The refused
+  `claude.settings` keys are `{env,apiKeyHelper,disableAllHooks}`.
 - `ResolveOptions::operator_layer` is the `fleetDefaults` mapping;
   `expect_mapping("fleetDefaults", …)` names it when it is not one, and
   the plugin sync refuses a non-mapping with

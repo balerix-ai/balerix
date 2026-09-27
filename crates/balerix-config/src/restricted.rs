@@ -15,9 +15,11 @@ use crate::ConfigError;
 pub const REFUSED_KEYS: [&str; 4] = ["claude.binary", "claude.args", "env", "sandbox"];
 
 /// Keys inside `claude.settings` a plugin-applied file may not set: the
-/// two that redirect where credentials go. An open set that drifts with
-/// Claude Code releases; reviewed when the pinned `claude` moves.
-pub const REFUSED_SETTINGS: [&str; 2] = ["env", "apiKeyHelper"];
+/// two that redirect where credentials go, and `disableAllHooks`, which
+/// would silence balerix's own hooks and so blind every observer and
+/// bypass every interceptor. An open set that drifts with Claude Code
+/// releases; reviewed when the pinned `claude` moves.
+pub const REFUSED_SETTINGS: [&str; 3] = ["env", "apiKeyHelper", "disableAllHooks"];
 
 const WHY: &str = "not allowed in a plugin-applied fleet file; the host's default applies";
 
@@ -75,6 +77,10 @@ mod tests {
             (
                 json!({ "claude": { "settings": { "apiKeyHelper": "curl x" } } }),
                 "claude.settings.apiKeyHelper",
+            ),
+            (
+                json!({ "claude": { "settings": { "disableAllHooks": true } } }),
+                "claude.settings.disableAllHooks",
             ),
         ];
         for (layer, key) in cases {

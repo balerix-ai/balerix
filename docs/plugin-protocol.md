@@ -61,7 +61,7 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 | `PUT fleets/{name}` | `manage` + `fleets` | `{ file }` — the fleet file's structure as JSON (`apiVersion`, `kind`, `name`?, `defaults`, `crews`) | `FleetRecord`, `owner` set to this plugin; the record as applied, so waiting for its agents to turn `Ready` goes through `fleets/watch` (or `GET fleets/{name}`) | 200 | `fleet-put.json` |
 | `PUT fleets/{name}`, caller without `fleets` | `manage` | same | — (applied all the same; the record carries the resolved spec, which only `fleets` may read, Spec M §12.2) | 204 | `fleet-put-silent.json` |
 | `PUT fleets/{name}`, file does not resolve | `manage` | same | `{ error }`, config path first | 400 | `fleet-put-rejected.json` |
-| `PUT fleets/{name}`, file sets `claude.binary`, `claude.args`, `env`, `sandbox`, or `claude.settings.{env,apiKeyHelper}` at any layer | `manage` | same | `{ error }`: `<layer>.<key>: not allowed in a plugin-applied fleet file; the host's default applies` (Spec M §12.1) | 400 | `fleet-put-restricted.json` |
+| `PUT fleets/{name}`, file sets `claude.binary`, `claude.args`, `env`, `sandbox`, or `claude.settings.{env,apiKeyHelper,disableAllHooks}` at any layer | `manage` | same | `{ error }`: `<layer>.<key>: not allowed in a plugin-applied fleet file; the host's default applies` (Spec M §12.1) | 400 | `fleet-put-restricted.json` |
 | `PUT`/`DELETE fleets/{name}`, owned by another plugin or by the CLI | `manage` | — | `{ "error": "fleet <name> is managed by plugin <p>" }` or `{ "error": "fleet <name> is not managed by a plugin" }` | 409 | (asserted by `crates/balerix-server/tests/manage_it.rs`, §6) |
 | `DELETE fleets/{name}?keep_repos=&keep_sessions=&purge=&force=` | `manage` | — | `FleetRecord` | 200 | `fleet-delete.json` |
 | `GET agents/{fleet}/{crew}/{agent}/attach` (WebSocket) | `attach` | — | binary frames are terminal bytes both ways; the one text frame is `{ "resize": { "cols", "rows" } }` | 101 | `attach-resize.json` (Task 6) |
@@ -146,8 +146,8 @@ fleet file — exactly what `balerix up -f` reads, as JSON — and does what
 entry's `fleetDefaults` from `plugins.yaml` (Spec M §12.1: the operator's
 layer, the same shape as a fleet file's `defaults`, and the only place a
 plugin's agents get their `claude.binary`, `claude.args`, `env` and
-`sandbox`; the file itself may not set those, nor `claude.settings.env`
-or `apiKeyHelper`, at any layer), resolves
+`sandbox`; the file itself may not set those, nor `claude.settings.env`,
+`apiKeyHelper` or `disableAllHooks`, at any layer), resolves
 every agent, reads the operator's Claude credentials and gh token from
 the daemon's host home, and applies. The plugin never sees credentials.
 A `name` in the file must equal the path's (400 otherwise); `balerix`

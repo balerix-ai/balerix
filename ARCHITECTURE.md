@@ -179,7 +179,7 @@ a fleet from an unresolved fleet file — `PUT
 `FleetResolver` port, beneath the entry's `fleetDefaults` from
 `plugins.yaml` and held to the restricted surface (Spec M §12.1: a
 plugin's file cannot set `claude.binary`, `claude.args`, `env`,
-`sandbox` or `claude.settings.{env,apiKeyHelper}`; those are the
+`sandbox` or `claude.settings.{env,apiKeyHelper,disableAllHooks}`; those are the
 operator's, per plugin), reads the operator's credentials through
 `CredentialSource`, and applies. The record carries the plugin as its
 `owner`; the admin routes refuse an owned fleet (409) except `down

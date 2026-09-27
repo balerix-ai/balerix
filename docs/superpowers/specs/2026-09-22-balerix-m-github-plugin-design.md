@@ -45,7 +45,7 @@ from two files in version control.
 | M-10 | A session ends on **close or merge**, and on an **idle timeout**; ending **removes the agent** from the fleet. | Removing frees the sandbox and tmux window; the branch survives in the crew cache (harvested from the clone at removal, Spec N §5) and seeds the clone on the next mention, which starts a fresh Claude session told where the earlier work is. Claude's own session does not survive removal (the home is deleted); that is the accepted cost of not holding idle sandboxes open. |
 | M-11 | The actor is generic over a **`GitHubPort`** with a recording fake; the listener enqueues and answers 202. | Spec G-13 and G-11: the ordering rules are unit-tested without GitHub, and a slow API never stalls hook delivery. |
 | M-12 | A thin `reqwest` client, not `octocrab`. | About ten endpoints; a small tree in a standalone project that already carries TLS. |
-| M-13 | **A plugin-applied fleet file cannot choose what runs, its environment or its sandbox**: the daemon's resolver refuses `claude.binary`, `claude.args`, `env`, `sandbox` and, inside `claude.settings`, `env` and `apiKeyHelper`, at every layer (#64). | The file this plugin applies is the repository's, written by anyone with write on the default branch. M-2 already lets such a person prompt an agent that holds the operator's credentials; letting the file pick the binary or widen the sandbox would let them run anything with those credentials, with neither Claude nor the sandbox in the loop. Enforced in the daemon, not the plugin, so the bound holds against the plugin too. |
+| M-13 | **A plugin-applied fleet file cannot choose what runs, its environment or its sandbox**: the daemon's resolver refuses `claude.binary`, `claude.args`, `env`, `sandbox` and, inside `claude.settings`, `env` and `apiKeyHelper`, at every layer (#64). The operator sets them per plugin in `plugins.yaml` (`fleetDefaults`). | The file this plugin applies is the repository's, written by anyone with write on the default branch. M-2 already lets such a person prompt an agent that holds the operator's credentials; letting the file pick the binary or widen the sandbox would let them run anything with those credentials, with neither Claude nor the sandbox in the loop. Enforced in the daemon, not the plugin, so the bound holds against the plugin too. |
 | M-14 | **`PUT fleets/{name}` answers the record only to a plugin with `fleets`**, 204 otherwise (#64). | The record carries the resolved spec with the host's `settings.json` folded in; reading records is what `fleets` means. |
 | M-15 | **A reaction says what the plugin knows**: "sent" on `send_text`'s `Ok`, confirmed on the agent's matching `UserPromptSubmit`, a note when neither comes in time; shared with matrix through common (#85). | `Ok` means the daemon typed into the pane. A reader takes ✓ as "the agent is on it", and an open dialog or a mid-turn queue makes that false. The hook the plugin already observes is the proof. |
 
@@ -523,6 +523,20 @@ this plugin the check is free: §6 posts the daemon's 400 verbatim on the
 issue, so a repository whose `.balerix.yaml` sets `sandbox` sees exactly
 why nothing started.
 
+**The operator's layer.** What a plugin's agents run as is the
+operator's to set, and the place is the plugin's own entry in
+`plugins.yaml`: an optional `fleetDefaults` mapping, the same shape as a
+fleet file's `defaults`, which the daemon layers between the host's
+`settings.json` and the plugin's file for every fleet that plugin
+applies. The restricted check does not read it, since the operator wrote
+it, so it is where `claude.binary`, `claude.args`, `env` and `sandbox`
+for a plugin's agents live (the e2e's fake plugin runs `dev fake-claude`
+from there). It travels `PluginEntry` → `ResolvedPlugin` → the registry
+→ `FleetResolver::resolve(file, name, operator_layer)`; it is not part of
+the plugin's restart hash, so an edit takes effect at the plugin's next
+apply. Layer order, bottom up: host `claude.settings`, `fleetDefaults`,
+the file's `defaults`, the crew's `defaults`, the agent.
+
 ### 12.2 The `PUT` answer (M-14, #64)
 
 `PUT /v1/plugin-host/fleets/{name}` answers what `GET fleets/{name}`
@@ -610,8 +624,9 @@ credentials or the gh token (Spec L-3).
 - `balerix-config`: restricted resolution refuses each of the four keys
   at each of the three layers with the layer path in the message, and
   `claude.settings.env` and `claude.settings.apiKeyHelper`; a file that
-  sets only allowed keys resolves as before; unrestricted resolution is
-  unchanged.
+  sets only allowed keys resolves as before; the operator layer may set
+  every refused key and sits beneath the file's `defaults`; unrestricted
+  resolution is unchanged.
 - `balerix-server`: `manage_it.rs` gains the restricted rejection as a
   400 with its path, and the `PUT` answer both ways (the record with
   `fleets`, 204 without); the conformance fixtures of §12.2.

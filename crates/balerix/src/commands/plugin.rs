@@ -258,12 +258,16 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
     if args.purge {
         let client = Client::connect(args.api_url.as_deref())
             .map_err(|e| anyhow!("{e}; --purge needs a running daemon (the entry was removed)"))?;
-        // Spec L-6: `--purge` purges every fleet the plugin owns, the
-        // ones already down included, so they are listed before the sync.
-        // The daemon downs the up ones during the sync; a second, forced
-        // down with `purge` deletes their records and directories.
-        let owned = owned_fleets(&client.list()?, &args.name);
+        // Spec L-6: the daemon downs the plugin's up fleets during the
+        // sync; a second, forced down with `purge` deletes their records
+        // and directories. The set to purge is listed *after* the sync
+        // (#62): a fleet keeps its owner through a down, so the list then
+        // names every fleet the plugin owns — the ones already down, and
+        // one the still-running plugin applied while an earlier list
+        // would have been in flight — and no other plugin's, which the
+        // sync's `downed` would (it downs every undeclared owner's).
         let report = client.sync_plugins()?;
+        let owned = owned_fleets(&client.list()?, &args.name);
         let mut out = render_sync(&report);
         for fleet in &owned {
             let result = client

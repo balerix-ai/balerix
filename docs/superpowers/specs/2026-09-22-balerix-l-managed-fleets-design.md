@@ -286,9 +286,19 @@ pub branch: Option<String>,
   daemon start is covered by the same rule: the first sync, in `serve`,
   downs its fleets and logs one warning per fleet. A sync that fails
   resolving (an install failure) downs nothing. `--purge` lists the
-  plugin's fleets (`managed_by`) before the sync and purges each after it
-  with `purge` + `force` from the CLI, so a fleet that was already down
-  is purged too.
+  plugin's fleets (`managed_by`) *after* the sync and purges each with
+  `purge` + `force` from the CLI: the owner survives a down, so the list
+  names a fleet that was already down and one the plugin applied while
+  the sync was on its way (#62), and not the fleets of another
+  undeclared plugin, which `SyncReport.downed` would.
+- A plugin the registry no longer lists cannot apply (#62): `apply_as`
+  refuses `Caller::Plugin(p)` with 409 `fleet <f>: plugin <p> is not
+  installed`, under the fleet's lock, whether the fleet exists or not.
+  `PluginHost::sync` replaces the plugin set before `sync_plugins`
+  snapshots the fleets to down, so a `PUT` that passed `manage_fleet`'s
+  owner check before the removal is either finished before the sync's
+  `down_as` of its fleet (the lock orders them) or refused. A plugin's
+  `DELETE` is still honoured: it only does what the sync would.
 - `balerix_config::from_value` reads the file from JSON with
   `serde_path_to_error`, so a shape error names its key (`file` for the
   root); the daemon checks `file.name` against the path before resolving.

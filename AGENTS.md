@@ -349,7 +349,13 @@ credentials, hook input, or sandbox rules.
   sync, and the first sync at `serve` for a plugin removed while the
   daemon was stopped. The
   daemon-side rule is `Daemon::check_owner`; `apply`/`down` are the
-  admin wrappers of `apply_as`/`down_as`.
+  admin wrappers of `apply_as`/`down_as`. `apply_as` also refuses a
+  plugin caller the registry no longer lists (409 `plugin <p> is not
+  installed`): a `PUT` in flight across `plugin remove` must not
+  re-raise a fleet the sync downed (#62). A test that seeds a
+  plugin-owned fleet through `apply_as` therefore installs that plugin
+  first (`cli_fleet.rs::install_gh`). `plugin remove --purge` lists the
+  plugin's fleets after the sync, not before.
 - The resolver a plugin's fleet file goes through lives in the binary
   (`crates/balerix/src/wiring.rs::HostResolver`, both ports): it reads
   `HostPaths::discover()` at call time, so the daemon's `HOME` is the

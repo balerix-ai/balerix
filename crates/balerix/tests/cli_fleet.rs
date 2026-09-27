@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use assert_cmd::Command;
+use axum::Router;
 use balerix_api::AgentPhase;
 use balerix_core::FleetRecord;
 use balerix_core::{AgentId, PassThrough};
@@ -52,32 +53,40 @@ fn fleet_file(dir: &Path) -> PathBuf {
 }
 
 /// A daemon on port 0 over the fakes; the binary finds it through the
-/// endpoint and token files under this HOME.
+/// endpoint and token files under this HOME. The daemon's plugin config
+/// dir is this HOME's `.config/balerix`, so a `plugins.yaml` the binary
+/// edits is the one the daemon syncs.
 struct Stub {
     home: tempfile::TempDir,
     url: String,
     daemon: Arc<Daemon>,
     _stop: tokio::sync::oneshot::Sender<()>,
     _rt: tokio::runtime::Runtime,
-    /// The plugin host's (empty) config and install roots; dropped with the stub.
-    _plugin_dir: tempfile::TempDir,
 }
 
 fn stub() -> Stub {
+    stub_with(|r, _| r)
+}
+
+/// The same, with the router wrapped: a test that needs the daemon to do
+/// something *while* the binary's request is in flight layers it here.
+fn stub_with(wrap: impl FnOnce(Router, Arc<Daemon>) -> Router) -> Stub {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let h = Harness::new(Duration::from_secs(3600));
-    let plugin_dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".config/balerix");
+    fs::create_dir_all(&config).unwrap();
     let (daemon, url, stop) = rt.block_on(async {
-        let daemon = h.daemon_with_token(Arc::new(PassThrough), plugin_dir.path(), "tok");
+        let daemon = h.daemon_with_token(Arc::new(PassThrough), &config, "tok");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(serve(listener, router(daemon.clone()), async {
+        let app = wrap(router(daemon.clone()), daemon.clone());
+        tokio::spawn(serve(listener, app, async {
             let _ = rx.await;
         }));
         (daemon, url, tx)
     });
-    let home = tempfile::tempdir().unwrap();
     let server = home.path().join(".local/state/balerix/server");
     fs::create_dir_all(&server).unwrap();
     fs::write(server.join("endpoint"), &url).unwrap();
@@ -88,8 +97,25 @@ fn stub() -> Stub {
         daemon,
         _stop: stop,
         _rt: rt,
-        _plugin_dir: plugin_dir,
     }
+}
+
+/// Declares a `gh` plugin (a package under the config dir) in the
+/// `plugins.yaml` the binary and the daemon share, and syncs the daemon
+/// so `gh` is installed: only an installed plugin can own a fleet.
+fn install_gh(s: &Stub) {
+    let config = s.home.path().join(".config/balerix");
+    balerix_server::testing::write_plugin_package(
+        &config.join("gh-pkg"),
+        "gh",
+        "needs: [manage]\n",
+    );
+    fs::write(
+        config.join("plugins.yaml"),
+        "plugins:\n  - name: gh\n    source: ./gh-pkg\n",
+    )
+    .unwrap();
+    s._rt.block_on(s.daemon.sync_plugins()).unwrap();
 }
 
 fn balerix(home: &Path) -> Command {
@@ -216,6 +242,7 @@ fn a_managed_fleet_shows_its_owner_and_needs_force_to_go_down() {
     let home = s.home.path();
     let fleet = fleet_file(home);
     let fleet = fleet.to_str().unwrap();
+    install_gh(&s);
     // seeded as the daemon's manage path would leave it: owned by `gh`
     let spec = balerix_api::FleetSpec {
         name: "payments".into(),
@@ -313,6 +340,7 @@ fn plugin_remove_purge_purges_every_fleet_the_plugin_owns() {
         ..Default::default()
     };
     let gh = Caller::Plugin("gh".parse().unwrap());
+    install_gh(&s);
     s._rt.block_on(async {
         for (name, caller) in [
             ("up", &gh),
@@ -335,15 +363,6 @@ fn plugin_remove_purge_purges_every_fleet_the_plugin_owns() {
             .await
             .unwrap();
     });
-    // declared on the CLI's side; the stub daemon's own plugins.yaml is
-    // empty, so its sync reads `gh` as removed either way
-    let config = home.join(".config/balerix");
-    fs::create_dir_all(&config).unwrap();
-    fs::write(
-        config.join("plugins.yaml"),
-        "plugins:\n  - name: gh\n    source: /nowhere\n",
-    )
-    .unwrap();
 
     balerix(home)
         .args(["plugin", "remove", "gh", "--purge"])
@@ -363,6 +382,124 @@ fn plugin_remove_purge_purges_every_fleet_the_plugin_owns() {
         .map(|r| r.name)
         .collect();
     assert_eq!(names, ["mine"], "both owned fleets purged, the CLI's kept");
+}
+
+/// #62: `plugin remove --purge` used to list the plugin's fleets *before*
+/// the sync and purge that set, so a fleet the still-running plugin
+/// applied in between was downed by the sync and never purged. The list
+/// is taken after the sync now: the owner survives a down, so it names
+/// every fleet the plugin ever owned, and a fleet of *another* undeclared
+/// plugin (which the sync downs too) is not in it.
+#[test]
+fn plugin_remove_purge_purges_a_fleet_applied_during_the_sync_and_no_other_plugins() {
+    let spec = |name: &str| balerix_api::FleetSpec {
+        name: name.into(),
+        crews: BTreeMap::from([(
+            "backend".to_string(),
+            balerix_api::CrewSpec {
+                repo: "acme/payments-api".into(),
+                git_ref: "main".into(),
+                git: balerix_api::GitSettings::default(),
+                agents: BTreeMap::from([(
+                    "alice".to_string(),
+                    balerix_api::AgentSettings::default(),
+                )]),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let gh = Caller::Plugin("gh".parse().unwrap());
+    // the moment the binary's sync request arrives, `gh` applies one more
+    // fleet — after any list the binary took before the sync
+    let late_spec = spec("late");
+    let late_gh = gh.clone();
+    let s = stub_with(move |r, daemon| {
+        r.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let daemon = daemon.clone();
+                let late_spec = late_spec.clone();
+                let late_gh = late_gh.clone();
+                async move {
+                    if req.method() == axum::http::Method::POST
+                        && req.uri().path() == "/v1/plugins/sync"
+                    {
+                        daemon
+                            .apply_as(
+                                &"late".parse().unwrap(),
+                                late_spec,
+                                Default::default(),
+                                ApplyMode::Create,
+                                &late_gh,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    next.run(req).await
+                }
+            },
+        ))
+    });
+    let home = s.home.path();
+    install_gh(&s);
+    // `other` is installed for its fleet's creation, then taken out of
+    // `plugins.yaml` by hand (no purge), so the binary's sync downs its
+    // fleet as well as gh's
+    let config = home.join(".config/balerix");
+    balerix_server::testing::write_plugin_package(
+        &config.join("other-pkg"),
+        "other",
+        "needs: [manage]\n",
+    );
+    fs::write(
+        config.join("plugins.yaml"),
+        "plugins:\n  - name: gh\n    source: ./gh-pkg\n  - name: other\n    source: ./other-pkg\n",
+    )
+    .unwrap();
+    s._rt.block_on(s.daemon.sync_plugins()).unwrap();
+    s._rt.block_on(async {
+        for (name, caller) in [
+            ("up", &gh),
+            ("other-old", &Caller::Plugin("other".parse().unwrap())),
+            ("mine", &Caller::Admin { force: false }),
+        ] {
+            s.daemon
+                .apply_as(
+                    &name.parse().unwrap(),
+                    spec(name),
+                    Default::default(),
+                    ApplyMode::Create,
+                    caller,
+                )
+                .await
+                .unwrap();
+        }
+    });
+    fs::write(
+        config.join("plugins.yaml"),
+        "plugins:\n  - name: gh\n    source: ./gh-pkg\n",
+    )
+    .unwrap();
+
+    balerix(home)
+        .args(["plugin", "remove", "gh", "--purge"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fleet up: purged\n"))
+        .stdout(predicate::str::contains("fleet late: purged\n"))
+        .stdout(predicate::str::contains("fleet other-old: down\n"))
+        .stdout(predicate::str::contains("fleet other-old: purged").not());
+    let names: Vec<String> = s
+        ._rt
+        .block_on(s.daemon.list())
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    assert_eq!(
+        names,
+        ["mine", "other-old"],
+        "gh's fleets purged, the late one included; the other plugin's only downed"
+    );
 }
 
 #[test]

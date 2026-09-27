@@ -579,6 +579,24 @@ impl Daemon {
         // so two applies of the same fleet cannot interleave.
         let lock = self.fleet_lock(name);
         let _guard = lock.lock().await;
+        // A plugin the registry no longer lists gets nothing (#62): its
+        // `PUT` may have passed `manage_fleet`'s cheap owner check before
+        // the operator removed it, and `sync_plugins` replaces the plugin
+        // set before it snapshots the fleets to down. Checked under the
+        // fleet's lock, so an apply that got in first finishes before the
+        // sync's `down_as` of the same fleet, and one that arrives after
+        // the replace is refused whether its fleet exists or not (hence
+        // not inside `check_owner`, which only sees existing fleets). The
+        // residual — an apply whose activation calls outlast the whole
+        // plugin-stop pass and lands after the snapshot — is downed by
+        // the next sync's undeclared-owner rule.
+        if let Caller::Plugin(p) = caller
+            && !self.registry.is_installed(p.as_str())
+        {
+            return Err(DaemonError::Managed(format!(
+                "fleet {name}: plugin {p} is not installed"
+            )));
+        }
         // The fleet's rows *now*, not what its spec says: a `down` answers
         // before its teardown pass and has already dropped every row, so
         // the record's spec would name pairs that are gone.
@@ -2258,5 +2276,40 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// #62: a plugin `PUT` in flight across the plugin's removal must not
+    /// re-raise a fleet the sync downed, or create one the sync's snapshot
+    /// never saw. `apply_as` refuses a plugin caller the registry no
+    /// longer lists, under the fleet's lock, so the refusal is ordered
+    /// against the sync's `replace_plugins`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_removed_plugin_cannot_apply_a_fleet() {
+        let w = world().await;
+        let flow: AgentName = "flow".parse().unwrap();
+        w.h.resolver.set(Ok(spec(&[("a", &[])])));
+        manage(&w, "flow", file()).await.unwrap();
+        std::fs::write(w.dir.join("plugins.yaml"), "plugins: []\n").unwrap();
+        let report = w.daemon.sync_plugins().await.unwrap();
+        assert_eq!(report.downed, vec!["f".to_string()]);
+
+        // the fleet the sync downed: not re-raised
+        let refused = DaemonError::Managed("fleet f: plugin flow is not installed".into());
+        assert_eq!(manage(&w, "flow", file()).await.unwrap_err(), refused);
+        let f = w.daemon.get(&"f".parse().unwrap()).await.unwrap();
+        assert!(matches!(f.desired, Desired::Down { .. }), "{:?}", f.desired);
+        assert_eq!(f.owner.as_deref(), Some("flow"));
+
+        // a new name: not created
+        let h: FleetName = "h".parse().unwrap();
+        let nameless = json!({ "apiVersion": "balerix/v1", "kind": "Fleet", "crews": {} });
+        assert_eq!(
+            w.daemon
+                .manage_fleet(&flow, &h, nameless)
+                .await
+                .unwrap_err(),
+            DaemonError::Managed("fleet h: plugin flow is not installed".into())
+        );
+        assert!(w.daemon.get(&h).await.is_none(), "no record was created");
     }
 }

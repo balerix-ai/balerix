@@ -213,7 +213,10 @@ pub branch: Option<String>,
   `git.auth` of an agent the daemon hands them to, and the `PUT` answer
   carries the host's `settings.json` folded in), which is why it is the
   operator's explicit choice in `needs`; a restricted settings surface for
-  plugin-applied files is deferred to Spec M.
+  plugin-applied files is deferred to Spec M. Settled by Spec M §12
+  (2026-09-27): the daemon refuses those keys from a plugin's file, the
+  operator sets them in `plugins.yaml` `fleetDefaults`, and the `PUT`
+  answer needs `fleets`.
 - The fleet file crosses the plugin → daemon boundary as **untrusted
   input** with the same treatment as the CLI's: full validation through
   the resolver, `deny_unknown_fields`, name rules, exact tool versions.
@@ -254,7 +257,7 @@ pub branch: Option<String>,
 - A restricted settings surface for plugin-applied fleet files (no
   `claude.binary`, `claude.args`, `env`, `sandbox` widening or `git.auth`
   choice), so that `manage` stops being, in effect, equivalent to holding
-  the operator's credentials. Deferred to Spec M.
+  the operator's credentials. Deferred to Spec M. Settled by Spec M §12.1.
 
 ## 10. Done when
 

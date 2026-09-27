@@ -692,3 +692,22 @@ credentials or the gh token (Spec L-3).
 9. A `.balerix.yaml` on the default branch that sets `sandbox` is refused
    on the issue with the daemon's path, and `verify-github` includes
    that case; #64 closes.
+
+## 16. Recorded at implementation, part 1 (daemon side)
+
+- The check is `balerix_config::restricted::check_layer`, run on each
+  raw layer inside `resolve` when `ResolveOptions::restricted` is set; a
+  refused key present with any value, null included, is refused.
+- `ResolveOptions::operator_layer` is the `fleetDefaults` mapping;
+  `expect_mapping("fleetDefaults", …)` names it when it is not one, and
+  the plugin sync refuses a non-mapping with
+  `plugins.yaml: plugins[i].fleetDefaults: expected a mapping`.
+- `FleetResolver::resolve` took a third argument, the layer;
+  `FakeResolver::layers()` records it. The layer is not in
+  `ResolvedPlugin::hash()`.
+- `Host::apply_fleet` answers `Option<FleetRecord>`; `FakeHost::
+  answer_manage_records(false)` fakes the 204. Fixtures
+  `fleet-put-silent.json` and `fleet-put-restricted.json`; the count is
+  twenty-eight.
+- The e2e's managed journey runs fake-claude from `fleetDefaults` and
+  asserts the refusal through a second, manage-only fake plugin.

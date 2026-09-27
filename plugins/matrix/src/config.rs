@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 
 use balerix_api::DEFAULT_KEY_DELAY_MS;
 pub use balerix_plugin_common::config::{
-    ConfigError, DEFAULT_EVENTS, EventFilter, LIFECYCLE, Secret, deserialize, validate_key_delay,
+    ConfigError, DEFAULT_EVENTS, EventFilter, LIFECYCLE, Secret, deserialize, deserialize_duration,
+    validate_key_delay,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -21,6 +22,10 @@ pub const DEFAULT_MAX_PARTS: usize = 10;
 /// A longer body is split across messages by `split`, never cut — the
 /// ceiling is readability on a phone, not the protocol's.
 pub const BODY_LIMIT: usize = 4000;
+
+/// How long a routed prompt may go without the agent's `UserPromptSubmit`
+/// before the thread gets a note (Spec M §8.7); `0` disables the note.
+pub const DEFAULT_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -60,6 +65,11 @@ pub struct AgentConfig {
     /// The pause after each key when answering a question (Spec J §7.5).
     #[serde(rename = "keyDelayMs")]
     pub key_delay_ms: u64,
+    /// How long a routed prompt may go without the agent's
+    /// `UserPromptSubmit` before the thread gets a note (Spec M §8.7);
+    /// `0` disables the note, not the confirmation.
+    #[serde(rename = "confirmWindow", deserialize_with = "deserialize_duration")]
+    pub confirm_window: std::time::Duration,
 }
 
 impl Default for AgentConfig {
@@ -69,6 +79,7 @@ impl Default for AgentConfig {
             events: EventFilter::default(),
             phases: true,
             key_delay_ms: DEFAULT_KEY_DELAY_MS,
+            confirm_window: DEFAULT_CONFIRM_WINDOW,
         }
     }
 }
@@ -274,6 +285,33 @@ mod tests {
         assert!(
             parse_agent(&json!({ "key_delay_ms": 100 })).is_err(),
             "camelCase only"
+        );
+    }
+
+    #[test]
+    fn confirm_window_defaults_to_30s_and_reads_the_duration_grammar() {
+        use std::time::Duration;
+        assert_eq!(
+            parse_agent(&json!({})).unwrap().confirm_window,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_agent(&json!({ "confirmWindow": "2m" }))
+                .unwrap()
+                .confirm_window,
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            parse_agent(&json!({ "confirmWindow": "0" }))
+                .unwrap()
+                .confirm_window,
+            Duration::ZERO
+        );
+        assert_eq!(
+            parse_agent(&json!({ "confirmWindow": "soon" }))
+                .unwrap_err()
+                .to_string(),
+            "confirmWindow: invalid duration \"soon\" (use 30s, 5m, 2h or 0)"
         );
     }
 }

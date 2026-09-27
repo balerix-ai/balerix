@@ -34,6 +34,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tokio-tungstenite = { workspace = true }

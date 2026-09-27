@@ -40,6 +40,7 @@ fn a_package_runs_its_start_task_inside_the_sandbox() {
         package: package.clone(),
         manifest,
         config: serde_json::json!({}),
+        fleet_defaults: serde_json::json!({}),
         digest: None,
     };
     let host = HookTarget {

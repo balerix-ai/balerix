@@ -40,6 +40,9 @@ pub struct PluginInfo {
     pub ready: bool,
     /// The health poller's verdict; `hello` clears it.
     pub degraded: Option<String>,
+    /// The operator's layer for the fleets this plugin applies (Spec M
+    /// §12.1); refreshed on every sync, changed or not.
+    pub fleet_defaults: Value,
 }
 
 impl fmt::Debug for PluginInfo {
@@ -50,6 +53,7 @@ impl fmt::Debug for PluginInfo {
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("ready", &self.ready)
             .field("degraded", &self.degraded)
+            .field("fleet_defaults", &self.fleet_defaults)
             .finish()
     }
 }
@@ -103,6 +107,7 @@ impl PluginRegistry {
                     token: prev.and_then(|i| i.token.clone()),
                     ready: prev.is_some_and(|i| i.ready),
                     degraded: prev.and_then(|i| i.degraded.clone()),
+                    fleet_defaults: p.fleet_defaults.clone(),
                 },
             );
         }
@@ -317,6 +322,7 @@ mod tests {
             }))
             .unwrap(),
             config: json!({}),
+            fleet_defaults: json!({}),
             digest: None,
         }
     }

@@ -42,6 +42,7 @@ fn plugin_files_match_the_snapshot() {
         package: dir.path().join("data/plugins/web/0123456789ab"),
         manifest,
         config: json!({ "title": "t" }),
+        fleet_defaults: json!({}),
         digest: Some("0123456789abcdef".into()),
     };
     let host = HookTarget {

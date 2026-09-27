@@ -683,6 +683,7 @@ impl SystemToolchain for FakeSystemToolchain {
 pub struct FakeResolver {
     answer: Mutex<Option<Result<FleetSpec, String>>>,
     calls: Mutex<Vec<(String, Value)>>,
+    layers: Mutex<Vec<Value>>,
 }
 
 impl FakeResolver {
@@ -703,11 +704,21 @@ impl FakeResolver {
     pub fn calls(&self) -> Vec<(String, Value)> {
         lock(&self.calls).clone()
     }
+    /// The operator layer handed to each call, in order.
+    pub fn layers(&self) -> Vec<Value> {
+        lock(&self.layers).clone()
+    }
 }
 
 impl FleetResolver for FakeResolver {
-    fn resolve(&self, file: &Value, name: &FleetName) -> Result<FleetSpec, String> {
+    fn resolve(
+        &self,
+        file: &Value,
+        name: &FleetName,
+        operator_layer: &Value,
+    ) -> Result<FleetSpec, String> {
         lock(&self.calls).push((name.to_string(), file.clone()));
+        lock(&self.layers).push(operator_layer.clone());
         match lock(&self.answer).clone() {
             Some(Ok(mut spec)) => {
                 spec.name = name.to_string();
@@ -854,6 +865,7 @@ mod tests {
             }))
             .unwrap(),
             config: serde_json::json!({}),
+            fleet_defaults: serde_json::json!({}),
             digest: None,
         };
         let host = HookTarget {
@@ -1142,19 +1154,23 @@ mod tests {
     fn the_fake_resolver_answers_under_the_requested_name_and_records_files() {
         let r = FakeResolver::default();
         let name: FleetName = "f".parse().unwrap();
+        let none = json!({});
         assert_eq!(
-            r.resolve(&json!({}), &name),
+            r.resolve(&json!({}), &name, &none),
             Err("name: no resolver answer configured".to_string())
         );
         r.set(Ok(FleetSpec {
             name: "other".into(),
             ..Default::default()
         }));
-        let spec = r.resolve(&json!({ "kind": "Fleet" }), &name).unwrap();
+        let layer = json!({ "env": { "A": "b" } });
+        let spec = r
+            .resolve(&json!({ "kind": "Fleet" }), &name, &layer)
+            .unwrap();
         assert_eq!(spec.name, "f", "the fixed spec is renamed to the request");
         r.set(Err("crews.c.repo: invalid repo".into()));
         assert_eq!(
-            r.resolve(&json!({}), &name),
+            r.resolve(&json!({}), &name, &none),
             Err("crews.c.repo: invalid repo".to_string())
         );
         assert_eq!(
@@ -1165,16 +1181,42 @@ mod tests {
                 ("f".to_string(), json!({})),
             ]
         );
+        assert_eq!(r.layers(), vec![json!({}), layer, json!({})]);
         assert_eq!(
-            FakeResolver::failing("x").resolve(&json!({}), &name),
+            FakeResolver::failing("x").resolve(&json!({}), &name, &none),
             Err("x".to_string())
         );
         assert_eq!(
             FakeResolver::answering(FleetSpec::default())
-                .resolve(&json!({}), &name)
+                .resolve(&json!({}), &name, &none)
                 .unwrap()
                 .name,
             "f"
+        );
+    }
+
+    #[test]
+    fn fleet_defaults_do_not_enter_the_plugin_hash() {
+        let base = ResolvedPlugin {
+            name: "p".parse().unwrap(),
+            package: "/pkg".into(),
+            manifest: serde_json::from_value(json!({
+                "apiVersion": "balerix/v1", "kind": "Plugin", "name": "p",
+                "version": "0.1.0", "protocol": 1, "start": "serve"
+            }))
+            .unwrap(),
+            config: json!({}),
+            fleet_defaults: json!({}),
+            digest: None,
+        };
+        let edited = ResolvedPlugin {
+            fleet_defaults: json!({ "env": { "A": "b" } }),
+            ..base.clone()
+        };
+        assert_eq!(
+            base.hash(),
+            edited.hash(),
+            "an operator edit does not restart the plugin"
         );
     }
 

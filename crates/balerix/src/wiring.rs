@@ -47,11 +47,13 @@ pub fn server_paths(layout: &StateLayout) -> ServerPaths {
 /// login` hands the next managed fleet the new token.
 pub struct HostResolver;
 
-/// The pure half: `file` resolved as fleet `name` beneath `defaults`.
+/// The pure half: `file` resolved as fleet `name` beneath `defaults` and
+/// the operator's `layer`, held to the restricted surface (Spec M §12.1).
 pub fn resolve_file(
     file: &Value,
     name: &FleetName,
     defaults: &HostDefaults,
+    layer: &Value,
 ) -> Result<FleetSpec, String> {
     let file = from_value(file).map_err(|e| e.to_string())?;
     let spec = resolve(
@@ -59,7 +61,8 @@ pub fn resolve_file(
         &ResolveOptions {
             name_override: Some(name.to_string()),
             host_claude_settings: defaults.claude_settings.clone(),
-            ..ResolveOptions::default()
+            operator_layer: Some(layer.clone()),
+            restricted: true,
         },
     )
     .map_err(|e| e.to_string())?;
@@ -76,13 +79,13 @@ fn host_defaults() -> Result<HostDefaults, String> {
 impl FleetResolver for HostResolver {
     /// Reads the host's `settings.json` only: a malformed credential file
     /// is `CredentialSource::load`'s 500, never a 400 blamed on the file.
-    fn resolve(&self, file: &Value, name: &FleetName) -> Result<FleetSpec, String> {
+    fn resolve(&self, file: &Value, name: &FleetName, layer: &Value) -> Result<FleetSpec, String> {
         let paths = HostPaths::discover().map_err(|e| e.to_string())?;
         let defaults = HostDefaults {
             claude_settings: host::load_settings(&paths).map_err(|e| e.to_string())?,
             ..HostDefaults::default()
         };
-        resolve_file(file, name, &defaults)
+        resolve_file(file, name, &defaults, layer)
     }
 }
 
@@ -111,7 +114,7 @@ mod tests {
             claude_settings: Some(json!({ "model": "haiku" })),
             ..HostDefaults::default()
         };
-        let spec = resolve_file(&file(), &name, &defaults).unwrap();
+        let spec = resolve_file(&file(), &name, &defaults, &json!({})).unwrap();
         assert_eq!(spec.name, "f");
         let a = &spec.crews["c"].agents["a"];
         assert_eq!(a.branch.as_deref(), Some("feature/x"));
@@ -123,10 +126,31 @@ mod tests {
         let name: FleetName = "f".parse().unwrap();
         let mut f = file();
         f["crews"]["c"]["agents"]["a"]["tools"] = json!({ "node": "22" });
-        let e = resolve_file(&f, &name, &HostDefaults::default()).unwrap_err();
+        let e = resolve_file(&f, &name, &HostDefaults::default(), &json!({})).unwrap_err();
         assert!(e.starts_with("crews.c.agents.a.tools.node:"), "{e}");
-        let e =
-            resolve_file(&json!({ "kind": "Fleet" }), &name, &HostDefaults::default()).unwrap_err();
+        let e = resolve_file(
+            &json!({ "kind": "Fleet" }),
+            &name,
+            &HostDefaults::default(),
+            &json!({}),
+        )
+        .unwrap_err();
         assert!(e.starts_with("file: missing field `apiVersion`"), "{e}");
+    }
+
+    #[test]
+    fn the_host_resolver_is_restricted_and_layers_the_operators_defaults() {
+        let name: FleetName = "f".parse().unwrap();
+        let mut f = file();
+        f["defaults"] = json!({ "sandbox": { "extends": "none" } });
+        let e = resolve_file(&f, &name, &HostDefaults::default(), &json!({})).unwrap_err();
+        assert_eq!(
+            e,
+            "defaults.sandbox: not allowed in a plugin-applied fleet file; the host's default applies"
+        );
+        let layer =
+            json!({ "claude": { "binary": "/opt/balerix", "args": ["dev", "fake-claude"] } });
+        let spec = resolve_file(&file(), &name, &HostDefaults::default(), &layer).unwrap();
+        assert_eq!(spec.crews["c"].agents["a"].claude.binary, "/opt/balerix");
     }
 }

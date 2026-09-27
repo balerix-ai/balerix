@@ -211,6 +211,12 @@ impl PluginHost {
                     PluginError::Config { path, message } => entry_error(i, &path, message),
                     other => other,
                 })?,
+                fleet_defaults: {
+                    if !entry.fleet_defaults.is_object() {
+                        return Err(entry_error(i, "fleetDefaults", "expected a mapping".into()));
+                    }
+                    entry.fleet_defaults.clone()
+                },
                 digest,
             });
         }

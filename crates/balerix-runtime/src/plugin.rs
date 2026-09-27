@@ -309,6 +309,7 @@ mod tests {
             package: "/data/plugins/web/abc123def456".into(),
             manifest,
             config: json!({}),
+            fleet_defaults: json!({}),
             digest: Some("abc123def456ffff".into()),
         }
     }

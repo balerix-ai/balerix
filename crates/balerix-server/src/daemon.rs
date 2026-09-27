@@ -820,10 +820,12 @@ impl Daemon {
     /// checked first (reserved, and a `name` in the file must equal the
     /// path's), then the owner (cheaply, so a foreign fleet costs no
     /// resolve; `apply_as` checks again under the fleet's lock), then the
-    /// file is resolved through the port (400 with the resolver's message,
-    /// config path first), the operator's credentials are read now (500:
-    /// an unreadable host home is the operator's problem, not the
-    /// plugin's), and the spec is applied as an upsert.
+    /// file is resolved through the port beneath the plugin's
+    /// `fleetDefaults` and held to the restricted surface (Spec M §12.1)
+    /// (400 with the resolver's message, config path first), the
+    /// operator's credentials are read now (500: an unreadable host home
+    /// is the operator's problem, not the plugin's), and the spec is
+    /// applied as an upsert.
     pub async fn manage_fleet(
         &self,
         plugin: &AgentName,
@@ -842,12 +844,18 @@ impl Daemon {
         if let Some(current) = self.get(name).await {
             Self::check_owner(name, current.owner.as_deref(), &caller, false)?;
         }
+        let layer = self
+            .registry()
+            .plugin(plugin)
+            .map(|p| p.fleet_defaults)
+            .unwrap_or_else(|| serde_json::json!({}));
         let resolver = self.ports.resolver.clone();
         let resolve_name = name.clone();
-        let spec = tokio::task::spawn_blocking(move || resolver.resolve(&file, &resolve_name))
-            .await
-            .map_err(|e| DaemonError::Internal(e.to_string()))?
-            .map_err(DaemonError::Invalid)?;
+        let spec =
+            tokio::task::spawn_blocking(move || resolver.resolve(&file, &resolve_name, &layer))
+                .await
+                .map_err(|e| DaemonError::Internal(e.to_string()))?
+                .map_err(DaemonError::Invalid)?;
         let source = self.ports.credentials.clone();
         let credentials = tokio::task::spawn_blocking(move || source.load())
             .await

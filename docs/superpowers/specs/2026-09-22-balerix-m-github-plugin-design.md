@@ -708,6 +708,11 @@ credentials or the gh token (Spec L-3).
   `expect_mapping("fleetDefaults", …)` names it when it is not one, and
   the plugin sync refuses a non-mapping with
   `plugins.yaml: plugins[i].fleetDefaults: expected a mapping`.
+- The sync also checks the layer's shape by deserializing it as
+  `AgentSettings` (nulls dropped first; they mean delete), so a typo
+  (`sandox:`) or a wrong shape (`env: "X=1"`) fails the sync under
+  `plugins[i].fleetDefaults` rather than an apply under the plugin's
+  file. `fleetDefaults: ~` reads as `{}`.
 - `FleetResolver::resolve` took a third argument, the layer;
   `FakeResolver::layers()` records it. The layer is not in
   `ResolvedPlugin::hash()`.

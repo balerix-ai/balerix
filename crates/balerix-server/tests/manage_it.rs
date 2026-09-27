@@ -362,6 +362,41 @@ async fn a_non_mapping_fleet_defaults_fails_the_sync_with_its_path() {
     );
 }
 
+/// A misspelt or mis-shaped layer is the operator's mistake: it fails the
+/// sync under the entry's path, not an apply under the plugin's file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mis_shaped_fleet_defaults_fails_the_sync_with_its_path() {
+    for (layer, needle) in [
+        ("    fleetDefaults: { sandox: {} }\n", "sandox"),
+        ("    fleetDefaults: { env: \"X=1\" }\n", "invalid type"),
+    ] {
+        let w = world_with_entries(&[("gh", "needs: [manage]\n", layer)]).await;
+        let e = w.daemon.sync_plugins().await.unwrap_err().to_string();
+        assert!(
+            e.starts_with("plugins.yaml: plugins[2].fleetDefaults"),
+            "{e}"
+        );
+        assert!(e.contains(needle), "{e}");
+    }
+}
+
+/// `fleetDefaults: ~` reads as no layer, like an absent key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_null_fleet_defaults_syncs_as_an_empty_layer() {
+    let w = world_with_entries(&[("gh", "needs: [fleets, manage]\n", "    fleetDefaults: ~\n")])
+        .await;
+    let _gh = start_silent(&w, "gh").await;
+    w.h.resolver.set(Ok(spec("f")));
+    let (s, _) = w.api.plugin(
+        &token(&w, "gh").await,
+        "PUT",
+        "/v1/plugin-host/fleets/f",
+        Some(&json!({ "file": file("f") })),
+    );
+    assert_eq!(s, 200);
+    assert_eq!(w.h.resolver.layers(), vec![json!({})]);
+}
+
 /// Spec M §12.2 (M-14): the record carries the resolved spec with the
 /// host's settings folded in, so it goes only to a plugin that may read
 /// records; a manage-only plugin gets 204 and nothing.

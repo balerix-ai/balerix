@@ -1,0 +1,22 @@
+{
+  "route": "PUT /v1/plugin-host/fleets/gh-acme-api",
+  "direction": "plugin-to-daemon",
+  "request": {
+    "file": {
+      "apiVersion": "balerix/v1",
+      "kind": "Fleet",
+      "name": "gh-acme-api",
+      "defaults": { "sandbox": { "extends": "none" } },
+      "crews": {
+        "repo": {
+          "repo": "acme/api",
+          "agents": { "issue-12": {} }
+        }
+      }
+    }
+  },
+  "status": 400,
+  "response": {
+    "error": "defaults.sandbox: not allowed in a plugin-applied fleet file; the host's default applies"
+  }
+}

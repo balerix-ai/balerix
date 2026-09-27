@@ -62,6 +62,8 @@ struct Inner {
     downed: Mutex<Vec<(String, DownQuery)>>,
     /// `fail_manage`: while set, both manage routes answer this.
     manage_failure: Mutex<Option<(u16, String)>>,
+    /// `answer_manage_records(false)`: `PUT fleets/{name}` answers 204.
+    manage_silent: Mutex<bool>,
 }
 
 /// A fake daemon, started on `127.0.0.1:0`, that a real `Host` can talk to.
@@ -91,6 +93,7 @@ impl FakeHost {
             applied: Mutex::new(Vec::new()),
             downed: Mutex::new(Vec::new()),
             manage_failure: Mutex::new(None),
+            manage_silent: Mutex::new(false),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -255,6 +258,18 @@ impl FakeHost {
             .manage_failure
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = answer.map(|(s, m)| (s, m.to_string()));
+    }
+
+    /// Whether `PUT fleets/{name}` answers the record (the daemon's answer
+    /// to a plugin with `fleets`) or 204 with nothing (Spec M §12.2, a
+    /// plugin with `manage` alone). The call is recorded and the watch
+    /// bumped either way. Default: the record.
+    pub fn answer_manage_records(&self, answer: bool) {
+        *self
+            .inner
+            .manage_silent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = !answer;
     }
 }
 
@@ -447,6 +462,13 @@ async fn put_fleet(
         }
     };
     inner.fleets_changed.send_modify(|n| *n += 1);
+    if *inner
+        .manage_silent
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        return StatusCode::NO_CONTENT.into_response();
+    }
     Json(record).into_response()
 }
 

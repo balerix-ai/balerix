@@ -32,6 +32,7 @@ pub fn materialize_command(args: &MaterializeArgs) -> Result<String> {
         &ResolveOptions {
             name_override: args.name.clone(),
             host_claude_settings: defaults.claude_settings,
+            ..ResolveOptions::default()
         },
     )?;
     let fleet = Fleet::try_from(spec)?;

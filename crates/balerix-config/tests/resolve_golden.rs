@@ -18,6 +18,7 @@ fn payments_example_resolves_to_known_spec() {
         &ResolveOptions {
             name_override: None,
             host_claude_settings: Some(host),
+            ..ResolveOptions::default()
         },
     )
     .unwrap();

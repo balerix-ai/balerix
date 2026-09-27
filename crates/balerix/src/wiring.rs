@@ -59,6 +59,7 @@ pub fn resolve_file(
         &ResolveOptions {
             name_override: Some(name.to_string()),
             host_claude_settings: defaults.claude_settings.clone(),
+            ..ResolveOptions::default()
         },
     )
     .map_err(|e| e.to_string())?;

@@ -6,6 +6,7 @@ pub mod file;
 pub mod host;
 pub mod merge;
 pub mod resolve;
+pub mod restricted;
 pub mod validate;
 
 pub use balerix_core::is_exact_version;
@@ -14,4 +15,5 @@ pub use file::{CrewFile, FleetFile, from_value, parse, read};
 pub use host::{HostDefaults, HostPaths};
 pub use merge::{merge, merge_layers, strip_nulls};
 pub use resolve::{ResolveOptions, resolve};
+pub use restricted::{REFUSED_KEYS, REFUSED_SETTINGS, check_layer};
 pub use validate::{RESERVED_ENV_PREFIXES, tools_layer, validate_agent};

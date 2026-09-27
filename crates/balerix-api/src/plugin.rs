@@ -86,6 +86,18 @@ pub struct PluginEntry {
     /// Daemon-level config, passed verbatim in the `hello` reply.
     #[serde(default = "empty_object")]
     pub config: Value,
+    /// An operator-written settings layer beneath every fleet file this
+    /// plugin applies (Spec M §12.1): the same shape as a fleet file's
+    /// `defaults`, and the one place `claude.binary`, `claude.args`,
+    /// `env` and `sandbox` may be set for a plugin's agents, since the
+    /// plugin's own file may not. Layered between the host's
+    /// `settings.json` and the file's `defaults`.
+    #[serde(
+        default = "empty_object",
+        rename = "fleetDefaults",
+        skip_serializing_if = "is_empty_object"
+    )]
+    pub fleet_defaults: Value,
 }
 
 /// Body of `POST /v1/plugin-host/hello`.
@@ -140,10 +152,15 @@ fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
 }
 
+fn is_empty_object(v: &Value) -> bool {
+    v.as_object().is_some_and(|m| m.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use serde_norway;
 
     /// `balerix-api` has no YAML dependency; the manifest is YAML on disk
     /// but JSON-shaped, so the fixture is JSON here.
@@ -304,5 +321,32 @@ mod tests {
             back["plugins"][1].get("secrets").is_none(),
             "an empty map is not serialized"
         );
+    }
+
+    #[test]
+    fn an_entry_without_fleet_defaults_round_trips_as_before() {
+        let yaml = "name: gh\nsource: ./gh\nconfig:\n  appId: 1\n";
+        let e: PluginEntry = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(e.fleet_defaults, json!({}));
+        let out = serde_json::to_value(&e).unwrap();
+        assert!(
+            out.get("fleetDefaults").is_none(),
+            "an empty layer is not written back: {out}"
+        );
+    }
+
+    #[test]
+    fn fleet_defaults_is_read_under_its_camel_case_name() {
+        let yaml = "name: gh\nsource: ./gh\nfleetDefaults:\n  claude: { binary: /opt/claude }\n  sandbox: { network: { block: false } }\n";
+        let e: PluginEntry = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(e.fleet_defaults["claude"]["binary"], "/opt/claude");
+        assert_eq!(e.fleet_defaults["sandbox"]["network"]["block"], false);
+        let out = serde_json::to_value(&e).unwrap();
+        assert_eq!(out["fleetDefaults"]["claude"]["binary"], "/opt/claude");
+        let err =
+            serde_norway::from_str::<PluginEntry>("name: gh\nsource: ./gh\nfleet_defaults: {}\n")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("unknown field `fleet_defaults`"), "{err}");
     }
 }

@@ -383,8 +383,8 @@ async fn a_mis_shaped_fleet_defaults_fails_the_sync_with_its_path() {
 /// `fleetDefaults: ~` reads as no layer, like an absent key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_null_fleet_defaults_syncs_as_an_empty_layer() {
-    let w = world_with_entries(&[("gh", "needs: [fleets, manage]\n", "    fleetDefaults: ~\n")])
-        .await;
+    let w =
+        world_with_entries(&[("gh", "needs: [fleets, manage]\n", "    fleetDefaults: ~\n")]).await;
     let _gh = start_silent(&w, "gh").await;
     w.h.resolver.set(Ok(spec("f")));
     let (s, _) = w.api.plugin(

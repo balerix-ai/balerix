@@ -113,8 +113,11 @@ mod tests {
             e.to_string(),
             "defaults.claude: not allowed in a plugin-applied fleet file; the host's default applies"
         );
-        let e = check_layer("crews.c.defaults", &json!({ "claude": { "settings": null } }))
-            .unwrap_err();
+        let e = check_layer(
+            "crews.c.defaults",
+            &json!({ "claude": { "settings": null } }),
+        )
+        .unwrap_err();
         assert_eq!(
             e.to_string(),
             "crews.c.defaults.claude.settings: not allowed in a plugin-applied fleet file; the host's default applies"

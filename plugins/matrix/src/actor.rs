@@ -5,17 +5,19 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use balerix_api::{HookEvent, PluginAction};
 use balerix_plugin_common::answer::{self, Decision, Reaction, Verdict};
+use balerix_plugin_common::delivery::{self, Deliveries, Kind};
 use balerix_plugin_common::metrics::Shared;
 use balerix_plugin_sdk::metrics::{IntCounter, IntCounterVec, IntGauge};
 use balerix_plugin_sdk::{Host, Metrics, SdkError};
 use serde_json::Value;
+use tokio::time::Instant;
 
 use crate::config::{AgentConfig, DaemonConfig};
-use crate::matrix::{ACK, CONFIRMED, FAILED, Inbound, MatrixError, MatrixPort, REFUSED};
+use crate::matrix::{ACK, CONFIRMED, FAILED, Inbound, MatrixError, MatrixPort, REFUSED, SENT};
 use crate::pending::{OpenQuestion, Questions, Stage};
 use crate::question;
 use crate::render::{self, PhaseChange};
@@ -44,6 +46,10 @@ const CREATE_COOLDOWN_MAX: Duration = Duration::from_secs(300);
 /// actor for up to a minute is the worse of the two.
 const MAX_INLINE_RETRY: Duration = Duration::from_secs(3);
 
+/// How often `main` pushes `Command::Tick`, which runs delivery expiry
+/// (Spec M §8.7).
+pub const TICK: Duration = Duration::from_secs(5);
+
 /// A crew whose room creation failed: when it may be attempted again, and
 /// the wait that produced that instant, which doubles on each further
 /// failure up to `CREATE_COOLDOWN_MAX`.
@@ -68,14 +74,30 @@ enum Tracking {
     Closed(Option<OpenQuestion>),
 }
 
+/// What a routed prompt is to the thread: where the 👍 or the note goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sent {
+    room: String,
+    root: String,
+    event_id: String,
+    agent: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Configure(DaemonConfig),
-    Activate { agent: String, config: AgentConfig },
-    Deactivate { agent: String },
+    Activate {
+        agent: String,
+        config: AgentConfig,
+    },
+    Deactivate {
+        agent: String,
+    },
     Events(Vec<HookEvent>),
     Phases(Vec<PhaseChange>),
     Inbound(Inbound),
+    /// Runs delivery expiry; pushed by `main` every `TICK`.
+    Tick,
 }
 
 /// The metric families of Spec G §10: the shared set plus the two gauges
@@ -89,6 +111,7 @@ pub struct Counters {
     pub threads_open: IntGauge,
     pub errors: IntCounterVec,
     pub answers_mismatched: IntCounter,
+    pub deliveries: IntCounterVec,
 }
 
 impl Counters {
@@ -103,6 +126,7 @@ impl Counters {
                 .int_gauge("threads_open", "Agent sessions with an open thread")?,
             errors: shared.errors,
             answers_mismatched: shared.answers_mismatched,
+            deliveries: shared.deliveries,
         })
     }
 }
@@ -127,6 +151,9 @@ pub struct Actor<M: MatrixPort> {
     /// be tried again. Only failures are kept: a crew whose room exists is
     /// answered from `maps` and never reaches the creation path again.
     cooldowns: HashMap<String, Cooldown>,
+    /// Prompts sent and not yet confirmed by the agent's own
+    /// `UserPromptSubmit` (Spec M §8.7).
+    deliveries: Deliveries<Sent>,
 }
 
 impl<M: MatrixPort> Actor<M> {
@@ -142,6 +169,7 @@ impl<M: MatrixPort> Actor<M> {
             maps: Maps::new(),
             questions: Questions::default(),
             cooldowns: HashMap::new(),
+            deliveries: Deliveries::default(),
         }
     }
 
@@ -209,6 +237,9 @@ impl<M: MatrixPort> Actor<M> {
             Command::Deactivate { agent } => {
                 self.agents.remove(&agent);
                 self.questions.clear(&self.host, &agent).await;
+                // Nothing reported: the agent is gone, so a note about a
+                // prompt it will never take again is noise, not a signal.
+                self.deliveries.forget(&agent);
                 if let Err(e) = self.maps.forget(&self.host, &agent).await {
                     tracing::warn!("matrix: forgetting {agent}: {e}");
                 }
@@ -225,6 +256,7 @@ impl<M: MatrixPort> Actor<M> {
                 }
             }
             Command::Inbound(message) => self.on_inbound(message).await,
+            Command::Tick => self.on_tick().await,
         }
     }
 
@@ -330,10 +362,52 @@ impl<M: MatrixPort> Actor<M> {
         first
     }
 
+    /// Runs on every `TICK`: whatever has aged past its `confirmWindow`
+    /// while the agent was idle (Spec M §8.7).
+    async fn on_tick(&mut self) {
+        for sent in self.deliveries.expire(Instant::now()) {
+            self.unconfirmed(sent).await;
+        }
+    }
+
+    /// Spec M §8.7: 📨 without 👍 plus this note is the picture.
+    async fn unconfirmed(&self, sent: Sent) {
+        self.counters
+            .deliveries
+            .with_label_values(&["unconfirmed"])
+            .inc();
+        let window = self
+            .agents
+            .get(&sent.agent)
+            .map(|c| c.confirm_window)
+            .unwrap_or(crate::config::DEFAULT_CONFIRM_WINDOW);
+        let body = format!(
+            "**not confirmed by {} after {}s**: Claude did not take the prompt (a dialog may be open, or the text may have been swallowed)",
+            sent.agent,
+            window.as_secs()
+        );
+        self.send(&sent.room, Some(&sent.root), &body, "notice")
+            .await;
+    }
+
     async fn on_event(&mut self, event: HookEvent) {
         let Some(config) = self.agents.get(&event.agent).cloned() else {
             return;
         };
+        // Spec M §8.7: the agent's own `UserPromptSubmit` is the proof a
+        // routed prompt was taken; like question tracking, it runs above
+        // every early return.
+        let outcome = self.deliveries.on_event(&event, Instant::now());
+        for sent in outcome.skipped {
+            self.unconfirmed(sent).await;
+        }
+        if let Some(sent) = outcome.confirmed {
+            self.counters
+                .deliveries
+                .with_label_values(&["confirmed"])
+                .inc();
+            self.react_to(&sent.room, &sent.event_id, ACK).await;
+        }
         // Spec J §5: tracking is unconditional, so it runs above everything
         // that can return early — the `enabled` check, `room_for`, a failed
         // root send, a failed `set_thread`. A question left untracked is
@@ -602,7 +676,37 @@ impl<M: MatrixPort> Actor<M> {
         match self.host.action(&agent, &action).await {
             Ok(()) => {
                 count("routed");
-                self.react(&message, ACK).await;
+                self.react(&message, SENT).await;
+                match delivery::classify(&message.body) {
+                    Kind::Command => {
+                        self.counters
+                            .deliveries
+                            .with_label_values(&["command"])
+                            .inc();
+                    }
+                    Kind::Prompt => {
+                        let window = self
+                            .agents
+                            .get(&agent)
+                            .map(|c| c.confirm_window)
+                            .unwrap_or(crate::config::DEFAULT_CONFIRM_WINDOW);
+                        let sent = Sent {
+                            room: message.room.clone(),
+                            root: root.clone(),
+                            event_id: message.event_id.clone(),
+                            agent: agent.clone(),
+                        };
+                        if let Some(evicted) = self.deliveries.sent(
+                            &agent,
+                            &message.body,
+                            sent,
+                            Instant::now(),
+                            window,
+                        ) {
+                            self.unconfirmed(evicted).await;
+                        }
+                    }
+                }
             }
             Err(e) => {
                 count("send_failed");
@@ -1477,17 +1581,39 @@ mod tests {
         assert!(!fake.kv().contains_key("thread/f/c/alice"));
     }
 
-    use crate::matrix::{ACK, FAILED, REFUSED};
+    use crate::matrix::{ACK, FAILED, REFUSED, SENT};
     use balerix_api::PluginAction;
 
     fn inbound(room: &str, root: Option<&str>, sender: &str, body: &str) -> Inbound {
+        inbound_with_id(room, root, sender, body, "$msg:fake")
+    }
+
+    fn inbound_with_id(
+        room: &str,
+        root: Option<&str>,
+        sender: &str,
+        body: &str,
+        id: &str,
+    ) -> Inbound {
         Inbound {
             room: room.to_string(),
-            event_id: "$msg:fake".into(),
+            event_id: id.to_string(),
             sender: sender.to_string(),
             thread_root: root.map(str::to_string),
             body: body.to_string(),
         }
+    }
+
+    fn submitted(agent: &str, text: &str) -> HookEvent {
+        during(agent, "s1", "UserPromptSubmit", json!({ "prompt": text }))
+    }
+
+    fn notices(calls: &[Call]) -> Vec<String> {
+        sends(calls)
+            .into_iter()
+            .filter(|(_, b)| b.starts_with("**not confirmed by"))
+            .map(|(_, b)| b)
+            .collect()
     }
 
     fn reactions(calls: &[Call]) -> Vec<String> {
@@ -1918,7 +2044,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_thread_reply_becomes_a_submitted_send_text_and_is_acknowledged() {
+    async fn a_thread_reply_is_marked_sent_and_confirmed_when_claude_takes_it() {
         let (fake, port, mut a, room, root) = with_thread().await;
         a.handle(Command::Inbound(inbound(
             &room,
@@ -1931,10 +2057,245 @@ mod tests {
             fake.actions_for("f/c/alice"),
             vec![PluginAction::SendText {
                 text: "run the tests".into(),
-                submit: true,
+                submit: true
             }]
         );
-        assert_eq!(reactions(&port.calls()), vec![ACK.to_string()]);
+        assert_eq!(
+            reactions(&port.calls()),
+            vec![SENT.to_string()],
+            "sent, not yet taken"
+        );
+
+        a.handle(Command::Events(vec![submitted(
+            "f/c/alice",
+            "run\n the  tests ",
+        )]))
+        .await;
+        assert_eq!(
+            reactions(&port.calls()),
+            vec![SENT.to_string(), ACK.to_string()]
+        );
+        assert!(notices(&port.calls()).is_empty());
+        assert_eq!(
+            port.calls().last(),
+            Some(&Call::React {
+                room,
+                event_id: "$msg:fake".into(),
+                key: ACK.into()
+            }),
+            "the 👍 lands on the operator's message"
+        );
+    }
+
+    // Not `start_paused = true`: `with_thread` and the `Inbound` below make
+    // real HTTP round trips to `FakeHost` (`set_room`/`set_thread`, the
+    // `action` call), and a clock paused from the start races those against
+    // the client's request timeout (Spec M §8.7's window tests need only
+    // the *later* clock, once every such call has already returned).
+    #[tokio::test]
+    async fn an_unconfirmed_prompt_gets_a_note_after_the_window() {
+        let (_fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "run the tests",
+        )))
+        .await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(29)).await;
+        a.handle(Command::Tick).await;
+        assert!(notices(&port.calls()).is_empty());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        a.handle(Command::Tick).await;
+        assert_eq!(
+            notices(&port.calls()),
+            vec!["**not confirmed by f/c/alice after 30s**: Claude did not take the prompt (a dialog may be open, or the text may have been swallowed)".to_string()]
+        );
+        assert_eq!(
+            reactions(&port.calls()),
+            vec![SENT.to_string()],
+            "no 👍, no extra mark"
+        );
+        a.handle(Command::Tick).await;
+        assert_eq!(notices(&port.calls()).len(), 1, "noted once");
+    }
+
+    // See `an_unconfirmed_prompt_gets_a_note_after_the_window`: real IO
+    // precedes the pause.
+    #[tokio::test]
+    async fn the_window_waits_for_the_turn_to_end() {
+        let (_fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Events(vec![submitted(
+            "f/c/alice",
+            "earlier work",
+        )]))
+        .await;
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "next",
+        )))
+        .await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(600)).await;
+        a.handle(Command::Tick).await;
+        assert!(
+            notices(&port.calls()).is_empty(),
+            "mid-turn: queued, not swallowed"
+        );
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "Stop",
+            json!({}),
+        )]))
+        .await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        a.handle(Command::Tick).await;
+        assert!(notices(&port.calls()).is_empty());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        a.handle(Command::Tick).await;
+        assert_eq!(notices(&port.calls()).len(), 1);
+    }
+
+    // See `an_unconfirmed_prompt_gets_a_note_after_the_window`: real IO
+    // precedes the pause.
+    #[tokio::test]
+    async fn a_slash_command_is_sent_and_never_confirmed_or_noted() {
+        let (_fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "/compact",
+        )))
+        .await;
+        assert_eq!(reactions(&port.calls()), vec![SENT.to_string()]);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        a.handle(Command::Tick).await;
+        assert!(notices(&port.calls()).is_empty());
+        assert_eq!(
+            a.counters.deliveries.with_label_values(&["command"]).get(),
+            1
+        );
+    }
+
+    // See `an_unconfirmed_prompt_gets_a_note_after_the_window`: real IO
+    // precedes the pause.
+    #[tokio::test]
+    async fn a_zero_window_never_notes_and_still_confirms() {
+        let (fake, port, mut a) = actor().await;
+        a.handle(Command::Configure(daemon_config())).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: crate::config::parse_agent(&json!({ "confirmWindow": "0" })).unwrap(),
+        })
+        .await;
+        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+            .await;
+        let room = "!room1:fake".to_string();
+        let root = minted_root(&port.take_calls(), 1);
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "x",
+        )))
+        .await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        a.handle(Command::Tick).await;
+        assert!(notices(&port.calls()).is_empty());
+        a.handle(Command::Events(vec![submitted("f/c/alice", "x")]))
+            .await;
+        assert_eq!(
+            reactions(&port.calls()),
+            vec![SENT.to_string(), ACK.to_string()]
+        );
+        let _ = fake;
+    }
+
+    #[tokio::test]
+    async fn a_later_prompt_taken_first_notes_the_earlier_one() {
+        let (_fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Inbound(inbound_with_id(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "first",
+            "$one:fake",
+        )))
+        .await;
+        a.handle(Command::Inbound(inbound_with_id(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "second",
+            "$two:fake",
+        )))
+        .await;
+        a.handle(Command::Events(vec![submitted("f/c/alice", "second")]))
+            .await;
+        assert_eq!(notices(&port.calls()).len(), 1, "the first was swallowed");
+        assert_eq!(
+            port.calls().last(),
+            Some(&Call::React {
+                room,
+                event_id: "$two:fake".into(),
+                key: ACK.into()
+            })
+        );
+        assert_eq!(
+            a.counters
+                .deliveries
+                .with_label_values(&["unconfirmed"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            a.counters
+                .deliveries
+                .with_label_values(&["confirmed"])
+                .get(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_body_is_sent_but_not_tracked() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "   ",
+        )))
+        .await;
+        assert_eq!(fake.actions_for("f/c/alice").len(), 1);
+        assert_eq!(reactions(&port.calls()), vec![SENT.to_string()]);
+        assert_eq!(a.deliveries.pending("f/c/alice"), 0);
+    }
+
+    // See `an_unconfirmed_prompt_gets_a_note_after_the_window`: real IO
+    // (here `Deactivate`'s `forget` too) precedes the pause.
+    #[tokio::test]
+    async fn deactivate_forgets_pending_prompts_silently() {
+        let (_fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "x",
+        )))
+        .await;
+        a.handle(deactivate("f/c/alice")).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        a.handle(Command::Tick).await;
+        assert!(notices(&port.calls()).is_empty());
     }
 
     #[tokio::test]

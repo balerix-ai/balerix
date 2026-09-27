@@ -4,6 +4,12 @@
 //! `plugins/matrix/logs/`. The actor itself does not start until
 //! `configure` arrives with the homeserver and the credentials.
 
+// `Actor::run`'s state machine, monomorphized here over `MatrixClient`, grew
+// past rustc's default query-depth limit once delivery tracking (Spec M
+// §8.7) added another branch to `on_event` and `on_inbound`; the compiler's
+// own suggested fix.
+#![recursion_limit = "256"]
+
 use balerix_plugin_matrix::MatrixPlugin;
 use balerix_plugin_matrix::actor::{Command, Counters, Health, Queue};
 use balerix_plugin_matrix::client::MatrixLauncher;
@@ -36,9 +42,18 @@ fn run() -> anyhow::Result<()> {
             host.clone(),
             move |changes| queue.push(Command::Phases(changes)),
         ));
+        let tick_queue = plugin.queue();
+        let ticker = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(balerix_plugin_matrix::actor::TICK);
+            loop {
+                interval.tick().await;
+                tick_queue.push(Command::Tick);
+            }
+        });
         eprintln!("matrix: starting");
         let result = serve(&host, env!("CARGO_PKG_VERSION"), plugin).await;
         phase_watch.abort();
+        ticker.abort();
         result?;
         Ok(())
     })

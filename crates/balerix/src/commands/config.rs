@@ -19,6 +19,7 @@ pub fn resolve_command(args: &ResolveArgs) -> Result<String> {
         &ResolveOptions {
             name_override: args.name.clone(),
             host_claude_settings,
+            ..ResolveOptions::default()
         },
     )?;
     Ok(if args.json {

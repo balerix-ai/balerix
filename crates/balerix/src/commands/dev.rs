@@ -32,6 +32,7 @@ pub fn materialize_command(args: &MaterializeArgs) -> Result<String> {
         &ResolveOptions {
             name_override: args.name.clone(),
             host_claude_settings: defaults.claude_settings,
+            ..ResolveOptions::default()
         },
     )?;
     let fleet = Fleet::try_from(spec)?;
@@ -338,7 +339,8 @@ async fn manage_from_config(host: &Host, config: &Value, scratch: &Path) -> Resu
     };
     let outcome = match (manage["fleet"].as_str(), manage.get("file")) {
         (Some(fleet), Some(file)) => match host.apply_fleet(fleet, file).await {
-            Ok(record) => serde_json::to_value(record)?,
+            Ok(Some(record)) => serde_json::to_value(record)?,
+            Ok(None) => json!({ "applied": true }),
             Err(e) => json!({ "error": e.to_string() }),
         },
         _ => json!({ "error": "config.manage needs `fleet` and `file`" }),

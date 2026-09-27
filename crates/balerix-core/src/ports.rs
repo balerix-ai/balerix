@@ -283,9 +283,17 @@ pub trait Clock: Send + Sync {
 pub trait FleetResolver: Send + Sync {
     /// `file` is the YAML fleet file's structure as JSON, `name` the fleet
     /// it must resolve to (a `name` inside the file has already been
-    /// checked against it). The host's `claude.settings` are folded in.
-    /// `Err` is the resolver's own message, config path first.
-    fn resolve(&self, file: &serde_json::Value, name: &FleetName) -> Result<FleetSpec, String>;
+    /// checked against it), `operator_layer` the applying plugin's
+    /// `fleetDefaults` (Spec M §12.1; `{}` when it has none). The host's
+    /// `claude.settings` are folded in beneath both, and the file is held
+    /// to the restricted surface. `Err` is the resolver's own message,
+    /// config path first.
+    fn resolve(
+        &self,
+        file: &serde_json::Value,
+        name: &FleetName,
+        operator_layer: &serde_json::Value,
+    ) -> Result<FleetSpec, String>;
 }
 
 /// The operator's Claude credentials and gh token, read from the host

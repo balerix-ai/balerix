@@ -211,6 +211,8 @@ impl PluginHost {
                     PluginError::Config { path, message } => entry_error(i, &path, message),
                     other => other,
                 })?,
+                fleet_defaults: fleet_defaults_layer(&entry.fleet_defaults)
+                    .map_err(|message| entry_error(i, "fleetDefaults", message))?,
                 digest,
             });
         }
@@ -380,6 +382,36 @@ impl PluginHost {
         })
         .await
         .map_err(|e| PluginError::Internal(format!("purge task panicked: {e}")))?
+    }
+}
+
+/// An entry's `fleetDefaults` as the layer the resolver gets (Spec M
+/// §12.1): null reads as no layer, and anything else must be a mapping
+/// shaped like an agent settings block, so the operator's typo fails the
+/// sync under the entry's path rather than an apply under the plugin's
+/// file. Nulls inside are dropped before the shape check: in the layer
+/// they mean "delete", which the typed shape cannot hold.
+fn fleet_defaults_layer(layer: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if layer.is_null() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    if !layer.is_object() {
+        return Err("expected a mapping".into());
+    }
+    serde_json::from_value::<balerix_api::AgentSettings>(without_nulls(layer))
+        .map_err(|e| e.to_string())?;
+    Ok(layer.clone())
+}
+
+fn without_nulls(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => serde_json::Value::Object(
+            m.iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k.clone(), without_nulls(v)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 

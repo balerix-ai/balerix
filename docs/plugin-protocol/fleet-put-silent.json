@@ -1,0 +1,20 @@
+{
+  "route": "PUT /v1/plugin-host/fleets/gh-acme-api",
+  "direction": "plugin-to-daemon",
+  "request": {
+    "file": {
+      "apiVersion": "balerix/v1",
+      "kind": "Fleet",
+      "name": "gh-acme-api",
+      "crews": {
+        "repo": {
+          "repo": "acme/api",
+          "agents": { "issue-12": { "branch": "feature/issue-12" } }
+        }
+      }
+    }
+  },
+  "status": 204,
+  "response": null,
+  "note": "The caller declares manage without fleets (Spec M §12.2): applied, and answered with nothing."
+}

@@ -15,7 +15,7 @@ use balerix_api::{
 use balerix_core::plugin_id;
 use balerix_plugin_sdk::{Env, Host, Plugin, bind, run};
 use serde_json::{Value, json};
-use support::{World, world_with};
+use support::{World, world_with, world_with_entries};
 
 struct Silent;
 impl Plugin for Silent {}
@@ -308,4 +308,144 @@ async fn the_manage_routes_refuse_bad_names_bodies_and_flags() {
         None,
     );
     assert_eq!((s, v["error"].as_str()), (404, Some("fleet not found")));
+}
+
+/// Spec M §12.1: the operator's `fleetDefaults` reaches the resolver as
+/// the layer for every file this plugin applies, and only this plugin's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_operator_layer_reaches_the_resolver_per_plugin() {
+    let w = world_with_entries(&[
+        (
+            "gh",
+            "needs: [fleets, manage]\n",
+            "    fleetDefaults: { env: { OPERATOR: \"1\" }, sandbox: { network: { block: false } } }\n",
+        ),
+        ("other", "needs: [fleets, manage]\n", ""),
+    ])
+    .await;
+    let _gh = start_silent(&w, "gh").await;
+    let _other = start_silent(&w, "other").await;
+    w.h.resolver.set(Ok(spec("f")));
+    let (s, _) = w.api.plugin(
+        &token(&w, "gh").await,
+        "PUT",
+        "/v1/plugin-host/fleets/f",
+        Some(&json!({ "file": file("f") })),
+    );
+    assert_eq!(s, 200);
+    w.h.resolver.set(Ok(spec("g")));
+    let (s, _) = w.api.plugin(
+        &token(&w, "other").await,
+        "PUT",
+        "/v1/plugin-host/fleets/g",
+        Some(&json!({ "file": file("g") })),
+    );
+    assert_eq!(s, 200);
+    assert_eq!(
+        w.h.resolver.layers(),
+        vec![
+            json!({ "env": { "OPERATOR": "1" }, "sandbox": { "network": { "block": false } } }),
+            json!({}),
+        ]
+    );
+}
+
+/// Review focus 3: a layer that is not a mapping fails the sync with the
+/// entry's path, before any plugin starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_mapping_fleet_defaults_fails_the_sync_with_its_path() {
+    let w = world_with_entries(&[("gh", "needs: [manage]\n", "    fleetDefaults: 3\n")]).await;
+    let e = w.daemon.sync_plugins().await.unwrap_err().to_string();
+    assert_eq!(
+        e,
+        "plugins.yaml: plugins[2].fleetDefaults: expected a mapping"
+    );
+}
+
+/// A misspelt or mis-shaped layer is the operator's mistake: it fails the
+/// sync under the entry's path, not an apply under the plugin's file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mis_shaped_fleet_defaults_fails_the_sync_with_its_path() {
+    for (layer, needle) in [
+        ("    fleetDefaults: { sandox: {} }\n", "sandox"),
+        ("    fleetDefaults: { env: \"X=1\" }\n", "invalid type"),
+    ] {
+        let w = world_with_entries(&[("gh", "needs: [manage]\n", layer)]).await;
+        let e = w.daemon.sync_plugins().await.unwrap_err().to_string();
+        assert!(
+            e.starts_with("plugins.yaml: plugins[2].fleetDefaults"),
+            "{e}"
+        );
+        assert!(e.contains(needle), "{e}");
+    }
+}
+
+/// `fleetDefaults: ~` reads as no layer, like an absent key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_null_fleet_defaults_syncs_as_an_empty_layer() {
+    let w =
+        world_with_entries(&[("gh", "needs: [fleets, manage]\n", "    fleetDefaults: ~\n")]).await;
+    let _gh = start_silent(&w, "gh").await;
+    w.h.resolver.set(Ok(spec("f")));
+    let (s, _) = w.api.plugin(
+        &token(&w, "gh").await,
+        "PUT",
+        "/v1/plugin-host/fleets/f",
+        Some(&json!({ "file": file("f") })),
+    );
+    assert_eq!(s, 200);
+    assert_eq!(w.h.resolver.layers(), vec![json!({})]);
+}
+
+/// Spec M §12.2 (M-14): the record carries the resolved spec with the
+/// host's settings folded in, so it goes only to a plugin that may read
+/// records; a manage-only plugin gets 204 and nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manage_only_plugin_gets_204_and_a_fleets_plugin_the_record() {
+    let w = world_with(&[
+        ("silent", "needs: [manage]\n"),
+        ("gh", "needs: [fleets, manage]\n"),
+    ])
+    .await;
+    let _silent = start_silent(&w, "silent").await;
+    let _gh = start_silent(&w, "gh").await;
+    w.h.resolver.set(Ok(spec("f")));
+    let (s, v) = w.api.plugin(
+        &token(&w, "silent").await,
+        "PUT",
+        "/v1/plugin-host/fleets/f",
+        Some(&json!({ "file": file("f") })),
+    );
+    assert_eq!((s, v), (204, Value::String(String::new())));
+    assert_eq!(
+        w.daemon.get(&"f".parse().unwrap()).await.map(|r| r.owner),
+        Some(Some("silent".into())),
+        "applied all the same"
+    );
+    w.h.resolver.set(Ok(spec("g")));
+    let (s, v) = w.api.plugin(
+        &token(&w, "gh").await,
+        "PUT",
+        "/v1/plugin-host/fleets/g",
+        Some(&json!({ "file": file("g") })),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["owner"], "gh");
+    assert_eq!(v["spec"]["name"], "g");
+}
+
+/// Review focus 4: the gate is on the success answer only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manage_only_plugin_still_gets_the_400_with_its_message() {
+    let w = world_with(&[("silent", "needs: [manage]\n")]).await;
+    let _silent = start_silent(&w, "silent").await;
+    let bad = "crews.c.defaults.sandbox: not allowed in a plugin-applied fleet file; the host's default applies";
+    w.h.resolver.set(Err(bad.into()));
+    let (s, v) = w.api.plugin(
+        &token(&w, "silent").await,
+        "PUT",
+        "/v1/plugin-host/fleets/f",
+        Some(&json!({ "file": file("f") })),
+    );
+    assert_eq!((s, v["error"].as_str()), (400, Some(bad)));
 }

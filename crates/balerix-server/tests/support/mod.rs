@@ -175,6 +175,15 @@ pub async fn world() -> World {
 /// `world`, plus one package per `(name, manifest lines)` in `extra`,
 /// declared after `flow` and `web`.
 pub async fn world_with(extra: &[(&str, &str)]) -> World {
+    let extra: Vec<(&str, &str, &str)> = extra.iter().map(|(n, m)| (*n, *m, "")).collect();
+    world_with_entries(&extra).await
+}
+
+/// `world`, plus one package per `(name, manifest lines, entry lines)`
+/// in `extra`, declared after `flow` and `web`; `entry lines` is YAML
+/// appended under the entry, four-space indented (`"    fleetDefaults:
+/// { env: { A: b } }\n"`), or "".
+pub async fn world_with_entries(extra: &[(&str, &str, &str)]) -> World {
     let h = Harness::new(Duration::from_secs(3600));
     let dir = tempfile::tempdir().unwrap();
     write_plugin_package(
@@ -190,9 +199,11 @@ pub async fn world_with(extra: &[(&str, &str)]) -> World {
     let mut plugins_yaml = String::from(
         "plugins:\n  - name: flow\n    source: ./flow-pkg\n  - name: web\n    source: ./web-pkg\n",
     );
-    for (name, manifest) in extra {
+    for (name, manifest, entry) in extra {
         write_plugin_package(&dir.path().join(format!("{name}-pkg")), name, manifest);
-        plugins_yaml.push_str(&format!("  - name: {name}\n    source: ./{name}-pkg\n"));
+        plugins_yaml.push_str(&format!(
+            "  - name: {name}\n    source: ./{name}-pkg\n{entry}"
+        ));
     }
     std::fs::write(dir.path().join("plugins.yaml"), plugins_yaml).unwrap();
     // One registry for both: the handler's counters are the ones `/metrics`
@@ -200,7 +211,9 @@ pub async fn world_with(extra: &[(&str, &str)]) -> World {
     let metrics = Metrics::new().unwrap();
     let handler = PluginEventHandler::new(h.registry.clone(), h.client.clone(), metrics.clone());
     let daemon = h.daemon_with(handler, dir.path(), metrics);
-    daemon.sync_plugins().await.unwrap();
+    // A test may want the failure itself; the ones that need plugins up
+    // call `start_silent`, which fails loudly if they are not.
+    let _ = daemon.sync_plugins().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (stop, rx) = tokio::sync::oneshot::channel::<()>();

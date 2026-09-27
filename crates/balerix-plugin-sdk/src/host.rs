@@ -156,20 +156,35 @@ impl Host {
 
     /// `PUT fleets/{name}` (Spec L §3.1): applies an unresolved fleet
     /// file — the YAML fleet file's structure as JSON — as a fleet this
-    /// plugin owns, and answers the record. Needs `manage`. 400 with the
-    /// resolver's message (config path first) when the file does not
-    /// resolve; 409 `fleet <name> is managed by plugin <p>` or `… is not
-    /// managed by a plugin` when the name belongs to someone else. The
-    /// call returns before the fleet is ready: watch `fleets/watch` or
-    /// poll `fleet` for that.
-    pub async fn apply_fleet(&self, name: &str, file: &Value) -> Result<FleetRecord, SdkError> {
-        self.json(
-            self.http
-                .put(self.url(&format!("fleets/{name}")))
-                .timeout(APPLY_TIMEOUT)
-                .json(&json!({ "file": file })),
-        )
-        .await
+    /// plugin owns. Needs `manage`. Answers the record when this plugin
+    /// also declares `fleets`, `None` otherwise (204, Spec M §12.2). 400
+    /// with the resolver's message (config path first) when the file does
+    /// not resolve, which includes the restricted surface (Spec M §12.1:
+    /// `claude.binary`, `claude.args`, `env`, `sandbox` are the operator's
+    /// to set, in `plugins.yaml`); 409 `fleet <name> is managed by plugin
+    /// <p>` or `… is not managed by a plugin` when the name belongs to
+    /// someone else. The call returns before the fleet is ready: watch
+    /// `fleets/watch` or poll `fleet` for that.
+    pub async fn apply_fleet(
+        &self,
+        name: &str,
+        file: &Value,
+    ) -> Result<Option<FleetRecord>, SdkError> {
+        let (status, bytes) = self
+            .send(
+                self.http
+                    .put(self.url(&format!("fleets/{name}")))
+                    .timeout(APPLY_TIMEOUT)
+                    .json(&json!({ "file": file })),
+            )
+            .await?;
+        match status {
+            204 => Ok(None),
+            200..=299 => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| SdkError::Transport(format!("bad reply: {e}"))),
+            _ => Err(Self::status_error(status, &bytes)),
+        }
     }
 
     /// `DELETE fleets/{name}?…` (Spec L §3.2): downs a fleet this plugin
@@ -679,7 +694,7 @@ mod tests {
 
         // Spec L: a fleet the plugin applies is watched like any other
         let file = json!({ "apiVersion": "balerix/v1", "kind": "Fleet", "crews": {} });
-        let rec = host.apply_fleet("billing", &file).await.unwrap();
+        let rec = host.apply_fleet("billing", &file).await.unwrap().unwrap();
         assert_eq!(
             (rec.name(), rec.owner.as_deref()),
             ("billing", Some("plugin"))

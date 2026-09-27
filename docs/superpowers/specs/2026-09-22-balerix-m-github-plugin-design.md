@@ -1,7 +1,9 @@
 # Balerix — Spec M: the GitHub plugin
 
 **Date:** 2026-09-22
-**Status:** Approved in brainstorm 2026-09-22
+**Status:** Approved in brainstorm 2026-09-22; amended 2026-09-27 for
+#64 (the restricted settings surface, §12.1 and §12.2) and #85 (delivery
+confirmation, §8.7), approved in brainstorm 2026-09-27
 **Scope:** a new plugin crate, `balerix-plugin-github`, that turns a
 mention of a GitHub App on an issue or pull request into a running agent
 whose session is that issue: Claude's turns and questions post as
@@ -10,7 +12,9 @@ submitted review on the PR reaches the agent as one message, and the fleet
 the agent runs in is built from the repository's own `.balerix.yaml`.
 
 Depends on Spec K (`balerix-plugin-common`) and Spec L (the `manage`
-capability, owned fleets, the per-agent `branch`).
+capability, owned fleets, the per-agent `branch`). Lands with two
+daemon-side changes (§12.1, §12.2), one common module (§8.7) and its
+adoption by matrix.
 
 ---
 
@@ -41,6 +45,9 @@ from two files in version control.
 | M-10 | A session ends on **close or merge**, and on an **idle timeout**; ending **removes the agent** from the fleet. | Removing frees the sandbox and tmux window; the branch survives in the crew cache (harvested from the clone at removal, Spec N §5) and seeds the clone on the next mention, which starts a fresh Claude session told where the earlier work is. Claude's own session does not survive removal (the home is deleted); that is the accepted cost of not holding idle sandboxes open. |
 | M-11 | The actor is generic over a **`GitHubPort`** with a recording fake; the listener enqueues and answers 202. | Spec G-13 and G-11: the ordering rules are unit-tested without GitHub, and a slow API never stalls hook delivery. |
 | M-12 | A thin `reqwest` client, not `octocrab`. | About ten endpoints; a small tree in a standalone project that already carries TLS. |
+| M-13 | **A plugin-applied fleet file cannot choose what runs, its environment or its sandbox**: the daemon's resolver refuses `claude.binary`, `claude.args`, `env`, `sandbox` and, inside `claude.settings`, `env` and `apiKeyHelper`, at every layer (#64). The operator sets them per plugin in `plugins.yaml` (`fleetDefaults`). | The file this plugin applies is the repository's, written by anyone with write on the default branch. M-2 already lets such a person prompt an agent that holds the operator's credentials; letting the file pick the binary or widen the sandbox would let them run anything with those credentials, with neither Claude nor the sandbox in the loop. Enforced in the daemon, not the plugin, so the bound holds against the plugin too. |
+| M-14 | **`PUT fleets/{name}` answers the record only to a plugin with `fleets`**, 204 otherwise (#64). | The record carries the resolved spec with the host's `settings.json` folded in; reading records is what `fleets` means. |
+| M-15 | **A reaction says what the plugin knows**: "sent" on `send_text`'s `Ok`, confirmed on the agent's matching `UserPromptSubmit`, a note when neither comes in time; shared with matrix through common (#85). | `Ok` means the daemon typed into the pane. A reader takes ✓ as "the agent is on it", and an open dialog or a mid-turn queue makes that false. The hook the plugin already observes is the proof. |
 
 ## 3. Crate and modules
 
@@ -137,11 +144,14 @@ defaults:
       events: [Notification, Stop]   # what reaches the status comment
       phases: true
       keyDelayMs: 100
+      confirmWindow: 30s
 ```
 
 `enabled` (default `true`), `events` (common's `EventFilter`; the default
 set; `SessionStart`/`SessionEnd` always), `phases`, `keyDelayMs` as in
-Spec J. `kind` (`issue`|`pr`) and `number` are accepted and validated;
+Spec J. `confirmWindow` (default `30s`, the `idleTimeout` grammar) is how
+long a prompt may go unconfirmed before the note of §8.7; `0` disables
+the note, not the confirmation. `kind` (`issue`|`pr`) and `number` are accepted and validated;
 an agent activated without them is rejected (`plugins.github.number:
 missing`), which is how a hand-written agent in `.balerix.yaml` is caught.
 
@@ -174,7 +184,8 @@ name stands for (§6).
 
 In memory only: installation tokens with their expiry; the collaborator
 permission cache (login, repo) → (permission, until), five minutes; the
-delivery-id ring (last 4 096 ids); per-agent pending status edit.
+delivery-id ring (last 4 096 ids); per-agent pending status edit; the
+prompts awaiting confirmation (§8.7).
 
 ## 6. The repository's fleet file
 
@@ -252,7 +263,7 @@ enum Command {
     Events(Vec<HookEvent>),
     Phases(Vec<PhaseChange>),
     Webhook(WebhookEvent),
-    Tick,                       // once a minute
+    Tick,                       // every five seconds (§8.7, §10)
 }
 ```
 
@@ -284,8 +295,10 @@ from a permitted author, on a number with no live session:
    `last_activity = now`.
 
 The first prompt is sent as `send_text` with submit on the agent's
-`SessionStart` (the agent is ready then, not before), rendered by
-`prompt.rs`:
+`SessionStart` (the agent is ready then, not before). It is tracked by
+§8.7 with the mentioning comment (or the issue, for an `IssueOpened`
+start) as its marker, so the `eyes` of step 1 gains `+1` once Claude
+takes it. Rendered by `prompt.rs`:
 
 ```
 You are attached to <owner>/<repo> issue #12: <title>
@@ -336,8 +349,9 @@ A permitted `Comment` on a number with a live, unclosed session:
   executed per Spec K §4 — post the echo as a comment, `send_keys`,
   commit the stage, react. Reactions: `Ack` → `+1`, `Refused` →
   `confused`, `Failed` → `-1`, `Confirmed` → `hooray` on the echo.
-- Otherwise `send_text { text: body, submit: true }`; `+1` on success; on
-  failure a comment `not delivered to <agent>: <error>` and `-1`.
+- Otherwise `send_text { text: body, submit: true }`. On `Ok`: `eyes`,
+  and the comment is tracked by §8.7, which adds `+1` when Claude takes
+  it. On failure: a comment `not delivered to <agent>: <error>` and `-1`.
 
 A permitted comment on a closed session: react `confused` and post once
 per session `this session has ended; mention @<slug> to start a new one`.
@@ -370,6 +384,54 @@ is written back on the next `Tick` rather than on every event.
 `phases::run` from common feeds `Phases`; only agents with a row are
 considered. A phase change updates the status header and, when `phases`
 is on, adds a line. `Dead` and `Failed` lines carry the daemon's message.
+
+### 8.7 Delivery confirmation
+
+`send_text`'s `Ok` says the daemon typed the body into the pane and
+pressed Enter. It does not say Claude took a prompt: a dialog may be
+open, or the agent may be mid-turn and queue the text. The plugin
+observes `UserPromptSubmit`, whose payload's `prompt` is the text Claude
+took, and that is the proof (#85). Common gets `delivery.rs`, pure like
+`answer.rs`, used by this plugin and by matrix:
+
+- `Deliveries<M>` holds, per agent, a FIFO of prompts sent and not yet
+  confirmed, each with the plugin's marker `M` (here a comment or issue
+  id) and its send time, and one bit: whether the agent is mid-turn.
+- `classify(text)`: a body whose first non-blank character is `/` is a
+  slash command and is never tracked; most commands fire no hook, so
+  "sent" is all the plugin can honestly say.
+- `sent(agent, text, marker, now)` registers a prompt.
+- `on_event(&HookEvent) -> Outcome`: a `UserPromptSubmit` whose `prompt`
+  matches the oldest pending prompt with that text on that agent removes
+  it and answers its marker as confirmed; any older pending prompts it
+  passed over are answered as unconfirmed at once, since Claude submits
+  queued text in order and a skipped one was swallowed. Matching is
+  equality after trimming both ends and collapsing each run of
+  whitespace to one space. A submit that matches nothing (the operator
+  typed at the terminal) is ignored. `UserPromptSubmit` sets the agent
+  mid-turn; `Stop` and `SessionEnd` clear it.
+- `expire(now, window) -> Vec<M>` removes and answers every prompt whose
+  `window` has passed since the later of its send time and the agent's
+  last `Stop`. Text typed mid-turn is queued by Claude and submitted
+  after the current turn ends, so the clock starts when the queue can
+  drain, not when the text was typed.
+- Nothing is persisted: a plugin restart loses the pending markers, and
+  at worst a reaction is missing. Accepted.
+
+Here: `eyes` on `Ok` means typed into the pane; the matching submit adds
+`+1`; expiry adds `confused` on the comment and the status line `prompt
+from @alice not confirmed after 30s`; a slash command gets `eyes` only.
+`Tick` runs `expire` every five seconds with `confirmWindow` (§4.2) as
+`window`; `0` skips `expire` and the note, and the confirmation still
+reacts. Common's `Shared` gains `deliveries_total{outcome}` (`confirmed`,
+`unconfirmed`, `command`).
+
+Matrix adopts the same in this spec's plan: a new 📨 mark on `Ok`, its 👍
+moved to the confirmation, a thread notice `not confirmed by <agent>
+after 30s` on expiry with no further reaction (📨 without 👍 plus the
+notice is the picture), `confirmWindow` in its agent block, and a `Tick`
+command from a five-second interval its actor did not have. The flow
+plugin's `send` step stays fire-and-forget (§14).
 
 ## 9. Pull request reviews
 
@@ -430,7 +492,77 @@ Metrics, prefixed by the SDK: common's `Shared` families, plus
 
 ## 12. Security
 
-Three entries in `docs/THREAT-MODEL.md`.
+### 12.1 The restricted settings surface (M-13, #64)
+
+A fleet file a plugin applies cannot choose what runs, its environment,
+or its sandbox. The `FleetResolver` port only ever resolves plugin files
+(the CLI resolves on the client and posts a spec), so its host
+implementation resolves in a restricted mode that `balerix-config`
+exposes as `ResolveOptions::restricted`. In that mode each of the file's
+layers, `defaults`, `crews.<c>.defaults` and `crews.<c>.agents.<a>`, is
+checked before merging:
+
+- Refused, naming the layer: `claude.binary`, `claude.args`, `env`,
+  `sandbox`. The message is `crews.repo.defaults.env: not allowed in a
+  plugin-applied fleet file; the host's default applies`. The host layer
+  never contributes these keys, so absence is the host default: the
+  pinned binary, no extra arguments, balerix's own environment, the base
+  nono profile.
+- Refused inside `claude.settings`, same wording: `env` and
+  `apiKeyHelper`, the two keys that redirect where credentials go (an
+  `ANTHROPIC_BASE_URL`, a helper command). `hooks` was already dropped.
+  This inner list is an open set that drifts with Claude Code releases
+  and is reviewed when the pinned `claude` moves; the top-level list does
+  not drift, since `AgentSettings` denies unknown fields.
+- Allowed: `tools`, the rest of `claude.settings`, `claude.resume`,
+  `runner`, `plugins`, `branch`, and the crew's `git` (`auth` can only be
+  the default or `none`, which narrows).
+
+Unrestricted resolution is unchanged, so `up` behaves as before. For
+this plugin the check is free: §6 posts the daemon's 400 verbatim on the
+issue, so a repository whose `.balerix.yaml` sets `sandbox` sees exactly
+why nothing started.
+
+**The operator's layer.** What a plugin's agents run as is the
+operator's to set, and the place is the plugin's own entry in
+`plugins.yaml`: an optional `fleetDefaults` mapping, the same shape as a
+fleet file's `defaults`, which the daemon layers between the host's
+`settings.json` and the plugin's file for every fleet that plugin
+applies. The restricted check does not read it, since the operator wrote
+it, so it is where `claude.binary`, `claude.args`, `env` and `sandbox`
+for a plugin's agents live (the e2e's fake plugin runs `dev fake-claude`
+from there). It travels `PluginEntry` → `ResolvedPlugin` → the registry
+→ `FleetResolver::resolve(file, name, operator_layer)`; it is not part of
+the plugin's restart hash, so an edit takes effect at the plugin's next
+apply. Layer order, bottom up: host `claude.settings`, `fleetDefaults`,
+the file's `defaults`, the crew's `defaults`, the agent.
+
+### 12.2 The `PUT` answer (M-14, #64)
+
+`PUT /v1/plugin-host/fleets/{name}` answers what `GET fleets/{name}`
+would answer this caller: the `FleetRecord` when the plugin also
+declares `fleets`, `204 No Content` otherwise. No redacted shape: a
+plugin that wants to read records asks for the capability that means
+that. This plugin declares `fleets` and waits through `fleets/watch`, so
+it loses nothing. `docs/plugin-protocol.md`'s `PUT` row and the
+`fleet-put` fixtures gain the 204 case, and `fleet-put-restricted.json`
+the §12.1 rejection.
+
+### 12.3 What the threat model says
+
+The `manage` bullet in `docs/THREAT-MODEL.md` is rewritten and three
+entries are added.
+
+**The `manage` bullet** loses "`manage` is, in effect, equivalent to
+holding the operator's credentials" and "deferred to Spec M". It now
+says: a plugin with `manage` runs agents under the host's defaults
+(binary, arguments, environment, sandbox) with the operator's
+credentials, which is what a prompt from any permitted person already
+does (G-5); the file cannot widen that (§12.1), and the `PUT` answer
+carries the resolved spec only to a plugin with `fleets` (§12.2). The
+table row for a plugin's fleet file gains both. Spec L §7 and §9 gain a
+one-line note that Spec M §12 settled them, and #64 closes with this
+spec's plan.
 
 **Accepted risk, recorded deliberately (M-2), the GitHub G-5.** Any
 collaborator with write permission on a repository the App is installed
@@ -439,7 +571,8 @@ token, prompt it, answer its questions, and have it push to that
 repository. What bounds it: the permission check on every inbound with a
 five-minute cache; the fleet file read from the default branch only, so
 a PR cannot change the sandbox, tools or settings of the agent that
-reviews it; forks refused; the sandbox around every agent; and the
+reviews it; §12.1, so the file cannot change what the agent runs as
+either; forks refused; the sandbox around every agent; and the
 operator's choice of which repositories the App is installed on. An
 operator who wants a narrower boundary installs the App on fewer
 repositories.
@@ -488,7 +621,26 @@ credentials or the gh token (Spec L-3).
   parsing, `kind`/`number` validation with paths.
 - `tests/plugin_it.rs`: the real `Plugin` over the wire with `FakeHost`
   and `FakePort`.
-- `balerix-server`: nothing new beyond Spec L.
+- `balerix-config`: restricted resolution refuses each of the four keys
+  at each of the three layers with the layer path in the message, and
+  `claude.settings.env` and `claude.settings.apiKeyHelper`; a file that
+  sets only allowed keys resolves as before; the operator layer may set
+  every refused key and sits beneath the file's `defaults`; unrestricted
+  resolution is unchanged.
+- `balerix-server`: `manage_it.rs` gains the restricted rejection as a
+  400 with its path, and the `PUT` answer both ways (the record with
+  `fleets`, 204 without); the conformance fixtures of §12.2.
+- common `delivery.rs`: a prompt confirmed on an exact and on a
+  whitespace-differing `UserPromptSubmit`; an unmatched submit ignored;
+  FIFO order with two pending; a slash command never tracked; expiry
+  waits for `Stop` while the agent is mid-turn; a `0` window never
+  expires.
+- `actor.rs`, continued: `eyes` then `+1` on a confirmed comment;
+  `confused` and the status line on expiry; the mention's `+1` on the
+  first prompt's submit; a slash command gets `eyes` only.
+- matrix's actor: the same four cases with 📨 and 👍 and the thread
+  notice; the existing "reacts 👍 on `Ok`" assertions move to the
+  confirmation.
 - `mise run verify-github`, by hand, not in CI: `scripts/verify-github.sh`
   against a real App on a scratch repository, needing `GITHUB_APP_ID`,
   `GITHUB_APP_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_REPO` and a reachable
@@ -501,7 +653,14 @@ credentials or the gh token (Spec L-3).
 - Pull requests from forks.
 - Commands in comments (`@bot stop`, `@bot status`).
 - Per-repository `configPath`; GitHub Enterprise hosts.
-- Pushes attributed to the App (installation tokens into agents).
+- Pushes attributed to the App (installation tokens into agents, Spec L
+  §9's first item). With §12.1 the remaining exposure is the operator's
+  gh token inside a sandboxed agent, which G-5 accepts for a prompt; an
+  installation token expires hourly and would need refresh into a
+  running agent's `hosts.yml` and a per-fleet credential override on
+  `PUT`, a new credential path across the boundary. M-4 stands.
+- Delivery confirmation for the flow plugin's `send` step: no reader, and
+  no machine gates on it.
 - Routing reviews on a PR the agent opened from an issue session to that
   session.
 - Posting a comment when the agent opens a PR or pushes.
@@ -528,3 +687,44 @@ credentials or the gh token (Spec L-3).
    session's settings; a broken file is reported on the issue.
 7. `docs/THREAT-MODEL.md` carries §12; `ARCHITECTURE.md` and AGENTS.md
    describe the plugin and `verify-github`.
+8. A comment Claude takes shows `eyes` then `+1`; matrix shows 📨 then
+   👍 for the same reply; #85 closes.
+9. A `.balerix.yaml` on the default branch that sets `sandbox` is refused
+   on the issue with the daemon's path, and `verify-github` includes
+   that case; #64 closes.
+
+## 16. Recorded at implementation, part 1 (daemon side)
+
+- The check is `balerix_config::restricted::check_layer`, run on each
+  raw layer inside `resolve` when `ResolveOptions::restricted` is set; a
+  refused key present with any value, null included, is refused.
+- A present ancestor of a refused key that is not a mapping (null, a
+  sequence, a scalar: `claude: null`, `claude: []`,
+  `claude: { settings: [] }`) is refused too, named at the ancestor
+  (`defaults.claude: not allowed …`): merging treats null as "delete
+  this subtree" and lets any other non-mapping replace the lower
+  layers' mapping, so it would strip the operator's and the host's
+  `binary`, `args` and `settings` from beneath, and a sequence
+  deserializes by position (`claude: [{}, [], false, /tmp/evil]` would
+  choose the binary). A mapping ancestor is fine.
+- `disableAllHooks` joined the inner list at implementation: a plugin's
+  file could otherwise silence balerix's hooks. The refused
+  `claude.settings` keys are `{env,apiKeyHelper,disableAllHooks}`.
+- `ResolveOptions::operator_layer` is the `fleetDefaults` mapping;
+  `expect_mapping("fleetDefaults", …)` names it when it is not one, and
+  the plugin sync refuses a non-mapping with
+  `plugins.yaml: plugins[i].fleetDefaults: expected a mapping`.
+- The sync also checks the layer's shape by deserializing it as
+  `AgentSettings` (nulls dropped first; they mean delete), so a typo
+  (`sandox:`) or a wrong shape (`env: "X=1"`) fails the sync under
+  `plugins[i].fleetDefaults` rather than an apply under the plugin's
+  file. `fleetDefaults: ~` reads as `{}`.
+- `FleetResolver::resolve` took a third argument, the layer;
+  `FakeResolver::layers()` records it. The layer is not in
+  `ResolvedPlugin::hash()`.
+- `Host::apply_fleet` answers `Option<FleetRecord>`; `FakeHost::
+  answer_manage_records(false)` fakes the 204. Fixtures
+  `fleet-put-silent.json` and `fleet-put-restricted.json`; the count is
+  twenty-eight.
+- The e2e's managed journey runs fake-claude from `fleetDefaults` and
+  asserts the refusal through a second, manage-only fake plugin.

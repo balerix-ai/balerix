@@ -193,18 +193,15 @@ fn fleet_yaml(bare: &Path, bob_model: Option<&str>, plugins: Option<&str>) -> St
 }
 
 /// The fleet a managed-fleet journey's plugin applies: `fleet_yaml`'s
-/// shape as the JSON object `PUT fleets/{name}` takes, one agent, on
-/// fake-claude, under a real nono profile.
+/// shape as the JSON object `PUT fleets/{name}` takes, one agent. What
+/// the agent runs as (fake-claude, its sandbox) is not the file's to say
+/// (Spec M §12.1): it comes from the entry's `fleetDefaults`, see
+/// `managed_fleet_defaults`.
 fn managed_fleet_file(bare: &Path) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "balerix/v1", "kind": "Fleet", "name": "managed",
         "defaults": {
-            "claude": {
-                "binary": BALERIX,
-                "args": ["dev", "fake-claude", "--verbose"],
-                "settings": { "model": "sonnet" }
-            },
-            "sandbox": { "network": { "block": false } },
+            "claude": { "settings": { "model": "sonnet" } },
             "tools": {}
         },
         "crews": {
@@ -215,6 +212,15 @@ fn managed_fleet_file(bare: &Path) -> serde_json::Value {
                 "agents": { "alice": {} }
             }
         }
+    })
+}
+
+/// The operator's layer for the fake plugin's fleets: fake-claude under a
+/// real nono profile, exactly what `fleet_yaml` sets for a CLI fleet.
+fn managed_fleet_defaults() -> serde_json::Value {
+    serde_json::json!({
+        "claude": { "binary": BALERIX, "args": ["dev", "fake-claude", "--verbose"] },
+        "sandbox": { "network": { "block": false } }
     })
 }
 
@@ -1019,13 +1025,14 @@ fn plugin_manage_journey() {
     let config = serde_json::json!({
         "manage": { "fleet": "managed", "file": managed_fleet_file(&bare) }
     });
-    // JSON is YAML: the object rides on one line after `config:`
+    // JSON is YAML: each object rides on one line after its key
     fs::write(
         cfg.join("plugins.yaml"),
         format!(
-            "plugins:\n  - name: fake\n    source: \"{}\"\n    config: {}\n",
+            "plugins:\n  - name: fake\n    source: \"{}\"\n    config: {}\n    fleetDefaults: {}\n",
             pkg.display(),
-            config
+            config,
+            managed_fleet_defaults()
         ),
     )
     .unwrap();
@@ -1077,6 +1084,46 @@ fn plugin_manage_journey() {
             .exists(),
         "the agent's worktree was created from the file's repo"
     );
+
+    // a second, manage-only plugin (no `fleets`, and no `fleetDefaults` of
+    // its own) tries to set `sandbox` in its fleet file directly: Spec M
+    // §12.1 refuses it at the daemon and the host's default applies
+    let refused_pkg = root.join("refused-pkg");
+    plugin_package(&refused_pkg, "needs: [manage]\n");
+    let manifest = fs::read_to_string(refused_pkg.join("balerix-plugin.yaml"))
+        .unwrap()
+        .replace("name: hello", "name: refused");
+    fs::write(refused_pkg.join("balerix-plugin.yaml"), manifest).unwrap();
+    let mut refused_file = managed_fleet_file(&bare);
+    refused_file["name"] = serde_json::json!("refused");
+    refused_file["defaults"]["sandbox"] = serde_json::json!({ "extends": "none" });
+    let refused_config = serde_json::json!({
+        "manage": { "fleet": "refused", "file": refused_file }
+    });
+    fs::write(
+        cfg.join("plugins.yaml"),
+        format!(
+            "plugins:\n  - name: fake\n    source: \"{}\"\n    config: {}\n    fleetDefaults: {}\n  - name: refused\n    source: \"{}\"\n    config: {}\n",
+            pkg.display(),
+            config,
+            managed_fleet_defaults(),
+            refused_pkg.display(),
+            refused_config
+        ),
+    )
+    .unwrap();
+    w.ok(&["plugin", "sync"]);
+    let refused_dir = w.state().join("plugins/refused");
+    wait_plugin_ready(&w, "refused", &refused_dir);
+
+    let outcome = wait_file(&w.state().join("plugins/refused/scratch/fake-plugin.manage"));
+    let outcome: serde_json::Value = serde_json::from_str(&outcome).unwrap();
+    assert_eq!(
+        outcome["error"],
+        "daemon: HTTP 400: defaults.sandbox: not allowed in a plugin-applied fleet file; the host's default applies",
+        "{outcome}"
+    );
+    assert!(w.ok(&["list"]).lines().all(|l| !l.starts_with("refused ")));
 
     // the CLI may not take it over
     let fleet = root.join("managed.yaml");

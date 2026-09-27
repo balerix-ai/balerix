@@ -26,7 +26,7 @@ fn fixtures() -> BTreeMap<String, Value> {
     }
     assert_eq!(
         out.len(),
-        26,
+        28,
         "every fixture accounted for: {:?}",
         out.keys()
     );
@@ -321,7 +321,13 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
     fake.set_fleets(vec![put_record]);
     let file = fx["fleet-put"]["request"]["file"].clone();
     assert_eq!(
-        serde_json::to_value(host.apply_fleet("gh-acme-api", &file).await.unwrap()).unwrap(),
+        serde_json::to_value(
+            host.apply_fleet("gh-acme-api", &file)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
         fx["fleet-put"]["response"]
     );
     assert_eq!(
@@ -353,6 +359,40 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
         fx["fleet-put-rejected"]["response"]
     );
     fake.fail_manage(None);
+
+    // Spec M §12.1: the restricted refusal is a 400 like any other.
+    let restricted = fx["fleet-put-restricted"]["response"]["error"]
+        .as_str()
+        .unwrap();
+    fake.fail_manage(Some((400, restricted)));
+    let e = host
+        .apply_fleet(
+            "gh-acme-api",
+            &fx["fleet-put-restricted"]["request"]["file"],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.to_string(), format!("daemon: HTTP 400: {restricted}"));
+    fake.fail_manage(None);
+
+    // Spec M §12.2: a manage-only caller is answered 204 and `None`.
+    fake.answer_manage_records(false);
+    let file = fx["fleet-put-silent"]["request"]["file"].clone();
+    assert_eq!(host.apply_fleet("gh-acme-api", &file).await.unwrap(), None);
+    let resp = c
+        .put(format!("{}/v1/plugin-host/fleets/gh-acme-api", fake.url))
+        .bearer_auth("tok")
+        .json(&fx["fleet-put-silent"]["request"])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        fx["fleet-put-silent"]["status"].as_u64().unwrap() as u16
+    );
+    assert!(resp.bytes().await.unwrap().is_empty());
+    fake.answer_manage_records(true);
+
     // a stray key beside `file` is a 400, as the daemon's
     // `deny_unknown_fields` body makes it, and records nothing
     let applied = fake.applied_fleets().len();

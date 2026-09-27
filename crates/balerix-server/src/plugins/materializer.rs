@@ -125,6 +125,7 @@ mod tests {
             }))
             .unwrap(),
             config: json!({}),
+            fleet_defaults: json!({}),
             digest: None,
         }
     }

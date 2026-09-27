@@ -172,6 +172,7 @@ fn load_request(args: &ApplyArgs) -> Result<(FleetSpec, CredentialBundle)> {
         &ResolveOptions {
             name_override: args.name.clone(),
             host_claude_settings: defaults.claude_settings,
+            ..ResolveOptions::default()
         },
     )?;
     // client-side validation before any request (architecture spec §9)

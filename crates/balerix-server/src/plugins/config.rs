@@ -207,6 +207,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), PathBuf::from(v)))
                 .collect(),
             config,
+            fleet_defaults: serde_json::Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -329,6 +330,7 @@ mod tests {
             sha256: Some("0".repeat(64)),
             secrets: Default::default(),
             config: serde_json::json!({}),
+            fleet_defaults: serde_json::Value::Object(serde_json::Map::new()),
         };
         assert_eq!(
             resolve_source(&entry, dir.path()).unwrap(),
@@ -388,6 +390,7 @@ mod tests {
             sha256: Some("0".repeat(64)),
             secrets: Default::default(),
             config: serde_json::json!({}),
+            fleet_defaults: serde_json::Value::Object(serde_json::Map::new()),
         };
         let e = resolve_source(&entry, dir.path()).unwrap_err().to_string();
         assert!(e.ends_with("a.tar.gz: not found"), "{e}");

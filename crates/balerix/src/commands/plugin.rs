@@ -213,6 +213,7 @@ pub fn install_command(args: &PluginInstallArgs) -> Result<String> {
             sha256: sha256.clone(),
             secrets: Default::default(),
             config: serde_json::Value::Object(serde_json::Map::new()),
+            fleet_defaults: serde_json::Value::Object(serde_json::Map::new()),
         },
     )?;
     save_file(&path, &file)?;
@@ -434,6 +435,7 @@ mod tests {
             sha256: Some("ab".into()),
             secrets: Default::default(),
             config: serde_json::json!({}),
+            fleet_defaults: serde_json::Value::Object(serde_json::Map::new()),
         };
         install_entry(&mut file, entry.clone()).unwrap();
         assert_eq!(
@@ -480,6 +482,7 @@ mod tests {
                 sha256: None,
                 secrets: Default::default(),
                 config: serde_json::json!({ "password": "hunter2" }),
+                fleet_defaults: serde_json::Value::Object(serde_json::Map::new()),
             },
         )
         .unwrap();

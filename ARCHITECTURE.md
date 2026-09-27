@@ -176,7 +176,11 @@ text has newlines.
 a fleet from an unresolved fleet file — `PUT
 /v1/plugin-host/fleets/{name}` takes what `balerix up -f` reads, as JSON
 — and the daemon does what `up` does: resolves it through the
-`FleetResolver` port, reads the operator's credentials through
+`FleetResolver` port, beneath the entry's `fleetDefaults` from
+`plugins.yaml` and held to the restricted surface (Spec M §12.1: a
+plugin's file cannot set `claude.binary`, `claude.args`, `env`,
+`sandbox` or `claude.settings.{env,apiKeyHelper,disableAllHooks}`; those are the
+operator's, per plugin), reads the operator's credentials through
 `CredentialSource`, and applies. The record carries the plugin as its
 `owner`; the admin routes refuse an owned fleet (409) except `down
 --force`, and a plugin may only apply or down what it owns. `plugin
@@ -200,6 +204,10 @@ makes an existing remote branch its clone's branch and start point
   hears from agents; users shape behaviour through the settings block's
   `plugins:` map instead (it was called `flow:` before Spec B, and still
   loads under that name).
+- **A plugin's fleet file cannot choose what its agents run as.** The
+  restricted surface (Spec M §12.1) is checked in `balerix-config` on the
+  file's raw layers, so the host's `settings.json` and the operator's
+  `fleetDefaults` may carry what the file may not.
 - **Ports live in `balerix-core`, adapters depend on it, never on each other.**
   The future Kubernetes split cuts between `balerix-server` and
   `balerix-runtime`; `core` is shared.

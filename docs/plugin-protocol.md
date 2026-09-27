@@ -58,8 +58,10 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 | `GET fleets/{name}` | `fleets` | — | `FleetRecord` | 200 | (shape as in `fleets.json`'s `response[0]`) |
 | `GET fleets/{name}`, unknown name | `fleets` | — | `{ error }` | 404 | `fleet-missing.json` |
 | `GET fleets/watch` (WebSocket) | `fleets` | — | one text frame per change, each the complete `GET fleets` body | 101 | `fleets-watch.json` (Task 6) |
-| `PUT fleets/{name}` | `manage` | `{ file }` — the fleet file's structure as JSON (`apiVersion`, `kind`, `name`?, `defaults`, `crews`) | `FleetRecord`, `owner` set to this plugin; the answer is the record as applied, so waiting for its agents to turn `Ready` through `fleets/watch` (or `GET fleets/{name}`) needs the `fleets` capability as well | 200 | `fleet-put.json` |
+| `PUT fleets/{name}` | `manage` + `fleets` | `{ file }` — the fleet file's structure as JSON (`apiVersion`, `kind`, `name`?, `defaults`, `crews`) | `FleetRecord`, `owner` set to this plugin; the record as applied, so waiting for its agents to turn `Ready` goes through `fleets/watch` (or `GET fleets/{name}`) | 200 | `fleet-put.json` |
+| `PUT fleets/{name}`, caller without `fleets` | `manage` | same | — (applied all the same; the record carries the resolved spec, which only `fleets` may read, Spec M §12.2) | 204 | `fleet-put-silent.json` |
 | `PUT fleets/{name}`, file does not resolve | `manage` | same | `{ error }`, config path first | 400 | `fleet-put-rejected.json` |
+| `PUT fleets/{name}`, file sets `claude.binary`, `claude.args`, `env`, `sandbox`, or `claude.settings.{env,apiKeyHelper,disableAllHooks}` at any layer | `manage` | same | `{ error }`: `<layer>.<key>: not allowed in a plugin-applied fleet file; the host's default applies` (Spec M §12.1) | 400 | `fleet-put-restricted.json` |
 | `PUT`/`DELETE fleets/{name}`, owned by another plugin or by the CLI | `manage` | — | `{ "error": "fleet <name> is managed by plugin <p>" }` or `{ "error": "fleet <name> is not managed by a plugin" }` | 409 | (asserted by `crates/balerix-server/tests/manage_it.rs`, §6) |
 | `DELETE fleets/{name}?keep_repos=&keep_sessions=&purge=&force=` | `manage` | — | `FleetRecord` | 200 | `fleet-delete.json` |
 | `GET agents/{fleet}/{crew}/{agent}/attach` (WebSocket) | `attach` | — | binary frames are terminal bytes both ways; the one text frame is `{ "resize": { "cols", "rows" } }` | 101 | `attach-resize.json` (Task 6) |
@@ -140,7 +142,12 @@ mean `diff` would answer the same; compare, never parse.
 
 **Managed fleets** (Spec L). `PUT fleets/{name}` takes the unresolved
 fleet file — exactly what `balerix up -f` reads, as JSON — and does what
-`up` does on the daemon: folds the host's `claude.settings` in, resolves
+`up` does on the daemon: folds the host's `claude.settings` in, then the
+entry's `fleetDefaults` from `plugins.yaml` (Spec M §12.1: the operator's
+layer, the same shape as a fleet file's `defaults`, and the only place a
+plugin's agents get their `claude.binary`, `claude.args`, `env` and
+`sandbox`; the file itself may not set those, nor `claude.settings.env`,
+`apiKeyHelper` or `disableAllHooks`, at any layer), resolves
 every agent, reads the operator's Claude credentials and gh token from
 the daemon's host home, and applies. The plugin never sees credentials.
 A `name` in the file must equal the path's (400 otherwise); `balerix`
@@ -149,7 +156,9 @@ with this plugin as its `owner`; every later `PUT` is a full replace and
 must come from the same plugin; the CLI's `up`/`update`/`down` refuse an
 owned fleet (409; `balerix down --force` is the operator's override).
 The call returns once the spec is applied, not when the fleet is ready:
-watch `fleets/watch`. `DELETE` takes the admin `DELETE`'s flags; `force`
+watch `fleets/watch`. The record is the answer only for a plugin that
+also declares `fleets`; a manage-only plugin gets 204 (Spec M §12.2).
+`DELETE` takes the admin `DELETE`'s flags; `force`
 is ignored here. `plugin remove` downs every fleet the plugin owned. An
 agent's `branch` setting names an existing remote branch to work on
 (`crews.<c>.agents.<a>.branch`, validated as `git check-ref-format
@@ -265,7 +274,7 @@ never activates simply never runs for that agent.
 
 ## 6. Conformance
 
-`docs/plugin-protocol/*.json` holds twenty-six fixtures, one JSON object
+`docs/plugin-protocol/*.json` holds twenty-eight fixtures, one JSON object
 each: `{ route, direction, request, status, response }` for
 `daemon-to-plugin` and most `plugin-to-daemon` routes; `raw` (base64)
 replaces `request`/`response` for the kv byte bodies, `health.json` and
@@ -342,4 +351,10 @@ file or a `secrets` key that collides with one already in `config`. The
 resolved value lives only in memory from there — it is never written back
 to `plugins.yaml` or logged. Rotating a file named in `secrets` changes
 the resolved plugin's hash, so the daemon restarts the plugin on its next
-sync to pick up the new value.
+sync to pick up the new value. An entry may also carry `fleetDefaults`,
+the settings layer beneath every fleet the plugin applies (§3, `PUT
+fleets/{name}`); unlike `secrets` it is not part of the plugin's restart
+hash, so an edit takes effect at the plugin's next apply. The sync
+checks its shape (a mapping, or null for none, shaped like an agent
+settings block) and fails with the entry's path, so a typo there is not
+blamed on the plugin's file.

@@ -62,6 +62,11 @@ pub struct ResolvedPlugin {
     pub package: PathBuf,
     pub manifest: PluginManifest,
     pub config: Value,
+    /// The operator's `fleetDefaults` from `plugins.yaml` (Spec M §12.1),
+    /// the layer beneath every fleet file this plugin applies. Not part
+    /// of `hash()`: an edit takes effect at the plugin's next apply, and
+    /// restarting the plugin for it would gain nothing.
+    pub fleet_defaults: Value,
     /// sha256 hex of the tarball; `None` for a directory source.
     pub digest: Option<String>,
 }
@@ -75,6 +80,7 @@ impl std::fmt::Debug for ResolvedPlugin {
             .field("package", &self.package)
             .field("manifest", &self.manifest)
             .field("config", &"<redacted>")
+            .field("fleet_defaults", &self.fleet_defaults)
             .field("digest", &self.digest)
             .finish()
     }
@@ -302,6 +308,7 @@ mod tests {
             package: format!("/pkg/{name}").into(),
             manifest: manifest(name),
             config,
+            fleet_defaults: json!({}),
             digest: Some("abc".into()),
         }
     }

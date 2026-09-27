@@ -17,11 +17,18 @@ use crate::validate::{tools_layer, validate_agent};
 pub struct ResolveOptions {
     /// `--name` on the CLI; wins over the file's `name`.
     pub name_override: Option<String>,
-    /// The host's `~/.claude/settings.json`, layered beneath `defaults`.
+    /// The host's `~/.claude/settings.json`, layered beneath everything.
     ///
     /// A `hooks` key in this value is dropped before layering, since balerix
     /// owns that key downstream (see `validate::validate_agent`).
     pub host_claude_settings: Option<Value>,
+    /// The operator's `fleetDefaults` for the plugin applying this file
+    /// (Spec M §12.1): a settings layer between the host settings and the
+    /// file's `defaults`, never subject to `restricted`.
+    pub operator_layer: Option<Value>,
+    /// Spec M §12.1: refuse `restricted::REFUSED_KEYS` at each of the
+    /// file's layers. Set for a plugin-applied file, never for `up`.
+    pub restricted: bool,
 }
 
 /// Resolves every agent and validates the result.
@@ -47,25 +54,37 @@ pub fn resolve(file: &FleetFile, opts: &ResolveOptions) -> Result<FleetSpec, Con
         }
         json!({ "claude": { "settings": s } })
     });
+    if let Some(layer) = &opts.operator_layer {
+        expect_mapping("fleetDefaults", layer)?;
+    }
+    let check = |path: &str, layer: &Value| -> Result<(), ConfigError> {
+        if opts.restricted {
+            crate::restricted::check_layer(path, layer)
+        } else {
+            Ok(())
+        }
+    };
     expect_mapping("defaults", &file.defaults)?;
+    check("defaults", &file.defaults)?;
     let fleet_tools = tools_layer("defaults", &file.defaults)?;
 
     let mut crews = BTreeMap::new();
     for (crew_name, crew) in &file.crews {
         let crew_path = format!("crews.{crew_name}");
         expect_mapping(&format!("{crew_path}.defaults"), &crew.defaults)?;
+        check(&format!("{crew_path}.defaults"), &crew.defaults)?;
         let crew_tools = tools_layer(&format!("{crew_path}.defaults"), &crew.defaults)?;
 
         let mut agents = BTreeMap::new();
         for (agent_name, layer) in &crew.agents {
             let agent_path = format!("{crew_path}.agents.{agent_name}");
             expect_mapping(&agent_path, layer)?;
-            let merged =
-                merge_layers(
-                    host_layer
-                        .iter()
-                        .chain([&file.defaults, &crew.defaults, layer]),
-                );
+            check(&agent_path, layer)?;
+            let merged = merge_layers(host_layer.iter().chain(opts.operator_layer.iter()).chain([
+                &file.defaults,
+                &crew.defaults,
+                layer,
+            ]));
             let settings: AgentSettings =
                 serde_json::from_value(merged).map_err(|e| ConfigError::Invalid {
                     path: agent_path.clone(),
@@ -122,6 +141,7 @@ mod tests {
         ResolveOptions {
             name_override: None,
             host_claude_settings: None,
+            ..ResolveOptions::default()
         }
     }
 
@@ -348,6 +368,153 @@ crews:
             .to_string();
         assert!(e.starts_with("defaults.tools.node:"), "got {e}");
         assert!(e.contains("expected a version string"), "got {e}");
+    }
+
+    fn restricted() -> ResolveOptions {
+        ResolveOptions {
+            restricted: true,
+            ..opts()
+        }
+    }
+
+    #[test]
+    fn restricted_mode_refuses_the_keys_at_every_layer() {
+        let at_fleet = "apiVersion: balerix/v1\nkind: Fleet\nname: f\ndefaults:\n  env: { X: \"1\" }\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a: {}\n";
+        assert_eq!(
+            resolve(&file(at_fleet), &restricted())
+                .unwrap_err()
+                .to_string(),
+            "defaults.env: not allowed in a plugin-applied fleet file; the host's default applies"
+        );
+        let at_crew = "apiVersion: balerix/v1\nkind: Fleet\nname: f\ncrews:\n  c:\n    repo: o/r\n    defaults:\n      sandbox: { extends: none }\n    agents:\n      a: {}\n";
+        assert_eq!(
+            resolve(&file(at_crew), &restricted())
+                .unwrap_err()
+                .to_string(),
+            "crews.c.defaults.sandbox: not allowed in a plugin-applied fleet file; the host's default applies"
+        );
+        let at_agent = "apiVersion: balerix/v1\nkind: Fleet\nname: f\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a:\n        claude: { binary: /bin/sh }\n";
+        assert_eq!(
+            resolve(&file(at_agent), &restricted())
+                .unwrap_err()
+                .to_string(),
+            "crews.c.agents.a.claude.binary: not allowed in a plugin-applied fleet file; the host's default applies"
+        );
+        // unrestricted, the same files resolve (or fail for their own reasons)
+        assert!(resolve(&file(at_fleet), &opts()).is_ok());
+        assert!(resolve(&file(at_agent), &opts()).is_ok());
+    }
+
+    #[test]
+    fn restricted_mode_refuses_a_non_mapping_ancestor_that_would_replace_the_hosts_keys() {
+        // a null deletes the operator's binary; a sequence replaces the
+        // operator's `claude` and deserializes by position, so the file
+        // chooses the binary
+        for (claude, unrestricted_binary) in [
+            ("null", "claude"),
+            ("[{}, [], false, /tmp/evil]", "/tmp/evil"),
+        ] {
+            let yaml = format!(
+                "apiVersion: balerix/v1\nkind: Fleet\nname: f\ndefaults:\n  claude: {claude}\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a: {{}}\n"
+            );
+            let operator = json!({ "claude": { "binary": "/opt/balerix", "args": ["--safe"] } });
+            assert_eq!(
+                resolve(
+                    &file(&yaml),
+                    &ResolveOptions {
+                        operator_layer: Some(operator.clone()),
+                        ..restricted()
+                    }
+                )
+                .unwrap_err()
+                .to_string(),
+                "defaults.claude: not allowed in a plugin-applied fleet file; the host's default applies",
+                "{claude}"
+            );
+            // unrestricted, the same file resolves, overriding the operator
+            let spec = resolve(
+                &file(&yaml),
+                &ResolveOptions {
+                    operator_layer: Some(operator),
+                    ..opts()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                spec.crews["c"].agents["a"].claude.binary, unrestricted_binary,
+                "{claude}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_host_settings_may_carry_what_the_file_may_not() {
+        let host =
+            json!({ "env": { "ANTHROPIC_BASE_URL": "https://proxy" }, "apiKeyHelper": "helper" });
+        let spec = resolve(
+            &file(BASE),
+            &ResolveOptions {
+                host_claude_settings: Some(host),
+                ..restricted()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            spec.crews["c"].agents["a"].claude.settings["env"]["ANTHROPIC_BASE_URL"],
+            "https://proxy"
+        );
+    }
+
+    #[test]
+    fn the_operator_layer_sits_beneath_the_file_and_is_not_restricted() {
+        let operator = json!({
+            "claude": { "binary": "/opt/balerix", "args": ["dev", "fake-claude"], "settings": { "model": "haiku" } },
+            "sandbox": { "network": { "block": false } },
+            "env": { "OPERATOR": "1" }
+        });
+        let yaml = "apiVersion: balerix/v1\nkind: Fleet\nname: f\ndefaults:\n  claude: { settings: { model: opus } }\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a: {}\n";
+        let spec = resolve(
+            &file(yaml),
+            &ResolveOptions {
+                operator_layer: Some(operator),
+                ..restricted()
+            },
+        )
+        .unwrap();
+        let a = &spec.crews["c"].agents["a"];
+        assert_eq!(a.claude.binary, "/opt/balerix");
+        assert_eq!(
+            a.claude.args,
+            vec!["dev".to_string(), "fake-claude".to_string()]
+        );
+        assert_eq!(
+            a.claude.settings["model"], "opus",
+            "the file's defaults win over the operator's"
+        );
+        assert_eq!(a.sandbox["network"]["block"], false);
+        assert_eq!(a.env["OPERATOR"], "1");
+    }
+
+    #[test]
+    fn a_non_mapping_operator_layer_is_rejected_with_its_path() {
+        let e = resolve(
+            &file(BASE),
+            &ResolveOptions {
+                operator_layer: Some(json!([1])),
+                ..restricted()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.to_string(), "fleetDefaults: expected a mapping");
+    }
+
+    #[test]
+    fn a_file_setting_only_allowed_keys_resolves_identically_in_both_modes() {
+        let yaml = "apiVersion: balerix/v1\nkind: Fleet\nname: f\ndefaults:\n  tools: { node: \"22.11.0\" }\n  claude: { settings: { model: opus }, resume: true }\ncrews:\n  c:\n    repo: o/r\n    git: { push: false, auth: none }\n    agents:\n      a: { branch: feature/x, plugins: { github: { kind: issue, number: 12 } } }\n";
+        assert_eq!(
+            resolve(&file(yaml), &restricted()).unwrap(),
+            resolve(&file(yaml), &opts()).unwrap()
+        );
     }
 
     #[test]

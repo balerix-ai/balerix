@@ -1670,39 +1670,76 @@ fn a_promisor_remote_in_the_clone_fetches_nothing_and_runs_nothing() {
     )
     .unwrap();
 
-    // (a) a changed `branch`: `symbolic-ref`, then `status` over a HEAD
-    // whose commit is missing. It fails (`bad object HEAD`) rather than
-    // fetch it, and no program runs.
-    let outcome = ws.ensure_clone("f/c/p", &crew, &paths, &repo, "other", "main");
-    assert!(
-        !git_ok(&paths.workspace, &["cat-file", "-e", &foreign_sha]),
-        "the daemon's status lazy-fetched the foreign commit into the clone"
+    // The refusal (#67) comes before any git runs over the clone's
+    // objects, on any git version: it names `.git/config` and the key,
+    // and leaves the clone as it is. Nothing is fetched and no program
+    // runs on either path.
+    let refused = |key: &str| {
+        // (a) a changed `branch`: `symbolic-ref`, then `status` over a
+        // HEAD whose commit is missing, would otherwise fetch it
+        let outcome = ws.ensure_clone("f/c/p", &crew, &paths, &repo, "other", "main");
+        assert!(
+            !git_ok(&paths.workspace, &["cat-file", "-e", &foreign_sha]),
+            "the daemon's status lazy-fetched the foreign commit into the clone"
+        );
+        assert!(!ran.exists(), "remote.evil.uploadpack ran as the daemon");
+        let e = outcome.unwrap_err().to_string();
+        assert!(e.starts_with("f/c/p: "), "{e}");
+        assert!(
+            e.contains(".git/config: sets ") && e.contains(key) && e.contains("--purge"),
+            "the message names the config file, {key} and the remedy: {e}"
+        );
+
+        // (b) the harvest: refused the same way, so nothing foreign can
+        // reach the cache
+        let e = ws
+            .harvest_and_remove("f/c/p", &crew, &paths)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(".git/config: sets ") && e.contains(key), "{e}");
+        assert!(
+            paths.workspace.exists(),
+            "a refused removal deletes nothing"
+        );
+        assert!(!ran.exists(), "remote.evil.uploadpack ran as the daemon");
+        assert!(!git_ok(&crew.repo, &["cat-file", "-e", &foreign_sha]));
+        assert!(!git_ok(
+            &crew.repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/balerix/f/c/p"
+            ]
+        ));
+    };
+    refused("extensions.partialclone");
+
+    // git lazy-fetches from any `remote.<x>.promisor` whether or not the
+    // extension names it, so a promisor remote alone is refused too
+    git(
+        &paths.workspace,
+        &["config", "--unset", "extensions.partialClone"],
     );
-    assert!(!ran.exists(), "remote.evil.uploadpack ran as the daemon");
-    let e = outcome.unwrap_err().to_string();
-    assert!(e.starts_with("f/c/p: git "), "{e}");
+    refused("remote.evil.promisor");
 
-    // (b) the harvest: the clone cannot serve a commit it does not have,
-    // so the fetch fails and nothing foreign reaches the cache
-    let e = ws
-        .harvest_and_remove("f/c/p", &crew, &paths)
-        .unwrap_err()
-        .to_string();
-    assert!(e.starts_with("f/c/p: git "), "{e}");
-    assert!(paths.workspace.exists());
-    assert!(!ran.exists(), "remote.evil.uploadpack ran as the daemon");
-    assert!(!git_ok(&crew.repo, &["cat-file", "-e", &foreign_sha]));
-    assert!(!git_ok(
-        &crew.repo,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            "refs/heads/balerix/f/c/p"
-        ]
-    ));
+    // the same keys through a file the config includes: the probe follows
+    // includes, as git would
+    git(
+        &paths.workspace,
+        &["config", "--unset", "remote.evil.promisor"],
+    );
+    let included = root.join("included.config");
+    std::fs::write(&included, "[remote \"inc\"]\n\tpromisor = true\n").unwrap();
+    git(
+        &paths.workspace,
+        &["config", "include.path", &included.display().to_string()],
+    );
+    refused("remote.inc.promisor");
+    git(&paths.workspace, &["config", "--unset", "include.path"]);
 
-    // an `alternates` file in the cache itself is refused, by name
+    // an `alternates` file in the cache itself is refused, by name: the
+    // message says the cache's objects are the suspect ones, not the clone's
     let cache_alternates = crew.cache_objects().join("info/alternates");
     std::fs::write(
         &cache_alternates,
@@ -1716,6 +1753,10 @@ fn a_promisor_remote_in_the_clone_fetches_nothing_and_runs_nothing() {
     assert!(e.starts_with("f/c/p: "), "{e}");
     assert!(
         e.contains(&cache_alternates.display().to_string()) && e.contains("--purge"),
+        "{e}"
+    );
+    assert!(
+        e.contains("the crew cache's objects may be another repository's"),
         "{e}"
     );
     assert!(paths.workspace.exists());

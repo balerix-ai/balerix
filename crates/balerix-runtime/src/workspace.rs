@@ -10,12 +10,16 @@ use crate::home::render_hosts_yml;
 use crate::layout::{AgentPaths, CrewPaths};
 use crate::tools::{Cmd, ToolPaths};
 
-/// `git` honours `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_PREFIX`
-/// and `GIT_COMMON_DIR` from the environment over an explicit `-C`: if any
-/// of these leak in (a pre-commit hook exports them, and so does a daemon
+/// The environment of every git call balerix makes. `git` honours
+/// `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_PREFIX` and
+/// `GIT_COMMON_DIR` from the environment over an explicit `-C`: if any of
+/// these leak in (a pre-commit hook exports them, and so does a daemon
 /// started under one), every `-C` call would silently operate on whatever
-/// repository those variables name. Scrubbed from every git call balerix
-/// makes.
+/// repository those variables name; scrubbed. `GIT_NO_LAZY_FETCH=1` is
+/// set, over whatever the daemon inherited: a `0` in its environment
+/// would otherwise reach the harvest's `upload-pack` (#67). Harmless on
+/// the cache and a fresh clone, which have no promisor remote; what it
+/// guards is described at `harden_agent_git`.
 pub(crate) fn scrub_git_env(mut cmd: Cmd) -> Cmd {
     for var in [
         "GIT_DIR",
@@ -26,7 +30,7 @@ pub(crate) fn scrub_git_env(mut cmd: Cmd) -> Cmd {
     ] {
         cmd = cmd.env_remove(var);
     }
-    cmd
+    cmd.env("GIT_NO_LAZY_FETCH", "1")
 }
 
 /// Config and environment for a git call in a repository the agent can
@@ -40,14 +44,17 @@ pub(crate) fn scrub_git_env(mut cmd: Cmd) -> Cmd {
 /// repository discovery would then walk up and run the command in whatever
 /// repository contains the state root. git only honours a ceiling that
 /// matches the resolved path, so it is canonical.
-/// `GIT_NO_LAZY_FETCH=1`: a promisor remote in the clone's config
-/// (`extensions.partialClone` plus `remote.<x>.promisor`) would otherwise
-/// make any call that reads a missing object (`status`, `diff`) fetch it
-/// from `remote.<x>.url` as the daemon, into the clone's own object store
-/// where the next harvest carries it into the cache, and run
-/// `remote.<x>.uploadpack` as the daemon on the way. Every call built here
-/// gets it: the clone step's `agent_git` and `inspect.rs`'s `inspect_git`
-/// alike, which closes the same route for the workspace reader's `diff`.
+/// `GIT_NO_LAZY_FETCH=1` (from `scrub_git_env`): a promisor remote in the
+/// clone's config (`extensions.partialClone`, or any `remote.<x>.promisor`)
+/// would otherwise make any call that reads a missing object (`status`,
+/// `diff`) fetch it from `remote.<x>.url` as the daemon, into the clone's
+/// own object store where the next harvest carries it into the cache, and
+/// run `remote.<x>.uploadpack` as the daemon on the way. git honours the
+/// variable from 2.45.1 (and the patched maintenance releases from
+/// 2.39.4), so it is the second layer: both callers refuse such a config
+/// by key before any call that reads an object (`check_clone_config` for
+/// the clone step, `refuse_filters` for the workspace reader, #67), on
+/// any git.
 pub(crate) fn harden_agent_git(cmd: Cmd, crew: &CrewPaths, agent_root: &Path) -> Cmd {
     let no_hooks = crew.root.join("no-hooks");
     let _ = std::fs::create_dir_all(&no_hooks);
@@ -56,7 +63,6 @@ pub(crate) fn harden_agent_git(cmd: Cmd, crew: &CrewPaths, agent_root: &Path) ->
         .unwrap_or_else(|_| agent_root.to_path_buf());
     scrub_git_env(cmd)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CEILING_DIRECTORIES", ceiling.display().to_string())
         .args(["-c", "core.fsmonitor=false"])
@@ -65,6 +71,11 @@ pub(crate) fn harden_agent_git(cmd: Cmd, crew: &CrewPaths, agent_root: &Path) ->
             format!("core.hooksPath={}", no_hooks.display()),
         ])
 }
+
+/// Config keys that declare a promisor remote, in the form `git config
+/// --name-only` prints them (lowercased). `inspect.rs`'s `FILTER_KEYS`
+/// carries the same alternation for the workspace reader.
+pub(crate) const PROMISOR_KEYS: &str = r"^(extensions\.partialclone|remote\..*\.promisor)$";
 
 /// What to do with an existing clone (Spec N §4 step 1): Spec L §12's
 /// marker rule, as a function of the marker, the clone's HEAD (`None`
@@ -145,10 +156,10 @@ fn remove_tree(id: &str, path: &Path) -> Result<(), MaterializeError> {
 ///   `--reference` and so never legitimately has one (a 0.1.x agent,
 ///   adopted under its old sandbox, could write the crew clone's).
 ///
-/// The object store is pinned by this check, and every git call in the
-/// clone runs with `GIT_NO_LAZY_FETCH=1` (`harden_agent_git`), so a
-/// promisor remote the agent writes into the clone's config cannot fetch
-/// another repository's objects into it, or run a program, as the daemon.
+/// The object store is pinned by this check. The clone's *config* is
+/// checked by `Workspace::check_clone_config` before the first git call
+/// that reads objects, not here: a matching marker reuses the clone with
+/// no git call at all (Spec L §12).
 ///
 /// A `.git` git no longer accepts as a repository is not checked here:
 /// `agent_git` names it with `--git-dir` and the harvest fetches with
@@ -161,41 +172,34 @@ fn remove_tree(id: &str, path: &Path) -> Result<(), MaterializeError> {
 fn check_clone(id: &str, crew: &CrewPaths, agent: &AgentPaths) -> Result<(), MaterializeError> {
     use std::os::unix::ffi::OsStrExt;
 
-    let refuse = |path: &Path, found: &str| {
-        // `id` is `<fleet>/<crew>/<agent>`
-        let fleet = id.split('/').next().unwrap_or(id);
-        MaterializeError::Invalid {
-            id: id.to_string(),
-            message: format!(
-                "{}: {found}, so the clone's objects may be another repository's; \
-                 balerix runs no git in it and harvests nothing from it. Run \
-                 `balerix down {fleet} --purge` to delete it (push unpushed work first)",
-                path.display()
-            ),
-        }
-    };
+    let refuse = |path: &Path, found: &str, store: &str| refuse_clone(id, path, found, store);
     let dot_git = agent.workspace.join(".git");
     match std::fs::symlink_metadata(&dot_git) {
         Ok(m) if m.is_dir() => {}
-        Ok(_) => return Err(refuse(&dot_git, "not a real directory")),
-        Err(e) => return Err(refuse(&dot_git, &format!("unreadable ({e})"))),
+        Ok(_) => return Err(refuse(&dot_git, "not a real directory", CLONE_STORE)),
+        Err(e) => return Err(refuse(&dot_git, &format!("unreadable ({e})"), CLONE_STORE)),
     }
     let commondir = dot_git.join("commondir");
     if std::fs::symlink_metadata(&commondir).is_ok() {
-        return Err(refuse(&commondir, "present (a clone has none)"));
+        return Err(refuse(
+            &commondir,
+            "present (a clone has none)",
+            CLONE_STORE,
+        ));
     }
     let cache_alternates = crew.cache_objects().join("info").join("alternates");
     if std::fs::symlink_metadata(&cache_alternates).is_ok() {
         return Err(refuse(
             &cache_alternates,
             "present (the cache is cloned without --reference)",
+            CACHE_STORE,
         ));
     }
     let objects = dot_git.join("objects");
     match first_symlink(&objects) {
         Ok(None) => {}
-        Ok(Some(link)) => return Err(refuse(&link, "a symlink")),
-        Err((path, e)) => return Err(refuse(&path, &format!("unreadable ({e})"))),
+        Ok(Some(link)) => return Err(refuse(&link, "a symlink", CLONE_STORE)),
+        Err((path, e)) => return Err(refuse(&path, &format!("unreadable ({e})"), CLONE_STORE)),
     }
     let alternates = objects.join("info").join("alternates");
     let cache = crew
@@ -216,13 +220,39 @@ fn check_clone(id: &str, crew: &CrewPaths, agent: &AgentPaths) -> Result<(), Mat
                         "names something other than the crew cache {}",
                         cache.display()
                     ),
+                    CLONE_STORE,
                 ));
             }
         }
-        Err(e) => return Err(refuse(&alternates, &format!("unreadable ({e})"))),
+        Err(e) => {
+            return Err(refuse(
+                &alternates,
+                &format!("unreadable ({e})"),
+                CLONE_STORE,
+            ));
+        }
     }
     Ok(())
 }
+
+/// The wording of a `check_clone`/`check_clone_config` refusal: which
+/// `store` is suspect (`CLONE_STORE` or `CACHE_STORE`), and the remedy.
+fn refuse_clone(id: &str, path: &Path, found: &str, store: &str) -> MaterializeError {
+    // `id` is `<fleet>/<crew>/<agent>`
+    let fleet = id.split('/').next().unwrap_or(id);
+    MaterializeError::Invalid {
+        id: id.to_string(),
+        message: format!(
+            "{}: {found}, so {store}. Run `balerix down {fleet} --purge` to \
+             delete it (push unpushed work first)",
+            path.display()
+        ),
+    }
+}
+const CLONE_STORE: &str = "the clone's objects may be another repository's; \
+                     balerix runs no git in it and harvests nothing from it";
+const CACHE_STORE: &str = "the crew cache's objects may be another repository's; \
+                     balerix runs no git in the clone and harvests nothing into the cache";
 
 /// The first symlink at or under `root`, found without following any.
 /// A work list, not recursion: the agent decides how deep the tree goes.
@@ -367,6 +397,52 @@ impl Workspace<'_> {
         Ok(())
     }
 
+    /// A promisor remote in the clone's config (`extensions.partialClone`,
+    /// or any `remote.<x>.promisor`: `PROMISOR_KEYS`) would make the first
+    /// git call that reads a missing object (`status`, the harvest's
+    /// `upload-pack`) fetch it from `remote.<x>.url` as the daemon, into
+    /// the object store `check_clone` pinned, and run
+    /// `remote.<x>.uploadpack` on the way. Refused by key, before that
+    /// call, on any git version (#67); `GIT_NO_LAZY_FETCH=1` on every call
+    /// closes the same route on a git that honours it (2.45.1, or a
+    /// patched maintenance release from 2.39.4) and stays as the second
+    /// layer. The probe is `config --local --includes` through
+    /// `agent_git`, the workspace reader's `refuse_filters` probe: it
+    /// reads no object, so it is safe to run before its own verdict, and
+    /// it follows `include.path` and `includeIf` exactly as git would in
+    /// that repository, which a read of the file alone would not. Runs
+    /// after `check_clone`, never before it.
+    fn check_clone_config(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        agent: &AgentPaths,
+    ) -> Result<(), MaterializeError> {
+        let keys = self.agent_git(
+            id,
+            crew,
+            agent,
+            &[
+                "config",
+                "--local",
+                "--includes",
+                "--name-only",
+                "--get-regexp",
+                PROMISOR_KEYS,
+            ],
+            &[0, 1],
+        )?;
+        match keys.lines().next().map(str::trim).filter(|k| !k.is_empty()) {
+            Some(key) => Err(refuse_clone(
+                id,
+                &agent.workspace.join(".git").join("config"),
+                &format!("sets {key} (a promisor remote)"),
+                CLONE_STORE,
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// One git call inside the agent's clone, hardened by
     /// `harden_agent_git` because the clone is agent-writable, and made
     /// only after `check_clone`. `--git-dir` names `workspace/.git`
@@ -417,7 +493,8 @@ impl Workspace<'_> {
     /// changed `branch` re-creates a clean clone after harvesting the old
     /// branch into the cache (§5), and fails a dirty one naming both
     /// branches. Every git call on an existing clone is `agent_git` (#62),
-    /// and none is made before `check_clone` has passed it.
+    /// none is made before `check_clone` has passed it, and none that
+    /// reads an object before `check_clone_config` has (#67).
     ///
     /// A `workspace/.git` *file* is a worktree from balerix 0.1, refused
     /// with the remedy (N-6). A `workspace/` with no `.git` at all (a
@@ -451,6 +528,7 @@ impl Workspace<'_> {
                 // call; `decide_clone` agrees (`Reuse`)
                 return Ok(());
             }
+            self.check_clone_config(id, crew, agent)?;
             // Err is a detached HEAD (`ref HEAD is not a symbolic ref`),
             // reused as is: its commits may be on no branch.
             let head = self
@@ -717,6 +795,7 @@ impl Workspace<'_> {
     ) -> Result<(), MaterializeError> {
         if crew.repo.join(".git").is_dir() && agent.workspace.join(".git").is_dir() {
             check_clone(id, crew, agent)?;
+            self.check_clone_config(id, crew, agent)?;
             if let Some(branch) = self.assigned_branch(id, crew, agent) {
                 self.harvest(id, crew, agent, &branch)?;
             }
@@ -738,13 +817,38 @@ impl Workspace<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::workspace::{CloneDecision, decide_clone};
+    use crate::tools::Cmd;
+    use crate::workspace::{CloneDecision, decide_clone, harden_agent_git, scrub_git_env};
 
     fn clean() -> Result<bool, ()> {
         Ok(false)
     }
     fn never() -> Result<bool, ()> {
         panic!("the tree is not inspected on this path")
+    }
+
+    /// #67: the variable is set on every git call balerix makes, over
+    /// whatever the daemon inherited (`GIT_NO_LAZY_FETCH=0` in its
+    /// environment would otherwise reach the harvest's `upload-pack`).
+    /// The probe is a script that ignores its arguments, since the
+    /// hardened builder adds `-c` pairs a shell would read as a command.
+    #[test]
+    fn every_git_call_sets_git_no_lazy_fetch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe.sh");
+        std::fs::write(&probe, "#!/bin/sh\nprintf '%s' \"$GIT_NO_LAZY_FETCH\"\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let inherited = || Cmd::new(&probe).env("GIT_NO_LAZY_FETCH", "0");
+        let sees = |cmd: Cmd| cmd.run().unwrap().stdout;
+
+        assert_eq!(sees(scrub_git_env(inherited())), "1");
+        assert_eq!(sees(scrub_git_env(Cmd::new(&probe))), "1");
+
+        let layout = crate::StateLayout::from_env(dir.path(), |_| None);
+        let crew = layout.crew(&"f/c".parse().unwrap());
+        assert_eq!(sees(harden_agent_git(inherited(), &crew, dir.path())), "1");
     }
 
     /// Spec L §12's marker rule over the clone (Spec N §4 step 1).

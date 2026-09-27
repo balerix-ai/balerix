@@ -15,6 +15,10 @@ asset is attested (`gh attestation verify <file> --repo balerix-ai/balerix`).
 - **CLI and daemon:** download `balerix-v<ver>-<arch>-unknown-linux-musl.tar.gz`
   (static; x86_64 or aarch64) and put `balerix` on `PATH`. `serve` also needs
   `git`, `gh`, `mise`, `nono` and `tmux` on `PATH` and a Landlock kernel (5.13+).
+  git 2.45.1 or newer is recommended: from there git honours
+  `GIT_NO_LAZY_FETCH`, balerix's second layer against a promisor remote
+  an agent writes into its clone's config (the first, a refusal of that
+  config, needs no particular version).
 - **Container:** `docker run -d --name balerix -v balerix:/home/balerix
   ghcr.io/balerix-ai/balerix:<ver>` runs the daemon with its tools. It listens on
   loopback inside the container only, so run the client there too:

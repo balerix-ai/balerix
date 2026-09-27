@@ -409,6 +409,41 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
     assert!(rt.diff(&id, "origin/main").is_ok(), "unset: diffs again");
     std::fs::remove_file(w.join(".gitattributes")).unwrap();
 
+    // a promisor remote (#67): a diff over a missing object would fetch
+    // it from `remote.<x>.url` as the daemon and run `remote.<x>.uploadpack`
+    // on a git older than 2.45.1, whatever `GIT_NO_LAZY_FETCH` says.
+    // Refused by key, the extension first and any promisor remote alone.
+    for (k, v) in [
+        ("core.repositoryformatversion", "1"),
+        ("extensions.partialClone", "evil"),
+        ("remote.evil.promisor", "true"),
+        ("remote.evil.url", "/nonexistent"),
+    ] {
+        git(w, &["config", k, v]);
+    }
+    assert_eq!(
+        rt.diff(&id, "origin/main").unwrap_err(),
+        WorkspaceError::Filter {
+            key: "extensions.partialclone".into()
+        }
+    );
+    git(w, &["config", "--unset", "extensions.partialClone"]);
+    assert_eq!(
+        rt.diff(&id, "origin/main").unwrap_err(),
+        WorkspaceError::Filter {
+            key: "remote.evil.promisor".into()
+        }
+    );
+    assert!(
+        matches!(
+            rt.version(&id, "origin/main"),
+            Err(WorkspaceError::Filter { .. })
+        ),
+        "version is refused by the same check"
+    );
+    git(w, &["config", "--unset", "remote.evil.promisor"]);
+    assert!(rt.diff(&id, "origin/main").is_ok(), "unset: diffs again");
+
     // a missing base is a git error naming the subcommand
     let e = rt.diff(&id, "origin/nope").unwrap_err();
     assert!(

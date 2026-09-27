@@ -406,6 +406,35 @@ crews:
     }
 
     #[test]
+    fn restricted_mode_refuses_a_null_ancestor_that_would_delete_the_hosts_keys() {
+        let yaml = "apiVersion: balerix/v1\nkind: Fleet\nname: f\ndefaults:\n  claude: null\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a: {}\n";
+        let operator = json!({ "claude": { "binary": "/opt/balerix" } });
+        assert_eq!(
+            resolve(
+                &file(yaml),
+                &ResolveOptions {
+                    operator_layer: Some(operator.clone()),
+                    ..restricted()
+                }
+            )
+            .unwrap_err()
+            .to_string(),
+            "defaults.claude: not allowed in a plugin-applied fleet file; the host's default applies"
+        );
+        // unrestricted, the same file resolves, the null deleting the
+        // operator's binary
+        let spec = resolve(
+            &file(yaml),
+            &ResolveOptions {
+                operator_layer: Some(operator),
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert_eq!(spec.crews["c"].agents["a"].claude.binary, "claude");
+    }
+
+    #[test]
     fn the_host_settings_may_carry_what_the_file_may_not() {
         let host =
             json!({ "env": { "ANTHROPIC_BASE_URL": "https://proxy" }, "apiKeyHelper": "helper" });

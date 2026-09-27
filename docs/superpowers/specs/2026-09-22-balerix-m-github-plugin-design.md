@@ -698,6 +698,12 @@ credentials or the gh token (Spec L-3).
 - The check is `balerix_config::restricted::check_layer`, run on each
   raw layer inside `resolve` when `ResolveOptions::restricted` is set; a
   refused key present with any value, null included, is refused.
+- A present ancestor of a refused key set to null (`claude: null`,
+  `claude: { settings: null }`) is refused too, named at the ancestor
+  (`defaults.claude: not allowed …`): merging treats null as "delete
+  this subtree", so it would strip the operator's and the host's
+  `binary`, `args` and `settings` from beneath. A mapping ancestor is
+  fine.
 - `ResolveOptions::operator_layer` is the `fleetDefaults` mapping;
   `expect_mapping("fleetDefaults", …)` names it when it is not one, and
   the plugin sync refuses a non-mapping with

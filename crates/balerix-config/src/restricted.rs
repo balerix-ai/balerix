@@ -2,7 +2,10 @@
 //! M §12.1): the file cannot choose what its agents run as. Checked on
 //! each raw layer before merging, so the host's own `settings.json` and
 //! the operator's `fleetDefaults`, which may carry these keys, are never
-//! read here.
+//! read here. A present ancestor of a refused key set to null (`claude:
+//! null`) is refused too: merging treats null as "delete this subtree",
+//! so it would strip the keys beneath from the host's and operator's
+//! layers.
 
 use serde_json::Value;
 
@@ -20,24 +23,30 @@ const WHY: &str = "not allowed in a plugin-applied fleet file; the host's defaul
 
 /// Refuses `layer` (a `defaults`, crew `defaults` or agent block, already
 /// known to be a mapping or null) when it carries a refused key,
-/// present with any value including null. The message names
-/// `<path>.<key>`.
+/// present with any value including null, or a present ancestor of one
+/// set to null (`claude`, `claude.settings`), which would delete the
+/// lower layers' keys beneath it. The message names `<path>.<key>`, the
+/// ancestor's key for a null ancestor.
 pub fn check_layer(path: &str, layer: &Value) -> Result<(), ConfigError> {
     let refused = |key: &str| ConfigError::Invalid {
         path: format!("{path}.{key}"),
         message: WHY.to_string(),
     };
-    for key in REFUSED_KEYS {
-        if layer
-            .pointer(&format!("/{}", key.replace('.', "/")))
-            .is_some()
-        {
-            return Err(refused(key));
-        }
-    }
-    for key in REFUSED_SETTINGS {
-        if layer.pointer(&format!("/claude/settings/{key}")).is_some() {
-            return Err(refused(&format!("claude.settings.{key}")));
+    let settings = REFUSED_SETTINGS.map(|key| format!("claude.settings.{key}"));
+    let keys = REFUSED_KEYS
+        .iter()
+        .copied()
+        .chain(settings.iter().map(String::as_str));
+    for key in keys {
+        let segments: Vec<&str> = key.split('.').collect();
+        for depth in 1..=segments.len() {
+            let prefix = &segments[..depth];
+            let Some(found) = layer.pointer(&format!("/{}", prefix.join("/"))) else {
+                break;
+            };
+            if depth == segments.len() || found.is_null() {
+                return Err(refused(&prefix.join(".")));
+            }
         }
     }
     Ok(())
@@ -87,6 +96,26 @@ mod tests {
             "defaults.env: not allowed in a plugin-applied fleet file; the host's default applies"
         );
         assert!(check_layer("defaults", &json!({ "sandbox": null })).is_err());
+    }
+
+    #[test]
+    fn a_null_ancestor_of_a_refused_key_is_refused_at_the_ancestor() {
+        // merge treats null as "delete this subtree", so `claude: null`
+        // would strip the operator's and host's binary, args and settings
+        let e = check_layer("defaults", &json!({ "claude": null })).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "defaults.claude: not allowed in a plugin-applied fleet file; the host's default applies"
+        );
+        let e = check_layer("crews.c.defaults", &json!({ "claude": { "settings": null } }))
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "crews.c.defaults.claude.settings: not allowed in a plugin-applied fleet file; the host's default applies"
+        );
+        // a present ancestor that is a mapping is how allowed keys get set
+        check_layer("defaults", &json!({ "claude": { "settings": {} } })).unwrap();
+        check_layer("defaults", &json!({ "claude": { "resume": null } })).unwrap();
     }
 
     #[test]

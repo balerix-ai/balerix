@@ -343,3 +343,22 @@ directory, not a repository.
   (`a_force_pushed_default_branch_does_not_seed_from_the_cache`) proves
   the new clone sits on the rewritten `origin/main` with no `main` and a
   detached HEAD in the cache.
+- 2026-09-27 (#67): `GIT_NO_LAZY_FETCH` is honoured from git 2.45.1
+  (and the patched maintenance releases from 2.39.4), and `git` comes
+  from the host, not a mise pin, so the promisor guard above depended on
+  the host's version. Both readers of the clone now refuse a promisor
+  remote by key before any git call that reads an object:
+  `Workspace::check_clone_config` (`config --local --includes`, so
+  includes count as git counts them; after the filesystem `check_clone`,
+  and after the marker's reuse path, which still makes no git call) on a
+  branch change and before a harvest, and the workspace reader's
+  `refuse_filters` with the same two keys (`extensions.partialclone`,
+  `remote.*.promisor`). The variable moved into `scrub_git_env`, so every
+  git call carries it over whatever the daemon inherited, as the second
+  layer. The cache-`alternates` refusal names the cache's objects as the
+  suspect ones. No startup version check: nothing depends on the version
+  any more, and a compare against `git --version` misreads distribution
+  backports both ways. `workspace_it` proves the refusal on the
+  extension, on a promisor remote alone and through an included file;
+  `inspect_it` the reader's; a unit test that both builders set the
+  variable over an inherited `0`.

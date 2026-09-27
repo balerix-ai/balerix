@@ -53,7 +53,13 @@ const DIFF_FLAGS: &[&str] = &[
 /// something balerix sets, and a diff is refused outright. `git
 /// sparse-checkout init/set` (and `scalar`) enable it too, so the remedy is
 /// `git sparse-checkout disable` rather than unsetting the key by hand.
-const FILTER_KEYS: &str = r"^(filter\..*\.(clean|smudge|process)|extensions\.worktreeconfig)$";
+/// A promisor remote (`extensions.partialclone`, or any
+/// `remote.<x>.promisor`; the alternation is `workspace::PROMISOR_KEYS`)
+/// would make a diff over a missing object fetch it from `remote.<x>.url`
+/// as the daemon and run `remote.<x>.uploadpack`; `GIT_NO_LAZY_FETCH=1`
+/// (`harden_agent_git`) closes that on git 2.45.1 and later, the refusal
+/// on any git (#67).
+const FILTER_KEYS: &str = r"^(filter\..*\.(clean|smudge|process)|extensions\.worktreeconfig|extensions\.partialclone|remote\..*\.promisor)$";
 
 impl Runtime {
     /// The agent's paths and its crew's; `Missing` when the worktree

@@ -78,10 +78,12 @@ pub fn render_hosts_yml(token: &str) -> String {
 /// Seed that suppresses first-run prompts, overlaid with the account fields
 /// the bundle carried (`oauthAccount`, `hasCompletedOnboarding`). `trusted`
 /// are the directories whose "do you trust this folder?" dialog is
-/// pre-accepted: the agent's workspace and the crew's `repo/` — claude
-/// 2.1.263 keys the decision on the worktree's common git dir, not on the
-/// cwd it asked about (verified by hand, Phase 3 spec §8.1). Without it a
-/// fresh agent parks on that dialog and never sends `SessionStart`.
+/// pre-accepted: the agent's workspace. Claude 2.1.263 keys the decision
+/// on the common git dir, not on the cwd it asked about (verified by
+/// hand, Phase 3 spec §8.1), which for a 0.1 worktree was the crew's
+/// `repo/` and for a private clone (Spec N) is the workspace itself
+/// (#74). Without it a fresh agent parks on that dialog and never sends
+/// `SessionStart`.
 ///
 /// `hasSeenAutoDefaultNudge` is the "No" to the one-time "Make auto mode
 /// your default permission mode?" dialog claude 2.1.282 added, shown when
@@ -312,7 +314,7 @@ mod tests {
             render_hosts_yml("gho_x"),
             "github.com:\n    oauth_token: gho_x\n    git_protocol: https\n"
         );
-        let trusted = [Path::new("/w/workspace"), Path::new("/w/repo")];
+        let trusted = [Path::new("/w/workspace")];
         let v = render_claude_json(
             Some(
                 &json!({ "oauthAccount": { "emailAddress": "a@b.c" }, "hasCompletedOnboarding": true }),
@@ -325,10 +327,7 @@ mod tests {
             v["projects"]["/w/workspace"]["hasTrustDialogAccepted"], true,
             "the workspace trust dialog is pre-accepted"
         );
-        assert_eq!(
-            v["projects"]["/w/repo"]["hasTrustDialogAccepted"], true,
-            "claude keys trust on the worktree's common repo too"
-        );
+        assert_eq!(v["projects"].as_object().unwrap().len(), 1);
         assert_eq!(
             render_claude_json(None, &[]),
             json!({

@@ -1761,3 +1761,182 @@ fn a_promisor_remote_in_the_clone_fetches_nothing_and_runs_nothing() {
     );
     assert!(paths.workspace.exists());
 }
+
+/// `tools` with `git` replaced by a shim that exits 128 on any call whose
+/// argv holds `subcommand` as a word, and runs the real git otherwise: how
+/// a real git error (not a "no" answer) is injected into one step (#74).
+fn failing_git(
+    root: &Path,
+    tools: &balerix_runtime::ToolPaths,
+    subcommand: &str,
+) -> balerix_runtime::ToolPaths {
+    use std::os::unix::fs::PermissionsExt;
+
+    let shim = root.join(format!("git-failing-{subcommand}.sh"));
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"{subcommand}\" ]; then\n    echo \"shim: {subcommand} refused\" >&2\n    exit 128\n  fi\ndone\nexec {} \"$@\"\n",
+            tools.git.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    balerix_runtime::ToolPaths {
+        git: shim,
+        ..tools.clone()
+    }
+}
+
+/// #74: a cache whose `gc.auto` pin failed is not kept, since an existing
+/// cache is never touched again; the next pass re-clones and pins it.
+#[test]
+fn a_cache_whose_pin_failed_is_removed_and_made_again() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-pin-failed");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let crew = layout.crew(&"f/c".parse().unwrap());
+    let broken = failing_git(&root, &tools, "config");
+    let e = Workspace {
+        tools: &broken,
+        gh_config_dir: None,
+    }
+    .ensure_repo("f/c", &crew, &repo, "main")
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("config refused"), "{e}");
+    assert!(
+        !crew.repo.join(".git").exists(),
+        "a half-made cache must not survive the failed pin"
+    );
+
+    Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    }
+    .ensure_repo("f/c", &crew, &repo, "main")
+    .unwrap();
+    assert_eq!(git(&crew.repo, &["config", "gc.auto"]).trim(), "0");
+}
+
+/// #74: a clone whose HEAD git cannot read, with no marker to fall back
+/// on, is not "detached": the removal fails and keeps the clone.
+#[test]
+fn an_unreadable_head_without_a_marker_fails_the_removal() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-head-error");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    std::fs::remove_file(paths.branch_marker()).unwrap();
+
+    let broken = failing_git(&root, &tools, "symbolic-ref");
+    let e = Workspace {
+        tools: &broken,
+        gh_config_dir: None,
+    }
+    .harvest_and_remove("f/c/a", &crew, &paths)
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("symbolic-ref refused"), "{e}");
+    assert!(
+        paths.workspace.join(".git").is_dir(),
+        "nothing deleted when HEAD cannot be read"
+    );
+}
+
+/// #74: the same HEAD probe on a branch change: a git error is not a
+/// detached HEAD to reuse; the pass fails.
+#[test]
+fn an_unreadable_head_fails_a_branch_change() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-head-error-change");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    push_branch(&root, "feature/issue-74");
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+
+    let broken = failing_git(&root, &tools, "symbolic-ref");
+    let e = Workspace {
+        tools: &broken,
+        gh_config_dir: None,
+    }
+    .ensure_clone(
+        "f/c/a",
+        &crew,
+        &paths,
+        &repo,
+        "feature/issue-74",
+        "feature/issue-74",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("symbolic-ref refused"), "{e}");
+    assert_eq!(
+        git(&paths.workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "balerix/f/c/a",
+        "the clone is left as it was"
+    );
+}
+
+/// #74: a git error while probing the cache for a harvested copy fails
+/// the clone; it does not silently mean "no copy, build from the start
+/// ref" and drop the seed.
+#[test]
+fn a_failed_harvest_probe_fails_the_clone() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-probe-error");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    }
+    .ensure_repo("f/c", &crew, &repo, "main")
+    .unwrap();
+
+    let broken = failing_git(&root, &tools, "rev-parse");
+    let e = Workspace {
+        tools: &broken,
+        gh_config_dir: None,
+    }
+    .ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("rev-parse refused"), "{e}");
+    assert!(!paths.workspace.exists(), "the half-made clone is removed");
+}

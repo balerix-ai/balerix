@@ -61,6 +61,9 @@ pub(crate) struct Cmd {
 #[derive(Debug)]
 pub(crate) struct CmdOutput {
     pub stdout: String,
+    /// The exit code, one of the accepted ones: how a caller that accepts
+    /// `[0, 1]` tells a "no" (1) from a "yes" (0).
+    pub code: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,15 +309,15 @@ impl Cmd {
                 );
             }
         }
-        let ok = out.status.code().is_some_and(|c| accepted.contains(&c));
-        if !ok {
+        let code = out.status.code().filter(|c| accepted.contains(c));
+        let Some(code) = code else {
             return Err(failure(if stderr.trim().is_empty() {
                 format!("exit status {}", out.status)
             } else {
                 stderr
             }));
-        }
-        Ok(CmdOutput { stdout })
+        };
+        Ok(CmdOutput { stdout, code })
     }
 }
 
@@ -404,7 +407,9 @@ mod tests {
     fn an_accepted_exit_code_is_success_and_keeps_stdout() {
         let sh = Cmd::new(Path::new("/bin/sh")).args(["-c", "echo out; exit 1"]);
         assert!(sh.run().is_err());
-        assert_eq!(sh.run_with_exit_codes(&[0, 1]).unwrap().stdout, "out\n");
+        let out = sh.run_with_exit_codes(&[0, 1]).unwrap();
+        assert_eq!(out.stdout, "out\n");
+        assert_eq!(out.code, 1, "the accepted code is reported");
         assert!(sh.run_with_exit_codes(&[2]).is_err());
     }
 

@@ -65,7 +65,7 @@ impl Runtime {
                 hooks,
                 git: &agent.git,
                 relay: &self.tools.balerix,
-                trusted: &[&paths.workspace, &crew.repo],
+                trusted: &[&paths.workspace],
                 with_gh,
                 redact_credentials: opts.redact_credentials,
             },

@@ -379,7 +379,13 @@ credentials, hook input, or sandbox rules.
   from it. Only that branch survives: other local branches and every
   file in the tree go with the clone. Plain `down` and `--purge` delete
   the cache too and harvest nothing, so a broken clone cannot wedge a
-  purge. A `workspace/.git` that is a *file* is a 0.1.x worktree and is
+  purge. A git error is never a "no": a yes/no question (`rev-parse
+  --verify`, `merge-base --is-ancestor`, `symbolic-ref -q`) goes through
+  `git_probe`/`head_branch`, where exit 1 is the answer and any other
+  exit fails the step, and a marker or HEAD the daemon cannot read fails
+  the harvest rather than skipping it (#74). A cache or clone whose
+  making failed half-way is removed with the error, so the next pass
+  starts over instead of judging the remains. A `workspace/.git` that is a *file* is a 0.1.x worktree and is
   refused with the purge message; `down --keep-repos` + `up` also works
   (the old crew clone becomes the cache and its branches seed the new
   clones).

@@ -149,6 +149,21 @@ fn materialize_then_remove_round_trip() {
     assert!(paths.workspace.join("README").exists());
     assert!(paths.launch.exists() && paths.profile.exists() && paths.mise_toml.exists());
     assert!(paths.claude_dir().join("settings.json").exists());
+    // #74: with a private clone the workspace is its own common git dir,
+    // so it is the one directory claude keys the trust decision on.
+    let claude_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(paths.claude_dir().join(".claude.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        claude_json["projects"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec![&paths.workspace.display().to_string()],
+        "only the workspace is pre-trusted"
+    );
     assert!(
         !paths.claude_dir().join(".credentials.json").exists(),
         "no creds in the bundle → no file"

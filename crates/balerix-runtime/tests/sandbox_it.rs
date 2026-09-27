@@ -31,9 +31,11 @@ fn generated_profile_validates_and_enforces_isolation() {
     for d in &dirs {
         std::fs::create_dir_all(d).unwrap();
     }
-    // Spec N-3: the cache is readable and not writable from inside.
+    // Spec N-3: the cache is readable and not writable from inside. The
+    // probe sits where a loose object would, one fan-out level down.
     let objects = crew.cache_objects();
-    std::fs::write(objects.join("probe"), "probe-ok\n").unwrap();
+    std::fs::create_dir_all(objects.join("ab")).unwrap();
+    std::fs::write(objects.join("ab/probe"), "probe-ok\n").unwrap();
     let env = agent_env(
         &id,
         &paths,
@@ -58,7 +60,7 @@ fn generated_profile_validates_and_enforces_isolation() {
     let script = format!(
         "echo in > \"$HOME/ok\" && echo HOME=$HOME && echo FOO=$FOO \
          && (echo x > {outside}/nope 2>/dev/null && echo ESCAPED || echo denied) \
-         && (cat {objects}/probe 2>/dev/null || echo CACHE_UNREADABLE) \
+         && (cat {objects}/ab/probe 2>/dev/null || echo CACHE_UNREADABLE) \
          && (echo x > {objects}/nope 2>/dev/null && echo CACHE_WRITABLE || echo cache-denied)",
         outside = outside.display(),
         objects = objects.display()

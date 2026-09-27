@@ -8,7 +8,7 @@ use balerix_core::{MaterializeError, RepoRef};
 use crate::fsutil::write_atomic;
 use crate::home::render_hosts_yml;
 use crate::layout::{AgentPaths, CrewPaths};
-use crate::tools::{Cmd, ToolPaths};
+use crate::tools::{Cmd, CmdOutput, ToolPaths};
 
 /// The environment of every git call balerix makes. `git` honours
 /// `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_PREFIX` and
@@ -130,6 +130,34 @@ fn remove_tree(id: &str, path: &Path) -> Result<(), MaterializeError> {
             path: path.to_path_buf(),
             message: e.to_string(),
         }),
+    }
+}
+
+/// The error to return when a step failed half-way through making the
+/// repository at `path`: `failed` once the remains are removed, or, when
+/// the removal fails too, one naming both — a partial removal that left
+/// `.git` behind would otherwise be judged a whole repository with every
+/// file deleted on the next pass, with the real error never reported
+/// (#74).
+fn discard_half_made(id: &str, path: &Path, failed: MaterializeError) -> MaterializeError {
+    match remove_tree(id, path) {
+        Ok(()) => failed,
+        Err(cleanup) => {
+            let strip = |e: &MaterializeError| {
+                let s = e.to_string();
+                s.strip_prefix(&format!("{id}: "))
+                    .map(str::to_string)
+                    .unwrap_or(s)
+            };
+            MaterializeError::Invalid {
+                id: id.to_string(),
+                message: format!(
+                    "{}; then removing what it left behind failed: {}",
+                    strip(&failed),
+                    strip(&cleanup)
+                ),
+            }
+        }
     }
 }
 
@@ -299,6 +327,30 @@ impl Workspace<'_> {
     /// every call). For the cache and for a clone at creation; a call in
     /// an existing clone goes through `agent_git`.
     fn git(&self, id: &str, crew: &CrewPaths, args: &[&str]) -> Result<String, MaterializeError> {
+        self.git_accepting(id, crew, args, &[0]).map(|o| o.stdout)
+    }
+
+    /// `git` as a yes/no question: exit 0 is `true`, exit 1 is `false`
+    /// (`rev-parse --verify --quiet`, `merge-base --is-ancestor`), and any
+    /// other exit is the error it is, never a "no" (#74).
+    fn git_probe(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        args: &[&str],
+    ) -> Result<bool, MaterializeError> {
+        self.git_accepting(id, crew, args, &[0, 1])
+            .map(|o| o.code == 0)
+    }
+
+    /// `git`, with `accepted` the exit codes that count as success.
+    fn git_accepting(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        args: &[&str],
+        accepted: &[i32],
+    ) -> Result<CmdOutput, MaterializeError> {
         let mut cmd =
             scrub_git_env(Cmd::new(&self.tools.git).log(&crew.root.join("logs").join("git.log")));
         if let Some(dir) = &self.gh_config_dir {
@@ -315,8 +367,7 @@ impl Workspace<'_> {
         cmd = cmd
             .env("GIT_TERMINAL_PROMPT", "0")
             .args(args.iter().copied());
-        cmd.run()
-            .map(|o| o.stdout)
+        cmd.run_with_exit_codes(accepted)
             .map_err(|f| MaterializeError::Tool {
                 id: id.to_string(),
                 tool: f.tool,
@@ -333,7 +384,8 @@ impl Workspace<'_> {
     /// default branch deleted (`detach_cache_head`). A cache that exists
     /// is left alone, so a steady-state pass costs no git call (Phase 3
     /// spec §6.1); `ensure_clone` fetches when it actually needs
-    /// `origin/<ref>`.
+    /// `origin/<ref>`. Whatever fails after the clone removes it, so the
+    /// next pass clones and pins again.
     pub fn ensure_repo(
         &self,
         id: &str,
@@ -362,8 +414,11 @@ impl Workspace<'_> {
                 &cache,
             ],
         )?;
-        self.git(id, crew, &["-C", &cache, "config", "gc.auto", "0"])?;
-        self.detach_cache_head(id, crew)
+        // A cache left behind with its pin or its HEAD not yet settled
+        // would be taken for a whole one on every later pass (#74).
+        self.git(id, crew, &["-C", &cache, "config", "gc.auto", "0"])
+            .and_then(|_| self.detach_cache_head(id, crew))
+            .map_err(|e| discard_half_made(id, &crew.repo, e))
     }
 
     /// A `--no-checkout` clone still has the remote's default branch under
@@ -529,11 +584,7 @@ impl Workspace<'_> {
                 return Ok(());
             }
             self.check_clone_config(id, crew, agent)?;
-            // Err is a detached HEAD (`ref HEAD is not a symbolic ref`),
-            // reused as is: its commits may be on no branch.
-            let head = self
-                .agent_git(id, crew, agent, &["symbolic-ref", "--short", "HEAD"], &[0])
-                .ok();
+            let head = self.head_branch(id, crew, agent)?;
             let decision = decide_clone(marker.as_deref(), head.as_deref(), branch, || {
                 self.agent_git(id, crew, agent, &["status", "--porcelain"], &[0])
                     .map(|s| !s.trim().is_empty())
@@ -571,10 +622,8 @@ impl Workspace<'_> {
         } else {
             remove_tree(id, &agent.workspace)?;
         }
-        if let Err(e) = self.create_clone(id, crew, agent, repo, branch, start_ref) {
-            let _ = std::fs::remove_dir_all(&agent.workspace);
-            return Err(e);
-        }
+        self.create_clone(id, crew, agent, repo, branch, start_ref)
+            .map_err(|e| discard_half_made(id, &agent.workspace, e))?;
         Self::record_branch(id, agent, branch)
     }
 
@@ -626,32 +675,35 @@ impl Workspace<'_> {
         )?;
         let refname = format!("refs/heads/{branch}");
         let remote = format!("refs/remotes/origin/{branch}");
-        let cached = self
-            .git(
-                id,
-                crew,
-                &["-C", &cache, "rev-parse", "--verify", "--quiet", &refname],
-            )
-            .is_ok();
+        let cached = self.git_probe(
+            id,
+            crew,
+            &["-C", &cache, "rev-parse", "--verify", "--quiet", &refname],
+        )?;
         // The cache's copy is a harvest (`ensure_repo` keeps no other
         // branch there), worth seeding from only while it holds commits
         // `origin/<branch>` lacks: one the agent pushed is behind origin's
-        // once someone else pushes on top of it.
+        // once someone else pushes on top of it. A branch origin does not
+        // have contains nothing; `merge-base` would call that a fatal
+        // error rather than a "no".
         let contained = cached
-            && self
-                .git(
-                    id,
-                    crew,
-                    &[
-                        "-C",
-                        &cache,
-                        "merge-base",
-                        "--is-ancestor",
-                        &refname,
-                        &remote,
-                    ],
-                )
-                .is_ok();
+            && self.git_probe(
+                id,
+                crew,
+                &["-C", &cache, "rev-parse", "--verify", "--quiet", &remote],
+            )?
+            && self.git_probe(
+                id,
+                crew,
+                &[
+                    "-C",
+                    &cache,
+                    "merge-base",
+                    "--is-ancestor",
+                    &refname,
+                    &remote,
+                ],
+            )?;
         if cached && !contained {
             self.git(
                 id,
@@ -668,14 +720,11 @@ impl Workspace<'_> {
                 ],
             )?;
             self.git(id, crew, &["-C", &ws, "checkout", "--quiet", branch])?;
-            if self
-                .git(
-                    id,
-                    crew,
-                    &["-C", &ws, "rev-parse", "--verify", "--quiet", &remote],
-                )
-                .is_ok()
-            {
+            if self.git_probe(
+                id,
+                crew,
+                &["-C", &ws, "rev-parse", "--verify", "--quiet", &remote],
+            )? {
                 self.git(
                     id,
                     crew,
@@ -796,22 +845,54 @@ impl Workspace<'_> {
         if crew.repo.join(".git").is_dir() && agent.workspace.join(".git").is_dir() {
             check_clone(id, crew, agent)?;
             self.check_clone_config(id, crew, agent)?;
-            if let Some(branch) = self.assigned_branch(id, crew, agent) {
+            if let Some(branch) = self.assigned_branch(id, crew, agent)? {
                 self.harvest(id, crew, agent, &branch)?;
             }
         }
         remove_tree(id, &agent.workspace)
     }
 
-    /// The marker's branch, else HEAD's; `None` for a detached HEAD.
-    fn assigned_branch(&self, id: &str, crew: &CrewPaths, agent: &AgentPaths) -> Option<String> {
-        match std::fs::read_to_string(agent.branch_marker()) {
-            Ok(m) if !m.trim().is_empty() => Some(m.trim().to_string()),
-            _ => self
-                .agent_git(id, crew, agent, &["symbolic-ref", "--short", "HEAD"], &[0])
-                .ok()
-                .map(|h| h.trim().to_string()),
+    /// The marker's branch, else HEAD's; `None` for a detached HEAD. A
+    /// marker that is absent or empty falls back to HEAD; one that cannot
+    /// be read is an error, since guessing would harvest the wrong
+    /// branch or none (#74).
+    fn assigned_branch(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        agent: &AgentPaths,
+    ) -> Result<Option<String>, MaterializeError> {
+        let marker = agent.branch_marker();
+        match std::fs::read_to_string(&marker) {
+            Ok(m) if !m.trim().is_empty() => Ok(Some(m.trim().to_string())),
+            Ok(_) => self.head_branch(id, crew, agent),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.head_branch(id, crew, agent),
+            Err(e) => Err(MaterializeError::Io {
+                id: id.to_string(),
+                path: marker,
+                message: e.to_string(),
+            }),
         }
+    }
+
+    /// The branch HEAD is on, `None` when detached. `symbolic-ref -q`
+    /// exits 1 for a detached HEAD, silently; anything else git cannot do
+    /// with HEAD is an error, not a detached HEAD (#74).
+    fn head_branch(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        agent: &AgentPaths,
+    ) -> Result<Option<String>, MaterializeError> {
+        let head = self.agent_git(
+            id,
+            crew,
+            agent,
+            &["symbolic-ref", "-q", "--short", "HEAD"],
+            &[0, 1],
+        )?;
+        let head = head.trim();
+        Ok((!head.is_empty()).then(|| head.to_string()))
     }
 }
 

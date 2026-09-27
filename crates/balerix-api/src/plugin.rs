@@ -335,6 +335,30 @@ mod tests {
         );
     }
 
+    /// Review focus 5: a `plugins.yaml` in the form `plugin add` writes
+    /// (`serde_norway::to_string` of the file), with no `fleetDefaults`,
+    /// loads and writes back byte for byte.
+    #[test]
+    fn a_plugins_file_without_fleet_defaults_round_trips_byte_identical() {
+        let text = "plugins:\n- name: gh\n  source: ./gh\n  sha256: abc\n  secrets:\n    key: ../k.pem\n  config:\n    appId: 1\n- name: web\n  source: ./web\n  config: {}\n";
+        let f: PluginsFile = serde_norway::from_str(text).unwrap();
+        assert_eq!(serde_norway::to_string(&f).unwrap(), text);
+        let built = PluginsFile {
+            plugins: vec![PluginEntry {
+                name: "web".into(),
+                source: "./web".into(),
+                sha256: None,
+                secrets: BTreeMap::new(),
+                config: json!({}),
+                fleet_defaults: json!({}),
+            }],
+        };
+        assert_eq!(
+            serde_norway::to_string(&built).unwrap(),
+            "plugins:\n- name: web\n  source: ./web\n  config: {}\n"
+        );
+    }
+
     #[test]
     fn fleet_defaults_is_read_under_its_camel_case_name() {
         let yaml = "name: gh\nsource: ./gh\nfleetDefaults:\n  claude: { binary: /opt/claude }\n  sandbox: { network: { block: false } }\n";

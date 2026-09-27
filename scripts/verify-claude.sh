@@ -7,7 +7,9 @@
 # header (event counts after one prompt), which `.claude.json` copy Claude
 # read, whether any first-start dialog appeared (login, onboarding, folder
 # trust, or the "Make auto mode your default permission mode?" offer that
-# claude 2.1.282 added; #73), and HOME relocation (nono's own $HOME).
+# claude 2.1.282 added; #73), HOME relocation (nono's own $HOME), and that a
+# slash command typed the way `send_text` types it runs (#41: `/exit` sent
+# as `send-keys -l` then `Enter`, the pane exits and a SessionEnd arrives).
 #
 # Your real $HOME stays: the client needs ~/.claude for credentials and the
 # host settings layer. Only the three XDG roots move: config and state to
@@ -263,6 +265,43 @@ if [ -n "$BRANCH" ]; then
   say "origin $BRANCH tip: $(git -C "$BARE" rev-parse --short "$BRANCH" 2>&1)"
   say "origin main tip:   $(git -C "$BARE" rev-parse --short main 2>&1)"
   say "origin log of $BRANCH:"; git -C "$BARE" log --oneline "$BRANCH" 2>&1 | sed 's/^/  /'
+fi
+hr "G. #41: a slash command typed the way send_text types it (send-keys -l, then Enter) runs"
+# A matrix thread reply and a flow `send` step reach the pane as exactly
+# these two tmux commands (TmuxRunner::send_text). #41 saw `/exit` parked
+# in the input with the ✓ already sent; it never reproduced, and this is
+# what a claude bump has to keep true. The fake only records what arrived;
+# the real claude proves the exit (pane dead, SessionEnd counted).
+TARGET="$FLEET/$CREW:$AGENT"
+session_ends() { curl -sf "$URL/metrics" 2>/dev/null | sed -n 's/^balerix_hook_events_total{.*event="SessionEnd".*} //p' | head -1; }
+if tmux -L "$SOCKET" has-session -t "=$FLEET/$CREW" >/dev/null 2>&1; then
+  ends_before="$(session_ends)"; ends_before="${ends_before:-0}"
+  tmux -L "$SOCKET" send-keys -t "$TARGET" -l -- '/exit'
+  tmux -L "$SOCKET" send-keys -t "$TARGET" Enter
+  verdict=""
+  for _ in $(seq 1 60); do
+    if [ "$FAKE" = 1 ]; then
+      if grep -qx '/exit' "$AGENT_DIR/home/fake-claude.stdin" 2>/dev/null; then
+        verdict="arrived: '/exit' and its Enter reached the fake's stdin as one line (the fake does not exit)"; break
+      fi
+    else
+      dead="$(tmux -L "$SOCKET" display-message -p -t "$TARGET" '#{pane_dead}' 2>/dev/null || echo gone)"
+      ends="$(session_ends)"; ends="${ends:-0}"
+      if [ "$dead" != 0 ] || [ "$ends" -gt "$ends_before" ]; then
+        verdict="ran: pane dead=$dead, SessionEnd hooks $ends_before -> $ends"; break
+      fi
+    fi
+    sleep 0.25
+  done
+  if [ -n "$verdict" ]; then
+    say "$verdict"
+  else
+    say "PARKED (#41 reproduced): 15 s after Enter the pane is alive and no SessionEnd arrived; input line:"
+    tmux -L "$SOCKET" capture-pane -p -t "$TARGET" 2>/dev/null | grep '^❯' | sed 's/^/  /'
+    [ "$FAKE" = 1 ] && tail_file "fake-claude.stdin" "$AGENT_DIR/home/fake-claude.stdin" 5
+  fi
+else
+  say "agent session absent; skipped"
 fi
 say "=============================== END REPORT ==============================="
 exit 0

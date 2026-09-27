@@ -83,6 +83,20 @@ struct Sent {
     agent: String,
 }
 
+/// Why a prompt is reported unconfirmed (Spec M §8.7): each has its own
+/// note, because only expiry is a timeout — the other two are evidence a
+/// prompt was swallowed, seen well before any window could have elapsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unconfirmed {
+    /// `on_tick`: `confirmWindow` passed with the agent idle.
+    Expired,
+    /// `on_event`: a later `UserPromptSubmit` matched a newer pending
+    /// prompt first, so this older one was passed over.
+    Skipped,
+    /// `on_inbound`: `MAX_PENDING` was exceeded and this was the oldest.
+    Evicted,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Configure(DaemonConfig),
@@ -366,26 +380,43 @@ impl<M: MatrixPort> Actor<M> {
     /// while the agent was idle (Spec M §8.7).
     async fn on_tick(&mut self) {
         for sent in self.deliveries.expire(Instant::now()) {
-            self.unconfirmed(sent).await;
+            self.unconfirmed(sent, Unconfirmed::Expired).await;
         }
     }
 
-    /// Spec M §8.7: 📨 without 👍 plus this note is the picture.
-    async fn unconfirmed(&self, sent: Sent) {
+    /// Spec M §8.7: 📨 without 👍 plus this note is the picture. `why`
+    /// picks the note: only `Expired` is a timeout, so only it names a
+    /// duration — `Skipped` and `Evicted` are evidence a prompt was
+    /// swallowed, seen well before any window could have elapsed, and
+    /// post regardless of `confirmWindow` (a `0` window disables only the
+    /// expiry note; `expire` itself never returns a zero-window prompt).
+    async fn unconfirmed(&self, sent: Sent, why: Unconfirmed) {
         self.counters
             .deliveries
             .with_label_values(&["unconfirmed"])
             .inc();
-        let window = self
-            .agents
-            .get(&sent.agent)
-            .map(|c| c.confirm_window)
-            .unwrap_or(crate::config::DEFAULT_CONFIRM_WINDOW);
-        let body = format!(
-            "**not confirmed by {} after {}s**: Claude did not take the prompt (a dialog may be open, or the text may have been swallowed)",
-            sent.agent,
-            window.as_secs()
-        );
+        let body = match why {
+            Unconfirmed::Expired => {
+                let window = self
+                    .agents
+                    .get(&sent.agent)
+                    .map(|c| c.confirm_window)
+                    .unwrap_or(crate::config::DEFAULT_CONFIRM_WINDOW);
+                format!(
+                    "**not confirmed by {} after {}s**: Claude did not take the prompt (a dialog may be open, or the text may have been swallowed)",
+                    sent.agent,
+                    window.as_secs()
+                )
+            }
+            Unconfirmed::Skipped => format!(
+                "**not confirmed by {}**: Claude took a later prompt first, so this one was swallowed",
+                sent.agent
+            ),
+            Unconfirmed::Evicted => format!(
+                "**not confirmed by {}**: too many prompts are waiting on this agent, so this one is no longer tracked",
+                sent.agent
+            ),
+        };
         self.send(&sent.room, Some(&sent.root), &body, "notice")
             .await;
     }
@@ -399,7 +430,7 @@ impl<M: MatrixPort> Actor<M> {
         // every early return.
         let outcome = self.deliveries.on_event(&event, Instant::now());
         for sent in outcome.skipped {
-            self.unconfirmed(sent).await;
+            self.unconfirmed(sent, Unconfirmed::Skipped).await;
         }
         if let Some(sent) = outcome.confirmed {
             self.counters
@@ -703,7 +734,7 @@ impl<M: MatrixPort> Actor<M> {
                             Instant::now(),
                             window,
                         ) {
-                            self.unconfirmed(evicted).await;
+                            self.unconfirmed(evicted, Unconfirmed::Evicted).await;
                         }
                     }
                 }
@@ -2239,7 +2270,13 @@ mod tests {
         .await;
         a.handle(Command::Events(vec![submitted("f/c/alice", "second")]))
             .await;
-        assert_eq!(notices(&port.calls()).len(), 1, "the first was swallowed");
+        assert_eq!(
+            notices(&port.calls()),
+            vec![
+                "**not confirmed by f/c/alice**: Claude took a later prompt first, so this one was swallowed".to_string()
+            ],
+            "the first was swallowed, no duration claimed"
+        );
         assert_eq!(
             port.calls().last(),
             Some(&Call::React {
@@ -2262,6 +2299,36 @@ mod tests {
                 .get(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn overflowing_max_pending_evicts_and_notes_the_oldest() {
+        let (_fake, port, mut a, room, root) = with_thread().await;
+        for i in 0..=delivery::MAX_PENDING {
+            a.handle(Command::Inbound(inbound_with_id(
+                &room,
+                Some(&root),
+                "@rahul:example.org",
+                &format!("prompt {i}"),
+                &format!("$p{i}:fake"),
+            )))
+            .await;
+        }
+        assert_eq!(
+            notices(&port.calls()),
+            vec![
+                "**not confirmed by f/c/alice**: too many prompts are waiting on this agent, so this one is no longer tracked".to_string()
+            ],
+            "only the oldest, evicted once"
+        );
+        assert_eq!(
+            a.counters
+                .deliveries
+                .with_label_values(&["unconfirmed"])
+                .get(),
+            1
+        );
+        assert_eq!(a.deliveries.pending("f/c/alice"), delivery::MAX_PENDING);
     }
 
     #[tokio::test]

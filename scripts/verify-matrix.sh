@@ -60,6 +60,10 @@ Then check, in your Matrix client:
     once and 👍 a moment later, when Claude takes it;
   - replying while the agent is mid-turn: 📨 at once, 👍 only after the
     turn ends and the queued text is submitted, and no note in between;
+  - two replies while the agent is mid-turn: both 📨 at once and both 👍
+    after the turn ends (Claude may coalesce queued input into one
+    prompt; if only one 👍 follows and a note appears, the matcher needs
+    a concatenation match in common's `delivery::on_event`);
   - replying while a permission dialog is open (not a question): 📨, no
     👍, and after thirty seconds a "not confirmed by" note in the thread;
   - replying with a slash command (`/compact`): 📨 and nothing more;

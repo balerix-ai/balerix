@@ -387,6 +387,13 @@ is on, adds a line. `Dead` and `Failed` lines carry the daemon's message.
 
 ### 8.7 Delivery confirmation
 
+As implemented (§17), `sent` takes each prompt's window and `expire`
+takes only `now`; `on_event` records the turn for agents it has not seen
+a send for. The note names its reason, and only expiry claims a
+duration; a prompt skipped by a later one or evicted past `MAX_PENDING`
+gets its own wording regardless of `confirmWindow`. See §17 for the
+exact strings.
+
 `send_text`'s `Ok` says the daemon typed the body into the pane and
 pressed Enter. It does not say Claude took a prompt: a dialog may be
 open, or the agent may be mid-turn and queue the text. The plugin

@@ -193,18 +193,15 @@ fn fleet_yaml(bare: &Path, bob_model: Option<&str>, plugins: Option<&str>) -> St
 }
 
 /// The fleet a managed-fleet journey's plugin applies: `fleet_yaml`'s
-/// shape as the JSON object `PUT fleets/{name}` takes, one agent, on
-/// fake-claude, under a real nono profile.
+/// shape as the JSON object `PUT fleets/{name}` takes, one agent. What
+/// the agent runs as (fake-claude, its sandbox) is not the file's to say
+/// (Spec M §12.1): it comes from the entry's `fleetDefaults`, see
+/// `managed_fleet_defaults`.
 fn managed_fleet_file(bare: &Path) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "balerix/v1", "kind": "Fleet", "name": "managed",
         "defaults": {
-            "claude": {
-                "binary": BALERIX,
-                "args": ["dev", "fake-claude", "--verbose"],
-                "settings": { "model": "sonnet" }
-            },
-            "sandbox": { "network": { "block": false } },
+            "claude": { "settings": { "model": "sonnet" } },
             "tools": {}
         },
         "crews": {
@@ -215,6 +212,15 @@ fn managed_fleet_file(bare: &Path) -> serde_json::Value {
                 "agents": { "alice": {} }
             }
         }
+    })
+}
+
+/// The operator's layer for the fake plugin's fleets: fake-claude under a
+/// real nono profile, exactly what `fleet_yaml` sets for a CLI fleet.
+fn managed_fleet_defaults() -> serde_json::Value {
+    serde_json::json!({
+        "claude": { "binary": BALERIX, "args": ["dev", "fake-claude", "--verbose"] },
+        "sandbox": { "network": { "block": false } }
     })
 }
 
@@ -1019,13 +1025,14 @@ fn plugin_manage_journey() {
     let config = serde_json::json!({
         "manage": { "fleet": "managed", "file": managed_fleet_file(&bare) }
     });
-    // JSON is YAML: the object rides on one line after `config:`
+    // JSON is YAML: each object rides on one line after its key
     fs::write(
         cfg.join("plugins.yaml"),
         format!(
-            "plugins:\n  - name: fake\n    source: \"{}\"\n    config: {}\n",
+            "plugins:\n  - name: fake\n    source: \"{}\"\n    config: {}\n    fleetDefaults: {}\n",
             pkg.display(),
-            config
+            config,
+            managed_fleet_defaults()
         ),
     )
     .unwrap();

@@ -5,7 +5,7 @@ resolver = "3"
 [package]
 name = "balerix-plugin-web"
 description = "The web plugin: agents' terminals in a browser (plugins spec §18.5)"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"

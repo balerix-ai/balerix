@@ -1,7 +1,7 @@
 apiVersion: balerix/v1
 kind: Plugin
 name: web
-version: 0.2.0
+version: 0.2.1
 protocol: 1
 start: serve
 # phases come from fleets/watch (plugins spec §18.5); every event is

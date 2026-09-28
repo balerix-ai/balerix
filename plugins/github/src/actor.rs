@@ -208,6 +208,13 @@ impl<G: GitHubPort> Actor<G> {
         match command {
             Command::Configure(_) => unreachable!("handled above"),
             Command::Activate { agent, config } => self.on_activate(agent, config).await,
+            // The daemon deactivates every agent an apply drops, including
+            // the one `end` just removed. Memory is forgotten either way;
+            // the KV row goes only while it is still open (the daemon took
+            // away an agent the plugin did not end). A closed row stays:
+            // §10's "dropped on Deactivate" loses to its own "row kept with
+            // closed = true … the resume case", which the ended reply and
+            // the resume need.
             Command::Deactivate { agent } => {
                 self.agents.remove(&agent);
                 self.questions.clear(&self.host, &agent).await;
@@ -215,7 +222,9 @@ impl<G: GitHubPort> Actor<G> {
                 self.statuses.remove(&agent);
                 self.status_dirty.remove(&agent);
                 self.held.remove(&agent);
-                if let Err(e) = self.sessions.remove(&self.host, &agent).await {
+                if self.sessions.get(&agent).is_some_and(|r| !r.closed)
+                    && let Err(e) = self.sessions.remove(&self.host, &agent).await
+                {
                     tracing::warn!("github: forgetting {agent}: {e}");
                 }
                 self.publish_gauges();
@@ -299,11 +308,7 @@ impl<G: GitHubPort> Actor<G> {
             Ok(p) => p,
             Err(GitHubError::NotFound) => Permission::None,
             Err(e) => {
-                self.counters
-                    .errors
-                    .with_label_values(&["permission"])
-                    .inc();
-                tracing::warn!("github: permission of {} on {repo}: {e}", author.login);
+                self.github_failed("permission", &e);
                 return false;
             }
         };
@@ -767,6 +772,7 @@ impl<G: GitHubPort> Actor<G> {
         self.counters.errors.with_label_values(&[kind]).inc();
         tracing::warn!("github: {kind}: {e}");
         if matches!(e, GitHubError::Auth(_)) {
+            self.counters.errors.with_label_values(&["auth"]).inc();
             self.health.fail(format!("github: {e}"));
         }
     }
@@ -1212,5 +1218,51 @@ mod tests {
             reactions(&port.calls())[0],
             (Target::Issue(12), EYES.into())
         );
+    }
+
+    #[tokio::test]
+    async fn deactivate_drops_an_open_row_but_keeps_a_closed_one() {
+        let (fake, _port, mut a) = actor().await;
+        let agent = "gh-acme-api/repo/issue-12";
+        a.handle(comment(12, "alice", 5, "@balerix go")).await;
+        a.handle(Command::Deactivate {
+            agent: agent.into(),
+        })
+        .await;
+        assert!(
+            fake.kv_json("session/gh-acme-api/repo/issue-12").is_none(),
+            "an open row the daemon took away goes"
+        );
+        a.handle(comment(12, "alice", 6, "@balerix again")).await;
+        a.handle(Command::Activate {
+            agent: agent.into(),
+            config: AgentConfig::default(),
+        })
+        .await;
+        a.sessions.get_mut(agent).unwrap().closed = true;
+        a.handle(Command::Deactivate {
+            agent: agent.into(),
+        })
+        .await;
+        assert!(
+            fake.kv_json("session/gh-acme-api/repo/issue-12").is_some(),
+            "a closed row stays for the resume"
+        );
+        assert!(!a.agents.contains_key(agent));
+    }
+
+    #[tokio::test]
+    async fn an_auth_failure_on_the_permission_check_fails_health() {
+        let (fake, port, mut a) = actor().await;
+        port.fail_next(GitHubError::Auth("bad token".into()));
+        a.handle(comment(12, "alice", 5, "@balerix go")).await;
+        assert!(a.health.get().is_err());
+        assert_eq!(a.counters.errors.with_label_values(&["auth"]).get(), 1);
+        assert_eq!(
+            a.counters.errors.with_label_values(&["permission"]).get(),
+            1
+        );
+        assert!(fake.applied_fleets().is_empty());
+        assert!(comments(&port.calls()).is_empty() && reactions(&port.calls()).is_empty());
     }
 }

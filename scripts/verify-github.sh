@@ -26,13 +26,19 @@ done
 listen="${GITHUB_LISTEN:-127.0.0.1:8787}"
 
 root="$PWD/target/tmp/verify-github"
+data="$PWD/target/tmp/verify-data"   # shared with verify-matrix-local: tool installs only
+target="${CARGO_TARGET_DIR:-target}"
+case "$target" in /*) ;; *) target="$PWD/$target" ;; esac
+balerix="$target/debug/balerix"
 rm -rf "$root"
+saved_umask="$(umask)"
+umask 077
 mkdir -p "$root/config/balerix" "$root/secrets"
 cp "$GITHUB_APP_KEY" "$root/secrets/github-app.pem"
 printf '%s' "$GITHUB_WEBHOOK_SECRET" > "$root/secrets/github-webhook"
 chmod 600 "$root/secrets/github-app.pem" "$root/secrets/github-webhook"
 
-mise run package-plugins github
+(umask "$saved_umask"; mise run package-plugins github)   # the packaged plugin keeps normal modes
 
 cat > "$root/config/balerix/plugins.yaml" <<YAML
 plugins:
@@ -58,11 +64,16 @@ verify-github: config written. Now, by hand:
          repo:
            repo: $GITHUB_REPO
 
-  2. Start the daemon with XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_DATA_HOME
-     and HOME pointed under target/tmp/verify-github, as \`mise run serve\`
-     does; confirm \`balerix plugin list\` shows github ready, and that the
-     App's webhook URL reaches $listen (GitHub's "Recent Deliveries" shows
-     a 200 on the ping).
+  2. Build the daemon (\`mise x -- cargo build -p balerix\`) and start it,
+     with a logged-in \`claude\` in your real HOME (the agents use its
+     credentials):
+
+       env XDG_CONFIG_HOME=$root/config XDG_STATE_HOME=$root/state XDG_DATA_HOME=$data HOME=$HOME $balerix serve
+
+     In another shell with the same XDG_* variables, confirm
+     \`$balerix plugin list\` shows github ready, and that the App's
+     webhook URL reaches $listen (GitHub's "Recent Deliveries" shows a 200
+     on the ping).
 
 Then check, on $GITHUB_REPO:
 
@@ -94,4 +105,7 @@ Then check, on $GITHUB_REPO:
     revert the edit;
   - restart the daemon: the sessions survive (a comment on the open issue
     still reaches its agent).
+
+When done, stop the daemon and delete $root/secrets (the App key and the
+webhook secret): rm -rf $root/secrets
 NOTES

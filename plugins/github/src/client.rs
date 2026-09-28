@@ -35,7 +35,7 @@ pub fn jwt(app_id: u64, key: &Secret, now: u64) -> Result<String, String> {
         .map_err(|e| format!("privateKey: not an RSA PEM: {e}"))?;
     let claims = Claims {
         iss: app_id.to_string(),
-        iat: now - 60,
+        iat: now.saturating_sub(60),
         exp: now + 540,
     };
     jsonwebtoken::encode(
@@ -59,12 +59,12 @@ pub fn retry_after_ms(status: u16, headers: &HeaderMap, now: u64) -> Option<u64>
             .and_then(|s| s.trim().parse::<u64>().ok())
     };
     if let Some(s) = get("retry-after") {
-        return Some(s * 1000);
+        return Some(s.saturating_mul(1000));
     }
     if get("x-ratelimit-remaining") == Some(0)
         && let Some(reset) = get("x-ratelimit-reset")
     {
-        return Some(reset.saturating_sub(now) * 1000);
+        return Some(reset.saturating_sub(now).saturating_mul(1000));
     }
     None
 }

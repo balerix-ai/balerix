@@ -100,7 +100,7 @@ async fn a_mention_starts_a_session_and_the_first_prompt_reaches_the_agent() {
         host,
         port: port.clone(),
         counters: counters.clone(),
-        health: Health::new(),
+        health: health.clone(),
         listen: listen_cell.clone(),
     };
     let plugin = GitHubPlugin::new(metrics, health, queue.clone(), launcher);

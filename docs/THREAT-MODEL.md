@@ -122,7 +122,7 @@ phases; the rest exist in code today.
 | Script injection through agent names or messages on the web pages | names are validated identifiers; every rendered value is HTML-escaped and the polled rows are inserted with `textContent` | `balerix-plugin-web/src/routes.rs::{html_escape, index_html}` |
 | The vendored JavaScript | verbatim minified files from the pinned npm tarballs, sha256 recorded in `VENDOR.md` and checked by `scripts/vendor-xterm.sh`; served under the mount only, with `immutable` caching on a path that carries a digest of the bundle (`/assets/<sha256[..12]>/`), so a bump is a new URL | `plugins/web/assets/VENDOR.md` |
 | A GitHub webhook | HMAC-SHA256 over the raw body against the App's secret, constant-time; 1 MiB cap; delivery ids deduplicated; `installation.id` and `repository.full_name` from the verified payload only; issue, comment and review text are prompt text, never commands; the mention and the answer grammar are the only things parsed | `plugins/github/src/webhook.rs`, `mention.rs`, `actor.rs::permitted` |
-| GitHub App credentials | `privateKey`/`webhookSecret` arrive through `secrets` 0600 files or config literals and live in `Secret` newtypes; installation tokens are memory-only, refreshed hourly; the plugin never sees Claude credentials or the gh token | `plugins/github/src/config.rs`, `client.rs` |
+| GitHub App credentials | `privateKey`/`webhookSecret` arrive through `secrets` 0600 files or config literals and live in `Secret` newtypes and never reach KV, logs, comments or error messages; installation tokens are memory-only, refreshed hourly; the plugin never sees Claude credentials or the gh token | `plugins/github/src/config.rs`, `client.rs` |
 
 ## Release pipeline (Spec I)
 

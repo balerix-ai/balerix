@@ -344,6 +344,12 @@ credentials, hook input, or sandbox rules.
   plugin's `scratch/`, so `plugin remove --purge` discards the device keys:
   the bot rejoins as a new device and previously encrypted history stops
   being readable by it. Purge only when you mean that.
+- The GitHub plugin refuses a repository whose sanitised fleet name
+  (`gh-<owner>-<name>`) already stands for another repository
+  (`repo/<fleet>` in its KV, `plugins/github/kv/repo/<fleet>` on disk);
+  after a repository rename, delete that key. A row rebuilt from an
+  activation after a lost KV carries `installation: 0` until the next
+  webhook on it refreshes it.
 - `plugins.yaml` entries may carry `secrets: { <config key>: <path> }`. The
   daemon reads each file at load, trims one trailing newline and injects the
   value into the entry's `config` before `hello`. The file must not be

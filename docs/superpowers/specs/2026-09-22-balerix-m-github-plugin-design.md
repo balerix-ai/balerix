@@ -823,3 +823,7 @@ credentials or the gh token (Spec L-3).
   which pause after the fixtures' real round trips (as §17 records).
 - `FakePort::edit_comment` records the call before answering `NotFound`
   for a deleted comment.
+- Only the daemon's 400 (the resolver's message) is posted verbatim;
+  other daemon and GitHub failures post a fixed line and log the detail.
+  A live row's `installation` is refreshed from every verified webhook
+  that names it.

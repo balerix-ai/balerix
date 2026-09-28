@@ -264,6 +264,19 @@ impl Listener {
     }
 }
 
+/// The `event` label for a verified delivery: the names `parse` knows,
+/// else `other`, so no header value mints a counter child.
+fn event_label(event: &str) -> &'static str {
+    match event {
+        "issues" => "issues",
+        "pull_request" => "pull_request",
+        "issue_comment" => "issue_comment",
+        "pull_request_review" => "pull_request_review",
+        "ping" => "ping",
+        _ => "other",
+    }
+}
+
 async fn deliver(State(l): State<Arc<Listener>>, headers: HeaderMap, body: Bytes) -> Response {
     let header = |k: &str| {
         headers
@@ -271,31 +284,33 @@ async fn deliver(State(l): State<Arc<Listener>>, headers: HeaderMap, body: Bytes
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
     };
-    let event = header("x-github-event").unwrap_or_default();
     if !verify(&l.secret, &body, header("x-hub-signature-256").as_deref()) {
-        l.count(&event, "bad_signature");
+        // Unverified: the event header is the sender's choice, never a label.
+        l.count("unverified", "bad_signature");
         return (StatusCode::UNAUTHORIZED, "bad signature").into_response();
     }
+    let event = header("x-github-event").unwrap_or_default();
+    let label = event_label(&event);
     if event == "ping" {
-        l.count(&event, "handled");
+        l.count(label, "handled");
         return StatusCode::OK.into_response();
     }
     if let Some(id) = header("x-github-delivery")
         && l.replayed(&id)
     {
-        l.count(&event, "duplicate");
+        l.count(label, "duplicate");
         return StatusCode::ACCEPTED.into_response();
     }
     let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
-        l.count(&event, "ignored");
+        l.count(label, "ignored");
         return StatusCode::ACCEPTED.into_response();
     };
     match parse(&event, &payload) {
         Some(ev) => {
-            l.count(&event, "handled");
+            l.count(label, "handled");
             (l.sink)(ev);
         }
-        None => l.count(&event, "ignored"),
+        None => l.count(label, "ignored"),
     }
     StatusCode::ACCEPTED.into_response()
 }
@@ -518,11 +533,25 @@ mod tests {
             413
         );
         let get = |event: &str, outcome: &str| counters.with_label_values(&[event, outcome]).get();
-        assert_eq!(get("issue_comment", "bad_signature"), 1);
+        assert_eq!(get("unverified", "bad_signature"), 1);
         assert_eq!(get("issue_comment", "handled"), 1);
         assert_eq!(get("issue_comment", "duplicate"), 1);
         assert_eq!(get("ping", "handled"), 1);
-        assert_eq!(get("star", "ignored"), 1);
+        assert_eq!(get("other", "ignored"), 1);
+        let unsigned = c
+            .post(&url)
+            .header("X-GitHub-Delivery", "d5")
+            .header("X-GitHub-Event", "zzz-random")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status(), 401);
+        assert_eq!(get("unverified", "bad_signature"), 2);
+        assert_eq!(get("other", "ignored"), 1);
+        assert_eq!(get("other", "bad_signature"), 0);
+        assert_eq!(get("zzz-random", "bad_signature"), 0);
+        assert_eq!(get("issue_comment", "bad_signature"), 0);
     }
 
     #[test]

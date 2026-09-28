@@ -426,6 +426,7 @@ impl<G: GitHubPort> Actor<G> {
                 merged,
             } => {
                 if let Some(agent) = self.sessions.by_number(&repo, number).map(str::to_string) {
+                    self.refresh_installation(&agent, installation);
                     self.end(
                         &agent,
                         installation,
@@ -528,6 +529,9 @@ impl<G: GitHubPort> Actor<G> {
             return;
         }
         let live = self.sessions.by_number(repo, number).map(str::to_string);
+        if let Some(agent) = &live {
+            self.refresh_installation(agent, installation);
+        }
         let closed = live
             .as_deref()
             .and_then(|a| self.sessions.get(a))
@@ -644,7 +648,11 @@ impl<G: GitHubPort> Actor<G> {
                     installation,
                     repo,
                     number,
-                    &format!("fleet name {fleet} already stands for {other}"),
+                    &format!(
+                        "fleet name {fleet} already stands for {other}; clear the plugin's KV key \
+                         repo/{fleet} (plugins/github/kv/repo/{fleet} under the daemon's state \
+                         root) to reuse it"
+                    ),
                     "notice",
                 )
                 .await;
@@ -712,8 +720,16 @@ impl<G: GitHubPort> Actor<G> {
             }
         };
         if let Err(e) = self.host.apply_fleet(&fleet, &file).await {
-            self.refuse(installation, repo, number, target, &e.to_string(), "daemon")
-                .await;
+            tracing::warn!("github: applying {fleet} with {agent}: {e}");
+            self.refuse(
+                installation,
+                repo,
+                number,
+                target,
+                &apply_refusal(&e),
+                "daemon",
+            )
+            .await;
             return;
         }
         self.counters.applies.with_label_values(&["ok"]).inc();
@@ -799,6 +815,18 @@ impl<G: GitHubPort> Actor<G> {
         self.post(installation, repo, number, message, "notice")
             .await;
         self.react(installation, repo, target, CONFUSED).await;
+    }
+
+    /// A row rebuilt by `on_activate` carries `installation: 0`, and an App
+    /// reinstall changes every id: a verified webhook naming the row
+    /// brings it up to date.
+    fn refresh_installation(&mut self, agent: &str, installation: u64) {
+        if let Some(r) = self.sessions.get_mut(agent)
+            && r.installation != installation
+        {
+            r.installation = installation;
+            self.rows_dirty.insert(agent.to_string(), ());
+        }
     }
 
     fn github_failed(&self, kind: &str, e: &GitHubError) {
@@ -1301,6 +1329,7 @@ impl<G: GitHubPort> Actor<G> {
         let Some(agent) = self.sessions.by_number(repo, number).map(str::to_string) else {
             return;
         };
+        self.refresh_installation(&agent, installation);
         let Some(row) = self.sessions.get(&agent).cloned() else {
             return;
         };
@@ -1382,7 +1411,8 @@ impl<G: GitHubPort> Actor<G> {
                 Ok(b) => b,
                 Err(e) => {
                     self.github_failed("default_branch", &e);
-                    self.refile_failed(agent, &row, &e.to_string()).await;
+                    self.refile_failed(agent, &row, &github_refusal("default_branch"))
+                        .await;
                     return;
                 }
             };
@@ -1399,7 +1429,8 @@ impl<G: GitHubPort> Actor<G> {
             Ok(t) => t.unwrap_or_default(),
             Err(e) => {
                 self.github_failed("read_file", &e);
-                self.refile_failed(agent, &row, &e.to_string()).await;
+                self.refile_failed(agent, &row, &github_refusal("read_file"))
+                    .await;
                 return;
             }
         };
@@ -1416,7 +1447,7 @@ impl<G: GitHubPort> Actor<G> {
             tracing::warn!("github: applying {fleet} without {agent}: {e}");
             self.counters.applies.with_label_values(&["daemon"]).inc();
             self.health.fail(format!("github: applying {fleet}: {e}"));
-            self.refile_failed(agent, &row, &e.to_string()).await;
+            self.refile_failed(agent, &row, &apply_refusal(&e)).await;
             return;
         }
         self.counters.applies.with_label_values(&["ok"]).inc();
@@ -1468,12 +1499,7 @@ impl<G: GitHubPort> Actor<G> {
                 })
                 .collect();
             for (agent, installation) in stale {
-                let h = idle.as_secs() / 3600;
-                let after = if h > 0 {
-                    format!("{h}h")
-                } else {
-                    format!("{}m", idle.as_secs() / 60)
-                };
+                let after = idle_wording(idle);
                 let reason = format!(
                     "stopped after {after} idle — mention @{} to resume",
                     self.slug
@@ -1653,6 +1679,35 @@ struct FirstPrompt {
 /// An event's status line (§8.3): common's `event_message`, whose bold
 /// markers are for a chat thread, as the plain text the spec shows
 /// (`needs you: Claude needs your permission to use Bash`).
+/// What an `apply_fleet` failure posts on the issue (§6): the daemon's
+/// 400 carries the resolver's message and goes out verbatim; anything
+/// else is a fixed line, the detail in the plugin log.
+fn apply_refusal(e: &SdkError) -> String {
+    match e {
+        SdkError::Status { status: 400, .. } => e.to_string(),
+        _ => "the daemon refused the apply; see the plugin log".into(),
+    }
+}
+
+/// What a GitHub call failure posts on the issue: a fixed line naming the
+/// call, the detail in the plugin log (`github_failed`).
+fn github_refusal(kind: &str) -> String {
+    format!("github: {kind} failed; see the plugin log")
+}
+
+/// `idleTimeout` as the idle line says it: whole hours, else whole
+/// minutes, else seconds.
+fn idle_wording(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 fn status_line(event: &HookEvent) -> String {
     render::event_message(event).replace("**", "")
 }
@@ -1948,8 +2003,60 @@ mod tests {
         assert!(fake.applied_fleets().is_empty());
         assert_eq!(
             comments(&port.calls())[0].1,
-            "fleet name gh-acme-api already stands for acme/api."
+            "fleet name gh-acme-api already stands for acme/api.; clear the plugin's KV key \
+             repo/gh-acme-api (plugins/github/kv/repo/gh-acme-api under the daemon's state \
+             root) to reuse it"
         );
+    }
+
+    #[tokio::test]
+    async fn a_daemon_failure_other_than_400_posts_a_fixed_line() {
+        let (fake, port, mut a) = actor().await;
+        fake.fail_manage(Some((500, "disk full")));
+        a.handle(comment(12, "alice", 5, "@balerix go")).await;
+        let c = comments(&port.calls());
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].1, "the daemon refused the apply; see the plugin log");
+        assert!(!c[0].1.contains("disk full"));
+        assert_eq!(a.counters.applies.with_label_values(&["daemon"]).get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fork_pr_is_refused_on_the_comment_path() {
+        let (fake, port, mut a) = actor().await;
+        port.set_issue(
+            "acme/api",
+            40,
+            IssueInfo {
+                pr: Some(("feature/x".into(), "someone/api".into(), "main".into())),
+                ..Default::default()
+            },
+        );
+        a.handle(comment(40, "alice", 9, "@balerix review this"))
+            .await;
+        assert!(fake.applied_fleets().is_empty());
+        assert_eq!(
+            comments(&port.calls()),
+            vec![(
+                40,
+                "sessions on pull requests from forks are not supported".into()
+            )]
+        );
+        assert_eq!(
+            reactions(&port.calls()),
+            vec![
+                (Target::Comment(9), EYES.into()),
+                (Target::Comment(9), CONFUSED.into())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_idle_wording_keeps_whole_units_only() {
+        assert_eq!(idle_wording(Duration::from_secs(90 * 60)), "90m");
+        assert_eq!(idle_wording(Duration::from_secs(2 * 3600)), "2h");
+        assert_eq!(idle_wording(Duration::from_secs(30)), "30s");
+        assert_eq!(idle_wording(Duration::from_secs(90)), "90s");
     }
 
     #[tokio::test]
@@ -2503,6 +2610,28 @@ mod tests {
         .await;
         let text = actions_text(fake.actions_for(AGENT).last().unwrap());
         assert!(text.contains("Earlier work on this issue is on branch balerix/gh-acme-api/repo/issue-12; continue from it."), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_ninety_minute_idle_timeout_says_90m() {
+        let (_fake, _port, mut a) = started().await;
+        a.config.as_mut().unwrap().idle_timeout = Duration::from_secs(90 * 60);
+        a.now_secs = || 14 * 3600 + 2 * 60 + 90 * 60 + 1;
+        a.handle(Command::Tick).await;
+        assert!(a.sessions.get(AGENT).unwrap().closed);
+        let r = a.statuses[AGENT].render();
+        assert!(
+            r.contains("stopped after 90m idle — mention @balerix to resume"),
+            "{r}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_webhook_refreshes_a_rows_installation() {
+        let (_fake, _port, mut a) = started().await;
+        a.sessions.get_mut(AGENT).unwrap().installation = 0;
+        a.handle(comment(12, "bob", 60, "carry on")).await;
+        assert_eq!(a.sessions.get(AGENT).unwrap().installation, 7);
     }
 
     #[tokio::test]

@@ -132,6 +132,17 @@ run = [
 description = "By-hand spec §8.1 check: a real claude under a scratch daemon (config and state under target/tmp/verify-claude, wiped each run; tool installs kept under target/tmp/verify-data; your HOME kept for credentials); pauses for you to attach and type one prompt, then prints a report to paste back"
 run = "scripts/verify-claude.sh"
 
+[tasks.verify-matrix-local]
+description = "verify-matrix against a local tuwunel homeserver it starts itself: accounts, a pinned unencrypted room, the daemon and a two-agent fleet (needs a logged-in claude; not part of any CI tier). `-- down` stops it"
+# tuwunel is pinned here, not in [tools], so only this task downloads the
+# ~100 MB homeserver. ubi picks the OS/arch; the regex picks the portable
+# CPU level (x86_64-v1, aarch64-v8) and the plain zstd-compressed binary.
+# mise deprecates ubi in favour of `github:`, but that backend cannot unpack
+# a bare .zst (tuwunel ships no tarball), so ubi stays until 2027.1 forces
+# the move; nixpkgs has it as `matrix-tuwunel` should mise ever lose it.
+tools = { "ubi:matrix-construct/tuwunel" = { version = "1.9.3", matching_regex = "(x86_64-v1|aarch64-v8)-linux-gnu-tuwunel\\.zst$" } }
+run = "scripts/verify-matrix-local.sh"
+
 [tasks.verify-questions]
 description = "By-hand Spec J check: drives the real pinned claude through every AskUserQuestion dialog shape with the matrix plugin's own key plans and checks the recorded answers (scratch under target/tmp/verify-questions; your HOME kept for credentials; a few short model turns). Run after bumping claude. Not part of any CI tier"
 run = "scripts/verify-questions.sh"

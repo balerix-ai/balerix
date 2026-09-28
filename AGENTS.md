@@ -35,6 +35,13 @@ credentials, hook input, or sandbox rules.
 - `verify-matrix` — Spec G's manual check against a real Matrix homeserver
   (`scripts/verify-matrix.sh`); needs `MATRIX_HOMESERVER`, `MATRIX_USER_ID`,
   `MATRIX_PASSWORD` and `MATRIX_INVITE`. Not part of any CI tier.
+- `verify-matrix-local` — the same check with no real homeserver: starts a
+  pinned tuwunel (a task-level mise tool) under `target/tmp/verify-matrix-local`,
+  registers a bot and an operator, pins an unencrypted room so reactions are
+  readable over the client API (`scripts/verify-matrix-room.sh`), then runs
+  `verify-matrix.sh`, a daemon and a two-agent fleet the way `verify-claude`
+  does. `mise run verify-matrix-local -- down` stops it. Needs a logged-in
+  `claude`. Not part of any CI tier.
 - `verify-questions` — Spec J's manual check (`scripts/verify-questions.sh`):
   the real pinned `claude` in tmux, answered with the key plans common's
   `question.rs` (`plugins/common`) produces, the recorded answers read

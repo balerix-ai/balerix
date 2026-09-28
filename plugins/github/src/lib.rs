@@ -9,5 +9,6 @@ pub mod github;
 pub mod mention;
 pub mod prompt;
 pub mod repo_config;
+pub mod session;
 pub mod status;
 pub mod webhook;

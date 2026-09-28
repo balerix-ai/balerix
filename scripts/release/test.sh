@@ -95,7 +95,7 @@ assert_consistent() {
   local dir=$1 label=$2 core plugin version
   core=$(manifest_version "$dir" core)
   expect_eq "$label: Cargo.lock has balerix $core" "$(lock_version "$dir/Cargo.lock" balerix)" "$core"
-  for plugin in flow web matrix; do
+  for plugin in flow web matrix github; do
     version=$(manifest_version "$dir" "$plugin")
     expect_eq "$label: $plugin balerix-plugin.yaml matches Cargo.toml" \
       "$(sed -n 's/^version: //p' "$dir/plugins/$plugin/package/balerix-plugin.yaml")" "$version"
@@ -159,9 +159,9 @@ scenario_skipped_types() {
 scenario_sdk_change() {
   local dir unit
   dir=$(fixture sdk)
-  for unit in core flow web matrix; do release "$dir" "$unit" 0.4.0; done
+  for unit in core flow web matrix github; do release "$dir" "$unit" 0.4.0; done
   change "$dir" crates/balerix-plugin-sdk/release-test.txt "fix(sdk): an sdk fix"
-  for unit in core flow web matrix; do
+  for unit in core flow web matrix github; do
     expect_eq "sdk-only change: $unit releases" "$(field status "$(prepare "$dir" "$unit")")" release
     discard "$dir"
   done
@@ -413,27 +413,27 @@ scenario_affected() {
   expect_eq "affected: a core crate change" \
     "$(affected_by "$dir" crates/balerix-server/src/release-test.rs)" '["core"]'
   expect_eq "affected: an sdk change reaches every plugin" \
-    "$(affected_by "$dir" crates/balerix-plugin-sdk/src/release-test.rs)" '["core","flow","web","matrix"]'
+    "$(affected_by "$dir" crates/balerix-plugin-sdk/src/release-test.rs)" '["core","flow","web","matrix","github"]'
   expect_eq "affected: the root lockfile is core" \
     "$(affected_by "$dir" Cargo.lock)" '["core"]'
   expect_eq "affected: a plugin lockfile is that plugin" \
     "$(affected_by "$dir" plugins/web/Cargo.lock)" '["web"]'
   expect_eq "affected: a Dockerfile is every unit" \
-    "$(affected_by "$dir" docker/plugin/release-test.txt)" '["core","flow","web","matrix"]'
+    "$(affected_by "$dir" docker/plugin/release-test.txt)" '["core","flow","web","matrix","github"]'
   expect_eq "affected: the tool pins are every unit" \
-    "$(affected_by "$dir" mise.toml)" '["core","flow","web","matrix"]'
+    "$(affected_by "$dir" mise.toml)" '["core","flow","web","matrix","github"]'
   expect_eq "affected: the scan exceptions are every unit" \
-    "$(affected_by "$dir" .trivyignore.yaml)" '["core","flow","web","matrix"]'
+    "$(affected_by "$dir" .trivyignore.yaml)" '["core","flow","web","matrix","github"]'
   expect_eq "affected: the workflow itself is every unit" \
-    "$(affected_by "$dir" .github/workflows/images.yml)" '["core","flow","web","matrix"]'
+    "$(affected_by "$dir" .github/workflows/images.yml)" '["core","flow","web","matrix","github"]'
   expect_eq "affected: docs are no unit" \
     "$(affected_by "$dir" docs/release-test.md)" '[]'
   expect_eq "affected: another workflow is no unit" \
     "$(affected_by "$dir" .github/workflows/release-test.yml)" '[]'
   expect_eq "affected: no range is every unit (the nightly)" \
-    "$(field units "$(affected "$dir")")" '["core","flow","web","matrix"]'
+    "$(field units "$(affected "$dir")")" '["core","flow","web","matrix","github"]'
   expect_eq "affected: a common change reaches the plugins built on it" \
-    "$(affected_by "$dir" plugins/common/src/release-test.rs)" '["web","matrix"]'
+    "$(affected_by "$dir" plugins/common/src/release-test.rs)" '["web","matrix","github"]'
 }
 
 # A library unit releases like a plugin but ships crates, not a binary:
@@ -505,13 +505,13 @@ scenario_common_change_releases_dependents() {
   local dir unit out version
   dir=$(fixture common-dependents)
   release "$dir" core 0.4.0
-  for unit in common flow web matrix; do release "$dir" "$unit" 0.4.0; done
+  for unit in common flow web matrix github; do release "$dir" "$unit" 0.4.0; done
   change "$dir" plugins/common/src/release-test.rs "fix(common): a shared fix"
   out=$(prepare "$dir" common)
   expect_eq "common change: common releases" "$(field status "$out")" release
   version=$(field version "$out")
   expect_eq "common change: common's manifest at $version" "$(manifest_version "$dir" common)" "$version"
-  for unit in matrix web; do
+  for unit in matrix web github; do
     expect_eq "common change: $unit Cargo.lock has common at $version" \
       "$(lock_version "$dir/plugins/$unit/Cargo.lock" balerix-plugin-common)" "$version"
   done

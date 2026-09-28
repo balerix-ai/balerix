@@ -11,7 +11,7 @@ credentials, hook input, or sandbox rules.
   git/mise/nono/tmux, with `BALERIX_REQUIRE_TOOLS=1` so a missing tool fails
   instead of skipping.
 - `plugin <name>` — lint and test one standalone plugin project
-  (`mise run plugin matrix`). `plugins` does all four (common is the shared
+  (`mise run plugin matrix`). `plugins` does all five (common is the shared
   library, Spec K). Neither is part of `check`; CI runs them as their own
   concurrent jobs.
 - `mutants` — nightly tier: mutation-tests `balerix-core` (the reconciler).
@@ -21,7 +21,7 @@ credentials, hook input, or sandbox rules.
 - `package-plugins [names…]` — builds the named in-tree plugins inside
   their own projects and assembles each as a directory source under
   `target/plugins/<name>/` (under `CARGO_TARGET_DIR` when set). No names
-  means all three. `test` and `e2e` ask it for `flow web`, the two the
+  means all four. `test` and `e2e` ask it for `flow web`, the two the
   journey needs; the flow e2e skips (fails under `BALERIX_REQUIRE_TOOLS`)
   without it.
 - `serve` — a foreground daemon under `target/tmp/serve` for poking by hand
@@ -47,15 +47,19 @@ credentials, hook input, or sandbox rules.
   `question.rs` (`plugins/common`) produces, the recorded answers read
   back from the `PostToolUse` hook. Needs a logged-in `claude`. Not part
   of any CI tier.
+- `verify-github` — Spec M's manual check against a real GitHub App on a
+  scratch repository (`scripts/verify-github.sh`); needs `GITHUB_APP_ID`,
+  `GITHUB_APP_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_REPO` and a listener
+  GitHub can reach. Not part of any CI tier.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 - `vendor-xterm` is a script, not a task: `scripts/vendor-xterm.sh` re-fetches
   and verifies the web plugin's assets against
   `plugins/web/assets/VENDOR.md` (installing them only when
   every digest matches); `--check` verifies the committed files offline.
 - `release-prepare <unit> [version]` — what `release-pr.yml` runs: works
-  out one release unit's next version (core, common, flow, web, matrix) and
-  writes it into the manifests, lockfiles, plugin manifest and changelog.
-  Commits nothing. `docs/RELEASING.md` is the release process.
+  out one release unit's next version (core, common, flow, web, matrix,
+  github) and writes it into the manifests, lockfiles, plugin manifest and
+  changelog. Commits nothing. `docs/RELEASING.md` is the release process.
 - `release-test` — scenario tests for `scripts/release/` against throwaway
   clones under `target/tmp`; CI runs it when the scripts change.
 

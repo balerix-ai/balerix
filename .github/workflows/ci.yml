@@ -46,7 +46,7 @@ jobs:
   # the ones the e2e packages, from their own projects).
   #
   # GitHub evicts least-recently-used cache entries past 10 GB per
-  # repository, and four Rust caches can approach that. If eviction starts
+  # repository, and five Rust caches can approach that. If eviction starts
   # thrashing, give the plugin jobs `save-if: ${{ github.ref ==
   # 'refs/heads/main' }}` so pull requests restore but do not write.
   plugins:
@@ -54,7 +54,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        plugin: [common, flow, web, matrix]
+        plugin: [common, flow, web, matrix, github]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

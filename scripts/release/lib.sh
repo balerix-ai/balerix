@@ -5,15 +5,15 @@
 # repository root first.
 
 # shellcheck disable=SC2034 # read by the scripts that source this file
-UNITS=(core common flow web matrix)
+UNITS=(core common flow web matrix github)
 # shellcheck disable=SC2034
-PLUGIN_UNITS=(flow web matrix)
+PLUGIN_UNITS=(flow web matrix github)
 # Units that ship crates and no binary (Spec K §5).
 # shellcheck disable=SC2034
 LIBRARY_UNITS=(common)
 # Units with a binary, an image and an archive: every unit but the libraries.
 # shellcheck disable=SC2034
-IMAGE_UNITS=(core flow web matrix)
+IMAGE_UNITS=(core flow web matrix github)
 
 # The arguments as a JSON array of strings: unit names and other bare
 # identifiers, nothing that needs escaping.
@@ -31,7 +31,7 @@ die() {
 
 require_unit() {
   case ${1:-} in
-    core | common | flow | web | matrix) ;;
+    core | common | flow | web | matrix | github) ;;
     *) die "unknown release unit: '${1:-}' (expected one of: ${UNITS[*]})" ;;
   esac
 }

@@ -79,6 +79,17 @@ against what was declared.
   `mise run verify-questions`. Its `matrix-sdk` tree is larger
   than the rest of the repository put together, which is why plugins
   stopped being workspace members.
+- `balerix-plugin-github` — the fourth in-tree plugin: a mention of a
+  GitHub App on an issue or pull request starts an agent whose session is
+  that issue (Spec M). The fleet is the repository's own `.balerix.yaml`,
+  applied through `manage` (Spec L) with the plugin's agents injected;
+  turns and questions post as comments, permitted comments come back as
+  prompts or answers (eyes when typed, +1 when Claude takes it, through
+  common's `delivery`), a submitted review is one message, and close,
+  merge or idle removes the agent. `webhook.rs` is the listener,
+  `client.rs` the ten-endpoint `reqwest` client behind `GitHubPort`,
+  `repo_config.rs`, `mention.rs`, `prompt.rs` and `status.rs` the pure
+  parts, `actor.rs` the one task that owns the state.
 
 ## How it flows
 **Config (Phase 1):** `read` (file.rs) → `resolve` (resolve.rs): for each agent fold

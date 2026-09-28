@@ -51,8 +51,8 @@ asset is attested (`gh attestation verify <file> --repo balerix-ai/balerix`).
    `plugin list` shows each plugin's phase and how many agents it is active
    for; an agent opts into a plugin with `plugins: { <name>: { …config… } }`
    in its settings block and `up` waits until the plugin has accepted it.
-8. `mise run package-plugins` — assembles the in-tree `flow` plugin under
-   `target/plugins/flow/` (and `web` under `target/plugins/web/`); point a
+8. `mise run package-plugins` — assembles the in-tree `flow`, `web`,
+   `matrix` and `github` plugins under `target/plugins/<name>/`; point a
    `plugins.yaml` entry's `source` at that directory and give an agent a
    `plugins: { flow: … }` block to drive it by rule: block a tool call,
    send text on `Stop`, move between states. `examples/payments.yaml`
@@ -74,7 +74,10 @@ asset is attested (`gh attestation verify <file> --repo balerix-ai/balerix`).
 Spec A, Spec B (plugins) and Spec C (workspace reads and browser code
 review) are complete: plugin workloads, the event protocol, the `flow` and
 `web` plugins, the proxied plugin mount with browser sessions, attach and
-`fleets/watch`, and the web plugin's review page.
+`fleets/watch`, and the web plugin's review page. Spec M adds the
+`github` plugin: a mention of a GitHub App on an issue or pull request
+starts an agent whose session is that issue, turns and questions posting
+back as comments.
 
 ### Upgrading to Spec B phase 1
 - Fleet files rename the reserved `flow: {}` settings block to `plugins: {}`

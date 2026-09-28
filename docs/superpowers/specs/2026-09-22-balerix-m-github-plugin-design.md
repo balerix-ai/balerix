@@ -779,3 +779,47 @@ credentials or the gh token (Spec L-3).
   one `Stop` follows the combined turn. The "clock waits for `Stop`"
   rule therefore only delays the note for a genuinely swallowed prompt,
   which is the conservative side. No concatenation match is needed.
+
+## 18. Recorded at implementation, part 3 (the plugin)
+
+- Dependencies are path-only on the core crates (AGENTS.md); `base64`
+  was added for the `contents` API, beyond §3's list.
+- `GitHubPort` gained `issue(installation, repo, number)`: a mention in
+  a later comment carries no title or body, so the prompt fetches them.
+- The webhook's 413 is axum's body limit and is not counted
+  (`too_large` was dropped from `webhooks_total`).
+- `Tick` is every five seconds; the idle check, the two-second status
+  coalescing, delivery expiry and row write-back all ride on it.
+- The status comment continues across an idle stop and a resume: the row
+  keeps `status_comment`.
+- §6's `restarted: settings changed` line is not produced: the plugin
+  sees a reconciler restart as a `SessionEnd`/`SessionStart` pair and does
+  not know the reason; the two lines it does post say as much.
+- §11's `github_requests_total{endpoint,status}` is not produced: the
+  client counts nothing, `errors_total{kind}` covers failures.
+- Health: `health.fail` on an `Auth` error or a dead listener,
+  `health.ok()` on the next successful apply or comment.
+- #64 closes with this part (§15.9) and #85 closed with part 2.
+- `Deactivate` keeps a row whose `closed` is set (the daemon deactivates
+  every agent an apply drops, so the row must outlive it for the ended
+  reply and the resume); an open row is removed. §10's "dropped on
+  `Deactivate`" is superseded.
+- The unconfirmed note names its reason, as §17 records for matrix: `not
+  confirmed after <n>s` (expired), `skipped: Claude took a later one
+  first`, `dropped: too many pending`.
+- `end` flushes its final status line at once, ahead of the `Deactivate`
+  that follows the apply. A failed refile or apply in `end` is posted
+  once on the issue, fails health for a daemon refusal, and leaves the
+  row open with `last_activity` touched, so the idle check retries one
+  `idleTimeout` later.
+- Status lines are cut at 200 characters with an ellipsis; a failed edit
+  is retried on the next line, not every tick.
+- The row carries `base` (the PR's base ref) so a review message renders
+  against it after a restart; `installation` is 0 on a row rebuilt from
+  an activation.
+- `jsonwebtoken` needs its `aws_lc_rs` feature or it panics at runtime;
+  the tree already carried `aws-lc-rs` through rustls. `tokio`'s
+  `test-util` is a dev-dependency feature for the paused-clock tests,
+  which pause after the fixtures' real round trips (as §17 records).
+- `FakePort::edit_comment` records the call before answering `NotFound`
+  for a deleted comment.

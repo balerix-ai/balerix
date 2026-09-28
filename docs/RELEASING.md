@@ -12,6 +12,7 @@ Design: `docs/superpowers/specs/2026-09-11-release-pipeline-design.md`
 | flow | `balerix-plugin-flow-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-flow`, release package |
 | web | `balerix-plugin-web-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-web`, release package |
 | matrix | `balerix-plugin-matrix-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-matrix`, release package |
+| github | `balerix-plugin-github-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-github`, release package |
 
 Binaries are static musl builds for Linux x86_64 and aarch64.
 
@@ -138,7 +139,7 @@ Nothing releases until all of this is done.
    `RELEASE_APP_PRIVATE_KEY`, both in environment `release-bot`.
 2. **Environments** `release-bot` and `release`, each with deployment
    branches limited to `main`.
-3. **Branch protection** on `main`: require `check`, `plugins` (all four
+3. **Branch protection** on `main`: require `check`, `plugins` (all five
    legs) and `conventional` (pr-title) to pass, and require branches to be
    up to date before merging.
 4. **Merge settings:** allow squash merging only, with *Default commit
@@ -147,7 +148,8 @@ Nothing releases until all of this is done.
    PR and watch `release.yml` publish, sign, verify and promote. Crates are
    never published from a fork.
 6. **First releases**, in order: flow, then web, then matrix, then common
-   (after the next core release, not `balerix-v0.1.0`; see above).
+   (after the next core release, not `balerix-v0.1.0`; see above), then
+   github (after common's).
 7. **crates.io bootstrap** before merging core's first release PR: from that
    PR's head commit, `mise x -- cargo publish --locked -p balerix-api -p
    balerix-plugin-sdk` with a personal API token; then on crates.io add a

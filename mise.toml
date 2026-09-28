@@ -33,6 +33,7 @@ run = [
   "scripts/plugin.sh fmt flow",
   "scripts/plugin.sh fmt web",
   "scripts/plugin.sh fmt matrix",
+  "scripts/plugin.sh fmt github",
 ]
 
 [tasks.lint]
@@ -73,6 +74,7 @@ run = [
   "scripts/plugin.sh check flow",
   "scripts/plugin.sh check web",
   "scripts/plugin.sh check matrix",
+  "scripts/plugin.sh check github",
 ]
 
 [tasks.check]
@@ -99,6 +101,8 @@ run = [
   "cargo deny --manifest-path plugins/web/Cargo.toml check advisories bans sources licenses",
   "cargo audit --file plugins/matrix/Cargo.lock",
   "cargo deny --manifest-path plugins/matrix/Cargo.toml check advisories bans sources licenses",
+  "cargo audit --file plugins/github/Cargo.lock",
+  "cargo deny --manifest-path plugins/github/Cargo.toml check advisories bans sources licenses",
 ]
 
 [tasks.mutants]
@@ -151,10 +155,14 @@ run = "scripts/verify-questions.sh"
 description = "Spec G's manual check against a real Matrix homeserver (needs MATRIX_* credentials; not part of any CI tier)"
 run = "scripts/verify-matrix.sh"
 
+[tasks.verify-github]
+description = "Spec M's manual check against a real GitHub App on a scratch repository (needs GITHUB_* settings; not part of any CI tier)"
+run = "scripts/verify-github.sh"
+
 [tasks.release-prepare]
 description = "Prepare one release unit's next release in the working tree (what release-pr.yml runs): `mise run release-prepare flow [version]`"
 usage = '''
-arg "<unit>" help="core, common, flow, web or matrix"
+arg "<unit>" help="core, common, flow, web, matrix or github"
 arg "[version]" help="an exact version to force"
 '''
 run = 'scripts/release/prepare.sh "$usage_unit" ${usage_version:+"$usage_version"}'

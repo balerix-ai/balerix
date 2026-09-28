@@ -83,6 +83,16 @@ pub struct ReviewComment {
     pub body: String,
 }
 
+/// What `issue` answers: the issue or PR a comment was left on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IssueInfo {
+    pub title: String,
+    pub body: String,
+    pub url: String,
+    /// `(head, head_repo, base)` for a pull request.
+    pub pr: Option<(String, String, String)>,
+}
+
 pub trait GitHubPort: Send + Sync + 'static {
     /// `GET /app` with the App JWT: proves the key and answers the slug
     /// the mention is matched against.
@@ -136,6 +146,13 @@ pub trait GitHubPort: Send + Sync + 'static {
         number: u64,
         review_id: u64,
     ) -> impl Future<Output = Result<Vec<ReviewComment>, GitHubError>> + Send;
+    /// Title, body, URL and, for a PR, `(head, head_repo, base)`.
+    fn issue(
+        &self,
+        installation: u64,
+        repo: &str,
+        number: u64,
+    ) -> impl Future<Output = Result<IssueInfo, GitHubError>> + Send;
 }
 
 /// A recording port for tests; always compiled, `tests/plugin_it.rs`
@@ -144,7 +161,7 @@ pub mod fake {
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
-    use super::{GitHubError, GitHubPort, Permission, ReviewComment, Target};
+    use super::{GitHubError, GitHubPort, IssueInfo, Permission, ReviewComment, Target};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Call {
@@ -182,6 +199,10 @@ pub mod fake {
             number: u64,
             review_id: u64,
         },
+        Issue {
+            repo: String,
+            number: u64,
+        },
     }
 
     #[derive(Default)]
@@ -194,6 +215,7 @@ pub mod fake {
         default_branches: HashMap<String, String>,
         reviews: HashMap<(String, u64), Vec<ReviewComment>>,
         deleted: HashSet<u64>,
+        issues: HashMap<(String, u64), IssueInfo>,
     }
 
     #[derive(Clone)]
@@ -249,6 +271,11 @@ pub mod fake {
             self.lock()
                 .reviews
                 .insert((repo.into(), review_id), comments);
+        }
+        /// What `issue` answers for `number`; unset, an empty title and
+        /// body, the issue's URL, and no PR.
+        pub fn set_issue(&self, repo: &str, number: u64, info: IssueInfo) {
+            self.lock().issues.insert((repo.into(), number), info);
         }
         /// The comment is gone: `edit_comment` answers `NotFound`.
         pub fn delete_comment(&self, id: u64) {
@@ -391,6 +418,22 @@ pub mod fake {
                 .get(&(repo.into(), review_id))
                 .cloned()
                 .unwrap_or_default())
+        }
+        async fn issue(&self, _i: u64, repo: &str, number: u64) -> Result<IssueInfo, GitHubError> {
+            self.check()?;
+            self.record(Call::Issue {
+                repo: repo.into(),
+                number,
+            });
+            Ok(self
+                .lock()
+                .issues
+                .get(&(repo.into(), number))
+                .cloned()
+                .unwrap_or_else(|| IssueInfo {
+                    url: format!("https://github.com/{repo}/issues/{number}"),
+                    ..IssueInfo::default()
+                }))
         }
     }
 }

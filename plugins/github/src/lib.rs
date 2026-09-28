@@ -5,3 +5,4 @@
 //! repository's own `.balerix.yaml`.
 
 pub mod config;
+pub mod github;

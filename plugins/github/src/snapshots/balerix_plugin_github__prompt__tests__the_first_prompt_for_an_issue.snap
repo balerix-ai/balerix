@@ -1,0 +1,16 @@
+---
+source: src/prompt.rs
+expression: first(&start())
+---
+You are attached to acme/payments issue #12: Refunds double-post
+https://github.com/acme/payments/issues/12
+
+Branch: balerix/gh-acme-payments/repo/issue-12 (from main)
+
+When a refund is retried it posts twice.
+
+Steps: …
+
+---
+@alice asked:
+@balerix please fix this

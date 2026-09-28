@@ -7,4 +7,6 @@
 pub mod config;
 pub mod github;
 pub mod mention;
+pub mod prompt;
 pub mod repo_config;
+pub mod status;

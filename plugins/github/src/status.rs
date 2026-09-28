@@ -7,6 +7,9 @@ use balerix_plugin_common::render::short_session;
 
 /// Lines kept; older ones fall off the top.
 pub const MAX_LINES: usize = 20;
+/// Characters kept of a line; a longer one ends in `…`, so twenty lines
+/// stay far inside a comment's 65 536.
+pub const MAX_LINE_CHARS: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
@@ -29,7 +32,11 @@ impl Status {
     /// Adds a line stamped `at` (unix seconds, rendered as UTC hh:mm),
     /// its first line only.
     pub fn push(&mut self, at: u64, text: &str) {
-        let first = text.lines().next().unwrap_or("").trim().to_string();
+        let mut first = text.lines().next().unwrap_or("").trim().to_string();
+        if let Some((cut, _)) = first.char_indices().nth(MAX_LINE_CHARS) {
+            first.truncate(cut);
+            first.push('…');
+        }
         self.lines.push_back((at, first));
         while self.lines.len() > MAX_LINES {
             self.lines.pop_front();
@@ -82,5 +89,11 @@ mod tests {
         assert_eq!(r.matches("\n- ").count(), MAX_LINES);
         assert!(!r.contains("session started"), "the oldest fell off");
         assert!(r.ends_with("- 00:24 line 24"));
+        // a long line is cut at 200 characters, on a char boundary
+        s.push(0, &format!("running Bash: {}", "é".repeat(500)));
+        let last = s.render().lines().last().unwrap_or("").to_string();
+        let text = last.trim_start_matches("- 00:00 ");
+        assert_eq!(text.chars().count(), MAX_LINE_CHARS + 1);
+        assert!(text.ends_with("é…"), "{text}");
     }
 }

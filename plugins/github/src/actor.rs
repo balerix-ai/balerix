@@ -111,6 +111,18 @@ struct Sent {
     asker: String,
 }
 
+/// Why a routed prompt went unconfirmed (§8.7, §17): the note names its
+/// reason, and only expiry claims a duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unconfirmed {
+    /// Its `confirmWindow` passed with the agent idle.
+    Expired,
+    /// Claude took a later prompt first.
+    Skipped,
+    /// Pushed out past `MAX_PENDING`.
+    Evicted,
+}
+
 /// A review held while a question is open (§9).
 #[derive(Debug, Clone)]
 struct Held {
@@ -152,7 +164,7 @@ pub struct Actor<G: GitHubPort> {
     /// What the first prompt needs, kept from `start` until `SessionStart`.
     first_prompts: HashMap<String, FirstPrompt>,
     /// Markers evicted inside a sync path, reported on the next tick.
-    unconfirmed_queue: Vec<Sent>,
+    unconfirmed_queue: Vec<(Sent, Unconfirmed)>,
     /// Wall-clock seconds; a test pins it.
     now_secs: fn() -> u64,
 }
@@ -899,28 +911,37 @@ impl<G: GitHubPort> Actor<G> {
     }
 
     fn unconfirmed_later(&mut self, sent: Sent) {
-        self.unconfirmed_queue.push(sent);
+        self.unconfirmed_queue.push((sent, Unconfirmed::Evicted));
     }
 
-    async fn unconfirmed(&mut self, sent: Sent) {
+    async fn unconfirmed(&mut self, sent: Sent, why: Unconfirmed) {
         self.counters
             .deliveries
             .with_label_values(&["unconfirmed"])
             .inc();
         self.react(sent.installation, &sent.repo, sent.target, CONFUSED)
             .await;
-        let window = self
-            .agents
-            .get(&sent.agent)
-            .map_or(crate::config::DEFAULT_CONFIRM_WINDOW, |c| c.confirm_window);
-        self.line(
-            &sent.agent,
-            &format!(
-                "prompt from @{} not confirmed after {}s",
-                sent.asker,
-                window.as_secs()
+        let line = match why {
+            Unconfirmed::Expired => {
+                let window = self
+                    .agents
+                    .get(&sent.agent)
+                    .map_or(crate::config::DEFAULT_CONFIRM_WINDOW, |c| c.confirm_window);
+                format!(
+                    "prompt from @{} not confirmed after {}s",
+                    sent.asker,
+                    window.as_secs()
+                )
+            }
+            Unconfirmed::Skipped => format!(
+                "prompt from @{} skipped: Claude took a later one first",
+                sent.asker
             ),
-        );
+            Unconfirmed::Evicted => {
+                format!("prompt from @{} dropped: too many pending", sent.asker)
+            }
+        };
+        self.line(&sent.agent, &line);
     }
 
     async fn on_answer(
@@ -1019,7 +1040,7 @@ impl<G: GitHubPort> Actor<G> {
         // §8.7 and J §5: both run above every early return.
         let outcome = self.deliveries.on_event(&event, Instant::now());
         for s in outcome.skipped {
-            self.unconfirmed(s).await;
+            self.unconfirmed(s, Unconfirmed::Skipped).await;
         }
         if let Some(s) = outcome.confirmed {
             self.counters
@@ -1030,7 +1051,9 @@ impl<G: GitHubPort> Actor<G> {
                 .await;
         }
         let tracking = self.track_question(&event).await;
-        if !config.enabled {
+        // §10: an ended session posts nothing more; the tracking above
+        // still ran.
+        if row.closed || !config.enabled {
             return;
         }
         let (installation, repo, number) = (row.installation, row.repo.clone(), row.number);
@@ -1351,43 +1374,57 @@ impl<G: GitHubPort> Actor<G> {
         let fleet = session::fleet_of(agent).to_string();
         let mut live = self.sessions.live_in(&fleet);
         live.retain(|l| l.number != row.number);
-        let refile = async {
-            let default_branch =
-                retry_once(|| self.port.default_branch(installation, &row.repo)).await?;
-            let text = retry_once(|| {
-                self.port.read_file(
-                    installation,
-                    &row.repo,
-                    &self.cfg().config_path,
-                    &default_branch,
-                )
-            })
-            .await?
-            .unwrap_or_default();
-            Ok::<_, GitHubError>(repo_config::prepare(
-                &text,
-                &row.repo,
-                &fleet,
-                &default_branch,
-                &live,
-            ))
-        };
-        match refile.await {
-            Ok(Ok(file)) => {
-                if let Err(e) = self.host.apply_fleet(&fleet, &file).await {
-                    tracing::warn!("github: applying {fleet} without {agent}: {e}");
-                    self.counters.applies.with_label_values(&["daemon"]).inc();
-                } else {
-                    self.counters.applies.with_label_values(&["ok"]).inc();
+        // §11: a refile that fails is reported on the issue and the row
+        // stays open, touched so the idle check retries after another
+        // `idleTimeout` rather than every tick; the agent is still running.
+        let default_branch =
+            match retry_once(|| self.port.default_branch(installation, &row.repo)).await {
+                Ok(b) => b,
+                Err(e) => {
+                    self.github_failed("default_branch", &e);
+                    self.refile_failed(agent, &row, &e.to_string()).await;
+                    return;
                 }
+            };
+        let text = match retry_once(|| {
+            self.port.read_file(
+                installation,
+                &row.repo,
+                &self.cfg().config_path,
+                &default_branch,
+            )
+        })
+        .await
+        {
+            Ok(t) => t.unwrap_or_default(),
+            Err(e) => {
+                self.github_failed("read_file", &e);
+                self.refile_failed(agent, &row, &e.to_string()).await;
+                return;
             }
-            Ok(Err(m)) => {
+        };
+        let file = match repo_config::prepare(&text, &row.repo, &fleet, &default_branch, &live) {
+            Ok(f) => f,
+            Err(m) => {
                 tracing::warn!("github: {fleet}: {m}");
                 self.counters.applies.with_label_values(&["config"]).inc();
+                self.refile_failed(agent, &row, &m).await;
+                return;
             }
-            Err(e) => self.github_failed("read_file", &e),
+        };
+        if let Err(e) = self.host.apply_fleet(&fleet, &file).await {
+            tracing::warn!("github: applying {fleet} without {agent}: {e}");
+            self.counters.applies.with_label_values(&["daemon"]).inc();
+            self.health.fail(format!("github: applying {fleet}: {e}"));
+            self.refile_failed(agent, &row, &e.to_string()).await;
+            return;
         }
+        self.counters.applies.with_label_values(&["ok"]).inc();
+        self.health.ok();
         self.line(agent, reason);
+        // The apply makes the daemon deactivate the agent, which drops its
+        // status: the final line goes out now, not on a later tick.
+        self.flush_status(agent).await;
         if let Some(r) = self.sessions.get_mut(agent) {
             r.closed = true;
         }
@@ -1398,14 +1435,22 @@ impl<G: GitHubPort> Actor<G> {
         self.publish_gauges();
     }
 
+    /// `end` could not remove the agent: say so once on the issue and
+    /// leave the row open for a later try.
+    async fn refile_failed(&mut self, agent: &str, row: &Session, message: &str) {
+        self.post(row.installation, &row.repo, row.number, message, "notice")
+            .await;
+        self.touch(agent);
+    }
+
     // ---- the tick ----
 
     async fn on_tick(&mut self) {
-        for s in std::mem::take(&mut self.unconfirmed_queue) {
-            self.unconfirmed(s).await;
+        for (s, why) in std::mem::take(&mut self.unconfirmed_queue) {
+            self.unconfirmed(s, why).await;
         }
         for s in self.deliveries.expire(Instant::now()) {
-            self.unconfirmed(s).await;
+            self.unconfirmed(s, Unconfirmed::Expired).await;
         }
         // idle (§10)
         let idle = self.cfg().idle_timeout;
@@ -1503,8 +1548,8 @@ impl<G: GitHubPort> Actor<G> {
                         .status_edits
                         .with_label_values(&["failed"])
                         .inc();
+                    // retried on the next change (§8.3), not every tick
                     self.github_failed("edit_comment", &e);
-                    self.status_dirty.insert(agent.into(), Instant::now());
                     return;
                 }
             }
@@ -2506,5 +2551,98 @@ mod tests {
             2,
             "routed to the reloaded row"
         );
+    }
+
+    #[tokio::test]
+    async fn a_skipped_prompt_gets_confused_and_names_its_reason() {
+        let (_fake, port, mut a) = started().await;
+        a.handle(comment(12, "bob", 9, "first thing")).await;
+        a.handle(comment(12, "bob", 10, "second thing")).await;
+        port.take_calls();
+        a.handle(Command::Events(vec![during(
+            "UserPromptSubmit",
+            json!({ "prompt": "second thing" }),
+        )]))
+        .await;
+        assert_eq!(
+            reactions(&port.calls()),
+            vec![
+                (Target::Comment(9), CONFUSED.into()),
+                (Target::Comment(10), PLUS_ONE.into())
+            ]
+        );
+        let r = a.statuses[AGENT].render();
+        assert!(
+            r.contains("prompt from @bob skipped: Claude took a later one first"),
+            "{r}"
+        );
+        assert!(!r.contains("not confirmed after"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn the_final_line_reaches_the_status_comment_before_the_deactivate() {
+        let (_fake, port, mut a) = started().await;
+        a.handle(Command::Webhook(WebhookEvent::Closed {
+            repo: "acme/api".into(),
+            installation: 7,
+            number: 12,
+            merged: false,
+        }))
+        .await;
+        a.handle(Command::Deactivate {
+            agent: AGENT.into(),
+        })
+        .await;
+        let e = edits(&port.calls());
+        assert!(e.last().is_some_and(|b| b.ends_with(" closed")), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_refile_on_close_is_reported_and_the_row_stays_open() {
+        let (fake, port, mut a) = started().await;
+        port.set_file("acme/api", "main", ".balerix.yaml", "");
+        a.handle(Command::Webhook(WebhookEvent::Closed {
+            repo: "acme/api".into(),
+            installation: 7,
+            number: 12,
+            merged: false,
+        }))
+        .await;
+        assert_eq!(
+            comments(&port.calls()).len(),
+            1,
+            "one notice: {:?}",
+            comments(&port.calls())
+        );
+        assert!(!a.sessions.get(AGENT).unwrap().closed);
+        assert_eq!(a.counters.applies.with_label_values(&["config"]).get(), 1);
+        assert_eq!(fake.applied_fleets().len(), 1, "no apply without the agent");
+        // still open: a turn still posts
+        port.take_calls();
+        a.handle(Command::Events(vec![during(
+            "Stop",
+            json!({ "last_assistant_message": "still here" }),
+        )]))
+        .await;
+        assert_eq!(comments(&port.calls()), vec![(12, "still here".into())]);
+    }
+
+    #[tokio::test]
+    async fn a_closed_row_posts_no_turn() {
+        let (_fake, port, mut a) = started().await;
+        a.handle(Command::Webhook(WebhookEvent::Closed {
+            repo: "acme/api".into(),
+            installation: 7,
+            number: 12,
+            merged: true,
+        }))
+        .await;
+        port.take_calls();
+        a.handle(Command::Events(vec![during(
+            "Stop",
+            json!({ "last_assistant_message": "late" }),
+        )]))
+        .await;
+        assert!(comments(&port.calls()).is_empty());
     }
 }

@@ -6,3 +6,5 @@
 
 pub mod config;
 pub mod github;
+pub mod mention;
+pub mod repo_config;

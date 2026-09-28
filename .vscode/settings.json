@@ -3,6 +3,7 @@
     "Cargo.toml",
     "plugins/flow/Cargo.toml",
     "plugins/web/Cargo.toml",
-    "plugins/matrix/Cargo.toml"
+    "plugins/matrix/Cargo.toml",
+    "plugins/github/Cargo.toml"
   ]
 }

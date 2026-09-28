@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 names=("$@")
-(( ${#names[@]} )) || names=(flow web matrix)
+(( ${#names[@]} )) || names=(flow web matrix github)
 
 out_root="${CARGO_TARGET_DIR:-target}"
 

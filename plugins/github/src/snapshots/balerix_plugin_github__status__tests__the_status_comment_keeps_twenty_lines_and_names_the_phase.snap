@@ -1,0 +1,8 @@
+---
+source: src/status.rs
+expression: s.render()
+---
+**balerix** · `gh-acme-payments/repo/issue-12` · session `0199aa11` · **ready**
+
+- 14:02 session started (startup)
+- 14:05 needs you: Claude needs your permission to use Bash

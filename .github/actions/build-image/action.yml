@@ -6,7 +6,7 @@ description: >-
   jq, hadolint and trivy through mise, and logged in to ghcr when pushing.
 inputs:
   unit:
-    description: Release unit (core, flow, web, matrix)
+    description: Release unit (core, flow, web, matrix, github)
     required: true
   dist:
     description: Directory holding the unit's bare binary (build-binary's dist)

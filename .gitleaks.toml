@@ -18,3 +18,9 @@ paths = [
   '''^plugins/web/assets/xterm\.css$''',
   '''^plugins/web/assets/addon-fit\.js$''',
 ]
+
+[[allowlists]]
+description = "A throwaway RSA key generated for the GitHub plugin's JWT unit test; it signs nothing real"
+paths = [
+  '''^plugins/github/tests/fixtures/test-app-key\.pem$''',
+]

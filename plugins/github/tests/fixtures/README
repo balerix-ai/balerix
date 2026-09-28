@@ -1,0 +1,1 @@
+test-app-key.pem and test-app-key.pub.pem are a throwaway RSA key pair generated only for client.rs's JWT unit test; they sign nothing real.

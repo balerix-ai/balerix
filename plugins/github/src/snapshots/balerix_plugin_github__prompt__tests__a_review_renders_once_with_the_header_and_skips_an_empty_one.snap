@@ -1,0 +1,13 @@
+---
+source: src/prompt.rs
+expression: m
+---
+Review by @bob: changes requested, at 3f9c2a1
+Review against main at 3f9c2a1 (1 comment)
+
+src/lib.rs line 42 (new):
+> +    let x = foo();
+This unwrap can panic.
+
+Overall:
+Close.

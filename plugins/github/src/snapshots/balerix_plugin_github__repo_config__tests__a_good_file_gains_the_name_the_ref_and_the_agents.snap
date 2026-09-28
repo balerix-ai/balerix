@@ -1,0 +1,46 @@
+---
+source: src/repo_config.rs
+expression: v
+---
+{
+  "apiVersion": "balerix/v1",
+  "crews": {
+    "repo": {
+      "agents": {
+        "issue-12": {
+          "plugins": {
+            "github": {
+              "kind": "issue",
+              "number": 12
+            }
+          }
+        },
+        "pr-34": {
+          "branch": "feature/x",
+          "plugins": {
+            "github": {
+              "kind": "pr",
+              "number": 34
+            }
+          }
+        },
+        "reviewer": {
+          "claude": {
+            "settings": {
+              "model": "opus"
+            }
+          }
+        }
+      },
+      "ref": "develop",
+      "repo": "Acme/Payments"
+    }
+  },
+  "defaults": {
+    "tools": {
+      "node": "22.11.0"
+    }
+  },
+  "kind": "Fleet",
+  "name": "gh-acme-payments"
+}

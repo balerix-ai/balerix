@@ -1,0 +1,14 @@
+---
+source: src/prompt.rs
+expression: first(&s)
+---
+You are attached to acme/payments pull request #34: Refunds double-post
+https://github.com/acme/payments/issues/12
+
+Branch: feature/refunds (into main)
+
+Earlier work on this pull request is on branch feature/refunds; continue from it.
+
+When a refund is retried it posts twice.
+
+Steps: …

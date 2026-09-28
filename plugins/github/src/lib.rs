@@ -10,3 +10,4 @@ pub mod mention;
 pub mod prompt;
 pub mod repo_config;
 pub mod status;
+pub mod webhook;

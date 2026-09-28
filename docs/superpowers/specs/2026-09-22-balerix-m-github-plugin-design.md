@@ -770,3 +770,12 @@ credentials or the gh token (Spec L-3).
   before loopback IO lands. `tokio`'s `test-util` feature is a matrix
   dev-dependency for it, and `main.rs` carries `#![recursion_limit =
   "256"]` for the actor future's size.
+- Measured against claude 2.1.283 (2026-09-28, `verify-matrix` on a
+  local homeserver): text typed mid-turn fires `UserPromptSubmit` when
+  Claude queues it, within milliseconds and before the running turn's
+  `Stop`, and each queued message is its own event with its exact text,
+  so a mid-turn reply is 👍 at once and two mid-turn replies are both
+  👍. The running turn's `Stop` may be elided when prompts are queued;
+  one `Stop` follows the combined turn. The "clock waits for `Stop`"
+  rule therefore only delays the note for a genuinely swallowed prompt,
+  which is the conservative side. No concatenation match is needed.

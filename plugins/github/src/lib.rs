@@ -5,6 +5,7 @@
 //! repository's own `.balerix.yaml`.
 
 pub mod actor;
+pub mod client;
 pub mod config;
 pub mod github;
 pub mod mention;

@@ -23,8 +23,11 @@ balerix-plugin-sdk = { path = "../../crates/balerix-plugin-sdk" }
 balerix-plugin-common = { path = "../common" }
 # The GitHub REST client: ten endpoints, TLS through rustls (M-12).
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
-# The App JWT (RS256) that mints installation tokens.
-jsonwebtoken = "11.1.0"
+# The App JWT (RS256) that mints installation tokens. `aws_lc_rs` picks
+# the crypto backend jsonwebtoken 11 now requires explicitly; reqwest's
+# rustls already pulls aws-lc-rs, so this reuses it rather than adding
+# the pure-Rust `rust_crypto` backend's own dependency tree.
+jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 # Webhook signatures: HMAC-SHA256 over the raw body.
 hmac = "0.13.0"
 sha2 = "0.11.0"

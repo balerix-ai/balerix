@@ -4,16 +4,20 @@
 //! installation token refetched once.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use balerix_plugin_common::config::Secret;
+use balerix_plugin_sdk::Host;
 use base64::Engine;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::actor::{Actor, Command, Counters, Health, Queue, TICK};
+use crate::config::DaemonConfig;
 use crate::github::{GitHubError, GitHubPort, IssueInfo, Permission, ReviewComment, Target};
+use crate::webhook::Listener;
 
 pub const API: &str = "https://api.github.com";
 
@@ -434,6 +438,57 @@ impl GitHubPort for GitHubClient {
             )
             .await?;
         serde_json::from_value(v).map_err(|e| GitHubError::Other(format!("review comments: {e}")))
+    }
+}
+
+/// Proves the App, starts the actor with its slug, serves the webhook
+/// listener into the queue and spawns the ticker (Spec M §3, §11).
+pub struct GitHubLauncher {
+    pub host: Host,
+    pub counters: Counters,
+    pub health: Health,
+}
+
+impl crate::plugin::Launcher for GitHubLauncher {
+    async fn launch(&self, config: DaemonConfig, queue: Arc<Queue>) -> Result<(), String> {
+        let client = GitHubClient::new(config.app_id, &config.private_key)?;
+        let slug = client
+            .app_slug()
+            .await
+            .map_err(|e| format!("proving the App: {e}"))?;
+        tracing::info!("github: App @{slug}");
+        let listener = tokio::net::TcpListener::bind(config.listen)
+            .await
+            .map_err(|e| format!("listen {}: {e}", config.listen))?;
+        let mut actor = Actor::new(
+            self.host.clone(),
+            client,
+            self.counters.clone(),
+            self.health.clone(),
+            slug,
+        );
+        actor.load().await;
+        tokio::spawn(actor.run(queue.clone()));
+        let sink_queue = queue.clone();
+        let webhook = Listener::new(
+            config.webhook_secret.clone(),
+            move |ev| sink_queue.push(Command::Webhook(ev)),
+            self.counters.webhooks.clone(),
+        );
+        let health = self.health.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::webhook::serve(listener, webhook.router()).await {
+                health.fail(format!("webhook listener: {e}"));
+            }
+        });
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(TICK);
+            loop {
+                interval.tick().await;
+                queue.push(Command::Tick);
+            }
+        });
+        Ok(())
     }
 }
 

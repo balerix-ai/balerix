@@ -9,8 +9,11 @@ pub mod client;
 pub mod config;
 pub mod github;
 pub mod mention;
+pub mod plugin;
 pub mod prompt;
 pub mod repo_config;
 pub mod session;
 pub mod status;
 pub mod webhook;
+
+pub use plugin::{GitHubPlugin, Launcher};

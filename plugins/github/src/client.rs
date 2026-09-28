@@ -65,6 +65,22 @@ pub fn retry_after_ms(status: u16, headers: &HeaderMap, now: u64) -> Option<u64>
     None
 }
 
+/// The JSON `message` field when the body parses as JSON, else the body's
+/// first 200 characters — the same fallback for every failure body,
+/// whatever GitHub (or a proxy in front of it) actually sent back.
+fn error_message(text: &str) -> String {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| v["message"].as_str().map(str::to_string))
+        .unwrap_or_else(|| text.chars().take(200).collect())
+}
+
+/// A non-2xx on an App or installation-token call is always `Auth` (§11):
+/// never `Other`, whether or not the body happens to be JSON.
+fn auth_error(what: &str, status: u16, text: &str) -> GitHubError {
+    GitHubError::Auth(format!("{what}: HTTP {status}: {}", error_message(text)))
+}
+
 struct Token {
     value: Secret,
     expires: u64,
@@ -143,17 +159,15 @@ impl GitHubClient {
             .await
             .map_err(|e| GitHubError::Other(e.to_string()))?;
         let status = resp.status();
-        let body: Value = resp
-            .json()
+        let text = resp
+            .text()
             .await
             .map_err(|e| GitHubError::Other(e.to_string()))?;
         if !status.is_success() {
-            return Err(GitHubError::Auth(format!(
-                "installation token: HTTP {}: {}",
-                status.as_u16(),
-                body["message"].as_str().unwrap_or("")
-            )));
+            return Err(auth_error("installation token", status.as_u16(), &text));
         }
+        let body: Value = serde_json::from_str(&text)
+            .map_err(|e| GitHubError::Other(format!("installation token: bad JSON: {e}")))?;
         let value = Secret::new(body["token"].as_str().unwrap_or(""));
         // `expires_at` is RFC 3339; an hour is GitHub's fixed lifetime, so
         // a parse is not worth a dependency: cache for fifty minutes.
@@ -215,13 +229,10 @@ impl GitHubClient {
                 .await
                 .map_err(|e| GitHubError::Other(e.to_string()))?;
             if !status.is_success() {
-                let message = serde_json::from_str::<Value>(&text)
-                    .ok()
-                    .and_then(|v| v["message"].as_str().map(str::to_string))
-                    .unwrap_or_else(|| text.chars().take(200).collect());
                 return Err(GitHubError::Other(format!(
-                    "{method} {path}: HTTP {}: {message}",
-                    status.as_u16()
+                    "{method} {path}: HTTP {}: {}",
+                    status.as_u16(),
+                    error_message(&text)
                 )));
             }
             if text.trim().is_empty() {
@@ -244,17 +255,15 @@ impl GitHubPort for GitHubClient {
             .await
             .map_err(|e| GitHubError::Other(e.to_string()))?;
         let status = resp.status();
-        let v: Value = resp
-            .json()
+        let text = resp
+            .text()
             .await
             .map_err(|e| GitHubError::Other(e.to_string()))?;
         if !status.is_success() {
-            return Err(GitHubError::Auth(format!(
-                "GET /app: HTTP {}: {}",
-                status.as_u16(),
-                v["message"].as_str().unwrap_or("")
-            )));
+            return Err(auth_error("GET /app", status.as_u16(), &text));
         }
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| GitHubError::Other(format!("GET /app: bad JSON: {e}")))?;
         v["slug"]
             .as_str()
             .map(str::to_string)
@@ -455,6 +464,22 @@ mod tests {
             jwt(1, &Secret::new("not a key"), 0)
                 .unwrap_err()
                 .contains("privateKey")
+        );
+    }
+
+    #[test]
+    fn auth_error_reads_the_json_message_or_falls_back_to_the_body() {
+        assert_eq!(
+            auth_error(
+                "installation token",
+                401,
+                r#"{"message":"Bad credentials"}"#
+            ),
+            GitHubError::Auth("installation token: HTTP 401: Bad credentials".into())
+        );
+        assert_eq!(
+            auth_error("GET /app", 502, "<html>oops</html>"),
+            GitHubError::Auth("GET /app: HTTP 502: <html>oops</html>".into())
         );
     }
 

@@ -45,6 +45,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 insta = { version = "1.48.0", features = ["yaml", "json"] }
+# `test-util` gives the actor's delivery-window and status-coalescing tests
+# a paused, advanceable clock (`tokio::time::advance`); cargo unifies it
+# into the same tokio already in `[dependencies]`, so nothing new is
+# pulled in for the built binary.
+tokio = { version = "1.53.1", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

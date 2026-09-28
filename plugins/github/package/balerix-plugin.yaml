@@ -1,0 +1,15 @@
+apiVersion: balerix/v1
+kind: Plugin
+name: github
+version: 0.1.0
+protocol: 1
+start: serve
+# Every event is observed: the set is per-agent config (Spec M §4.2), so
+# the filtering is the plugin's job, not the subscription's.
+hooks:
+  observe: [SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, SubagentStop, PreCompact]
+  intercept: []
+# fleets: readiness and phases. actions: send_text and send_keys. kv:
+# session rows. manage: the fleet per repository (Spec L).
+needs: [fleets, actions, kv, manage]
+routes: false

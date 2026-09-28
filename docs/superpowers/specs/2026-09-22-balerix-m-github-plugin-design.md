@@ -387,6 +387,13 @@ is on, adds a line. `Dead` and `Failed` lines carry the daemon's message.
 
 ### 8.7 Delivery confirmation
 
+As implemented (§17), `sent` takes each prompt's window and `expire`
+takes only `now`; `on_event` records the turn for agents it has not seen
+a send for. The note names its reason, and only expiry claims a
+duration; a prompt skipped by a later one or evicted past `MAX_PENDING`
+gets its own wording regardless of `confirmWindow`. See §17 for the
+exact strings.
+
 `send_text`'s `Ok` says the daemon typed the body into the pane and
 pressed Enter. It does not say Claude took a prompt: a dialog may be
 open, or the agent may be mid-turn and queue the text. The plugin
@@ -728,3 +735,47 @@ credentials or the gh token (Spec L-3).
   twenty-eight.
 - The e2e's managed journey runs fake-claude from `fleetDefaults` and
   asserts the refusal through a second, manage-only fake plugin.
+
+## 17. Recorded at implementation, part 2 (delivery confirmation)
+
+- `common::delivery::Deliveries<M>`: `sent` takes the window per prompt
+  (`0` never expires) and evicts past `MAX_PENDING` (64) per agent,
+  answering the evicted marker; a body that normalises to nothing is not
+  tracked; `on_event` takes `now` for `Stop`/`SessionEnd`.
+- `common::config::{parse_duration, deserialize_duration}` carry the
+  `90s`/`5m`/`2h`/`0` grammar; `confirmWindow` is a `Duration` on the
+  agent config.
+- Matrix's `Tick` comes from a five-second `tokio::time::interval` in
+  `main`; the note is posted once per prompt and nothing else reacts.
+- `#85` closes with this part.
+- `Deliveries::on_event` creates an agent's state on `UserPromptSubmit`,
+  `Stop` and `SessionEnd` even before anything was sent to it, so the
+  mid-turn bit holds for a prompt routed during a turn that started
+  earlier; `forget` on `Deactivate` frees the entry, and the matrix actor
+  drops events for a deactivated agent before the tracker sees them.
+- The note names its reason. Only expiry claims a duration: `**not
+  confirmed by <agent> after <n>s**: Claude did not take the prompt (a
+  dialog may be open, or the text may have been swallowed)`. A prompt
+  skipped because Claude took a later one first posts `**not confirmed by
+  <agent>**: Claude took a later prompt first, so this one was swallowed`;
+  one evicted past `MAX_PENDING` posts `**not confirmed by <agent>**: too
+  many prompts are waiting on this agent, so this one is no longer
+  tracked`. `confirmWindow: 0` silences only the expiry note; skip and
+  evict notes are evidence, not a timeout, and still post.
+- `parse_duration` rejects a value whose seconds overflow `u64` with the
+  same invalid-duration error instead of panicking.
+- Matrix's actor tests pause tokio time (`tokio::time::pause`) after the
+  fixtures' real round trips to the fake host rather than starting paused:
+  a runtime paused from the start auto-advances into reqwest's timeout
+  before loopback IO lands. `tokio`'s `test-util` feature is a matrix
+  dev-dependency for it, and `main.rs` carries `#![recursion_limit =
+  "256"]` for the actor future's size.
+- Measured against claude 2.1.283 (2026-09-28, `verify-matrix` on a
+  local homeserver): text typed mid-turn fires `UserPromptSubmit` when
+  Claude queues it, within milliseconds and before the running turn's
+  `Stop`, and each queued message is its own event with its exact text,
+  so a mid-turn reply is 👍 at once and two mid-turn replies are both
+  👍. The running turn's `Stop` may be elided when prompts are queued;
+  one `Stop` follows the combined turn. The "clock waits for `Stop`"
+  rule therefore only delays the note for a genuinely swallowed prompt,
+  which is the conservative side. No concatenation match is needed.

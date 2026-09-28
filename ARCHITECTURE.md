@@ -52,10 +52,10 @@ against what was declared.
   built on (Spec K): `render` (events to markdown, the fence-aware
   `split`), `question` and `pending` (the `AskUserQuestion` dialog, its
   matching and key plan, the open question mirrored to KV), `answer` (the
-  answer flow as a pure decision the plugin's actor executes), `config`
-  helpers, `queue`, `metrics::Shared`, `phases` and `review`. A standalone
-  project under `plugins/common/`, published to crates.io as its own
-  release unit.
+  answer flow as a pure decision the plugin's actor executes), `delivery`,
+  `config` helpers, `queue`, `metrics::Shared`, `phases` and `review`. A
+  standalone project under `plugins/common/`, published to crates.io as
+  its own release unit.
 - `balerix-plugin-flow` — the first in-tree plugin, on the SDK: a per-agent
   state machine over hook events (`config.rs` parses and compiles the
   `plugins.flow` block, `machine.rs` is the pure step, `plugin.rs` owns the
@@ -73,7 +73,9 @@ against what was declared.
   `send_text` (Spec G), and an `AskUserQuestion` dialog shown in the thread
   and answered from it with paced `send_keys` (Spec J). Everything about
   Claude's dialog is in common's `question.rs`; the matrix actor executes
-  common's `answer` decisions. Bumping `claude` means running
+  common's `answer` decisions. A routed reply is 📨 when typed and 👍
+  when the agent's `UserPromptSubmit` carries it, through common's
+  `delivery` tracker (Spec M §8.7). Bumping `claude` means running
   `mise run verify-questions`. Its `matrix-sdk` tree is larger
   than the rest of the repository put together, which is why plugins
   stopped being workspace members.

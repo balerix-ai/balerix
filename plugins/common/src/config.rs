@@ -156,6 +156,44 @@ pub fn validate_key_delay(ms: u64) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// A duration as the plugins' config writes it (Spec M §4.1): `90`
+/// (seconds), `90s`, `5m`, `2h`, or `0`. `path` is the config key the
+/// error names.
+pub fn parse_duration(path: &str, s: &str) -> Result<std::time::Duration, ConfigError> {
+    let invalid = || ConfigError {
+        path: path.to_string(),
+        message: format!("invalid duration {s:?} (use 30s, 5m, 2h or 0)"),
+    };
+    let t = s.trim();
+    let (digits, unit) = match t.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => t.split_at(i),
+        None => (t, "s"),
+    };
+    if digits.is_empty() {
+        return Err(invalid());
+    }
+    let n: u64 = digits.parse().map_err(|_| invalid())?;
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => return Err(invalid()),
+    };
+    let secs = n.checked_mul(mult).ok_or_else(invalid)?;
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+/// `#[serde(deserialize_with = "deserialize_duration")]`: the grammar of
+/// `parse_duration` on a string field. The path in the error is the
+/// field's, added by `deserialize`'s `serde_path_to_error`.
+pub fn deserialize_duration<'de, D>(d: D) -> Result<std::time::Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    parse_duration("", &s).map_err(|e| serde::de::Error::custom(e.message))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +308,45 @@ mod tests {
             assert_eq!(e.path, "keyDelayMs");
             assert!(e.message.contains("20 to 500"), "{e}");
         }
+    }
+
+    #[test]
+    fn durations_take_seconds_minutes_hours_and_zero() {
+        use std::time::Duration;
+        assert_eq!(parse_duration("w", "90").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("w", "30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("w", "5m").unwrap(), Duration::from_secs(300));
+        assert_eq!(
+            parse_duration("w", "2h").unwrap(),
+            Duration::from_secs(7200)
+        );
+        assert_eq!(parse_duration("w", " 0 ").unwrap(), Duration::ZERO);
+        for bad in ["", "s", "5d", "-1", "1.5s", "5 m"] {
+            let e = parse_duration("idleTimeout", bad).unwrap_err();
+            assert_eq!(e.path, "idleTimeout", "{bad:?}");
+            assert_eq!(
+                e.message,
+                format!("invalid duration {bad:?} (use 30s, 5m, 2h or 0)"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_duration_reads_the_same_grammar_with_the_field_path() {
+        use std::time::Duration;
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct S {
+            #[serde(deserialize_with = "deserialize_duration")]
+            confirm_window: Duration,
+        }
+        let s: S = deserialize(&json!({ "confirmWindow": "45s" })).unwrap();
+        assert_eq!(s.confirm_window, Duration::from_secs(45));
+        let e = deserialize::<S>(&json!({ "confirmWindow": "soon" })).unwrap_err();
+        assert_eq!(e.path, "confirmWindow");
+        assert!(e.message.contains("invalid duration \"soon\""), "{e}");
+        let e = deserialize::<S>(&json!({ "confirmWindow": 30 })).unwrap_err();
+        assert_eq!(e.path, "confirmWindow");
     }
 }

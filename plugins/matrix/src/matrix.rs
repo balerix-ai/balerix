@@ -15,6 +15,9 @@ pub const REFUSED: &str = "🚫";
 pub const FAILED: &str = "❗";
 /// On the plugin's own echo: Claude recorded exactly what was chosen.
 pub const CONFIRMED: &str = "✅";
+/// The daemon typed the reply into the pane (Spec M §8.7); `ACK` follows
+/// once Claude takes it.
+pub const SENT: &str = "📨";
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MatrixError {

@@ -56,8 +56,20 @@ Then check, in your Matrix client:
     encrypted, with you invited;
   - each agent has its own thread, rooted on a session-started message;
   - a permission prompt from an agent appears in that agent's thread;
-  - replying inside a live thread reaches the agent and the reply is
-    acknowledged with a reaction;
+  - replying inside a live thread reaches the agent: the reply gets 📨 at
+    once and 👍 a moment later, when Claude takes it;
+  - replying while the agent is mid-turn: 📨 and 👍 at once, and no note.
+    Claude Code fires UserPromptSubmit when it queues the text, not when
+    the turn ends (measured with claude 2.1.283 on 2026-09-28), so the
+    confirmation does not wait; only a swallowed prompt's note does;
+  - two replies while the agent is mid-turn: both 📨 and both 👍 at once.
+    Each queued message is its own UserPromptSubmit with its exact text
+    (same measurement); if a claude bump ever coalesces them into one
+    prompt, only one 👍 follows and a note appears, and the matcher
+    needs a concatenation match in common's `delivery::on_event`;
+  - replying while a permission dialog is open (not a question): 📨, no
+    👍, and after thirty seconds a "not confirmed by" note in the thread;
+  - replying with a slash command (`/compact`): 📨 and nothing more;
   - a message posted at room level is refused with a reaction;
   - after SessionEnd, a reply in that thread is refused with a reaction;
   - restarting the daemon replays nothing into the room.

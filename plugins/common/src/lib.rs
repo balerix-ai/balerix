@@ -30,3 +30,6 @@ pub mod review;
 
 /// The answer flow of Spec J §7.2 and §7.3 as pure decisions (Spec K §4).
 pub mod answer;
+
+/// Delivery confirmation: 📨 on `Ok`, 👍 on the matching `UserPromptSubmit` (Spec M §8.7).
+pub mod delivery;

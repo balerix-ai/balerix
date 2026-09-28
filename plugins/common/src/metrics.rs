@@ -20,6 +20,9 @@ pub struct Shared {
     /// `answers_mismatched_total`: answers Claude recorded differently from
     /// what the channel chose (Spec J-6).
     pub answers_mismatched: IntCounter,
+    /// `deliveries_total{outcome}`: `confirmed`, `unconfirmed`, `command`
+    /// (Spec M §8.7).
+    pub deliveries: IntCounterVec,
 }
 
 impl Shared {
@@ -46,6 +49,11 @@ impl Shared {
                 "answers_mismatched_total",
                 "Answers Claude recorded differently from what was chosen",
             )?,
+            deliveries: metrics.int_counter_vec(
+                "deliveries_total",
+                "Prompts sent to an agent, by whether Claude took them",
+                &["outcome"],
+            )?,
         })
     }
 }
@@ -63,6 +71,7 @@ mod tests {
         s.inbound.with_label_values(&["routed"]).inc();
         s.errors.with_label_values(&["send"]).inc();
         s.answers_mismatched.inc();
+        s.deliveries.with_label_values(&["confirmed"]).inc();
         let text = metrics.render().unwrap();
         for family in [
             "events_dropped_total",
@@ -70,6 +79,7 @@ mod tests {
             "inbound_total",
             "errors_total",
             "answers_mismatched_total",
+            "deliveries_total",
         ] {
             assert!(
                 text.contains(&format!("balerix_plugin_chat_{family}")),

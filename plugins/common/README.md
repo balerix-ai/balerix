@@ -130,6 +130,13 @@ Reviews: `review::render_message` turns a `review::Review` into the one
 message the web plugin delivers, and the GitHub plugin (Spec M) will
 deliver.
 
+Delivery: `delivery::Deliveries<M>` tracks the prompts a plugin sent with
+`send_text` and pairs each with the agent's `UserPromptSubmit` (Spec M
+§8.7). Mark the message "sent" on `Ok`, feed every hook event to
+`on_event` and react "confirmed" on what it answers, feed a tick to
+`expire` and post its note for what never came; `classify` tells a slash
+command, which is never tracked, from a prompt.
+
 ## Testing your plugin
 
 `balerix_plugin_sdk::testing::{FakeHost, Harness}` serve the real router

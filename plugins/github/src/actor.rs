@@ -50,12 +50,19 @@ const MAX_INLINE_RETRY: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Configure(DaemonConfig),
-    Activate { agent: String, config: AgentConfig },
-    Deactivate { agent: String },
+    Activate {
+        agent: String,
+        config: AgentConfig,
+    },
+    Deactivate {
+        agent: String,
+    },
     Events(Vec<HookEvent>),
     Phases(Vec<PhaseChange>),
     Webhook(WebhookEvent),
     Tick,
+    /// The webhook listener's `serve` returned: its error.
+    ListenerFailed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -150,11 +157,58 @@ enum Tracking {
     Closed(Option<OpenQuestion>),
 }
 
+/// §11's three health kinds: the App token, the webhook listener, an
+/// apply.
+#[derive(Debug, Clone, Copy)]
+enum Fault {
+    Token,
+    Listener,
+    Apply,
+}
+
+/// The last failure of each kind, cleared by the next success of the
+/// same kind (§11). The SDK's `Health` is one cell, so it is derived:
+/// failed with the newest failure while any kind is failing, ok only
+/// when all three are clear.
+struct Faults {
+    cell: Health,
+    last: [Option<(u64, String)>; 3],
+    seq: u64,
+}
+
+impl Faults {
+    fn new(cell: Health) -> Self {
+        Self {
+            cell,
+            last: [None, None, None],
+            seq: 0,
+        }
+    }
+
+    fn fail(&mut self, kind: Fault, message: String) {
+        self.seq += 1;
+        self.last[kind as usize] = Some((self.seq, message));
+        self.derive();
+    }
+
+    fn ok(&mut self, kind: Fault) {
+        self.last[kind as usize] = None;
+        self.derive();
+    }
+
+    fn derive(&self) {
+        match self.last.iter().flatten().max_by_key(|(seq, _)| *seq) {
+            Some((_, message)) => self.cell.fail(message.clone()),
+            None => self.cell.ok(),
+        }
+    }
+}
+
 pub struct Actor<G: GitHubPort> {
     host: Host,
     port: G,
     counters: Counters,
-    health: Health,
+    faults: Faults,
     config: Option<DaemonConfig>,
     slug: String,
     pending: Vec<Command>,
@@ -189,7 +243,7 @@ impl<G: GitHubPort> Actor<G> {
             host,
             port,
             counters,
-            health,
+            faults: Faults::new(health),
             slug,
             config: None,
             pending: Vec::new(),
@@ -276,6 +330,9 @@ impl<G: GitHubPort> Actor<G> {
             }
             Command::Webhook(ev) => self.on_webhook(ev).await,
             Command::Tick => self.on_tick().await,
+            Command::ListenerFailed(e) => self
+                .faults
+                .fail(Fault::Listener, format!("webhook listener: {e}")),
         }
     }
 
@@ -755,7 +812,7 @@ impl<G: GitHubPort> Actor<G> {
             return;
         }
         self.counters.applies.with_label_values(&["ok"]).inc();
-        self.health.ok();
+        self.faults.ok(Fault::Apply);
         if let Err(e) = session::set_repo_of_fleet(&self.host, &fleet, repo).await {
             tracing::warn!("github: writing repo/{fleet}: {e}");
         }
@@ -851,13 +908,20 @@ impl<G: GitHubPort> Actor<G> {
         }
     }
 
-    fn github_failed(&self, kind: &str, e: &GitHubError) {
+    fn github_failed(&mut self, kind: &str, e: &GitHubError) {
         self.counters.errors.with_label_values(&[kind]).inc();
         tracing::warn!("github: {kind}: {e}");
         if matches!(e, GitHubError::Auth(_)) {
             self.counters.errors.with_label_values(&["auth"]).inc();
-            self.health.fail(format!("github: {e}"));
+            self.faults.fail(Fault::Token, format!("github: {e}"));
         }
+    }
+
+    /// A daemon action the agent did not get: counted and logged with
+    /// the daemon's detail, which the issue never sees (§18).
+    fn action_failed(&self, agent: &str, kind: &str, e: &SdkError) {
+        self.counters.errors.with_label_values(&[kind]).inc();
+        tracing::warn!("github: {kind} to {agent}: {e}");
     }
 
     // ---- §8.4 inbound while live ----
@@ -904,15 +968,9 @@ impl<G: GitHubPort> Actor<G> {
                     .inbound
                     .with_label_values(&["send_failed"])
                     .inc();
-                self.counters.errors.with_label_values(&["send_text"]).inc();
-                self.post(
-                    installation,
-                    repo,
-                    number,
-                    &format!("not delivered to {agent}: {e}"),
-                    "notice",
-                )
-                .await;
+                self.action_failed(agent, "send_text", &e);
+                self.post(installation, repo, number, &not_delivered(agent), "notice")
+                    .await;
                 self.react(installation, repo, Target::Comment(comment_id), MINUS_ONE)
                     .await;
             }
@@ -1071,16 +1129,10 @@ impl<G: GitHubPort> Actor<G> {
                 .inbound
                 .with_label_values(&["send_failed"])
                 .inc();
-            self.counters.errors.with_label_values(&["send_keys"]).inc();
+            self.action_failed(agent, "send_keys", &e);
             self.questions.set_stage(agent, Stage::Open);
-            self.post(
-                installation,
-                repo,
-                number,
-                &format!("not delivered to {agent}: {e}"),
-                "notice",
-            )
-            .await;
+            self.post(installation, repo, number, &not_delivered(agent), "notice")
+                .await;
             self.react(installation, repo, Target::Comment(comment_id), MINUS_ONE)
                 .await;
             return;
@@ -1238,15 +1290,9 @@ impl<G: GitHubPort> Actor<G> {
                 START_UP_ALLOWANCE,
             ),
             Err(e) => {
-                self.counters.errors.with_label_values(&["send_text"]).inc();
-                self.post(
-                    installation,
-                    repo,
-                    number,
-                    &format!("not delivered to {agent}: {e}"),
-                    "notice",
-                )
-                .await;
+                self.action_failed(agent, "send_text", &e);
+                self.post(installation, repo, number, &not_delivered(agent), "notice")
+                    .await;
                 self.react(installation, repo, fp.target, MINUS_ONE).await;
             }
         }
@@ -1428,10 +1474,10 @@ impl<G: GitHubPort> Actor<G> {
         match self.host.action(agent, &action).await {
             Ok(()) => self.line(agent, &format!("review from @{reviewer} delivered")),
             Err(e) => {
-                self.counters.errors.with_label_values(&["send_text"]).inc();
+                self.action_failed(agent, "send_text", &e);
                 self.line(
                     agent,
-                    &format!("review from @{reviewer} not delivered: {e}"),
+                    &format!("review from @{reviewer} not delivered: {REFUSED}"),
                 );
             }
         }
@@ -1501,12 +1547,13 @@ impl<G: GitHubPort> Actor<G> {
         if let Err(e) = self.host.apply_fleet(&fleet, &file).await {
             tracing::warn!("github: applying {fleet} without {agent}: {e}");
             self.counters.applies.with_label_values(&["daemon"]).inc();
-            self.health.fail(format!("github: applying {fleet}: {e}"));
+            self.faults
+                .fail(Fault::Apply, format!("github: applying {fleet}: {e}"));
             self.refile_failed(agent, &row, &apply_refusal(&e)).await;
             return;
         }
         self.counters.applies.with_label_values(&["ok"]).inc();
-        self.health.ok();
+        self.faults.ok(Fault::Apply);
         self.line(agent, reason);
         // The apply makes the daemon deactivate the agent, which drops its
         // status: the final line goes out now, not on a later tick.
@@ -1684,7 +1731,7 @@ impl<G: GitHubPort> Actor<G> {
     /// Posts `body` split into comments (§8.5); a failed part stops the
     /// rest. Answers the first comment's id.
     async fn post(
-        &self,
+        &mut self,
         installation: u64,
         repo: &str,
         number: u64,
@@ -1700,7 +1747,7 @@ impl<G: GitHubPort> Actor<G> {
             match retry_once(|| self.port.comment(installation, repo, number, &part)).await {
                 Ok(id) => {
                     self.counters.messages_sent.with_label_values(&[kind]).inc();
-                    self.health.ok();
+                    self.faults.ok(Fault::Token);
                     first.get_or_insert(id);
                 }
                 Err(e) => {
@@ -1751,6 +1798,15 @@ fn apply_refusal(e: &SdkError) -> String {
 /// call, the detail in the plugin log (`github_failed`).
 fn github_refusal(kind: &str) -> String {
     format!("github: {kind} failed; see the plugin log")
+}
+
+/// What a failed daemon action says on the issue (§18): the daemon's
+/// error is its transport or tmux message and can name a socket path or
+/// a session, so it stays in the plugin log (`action_failed`).
+const REFUSED: &str = "the daemon refused the message";
+
+fn not_delivered(agent: &str) -> String {
+    format!("not delivered to {agent}: {REFUSED}")
 }
 
 /// `idleTimeout` as the idle line says it: whole hours, else whole
@@ -2186,7 +2242,7 @@ mod tests {
         let (fake, port, mut a) = actor().await;
         port.fail_next(GitHubError::Auth("bad token".into()));
         a.handle(comment(12, "alice", 5, "@balerix go")).await;
-        assert!(a.health.get().is_err());
+        assert!(a.faults.cell.get().is_err());
         assert_eq!(a.counters.errors.with_label_values(&["auth"]).get(), 1);
         assert_eq!(
             a.counters.errors.with_label_values(&["permission"]).get(),
@@ -2469,19 +2525,125 @@ mod tests {
         );
     }
 
+    /// #98: the daemon's action error can carry a socket path or a tmux
+    /// session name; the issue gets a fixed line, the log the detail.
     #[tokio::test]
-    async fn a_failed_send_posts_the_error_and_minus_one() {
+    async fn a_failed_send_posts_a_fixed_line_and_minus_one() {
         let (fake, port, mut a) = started().await;
         fake.fail_actions(Some("window gone"));
         a.handle(comment(12, "bob", 9, "hello")).await;
-        assert!(
-            comments(&port.calls())
-                .iter()
-                .any(|(_, b)| b.starts_with("not delivered to gh-acme-api/repo/issue-12: "))
+        let notices: Vec<String> = comments(&port.calls())
+            .into_iter()
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(
+            notices,
+            vec!["not delivered to gh-acme-api/repo/issue-12: the daemon refused the message"]
         );
         assert_eq!(
             reactions(&port.calls()),
             vec![(Target::Comment(9), MINUS_ONE.into())]
+        );
+        assert_eq!(a.counters.errors.with_label_values(&["send_text"]).get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_review_delivery_names_no_daemon_detail() {
+        let (fake, _port, mut a) = pr_session().await;
+        fake.fail_actions(Some("window gone"));
+        a.handle(review_by("bob", 9)).await;
+        let status = a.statuses[PR_AGENT].render();
+        assert!(
+            status.contains("review from @bob not delivered: the daemon refused the message"),
+            "{status}"
+        );
+        assert!(!status.contains("window gone"), "{status}");
+    }
+
+    // ---- #98: three health kinds behind one cell ----
+
+    #[tokio::test]
+    async fn a_listener_failure_survives_a_successful_start() {
+        let (fake, _port, mut a) = actor().await;
+        a.handle(Command::ListenerFailed("address in use".into()))
+            .await;
+        assert_eq!(
+            a.faults.cell.get(),
+            Err("webhook listener: address in use".into())
+        );
+        a.handle(comment(12, "alice", 5, "@balerix please look"))
+            .await;
+        assert_eq!(fake.applied_fleets().len(), 1, "the apply went through");
+        assert_eq!(
+            a.faults.cell.get(),
+            Err("webhook listener: address in use".into()),
+            "an apply and a status comment are not listener successes"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_apply_failure_survives_its_own_notice_and_clears_on_the_next_apply() {
+        let (fake, port, mut a) = started().await;
+        a.config.as_mut().unwrap().idle_timeout = Duration::from_secs(60);
+        fake.fail_manage(Some((500, "disk full")));
+        a.now_secs = || 14 * 3600 + 2 * 60 + 61;
+        a.handle(Command::Tick).await;
+        assert!(
+            comments(&port.calls())
+                .iter()
+                .any(|(_, b)| b == "the daemon refused the apply; see the plugin log"),
+            "{:?}",
+            comments(&port.calls())
+        );
+        assert_eq!(
+            a.faults.cell.get(),
+            Err("github: applying gh-acme-api: daemon: HTTP 500: disk full".into()),
+            "the notice that reports the failure does not clear it"
+        );
+        fake.fail_manage(None);
+        a.now_secs = || 14 * 3600 + 2 * 60 + 122;
+        a.handle(Command::Tick).await;
+        assert!(a.sessions.get(AGENT).unwrap().closed);
+        assert_eq!(a.faults.cell.get(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_token_failure_survives_an_apply_and_clears_on_a_posted_comment() {
+        let (fake, port, mut a) = started().await;
+        port.fail_next(GitHubError::Auth("bad token".into()));
+        a.handle(comment(12, "bob", 9, "hello")).await;
+        assert_eq!(a.faults.cell.get(), Err("github: auth: bad token".into()));
+        a.now_secs = || 14 * 3600 + 2 * 60 + 2 * 3600 + 1;
+        a.handle(Command::Tick).await;
+        assert!(
+            a.sessions.get(AGENT).unwrap().closed,
+            "the idle end applied"
+        );
+        assert_eq!(
+            a.faults.cell.get(),
+            Err("github: auth: bad token".into()),
+            "a successful apply is not a token success"
+        );
+        port.take_calls();
+        fake.fail_actions(Some("window gone"));
+        a.handle(comment(12, "alice", 40, "@balerix continue"))
+            .await;
+        a.handle(Command::Events(vec![during(
+            "SessionStart",
+            json!({ "source": "startup" }),
+        )]))
+        .await;
+        assert!(
+            comments(&port.calls())
+                .iter()
+                .any(|(_, b)| b.starts_with("not delivered to")),
+            "{:?}",
+            comments(&port.calls())
+        );
+        assert_eq!(
+            a.faults.cell.get(),
+            Ok(()),
+            "a posted comment proves the token"
         );
     }
 

@@ -799,8 +799,15 @@ credentials or the gh token (Spec L-3).
   not know the reason; the two lines it does post say as much.
 - §11's `github_requests_total{endpoint,status}` is not produced: the
   client counts nothing, `errors_total{kind}` covers failures.
-- Health: `health.fail` on an `Auth` error or a dead listener,
-  `health.ok()` on the next successful apply or comment.
+- Health: the SDK's cell is one `ok`/`fail`, so the actor keeps §11's
+  three kinds itself (`Faults`: token, listener, apply) and derives the
+  cell after every change: failed with the newest failure while any
+  kind is failing, ok only when all three are clear. An `Auth` error
+  fails the token kind and a posted comment clears it; a daemon refusal
+  of `end`'s apply fails the apply kind and the next successful apply
+  clears it; the listener's death reaches the actor as
+  `Command::ListenerFailed` and nothing clears it short of a restart
+  (#98). If the SDK grows a per-kind health, adopt it and drop `Faults`.
 - #64 closes with this part (§15.9) and #85 closed with part 2.
 - `Deactivate` keeps a row whose `closed` is set (the daemon deactivates
   every agent an apply drops, so the row must outlive it for the ended
@@ -827,6 +834,10 @@ credentials or the gh token (Spec L-3).
   for a deleted comment.
 - Only the daemon's 400 (the resolver's message) is posted verbatim;
   other daemon and GitHub failures post a fixed line and log the detail.
+  That covers a failed action too: `not delivered to <agent>: the daemon
+  refused the message` on the issue, and `review from @<login> not
+  delivered: the daemon refused the message` on the status comment, the
+  daemon's error at `warn` in the plugin log (#98).
   A live row's `installation` is refreshed from every verified webhook
   that names it.
 - An opening whose row is live and open is a redelivery (GitHub's

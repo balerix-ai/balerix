@@ -30,6 +30,10 @@ data="$PWD/target/tmp/verify-data"   # shared with verify-matrix-local: tool ins
 target="${CARGO_TARGET_DIR:-target}"
 case "$target" in /*) ;; *) target="$PWD/$target" ;; esac
 balerix="$target/debug/balerix"
+# The daemon's XDG_CONFIG_HOME moves under $root, and with it where
+# `HostPaths` looks for gh's hosts.yml; without this the crew's
+# `ensure-crew` fails with "git.auth is gh but no gh token was provided".
+gh_dir="${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}"
 rm -rf "$root"
 saved_umask="$(umask)"
 umask 077
@@ -68,9 +72,12 @@ verify-github: config written. Now, by hand:
      with a logged-in \`claude\` in your real HOME (the agents use its
      credentials):
 
-       env XDG_CONFIG_HOME=$root/config XDG_STATE_HOME=$root/state XDG_DATA_HOME=$data HOME=$HOME $balerix serve
+       env XDG_CONFIG_HOME=$root/config XDG_STATE_HOME=$root/state XDG_DATA_HOME=$data GH_CONFIG_DIR=$gh_dir HOME=$HOME $balerix serve
 
-     In another shell with the same XDG_* variables, confirm
+     GH_CONFIG_DIR keeps your gh login visible to the daemon now that
+     XDG_CONFIG_HOME points elsewhere. In another shell with the same
+     XDG_* variables (never a shell you run \`gh\` in: it would look for
+     its login under them), confirm
      \`$balerix plugin list\` shows github ready, and that the App's
      webhook URL reaches $listen (GitHub's "Recent Deliveries" shows a 200
      on the ping).
@@ -80,8 +87,10 @@ Then check, on $GITHUB_REPO:
   - open an issue and comment "@<app slug> please summarise this issue":
     the comment gets eyes, a status comment appears and turns "ready", the
     first prompt reaches Claude (the status line "session started"), the
-    comment gains +1 when Claude takes it, and Claude's turn appears as a
-    comment;
+    comment gains +1 when Claude takes it (the first Enter is lost while
+    Claude starts and the plugin presses it again every 5 s, #99; a
+    "not confirmed after 90s" line means none of them was taken), and
+    Claude's turn appears as a comment;
   - a further comment from you (write permission) reaches the agent with
     eyes then +1; a comment from an account without write does nothing;
   - ask the agent to use AskUserQuestion: the question posts as a comment,

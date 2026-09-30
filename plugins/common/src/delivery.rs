@@ -10,6 +10,14 @@
 //! of its send and the agent's last `Stop`, and never runs while the
 //! agent is mid-turn.
 //!
+//! A prompt sent while Claude's TUI is starting (the first prompt, sent
+//! on `SessionStart`) lands in the composer and loses its Enter (#99).
+//! `nudge` answers the agents whose prompt has sat unconfirmed for
+//! `NUDGE_AFTER`, and the plugin presses Enter there once more, again
+//! every `NUDGE_AFTER` for up to `NUDGE_FOR`. It obeys the same clock as
+//! expiry: never mid-turn, where an Enter would answer whatever dialog is
+//! open.
+//!
 //! `UserPromptSubmit`, `Stop` and `SessionEnd` create an agent's state on
 //! arrival if it did not already exist, so the mid-turn bit and the last
 //! `Stop` are recorded even before anything was ever sent to that agent;
@@ -26,6 +34,16 @@ use tokio::time::Instant;
 /// Prompts pending per agent beyond which the oldest is evicted and
 /// reported unconfirmed: a stuck agent must not grow this without bound.
 pub const MAX_PENDING: usize = 64;
+
+/// How long a prompt sits unconfirmed on an idle agent before its Enter
+/// is pressed again, and the pause between two such presses.
+pub const NUDGE_AFTER: Duration = Duration::from_secs(5);
+
+/// How long after a prompt's clock starts its Enter is still pressed
+/// again: what bounds a prompt whose window is zero, which never expires.
+/// A cold start under nono has swallowed an Enter 20 s after
+/// `SessionStart` and taken one at 60 s (#99).
+pub const NUDGE_FOR: Duration = Duration::from_secs(90);
 
 /// What a body is to Claude's input line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +102,7 @@ struct AgentState<M> {
     pending: VecDeque<Pending<M>>,
     in_turn: bool,
     last_stop: Option<Instant>,
+    last_nudge: Option<Instant>,
 }
 
 impl<M> Default for AgentState<M> {
@@ -92,6 +111,7 @@ impl<M> Default for AgentState<M> {
             pending: VecDeque::new(),
             in_turn: false,
             last_stop: None,
+            last_nudge: None,
         }
     }
 }
@@ -201,6 +221,38 @@ impl<M> Deliveries<M> {
             }
             state.pending = kept;
         }
+        out
+    }
+
+    /// The agents, in name order, to press Enter on once more: those not
+    /// mid-turn holding a prompt whose clock (the later of its send and
+    /// the agent's last `Stop`) started less than `NUDGE_FOR` ago and
+    /// less than its window ago, `NUDGE_AFTER` after the later of that
+    /// start and the agent's last nudge. One Enter submits the composer
+    /// whatever it holds, so an agent is answered once however many of
+    /// its prompts wait. Nothing is removed: confirmation and expiry stay
+    /// what settles a prompt.
+    pub fn nudge(&mut self, now: Instant) -> Vec<String> {
+        let mut out = Vec::new();
+        for (agent, state) in &mut self.agents {
+            if state.in_turn {
+                continue;
+            }
+            let (last_stop, last_nudge) = (state.last_stop, state.last_nudge);
+            let due = state.pending.iter().any(|p| {
+                let start = last_stop.map_or(p.sent_at, |s| s.max(p.sent_at));
+                let waited = now.duration_since(start);
+                let since_nudge = last_nudge.map_or(waited, |n| now.duration_since(n.max(start)));
+                waited < NUDGE_FOR
+                    && (p.window.is_zero() || waited < p.window)
+                    && since_nudge >= NUDGE_AFTER
+            });
+            if due {
+                state.last_nudge = Some(now);
+                out.push(agent.clone());
+            }
+        }
+        out.sort();
         out
     }
 
@@ -360,6 +412,112 @@ mod tests {
         d.sent("f/c/a", "x", 1, now, Duration::ZERO);
         assert!(d.expire(now + Duration::from_secs(86_400)).is_empty());
         assert_eq!(d.on_event(&submit("x"), now).confirmed, Some(1));
+    }
+
+    #[test]
+    fn an_idle_agent_is_nudged_once_its_prompt_is_five_seconds_unconfirmed() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", "x", 1, now, W);
+        assert!(d.nudge(now + Duration::from_secs(4)).is_empty());
+        assert_eq!(d.nudge(now + Duration::from_secs(5)), vec!["f/c/a"]);
+        assert_eq!(d.pending("f/c/a"), 1, "a nudge settles nothing");
+    }
+
+    #[test]
+    fn the_next_nudge_waits_five_seconds_from_the_last() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", "x", 1, now, W);
+        assert_eq!(d.nudge(now + Duration::from_secs(7)), vec!["f/c/a"]);
+        assert!(d.nudge(now + Duration::from_secs(11)).is_empty());
+        assert_eq!(d.nudge(now + Duration::from_secs(12)), vec!["f/c/a"]);
+    }
+
+    #[test]
+    fn no_nudge_mid_turn_and_the_wait_restarts_at_the_stop() {
+        // An Enter pressed mid-turn would answer whatever dialog is open.
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.on_event(&submit("earlier work"), now);
+        d.sent("f/c/a", "x", 1, now, W);
+        assert!(d.nudge(now + Duration::from_secs(5)).is_empty(), "mid-turn");
+        let stopped = now + Duration::from_secs(600);
+        d.on_event(&stop(), stopped);
+        assert!(d.nudge(stopped + Duration::from_secs(4)).is_empty());
+        assert_eq!(d.nudge(stopped + Duration::from_secs(5)), vec!["f/c/a"]);
+    }
+
+    #[test]
+    fn a_confirmed_prompt_is_not_nudged() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", "x", 1, now, W);
+        d.on_event(&submit("x"), now + Duration::from_secs(1));
+        d.on_event(&stop(), now + Duration::from_secs(2));
+        assert!(d.nudge(now + Duration::from_secs(60)).is_empty());
+    }
+
+    #[test]
+    fn a_prompt_past_its_window_is_not_nudged() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", "x", 1, now, W);
+        assert!(d.nudge(now + W).is_empty(), "expiry's, not a nudge's");
+        assert_eq!(d.expire(now + W), vec![1]);
+    }
+
+    #[test]
+    fn several_pending_prompts_are_one_enter() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", "first", 1, now, W);
+        d.sent("f/c/a", "second", 2, now + Duration::from_secs(1), W);
+        assert_eq!(d.nudge(now + Duration::from_secs(6)), vec!["f/c/a"]);
+        assert!(d.nudge(now + Duration::from_secs(7)).is_empty());
+    }
+
+    #[test]
+    fn a_prompt_that_never_expires_is_nudged_for_ninety_seconds_and_no_longer() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", "x", 1, now, Duration::ZERO);
+        let nudged: Vec<u64> = (1..=100)
+            .map(|i| 5 * i)
+            .filter(|s| !d.nudge(now + Duration::from_secs(*s)).is_empty())
+            .collect();
+        assert_eq!(nudged.first(), Some(&5));
+        assert_eq!(nudged.last(), Some(&85));
+        assert_eq!(nudged.len(), 17, "every five seconds in between");
+        assert_eq!(d.on_event(&submit("x"), now).confirmed, Some(1));
+    }
+
+    #[test]
+    fn a_long_window_is_nudged_past_thirty_seconds() {
+        // a cold start under nono swallowed an Enter 20 s after `SessionStart`
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", "x", 1, now, Duration::from_secs(90));
+        for s in [5, 10, 15, 20, 25, 30, 35] {
+            assert_eq!(
+                d.nudge(now + Duration::from_secs(s)),
+                vec!["f/c/a"],
+                "at {s} s"
+            );
+        }
+    }
+
+    #[test]
+    fn every_idle_agent_with_a_stale_prompt_is_nudged_in_name_order() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.sent("f/c/b", "y", 2, now, W);
+        d.sent("f/c/a", "x", 1, now, W);
+        d.sent("f/c/late", "z", 3, now + Duration::from_secs(3), W);
+        assert_eq!(
+            d.nudge(now + Duration::from_secs(5)),
+            vec!["f/c/a", "f/c/b"]
+        );
     }
 
     #[test]

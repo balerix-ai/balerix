@@ -41,6 +41,10 @@ target="${CARGO_TARGET_DIR:-target}"
 case "$target" in /*) ;; *) target="$REPO/$target" ;; esac
 BALERIX="$target/debug/balerix"
 
+# Before XDG_CONFIG_HOME moves: `HostPaths` would otherwise look for gh's
+# hosts.yml under the check's root, and a crew with `git.auth: gh` would
+# fail with "git.auth is gh but no gh token was provided" (#99).
+export GH_CONFIG_DIR="${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}"
 export XDG_CONFIG_HOME="$ROOT/config"
 export XDG_STATE_HOME="$ROOT/state"
 export XDG_DATA_HOME="$DATA"

@@ -7,7 +7,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use balerix_api::{HookEvent, PluginAction};
+use balerix_api::{HookEvent, Key, KeyStep, PluginAction};
 use balerix_plugin_common::answer::{self, Decision, Reaction, Verdict};
 use balerix_plugin_common::delivery::{self, Deliveries, Kind};
 use balerix_plugin_common::metrics::Shared;
@@ -381,6 +381,36 @@ impl<M: MatrixPort> Actor<M> {
     async fn on_tick(&mut self) {
         for sent in self.deliveries.expire(Instant::now()) {
             self.unconfirmed(sent, Unconfirmed::Expired).await;
+        }
+        for agent in self.deliveries.nudge(Instant::now()) {
+            self.press_enter(&agent).await;
+        }
+    }
+
+    /// #99: a prompt sent while Claude's TUI was starting sits in the
+    /// composer with its Enter lost, so an idle agent with an unconfirmed
+    /// prompt gets Enter once more. A refusal is counted and nothing
+    /// else: the prompt's own expiry is what the operator hears about.
+    async fn press_enter(&self, agent: &str) {
+        let delay_ms = self
+            .agents
+            .get(agent)
+            .map(|c| c.key_delay_ms)
+            .unwrap_or(balerix_api::DEFAULT_KEY_DELAY_MS);
+        let action = PluginAction::SendKeys {
+            steps: vec![KeyStep::Key(Key::Enter)],
+            delay_ms,
+        };
+        match self.host.action(agent, &action).await {
+            Ok(()) => self
+                .counters
+                .deliveries
+                .with_label_values(&["nudged"])
+                .inc(),
+            Err(e) => {
+                self.counters.errors.with_label_values(&["send_keys"]).inc();
+                tracing::warn!("matrix: Enter again for {agent}: {e}");
+            }
         }
     }
 
@@ -2118,6 +2148,94 @@ mod tests {
         );
     }
 
+    /// A tick `d` later, on a running clock: a paused one jumps to the
+    /// HTTP client's timeout while a host round trip waits on real I/O,
+    /// which would age the prompts under test by ten seconds a call.
+    async fn tick_after(a: &mut Actor<FakePort>, d: Duration) {
+        tokio::time::pause();
+        tokio::time::advance(d).await;
+        tokio::time::resume();
+        a.handle(Command::Tick).await;
+    }
+
+    /// #99: a prompt that reaches the composer while Claude's TUI is
+    /// starting loses its Enter.
+    #[tokio::test]
+    async fn an_unconfirmed_prompt_gets_enter_again_until_claude_takes_it() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "run the tests",
+        )))
+        .await;
+        let sent = fake.actions_for("f/c/alice");
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let enter = PluginAction::SendKeys {
+            steps: vec![balerix_api::KeyStep::Key(balerix_api::Key::Enter)],
+            delay_ms: balerix_api::DEFAULT_KEY_DELAY_MS,
+        };
+
+        tick_after(&mut a, Duration::from_secs(4)).await;
+        assert_eq!(fake.actions_for("f/c/alice").len(), 1, "too early");
+        tick_after(&mut a, Duration::from_secs(1)).await;
+        assert_eq!(
+            fake.actions_for("f/c/alice")[1..],
+            *std::slice::from_ref(&enter)
+        );
+        tick_after(&mut a, Duration::from_secs(5)).await;
+        assert_eq!(
+            fake.actions_for("f/c/alice")[1..],
+            [enter.clone(), enter.clone()]
+        );
+
+        a.handle(Command::Events(vec![submitted(
+            "f/c/alice",
+            "run the tests",
+        )]))
+        .await;
+        a.handle(Command::Events(vec![event("f/c/alice", "Stop", json!({}))]))
+            .await;
+        tick_after(&mut a, Duration::from_secs(60)).await;
+        assert_eq!(fake.actions_for("f/c/alice").len(), 3);
+        assert_eq!(
+            reactions(&port.calls()),
+            vec![SENT.to_string(), ACK.to_string()]
+        );
+        assert!(notices(&port.calls()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_enter_is_counted_and_the_prompt_still_expires() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "run the tests",
+        )))
+        .await;
+        fake.fail_actions(Some("window gone"));
+        let errors = a.counters.errors.with_label_values(&["send_keys"]).get();
+        tick_after(&mut a, Duration::from_secs(5)).await;
+        assert_eq!(
+            a.counters.errors.with_label_values(&["send_keys"]).get(),
+            errors + 1
+        );
+        assert!(
+            notices(&port.calls()).is_empty(),
+            "a nudge is not the operator's message: no note for it"
+        );
+        tick_after(&mut a, Duration::from_secs(26)).await;
+        assert_eq!(notices(&port.calls()).len(), 1);
+        assert!(
+            notices(&port.calls())[0].starts_with("**not confirmed by f/c/alice after 30s**"),
+            "{:?}",
+            notices(&port.calls())
+        );
+    }
+
     // Not `start_paused = true`: `with_thread` and the `Inbound` below make
     // real HTTP round trips to `FakeHost` (`set_room`/`set_thread`, the
     // `action` call), and a clock paused from the start races those against
@@ -2133,12 +2251,10 @@ mod tests {
             "run the tests",
         )))
         .await;
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(29)).await;
-        a.handle(Command::Tick).await;
+        // the tick at 29 s presses Enter again (#99), a host round trip
+        tick_after(&mut a, Duration::from_secs(29)).await;
         assert!(notices(&port.calls()).is_empty());
-        tokio::time::advance(Duration::from_secs(1)).await;
-        a.handle(Command::Tick).await;
+        tick_after(&mut a, Duration::from_secs(1)).await;
         assert_eq!(
             notices(&port.calls()),
             vec!["**not confirmed by f/c/alice after 30s**: Claude did not take the prompt (a dialog may be open, or the text may have been swallowed)".to_string()]

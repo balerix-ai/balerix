@@ -133,7 +133,11 @@ Delivery: `delivery::Deliveries<M>` tracks the prompts a plugin sent with
 §8.7). Mark the message "sent" on `Ok`, feed every hook event to
 `on_event` and react "confirmed" on what it answers, feed a tick to
 `expire` and post its note for what never came; `classify` tells a slash
-command, which is never tracked, from a prompt.
+command, which is never tracked, from a prompt. Feed the same tick to
+`nudge` and press Enter (`send_keys`) on each agent it answers: a prompt
+sent while Claude's TUI is starting, the first one on `SessionStart`
+above all, lands in the composer and loses its Enter (#99). `nudge` never
+answers an agent that is mid-turn, where an Enter would answer a dialog.
 
 ## Testing your plugin
 

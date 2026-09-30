@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use balerix_api::{HookEvent, PluginAction};
+use balerix_api::{HookEvent, Key, KeyStep, PluginAction};
 use balerix_plugin_common::delivery::{self, Deliveries, Kind as BodyKind};
 use balerix_plugin_common::metrics::Shared;
 use balerix_plugin_common::pending::{OpenQuestion, Questions};
@@ -37,6 +37,11 @@ pub type Queue = balerix_plugin_common::queue::Queue<Command>;
 pub const TICK: Duration = Duration::from_secs(5);
 /// A status edit waits this long for more lines (§8.3).
 pub const STATUS_COALESCE: Duration = Duration::from_secs(2);
+/// What the first prompt waits beyond `confirmWindow` before it is
+/// reported unconfirmed: it is sent on `SessionStart`, and a cold start
+/// under nono has swallowed an Enter 20 s after that and taken one at
+/// 60 s (#99). Enter is pressed again all the while.
+pub const START_UP_ALLOWANCE: Duration = Duration::from_secs(60);
 /// The collaborator permission cache (§8.1).
 pub const PERMISSION_TTL: Duration = Duration::from_secs(300);
 /// `retry_once` waits at most this long on `Retry-After`.
@@ -109,6 +114,8 @@ struct Sent {
     target: Target,
     agent: String,
     asker: String,
+    /// What it was given before the expiry note; the note names it.
+    window: Duration,
 }
 
 /// Why a routed prompt went unconfirmed (§8.7, §17): the note names its
@@ -874,6 +881,7 @@ impl<G: GitHubPort> Actor<G> {
                     asker,
                     Target::Comment(comment_id),
                     body,
+                    Duration::ZERO,
                 );
             }
             Err(e) => {
@@ -907,6 +915,7 @@ impl<G: GitHubPort> Actor<G> {
         asker: &str,
         target: Target,
         body: &str,
+        allowance: Duration,
     ) {
         match delivery::classify(body) {
             BodyKind::Command => {
@@ -920,6 +929,12 @@ impl<G: GitHubPort> Actor<G> {
                     .agents
                     .get(agent)
                     .map_or(crate::config::DEFAULT_CONFIRM_WINDOW, |c| c.confirm_window);
+                // zero stays zero: never reported
+                let window = if window.is_zero() {
+                    window
+                } else {
+                    window + allowance
+                };
                 let sent = Sent {
                     repo: repo.into(),
                     installation,
@@ -927,6 +942,7 @@ impl<G: GitHubPort> Actor<G> {
                     target,
                     agent: agent.into(),
                     asker: asker.into(),
+                    window,
                 };
                 if let Some(evicted) =
                     self.deliveries
@@ -934,6 +950,32 @@ impl<G: GitHubPort> Actor<G> {
                 {
                     self.unconfirmed_later(evicted);
                 }
+            }
+        }
+    }
+
+    /// #99: a prompt sent while Claude's TUI was starting sits in the
+    /// composer with its Enter lost, so an idle agent with an unconfirmed
+    /// prompt gets Enter once more. A refusal is counted and nothing
+    /// else: the prompt's own expiry is what its asker hears about.
+    async fn press_enter(&mut self, agent: &str) {
+        let delay_ms = self
+            .agents
+            .get(agent)
+            .map_or(balerix_api::DEFAULT_KEY_DELAY_MS, |c| c.key_delay_ms);
+        let action = PluginAction::SendKeys {
+            steps: vec![KeyStep::Key(Key::Enter)],
+            delay_ms,
+        };
+        match self.host.action(agent, &action).await {
+            Ok(()) => self
+                .counters
+                .deliveries
+                .with_label_values(&["nudged"])
+                .inc(),
+            Err(e) => {
+                self.counters.errors.with_label_values(&["send_keys"]).inc();
+                tracing::warn!("github: Enter again for {agent}: {e}");
             }
         }
     }
@@ -950,17 +992,11 @@ impl<G: GitHubPort> Actor<G> {
         self.react(sent.installation, &sent.repo, sent.target, CONFUSED)
             .await;
         let line = match why {
-            Unconfirmed::Expired => {
-                let window = self
-                    .agents
-                    .get(&sent.agent)
-                    .map_or(crate::config::DEFAULT_CONFIRM_WINDOW, |c| c.confirm_window);
-                format!(
-                    "prompt from @{} not confirmed after {}s",
-                    sent.asker,
-                    window.as_secs()
-                )
-            }
+            Unconfirmed::Expired => format!(
+                "prompt from @{} not confirmed after {}s",
+                sent.asker,
+                sent.window.as_secs()
+            ),
             Unconfirmed::Skipped => format!(
                 "prompt from @{} skipped: Claude took a later one first",
                 sent.asker
@@ -1184,6 +1220,7 @@ impl<G: GitHubPort> Actor<G> {
                 &fp.asker,
                 fp.target,
                 &text,
+                START_UP_ALLOWANCE,
             ),
             Err(e) => {
                 self.counters.errors.with_label_values(&["send_text"]).inc();
@@ -1482,6 +1519,9 @@ impl<G: GitHubPort> Actor<G> {
         }
         for s in self.deliveries.expire(Instant::now()) {
             self.unconfirmed(s, Unconfirmed::Expired).await;
+        }
+        for agent in self.deliveries.nudge(Instant::now()) {
+            self.press_enter(&agent).await;
         }
         // idle (§10)
         let idle = self.cfg().idle_timeout;
@@ -2245,6 +2285,139 @@ mod tests {
         assert_eq!(
             reactions(&port.calls()).last(),
             Some(&(Target::Comment(5), PLUS_ONE.to_string()))
+        );
+    }
+
+    /// A tick `d` later, on a running clock: a paused one jumps to the
+    /// HTTP client's timeout while a host round trip waits on real I/O,
+    /// which would age the prompts under test by ten seconds a call.
+    async fn tick_after(a: &mut Actor<FakePort>, d: Duration) {
+        tokio::time::pause();
+        tokio::time::advance(d).await;
+        tokio::time::resume();
+        a.handle(Command::Tick).await;
+    }
+
+    /// #99: a prompt sent on `SessionStart` reaches the composer while
+    /// Claude's TUI is starting and loses its Enter.
+    #[tokio::test]
+    async fn an_unconfirmed_first_prompt_gets_enter_again_until_claude_takes_it() {
+        let (fake, port, mut a) = actor().await;
+        a.handle(comment(12, "alice", 5, "@balerix please look"))
+            .await;
+        a.handle(Command::Activate {
+            agent: AGENT.into(),
+            config: crate::config::parse_agent(
+                &json!({ "kind": "issue", "number": 12, "keyDelayMs": 40 }),
+            )
+            .unwrap(),
+        })
+        .await;
+        a.handle(Command::Events(vec![during(
+            "SessionStart",
+            json!({ "source": "startup" }),
+        )]))
+        .await;
+        let first = fake.actions_for(AGENT);
+        assert_eq!(first.len(), 1, "{first:?}");
+        let enter = PluginAction::SendKeys {
+            steps: vec![KeyStep::Key(Key::Enter)],
+            delay_ms: 40,
+        };
+
+        tick_after(&mut a, Duration::from_secs(4)).await;
+        assert_eq!(fake.actions_for(AGENT).len(), 1, "too early for an Enter");
+        tick_after(&mut a, Duration::from_secs(1)).await;
+        assert_eq!(fake.actions_for(AGENT)[1..], *std::slice::from_ref(&enter));
+        tick_after(&mut a, Duration::from_secs(5)).await;
+        assert_eq!(fake.actions_for(AGENT)[1..], [enter.clone(), enter.clone()]);
+
+        // Claude takes it: 👍, and the turn's end brings no further Enter
+        a.handle(Command::Events(vec![during(
+            "UserPromptSubmit",
+            json!({ "prompt": actions_text(&first[0]) }),
+        )]))
+        .await;
+        assert_eq!(
+            reactions(&port.calls()).last(),
+            Some(&(Target::Comment(5), PLUS_ONE.to_string()))
+        );
+        a.handle(Command::Events(vec![during("Stop", json!({}))]))
+            .await;
+        tick_after(&mut a, Duration::from_secs(60)).await;
+        assert_eq!(fake.actions_for(AGENT).len(), 3);
+        assert!(
+            !edits(&port.calls())
+                .iter()
+                .any(|e| e.contains("not confirmed")),
+            "{:?}",
+            edits(&port.calls())
+        );
+    }
+
+    /// #99: a cold start under nono swallowed an Enter 20 s after
+    /// `SessionStart` and took one at 60 s, so the first prompt is not
+    /// reported at `confirmWindow` alone.
+    #[tokio::test]
+    async fn the_first_prompt_has_a_start_up_allowance_before_it_is_reported() {
+        let (fake, port, mut a) = actor().await;
+        a.handle(comment(12, "alice", 5, "@balerix please look"))
+            .await;
+        a.handle(Command::Activate {
+            agent: AGENT.into(),
+            config: crate::config::parse_agent(&json!({ "kind": "issue", "number": 12 })).unwrap(),
+        })
+        .await;
+        a.handle(Command::Events(vec![during(
+            "SessionStart",
+            json!({ "source": "startup" }),
+        )]))
+        .await;
+        tick_after(&mut a, Duration::from_secs(31)).await;
+        assert!(
+            !reactions(&port.calls()).contains(&(Target::Comment(5), CONFUSED.into())),
+            "past confirmWindow, inside the allowance"
+        );
+        assert_eq!(fake.actions_for(AGENT).len(), 2, "the prompt and one Enter");
+        tick_after(&mut a, Duration::from_secs(5)).await;
+        assert_eq!(fake.actions_for(AGENT).len(), 3, "Enter again at 36 s");
+        tick_after(&mut a, Duration::from_secs(54)).await;
+        assert_eq!(
+            reactions(&port.calls()).last(),
+            Some(&(Target::Comment(5), CONFUSED.into()))
+        );
+        tick_after(&mut a, STATUS_COALESCE).await;
+        assert!(
+            edits(&port.calls())
+                .last()
+                .unwrap()
+                .contains("prompt from @alice not confirmed after 90s"),
+            "{:?}",
+            edits(&port.calls()).last()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_enter_is_counted_and_the_prompt_still_expires() {
+        let (fake, port, mut a) = started().await;
+        a.handle(comment(12, "bob", 9, "hello")).await;
+        fake.fail_actions(Some("window gone"));
+        let errors = a.counters.errors.with_label_values(&["send_keys"]).get();
+        tick_after(&mut a, Duration::from_secs(5)).await;
+        assert_eq!(
+            a.counters.errors.with_label_values(&["send_keys"]).get(),
+            errors + 1
+        );
+        assert!(
+            !comments(&port.calls())
+                .iter()
+                .any(|(_, b)| b.starts_with("not delivered")),
+            "a nudge is not the user's message: no note for it"
+        );
+        tick_after(&mut a, Duration::from_secs(26)).await;
+        assert_eq!(
+            reactions(&port.calls()).last(),
+            Some(&(Target::Comment(9), CONFUSED.into()))
         );
     }
 

@@ -9,7 +9,10 @@
 # trust, or the "Make auto mode your default permission mode?" offer that
 # claude 2.1.282 added; #73), HOME relocation (nono's own $HOME), and that a
 # slash command typed the way `send_text` types it runs (#41: `/exit` sent
-# as `send-keys -l` then `Enter`, the pane exits and a SessionEnd arrives).
+# as `send-keys -l` then `Enter`, the pane exits and a SessionEnd arrives),
+# and that a text sent the moment `SessionStart` arrives is submitted once
+# its Enter is pressed again (#99: the first Enter is lost while Claude's
+# TUI starts; section H adds a second agent and times its first start).
 #
 # Your real $HOME stays: the client needs ~/.claude for credentials and the
 # host settings layer. Only the three XDG roots move: config and state to
@@ -273,7 +276,13 @@ hr "G. #41: a slash command typed the way send_text types it (send-keys -l, then
 # what a claude bump has to keep true. The fake only records what arrived;
 # the real claude proves the exit (pane dead, SessionEnd counted).
 TARGET="$FLEET/$CREW:$AGENT"
-session_ends() { curl -sf "$URL/metrics" 2>/dev/null | sed -n 's/^balerix_hook_events_total{.*event="SessionEnd".*} //p' | head -1; }
+hook_count() { # hook_count <event> [agent]: how many the daemon has counted, 0 when none
+  local n
+  n="$(curl -sf "$URL/metrics" 2>/dev/null | grep "agent=\"${2:-$AGENT}\".*fleet=\"$FLEET\"" \
+    | sed -n "s/^balerix_hook_events_total{.*event=\"$1\".*} //p" | head -1)"
+  printf '%s' "${n:-0}"
+}
+session_ends() { hook_count SessionEnd; }
 if tmux -L "$SOCKET" has-session -t "=$FLEET/$CREW" >/dev/null 2>&1; then
   ends_before="$(session_ends)"; ends_before="${ends_before:-0}"
   tmux -L "$SOCKET" send-keys -t "$TARGET" -l -- '/exit'
@@ -302,6 +311,72 @@ if tmux -L "$SOCKET" has-session -t "=$FLEET/$CREW" >/dev/null 2>&1; then
   fi
 else
   say "agent session absent; skipped"
+fi
+hr "H. #99: a text sent the moment SessionStart arrives is submitted (UserPromptSubmit confirms it)"
+# The github first prompt and a flow `send` on SessionStart reach the pane
+# while Claude's TUI is still starting: the text lands in the composer and
+# its Enter is lost. The delivery tracker presses Enter again every
+# NUDGE_AFTER while the prompt is unconfirmed (plugins/common's
+# `delivery.rs`); this does the same by hand and times it. It needs a
+# first start, which agent $AGENT spent on the dialog check above (a text
+# and an Enter typed at a first-start dialog would answer it), and a
+# restart proved too warm to lose the Enter, so the fleet gains agent
+# $AGENT_B here. How long Enter is swallowed varies between cold starts
+# (1 s to 10 s here, over 20 s in the github check), so zero resent Enters
+# on one run does not mean the race is gone. The text has several lines so that it travels as the
+# first prompt does: `load-buffer -`, `paste-buffer -p -d`, then `Enter`.
+NUDGE="${BALERIX_VERIFY_NUDGE:-5}"                 # seconds between Enters
+STARTUP_WAIT="${BALERIX_VERIFY_STARTUP_WAIT:-60}"  # seconds to wait for the submit
+AGENT_B=b
+B_DIR="$STATE/fleets/$FLEET/crews/$CREW/agents/$AGENT_B"
+B_TARGET="$FLEET/$CREW:$AGENT_B"
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+secs() { printf '%d.%d' $(( $1 / 1000 )) $(( $1 % 1000 / 100 )); }
+sed "s|^      $AGENT: .*|&\n      $AGENT_B: { plugins: { $( [ "$WEB" = 1 ] && printf 'web: {}' ) } }|" \
+  "$ROOT/fleet.yaml" > "$ROOT/fleet-h.yaml"
+# shellcheck disable=SC2086
+if ! "$BALERIX" update "$ROOT/fleet-h.yaml" $HOST_FLAG --no-wait; then
+  say "update with agent $AGENT_B was refused; skipped"
+else
+  started=""
+  for _ in $(seq 1 3000); do
+    if [ "$(hook_count SessionStart "$AGENT_B")" -gt 0 ]; then started="$(now_ms)"; break; fi
+    sleep 0.1
+  done
+  if [ -z "$started" ]; then
+    say "no SessionStart from agent $AGENT_B within 5 min; skipped"
+    "$BALERIX" status "$FLEET" || true
+    tail_file "agent $AGENT_B tmux.log" "$B_DIR/logs/tmux.log" 20
+  else
+    printf 'Reply with the single word ready.\n\nThe lines below only make this text a paste,\nas the first prompt of the github plugin is:\n\n- one\n- two\n' \
+      | tmux -L "$SOCKET" load-buffer -b balerix-verify-h -
+    tmux -L "$SOCKET" paste-buffer -p -d -b balerix-verify-h -t "$B_TARGET"
+    tmux -L "$SOCKET" send-keys -t "$B_TARGET" Enter
+    sent="$(now_ms)"; last="$sent"; resent=0; verdict=""
+    say "SessionStart seen; text and Enter sent $(secs $(( sent - started ))) s later"
+    while [ $(( $(now_ms) - sent )) -lt $(( STARTUP_WAIT * 1000 )) ]; do
+      if [ "$FAKE" = 1 ]; then
+        if grep -q '^- two$' "$B_DIR/home/fake-claude.stdin" 2>/dev/null; then
+          verdict="arrived: the text and its Enter reached the fake's stdin (the fake reads from the start and fires no UserPromptSubmit)"; break
+        fi
+      elif [ "$(hook_count UserPromptSubmit "$AGENT_B")" -gt 0 ]; then
+        verdict="submitted: UserPromptSubmit $(secs $(( $(now_ms) - sent ))) s after the send, after $resent resent Enter(s)"; break
+      fi
+      if [ "$FAKE" = 0 ] && [ $(( $(now_ms) - last )) -ge $(( NUDGE * 1000 )) ]; then
+        tmux -L "$SOCKET" send-keys -t "$B_TARGET" Enter
+        last="$(now_ms)"; resent=$(( resent + 1 ))
+        say "  Enter resent $(secs $(( last - sent ))) s after the send"
+      fi
+      sleep 0.25
+    done
+    if [ -n "$verdict" ]; then
+      say "$verdict"
+      [ "$FAKE" = 0 ] && [ "$resent" = 0 ] && say "(the first Enter was taken: #99 did not reproduce on this start)"
+    else
+      say "NOT SUBMITTED (#99): no UserPromptSubmit ${STARTUP_WAIT} s after the send and $resent resent Enter(s); input line:"
+      tmux -L "$SOCKET" capture-pane -p -t "$B_TARGET" 2>/dev/null | grep '^❯' | sed 's/^/  /'
+    fi
+  fi
 fi
 say "=============================== END REPORT ==============================="
 exit 0

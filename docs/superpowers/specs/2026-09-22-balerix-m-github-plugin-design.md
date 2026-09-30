@@ -460,7 +460,9 @@ nor comments is skipped. A review on a PR with no session is ignored;
 a review while a question is open is held in memory and delivered when
 the question clears, so it never reaches the dialog; a plugin restart in
 between loses it, and the status comment says `review from @bob held`
-until it is delivered.
+until it is delivered. Reviews reach the agent in arrival order: one
+that arrives behind a held review is held with it, whatever cleared the
+question (#96).
 
 ## 10. Ending
 
@@ -827,3 +829,8 @@ credentials or the gh token (Spec L-3).
   other daemon and GitHub failures post a fixed line and log the detail.
   A live row's `installation` is refreshed from every verified webhook
   that names it.
+- An opening whose row is live and open is a redelivery (GitHub's
+  "Redeliver", or a retry the delivery ring no longer remembers): the
+  agent already holds the body as its first prompt, so it is counted as
+  `inbound_total{outcome="duplicate"}` and nothing else happens. An
+  opening on a closed row resumes, as a mentioning comment does (#96).

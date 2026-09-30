@@ -433,7 +433,7 @@ scenario_affected() {
   expect_eq "affected: no range is every unit (the nightly)" \
     "$(field units "$(affected "$dir")")" '["core","flow","web","matrix","github"]'
   expect_eq "affected: a common change reaches the plugins built on it" \
-    "$(affected_by "$dir" plugins/common/src/release-test.rs)" '["web","matrix","github"]'
+    "$(affected_by "$dir" plugins/common/src/release-test.rs)" '["flow","web","matrix","github"]'
 }
 
 # A library unit releases like a plugin but ships crates, not a binary:
@@ -511,16 +511,17 @@ scenario_common_change_releases_dependents() {
   expect_eq "common change: common releases" "$(field status "$out")" release
   version=$(field version "$out")
   expect_eq "common change: common's manifest at $version" "$(manifest_version "$dir" common)" "$version"
-  for unit in matrix web github; do
+  # Every in-tree plugin is built on common since flow took its delivery
+  # tracker (#100); core is what a common change leaves alone.
+  for unit in flow web matrix github; do
     expect_eq "common change: $unit Cargo.lock has common at $version" \
       "$(lock_version "$dir/plugins/$unit/Cargo.lock" balerix-plugin-common)" "$version"
   done
+  for unit in flow web matrix github; do
+    discard "$dir"
+    expect_eq "common change: $unit releases" "$(field status "$(prepare "$dir" "$unit")")" release
+  done
   discard "$dir"
-  expect_eq "common change: matrix releases" "$(field status "$(prepare "$dir" matrix)")" release
-  discard "$dir"
-  expect_eq "common change: web releases" "$(field status "$(prepare "$dir" web)")" release
-  discard "$dir"
-  expect_eq "common change: flow does not" "$(field status "$(prepare "$dir" flow)")" none
   expect_eq "common change: core does not" "$(field status "$(prepare "$dir" core)")" none
 }
 

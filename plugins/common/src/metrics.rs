@@ -21,7 +21,8 @@ pub struct Shared {
     /// what the channel chose (Spec J-6).
     pub answers_mismatched: IntCounter,
     /// `deliveries_total{outcome}`: `confirmed`, `unconfirmed`, `command`
-    /// (Spec M §8.7).
+    /// (Spec M §8.7), and `nudged`, an Enter pressed again for a prompt
+    /// not yet confirmed (#99).
     pub deliveries: IntCounterVec,
 }
 

@@ -59,8 +59,12 @@ against what was declared.
 - `balerix-plugin-flow` — the first in-tree plugin, on the SDK: a per-agent
   state machine over hook events (`config.rs` parses and compiles the
   `plugins.flow` block, `machine.rs` is the pure step, `plugin.rs` owns the
-  agents, the KV-mirrored state and the metrics). Plugin crates depend on
-  the SDK and `api` only, and are not workspace members: each is a
+  agents, the KV-mirrored state and the metrics). A `send` with
+  `submit: true` is registered with common's delivery tracker and its Enter
+  pressed again on a 5 s tick until the agent's `UserPromptSubmit` confirms
+  it (#100): the first prompt, sent on `SessionStart`, otherwise loses its
+  Enter to the starting TUI. Plugin crates depend on the SDK, `api` and,
+  where they need it, `common`, and are not workspace members: each is a
   standalone project under `plugins/<name>/` with its own lockfile and
   dependency table (Spec H).
 - `balerix-plugin-web` — the second in-tree plugin: a per-agent `enabled`

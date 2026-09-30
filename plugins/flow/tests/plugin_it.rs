@@ -2,11 +2,14 @@
 //! every call crosses the wire as the daemon's would.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use balerix_api::PluginAction;
-use balerix_plugin_flow::plugin::{FlowPlugin, Stored};
+use std::time::Duration;
+
+use balerix_api::{Key, KeyStep, PluginAction};
+use balerix_plugin_flow::plugin::{FlowPlugin, Nudger, Stored};
 use balerix_plugin_sdk::testing::{FakeHost, Harness, event, metric};
 use balerix_plugin_sdk::{Env, Host};
 use serde_json::{Value, json};
+use tokio::time::Instant;
 
 const ALICE: &str = "e2e/c/alice";
 
@@ -247,4 +250,173 @@ async fn activation_fails_loudly_when_kv_is_unavailable() {
 async fn health_is_always_ok() {
     let (_, _, h) = world().await;
     assert_eq!(h.health().await, Ok(()));
+}
+
+/// A rule that sends the first prompt the moment the session starts (#100).
+fn first_prompt_config() -> Value {
+    json!({
+        "initial": "starting",
+        "states": {
+            "starting": { "on": [
+                { "event": "SessionStart", "goto": "working",
+                  "send": { "text": "flow says: read the issue", "submit": true } }
+            ] },
+            "working": {}
+        }
+    })
+}
+
+fn session_start() -> balerix_api::HookEvent {
+    event(ALICE, "SessionStart", json!({ "source": "startup" }))
+}
+
+fn submitted(text: &str) -> balerix_api::HookEvent {
+    event(ALICE, "UserPromptSubmit", json!({ "prompt": text }))
+}
+
+fn enter() -> PluginAction {
+    PluginAction::SendKeys {
+        steps: vec![KeyStep::Key(Key::Enter)],
+        delay_ms: balerix_api::DEFAULT_KEY_DELAY_MS,
+    }
+}
+
+async fn nudged_world() -> (FakeHost, Harness, Nudger) {
+    let fake = FakeHost::start("tok", json!({}), vec![]).await;
+    let env = fake.env("flow", std::path::Path::new("/s"));
+    let plugin = FlowPlugin::new(Host::new(env.clone()).unwrap()).unwrap();
+    let nudger = plugin.nudger();
+    let h = Harness::start(&env, plugin).await;
+    (fake, h, nudger)
+}
+
+/// #100: a prompt sent on `SessionStart` reaches the composer while the
+/// TUI is starting and loses its Enter, so an unconfirmed submitted send
+/// gets Enter again every 5 s until `UserPromptSubmit` names it.
+#[tokio::test]
+async fn an_unconfirmed_submitted_send_gets_enter_again_until_confirmed() {
+    let (fake, h, nudger) = nudged_world().await;
+    h.activate(ALICE, first_prompt_config()).await.unwrap();
+    let t0 = Instant::now();
+    let v = h.intercept(session_start()).await;
+    assert_eq!(
+        v.actions,
+        vec![PluginAction::SendText {
+            text: "flow says: read the issue".into(),
+            submit: true
+        }]
+    );
+    // the prompt's clock starts inside `intercept`, a moment after `t0`
+    nudger.tick(t0 + Duration::from_secs(4)).await;
+    assert!(fake.actions_for(ALICE).is_empty(), "too early");
+    nudger.tick(t0 + Duration::from_secs(6)).await;
+    assert_eq!(fake.actions_for(ALICE), vec![enter()]);
+    nudger.tick(t0 + Duration::from_secs(8)).await;
+    assert_eq!(fake.actions_for(ALICE).len(), 1, "5 s between presses");
+    nudger.tick(t0 + Duration::from_secs(12)).await;
+    assert_eq!(fake.actions_for(ALICE), vec![enter(), enter()]);
+
+    h.intercept(submitted("flow says: read the issue")).await;
+    h.intercept(stop()).await;
+    nudger.tick(t0 + Duration::from_secs(60)).await;
+    assert_eq!(fake.actions_for(ALICE).len(), 2, "confirmed: no more");
+}
+
+#[tokio::test]
+async fn a_send_left_in_the_composer_on_purpose_is_never_nudged() {
+    let (fake, h, nudger) = nudged_world().await;
+    let mut config = first_prompt_config();
+    config["states"]["starting"]["on"][0]["send"]["submit"] = json!(false);
+    h.activate(ALICE, config).await.unwrap();
+    let t0 = Instant::now();
+    h.intercept(session_start()).await;
+    nudger.tick(t0 + Duration::from_secs(6)).await;
+    nudger.tick(t0 + Duration::from_secs(60)).await;
+    assert!(fake.actions_for(ALICE).is_empty());
+}
+
+#[tokio::test]
+async fn a_send_typed_mid_turn_is_not_nudged_until_the_turn_ends() {
+    let (fake, h, nudger) = nudged_world().await;
+    let config = json!({
+        "initial": "working",
+        "states": { "working": { "on": [
+            { "event": "PreToolUse", "send": { "text": "flow says: careful", "submit": true } }
+        ] } }
+    });
+    h.activate(ALICE, config).await.unwrap();
+    let t0 = Instant::now();
+    h.intercept(submitted("something else")).await; // a turn is open
+    h.intercept(event(ALICE, "PreToolUse", json!({ "tool_name": "Bash" })))
+        .await;
+    nudger.tick(t0 + Duration::from_secs(30)).await;
+    assert!(
+        fake.actions_for(ALICE).is_empty(),
+        "Claude queues text typed mid-turn; an Enter would answer a dialog"
+    );
+    h.intercept(stop()).await;
+    let t1 = Instant::now();
+    nudger.tick(t1 + Duration::from_secs(6)).await;
+    assert_eq!(fake.actions_for(ALICE), vec![enter()]);
+}
+
+#[tokio::test]
+async fn deliveries_are_counted_and_a_refused_enter_is_an_error() {
+    let (fake, h, nudger) = nudged_world().await;
+    h.activate(ALICE, first_prompt_config()).await.unwrap();
+    let t0 = Instant::now();
+    h.intercept(session_start()).await;
+    nudger.tick(t0 + Duration::from_secs(6)).await;
+    let m = h.metrics().await;
+    assert_eq!(
+        metric(
+            &m,
+            "balerix_plugin_flow_deliveries_total",
+            &[("outcome", "nudged")]
+        ),
+        Some(1.0)
+    );
+    fake.fail_actions(Some("window gone"));
+    nudger.tick(t0 + Duration::from_secs(12)).await;
+    let m = h.metrics().await;
+    assert_eq!(
+        metric(
+            &m,
+            "balerix_plugin_flow_deliveries_total",
+            &[("outcome", "nudged")]
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        metric(
+            &m,
+            "balerix_plugin_flow_errors_total",
+            &[("kind", "send_keys")]
+        ),
+        Some(1.0)
+    );
+    h.intercept(submitted("flow says: read the issue")).await;
+    let m = h.metrics().await;
+    assert_eq!(
+        metric(
+            &m,
+            "balerix_plugin_flow_deliveries_total",
+            &[("outcome", "confirmed")]
+        ),
+        Some(1.0)
+    );
+}
+
+#[tokio::test]
+async fn deactivate_forgets_what_was_pending() {
+    let (fake, h, nudger) = nudged_world().await;
+    h.activate(ALICE, first_prompt_config()).await.unwrap();
+    let t0 = Instant::now();
+    h.intercept(session_start()).await;
+    h.deactivate(ALICE).await;
+    nudger.tick(t0 + Duration::from_secs(6)).await;
+    assert!(
+        fake.actions_for(ALICE).is_empty(),
+        "down: nothing to submit"
+    );
 }

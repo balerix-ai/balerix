@@ -1,15 +1,28 @@
 //! The `Plugin` impl (plugins spec §17.3, §17.4): one entry per active
 //! agent, the current state mirrored to the daemon's KV under
-//! `state/<agent>` so a restart resumes, and the two metric families.
+//! `state/<agent>` so a restart resumes, and the metric families.
+//!
+//! A `send` with `submit: true` is a prompt the daemon types and submits,
+//! and `SessionStart` is the natural place to send the first one. Text
+//! that reaches the pane while Claude Code's TUI is still starting lands
+//! in the composer and loses its Enter (#100). So every submitted send is
+//! registered with common's delivery tracker (Spec M §8.7), the agent's
+//! own `UserPromptSubmit` confirms it, and until then [`Nudger::tick`]
+//! presses Enter again on the tracker's cadence. Flow has nobody to
+//! report an expiry to, so a prompt's window is zero: confirmation and
+//! the tracker's own nudge bound are all that settle it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use balerix_api::{HookEvent, InterceptResponse};
+use balerix_api::{DEFAULT_KEY_DELAY_MS, HookEvent, InterceptResponse, Key, KeyStep, PluginAction};
+use balerix_plugin_common::delivery::Deliveries;
 use balerix_plugin_sdk::metrics::{IntCounterVec, IntGaugeVec};
 use balerix_plugin_sdk::{Host, Metrics, Plugin, SdkError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::time::Instant;
 
 use crate::config::{Compiled, compile};
 use crate::machine::step;
@@ -33,6 +46,72 @@ pub struct FlowPlugin {
     metrics: Metrics,
     state_gauge: IntGaugeVec,
     transitions: IntCounterVec,
+    nudger: Nudger,
+}
+
+/// The half of the plugin that runs on a timer: the submitted sends not
+/// yet confirmed, and the Enter pressed again for them. Cloned out of
+/// the plugin before `serve` takes it, and ticked from `main`.
+#[derive(Clone)]
+pub struct Nudger {
+    host: Host,
+    deliveries: Arc<Mutex<Deliveries<()>>>,
+    /// `deliveries_total{outcome}`: `confirmed`, `skipped`, `evicted`, `nudged`.
+    deliveries_total: IntCounterVec,
+    /// `errors_total{kind}`: `send_keys`, an Enter the daemon refused.
+    errors: IntCounterVec,
+}
+
+impl Nudger {
+    fn deliveries(&self) -> std::sync::MutexGuard<'_, Deliveries<()>> {
+        self.deliveries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Presses Enter once on every agent the tracker says is due at
+    /// `now` (#100): idle, holding an unconfirmed prompt, and 5 s past
+    /// its clock or its last press.
+    pub async fn tick(&self, now: Instant) {
+        let due = self.deliveries().nudge(now);
+        for agent in due {
+            let action = PluginAction::SendKeys {
+                steps: vec![KeyStep::Key(Key::Enter)],
+                delay_ms: DEFAULT_KEY_DELAY_MS,
+            };
+            match self.host.action(&agent, &action).await {
+                Ok(()) => self.deliveries_total.with_label_values(&["nudged"]).inc(),
+                Err(e) => {
+                    self.errors.with_label_values(&["send_keys"]).inc();
+                    eprintln!("flow: Enter again for {agent}: {e}");
+                }
+            }
+        }
+    }
+
+    /// One hook event to the tracker: what it confirms or skips is counted.
+    fn on_event(&self, event: &HookEvent, now: Instant) {
+        let outcome = self.deliveries().on_event(event, now);
+        if outcome.confirmed.is_some() {
+            self.deliveries_total
+                .with_label_values(&["confirmed"])
+                .inc();
+        }
+        self.deliveries_total
+            .with_label_values(&["skipped"])
+            .inc_by(outcome.skipped.len() as u64);
+    }
+
+    /// A submitted send just returned in a verdict, with a zero window:
+    /// flow reports no expiry, so only confirmation settles it.
+    fn sent(&self, agent: &str, text: &str, now: Instant) {
+        let evicted = self.deliveries().sent(agent, text, (), now, Duration::ZERO);
+        if evicted.is_some() {
+            self.deliveries_total.with_label_values(&["evicted"]).inc();
+        }
+    }
+
+    fn forget(&self, agent: &str) {
+        self.deliveries().forget(agent);
+    }
 }
 
 impl std::fmt::Debug for FlowPlugin {
@@ -42,6 +121,9 @@ impl std::fmt::Debug for FlowPlugin {
             .finish()
     }
 }
+
+/// How often `main` ticks the [`Nudger`]: the tracker's own cadence.
+pub const TICK: Duration = balerix_plugin_common::delivery::NUDGE_AFTER;
 
 const STATE_LABELS: [&str; 4] = ["fleet", "crew", "agent", "state"];
 const TRANSITION_LABELS: [&str; 5] = ["fleet", "crew", "agent", "from", "to"];
@@ -59,13 +141,30 @@ impl FlowPlugin {
             "Flow transitions since the plugin started",
             &TRANSITION_LABELS,
         )?;
+        let deliveries_total = metrics.int_counter_vec(
+            "deliveries_total",
+            "Submitted sends by what settled them (#100)",
+            &["outcome"],
+        )?;
+        let errors = metrics.int_counter_vec("errors_total", "Failures by kind", &["kind"])?;
         Ok(Self {
+            nudger: Nudger {
+                host: host.clone(),
+                deliveries: Arc::new(Mutex::new(Deliveries::default())),
+                deliveries_total,
+                errors,
+            },
             host,
             agents: Mutex::new(HashMap::new()),
             metrics,
             state_gauge,
             transitions,
         })
+    }
+
+    /// The timer half; see [`Nudger`].
+    pub fn nudger(&self) -> Nudger {
+        self.nudger.clone()
     }
 
     pub fn state_key(agent: &str) -> String {
@@ -161,6 +260,7 @@ impl Plugin for FlowPlugin {
     /// Forget the agent and its stored state: `down`, a dropped block and
     /// a config change all reset to `initial` on the next `activate`.
     async fn deactivate(&self, agent: &str) {
+        self.nudger.forget(agent);
         let old = self
             .agents
             .lock()
@@ -186,6 +286,8 @@ impl Plugin for FlowPlugin {
         _deadline_ms: u64,
     ) -> InterceptResponse {
         let agent = event.agent.clone();
+        let now = Instant::now();
+        self.nudger.on_event(&event, now);
         let (outcome, transition) = {
             let mut agents = self.agents.lock().unwrap_or_else(|e| e.into_inner());
             let Some(flow) = agents.get_mut(&agent) else {
@@ -195,6 +297,11 @@ impl Plugin for FlowPlugin {
                 };
             };
             let s = step(&flow.compiled, &flow.state, &event, so_far);
+            for action in &s.actions {
+                if let PluginAction::SendText { text, submit: true } = action {
+                    self.nudger.sent(&agent, text, now);
+                }
+            }
             let transition = s.next.clone().map(|to| {
                 let from = std::mem::replace(&mut flow.state, to.clone());
                 (from, to, flow.compiled.hash.clone())

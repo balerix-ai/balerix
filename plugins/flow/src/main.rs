@@ -19,8 +19,18 @@ fn run() -> anyhow::Result<()> {
     rt.block_on(async {
         let host = Host::new(env.clone())?;
         let plugin = FlowPlugin::new(Host::new(env)?)?;
+        let nudger = plugin.nudger();
+        let ticker = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(balerix_plugin_flow::plugin::TICK);
+            loop {
+                interval.tick().await;
+                nudger.tick(tokio::time::Instant::now()).await;
+            }
+        });
         eprintln!("flow: starting");
-        serve(&host, env!("CARGO_PKG_VERSION"), plugin).await?;
+        let result = serve(&host, env!("CARGO_PKG_VERSION"), plugin).await;
+        ticker.abort();
+        result?;
         Ok(())
     })
 }

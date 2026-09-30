@@ -28,8 +28,10 @@ credentials, hook input, or sandbox rules.
   (`HOME` is overridden, so it never touches your real state).
 - `verify-claude` — the interactive spec §8.1 check with a real `claude`
   (`scripts/verify-claude.sh`); `BALERIX_VERIFY_FAKE=1` self-tests it with
-  `dev fake-claude`. Its last section sends `/exit` the way `send_text`
-  does and reports whether the session ended (#41). Its data root (`target/tmp/verify-data`, the daemon
+  `dev fake-claude`. Section G sends `/exit` the way `send_text`
+  does and reports whether the session ended (#41); section H adds a
+  second agent, sends a text the moment its `SessionStart` arrives and
+  reports how many Enters it took before `UserPromptSubmit` (#99). Its data root (`target/tmp/verify-data`, the daemon
   pool) is kept across runs so claude downloads once per version; config and
   state under `target/tmp/verify-claude` are wiped.
 - `verify-matrix` — Spec G's manual check against a real Matrix homeserver
@@ -123,6 +125,19 @@ credentials, hook input, or sandbox rules.
   and you run it. Keys sent with no pause are dropped at a question
   transition, which is why `send_keys` has a 20 ms floor; and never use Tab
   in a plan: it goes to different places from different rows.
+- `SessionStart` is not "ready for keys": Claude Code's TUI reads the
+  keyboard a second or more after the hook fires, so a text sent on
+  `SessionStart` lands in the composer and its Enter is lost (#99).
+  `send_text` does not wait; the plugins that track deliveries (github,
+  matrix) press Enter again every 5 s, for up to 90 s, while a prompt is
+  unconfirmed and the agent is not mid-turn
+  (`plugins/common/src/delivery.rs::nudge`). How long Claude swallows
+  Enter varies from 1 s to over 20 s between cold starts, so github
+  reports its first prompt only after `confirmWindow` plus 60 s
+  (`START_UP_ALLOWANCE`).
+  Flow tracks nothing, so a flow `send` on `SessionStart` is still lost.
+  `dev fake-claude` reads stdin from the start and cannot show any of
+  this; `mise run verify-claude` section H does.
 - nono's state root follows nono's own `$HOME`; never point that at the agent's
   `home/` (see ARCHITECTURE.md).
 - The sandbox grants read on exactly two binaries outside `/usr`, `/bin`,

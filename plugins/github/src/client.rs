@@ -475,10 +475,12 @@ impl crate::plugin::Launcher for GitHubLauncher {
             move |ev| sink_queue.push(Command::Webhook(ev)),
             self.counters.webhooks.clone(),
         );
-        let health = self.health.clone();
+        // §11: the listener is one of the actor's three health kinds, so
+        // its death is reported through the queue, not written to the cell.
+        let listener_queue = queue.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::webhook::serve(listener, webhook.router()).await {
-                health.fail(format!("webhook listener: {e}"));
+                listener_queue.push(Command::ListenerFailed(e.to_string()));
             }
         });
         tokio::spawn(async move {

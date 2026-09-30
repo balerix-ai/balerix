@@ -4,7 +4,8 @@ Shared building blocks for [balerix](https://github.com/balerix-ai/balerix)
 chat plugins: rendering hook events as markdown, splitting long bodies,
 showing and answering Claude's `AskUserQuestion` dialogs, config helpers,
 a drop-oldest command queue, the shared metric families and phase diffing.
-The matrix and GitHub plugins are built on it. This crate pairs with the
+The matrix and GitHub plugins are built on it; the flow plugin takes only
+`delivery`, for its submitted sends. This crate pairs with the
 `balerix-plugin-sdk` and `balerix-api` versions its manifest names.
 
 The wire contract a plugin speaks is

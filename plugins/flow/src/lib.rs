@@ -1,7 +1,9 @@
 //! The flow plugin (plugins spec §8.1, §17): a per-agent state machine over
 //! hook events. `config` parses and compiles an agent's `plugins.flow`
 //! block, `machine` is the pure step, `plugin` is the `Plugin` impl that
-//! owns the agents, the KV-backed state and the metrics.
+//! owns the agents, the KV-backed state, the metrics and the delivery
+//! tracker that presses Enter again for an unconfirmed submitted send
+//! (#100).
 
 pub mod config;
 pub mod machine;

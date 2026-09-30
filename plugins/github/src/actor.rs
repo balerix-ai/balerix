@@ -130,7 +130,7 @@ enum Unconfirmed {
     Evicted,
 }
 
-/// A review held while a question is open (§9).
+/// A review held while a question is open, or behind one held earlier (§9).
 #[derive(Debug, Clone)]
 struct Held {
     reviewer: String,
@@ -493,6 +493,21 @@ impl<G: GitHubPort> Actor<G> {
                 .inbound
                 .with_label_values(&["unpermitted"])
                 .inc();
+            return;
+        }
+        // An opening whose row is live and open is a redelivery (#96): the
+        // agent already holds this body as its first prompt. A closed row
+        // goes on to `start`, which resumes it.
+        let live = self.sessions.by_number(repo, number).map(str::to_string);
+        if let Some(agent) = live
+            && self.sessions.get(&agent).is_some_and(|r| !r.closed)
+        {
+            self.refresh_installation(&agent, installation);
+            self.counters
+                .inbound
+                .with_label_values(&["duplicate"])
+                .inc();
+            tracing::debug!("github: opening of {repo}#{number} redelivered while {agent} is live");
             return;
         }
         self.start(
@@ -1391,15 +1406,18 @@ impl<G: GitHubPort> Actor<G> {
         else {
             return;
         };
+        // Always behind what is already held, so reviews reach the agent
+        // in arrival order (#96); `release_held` drains at once unless a
+        // question is open.
+        self.held.entry(agent.clone()).or_default().push(Held {
+            reviewer: author.login.clone(),
+            message,
+        });
         if self.questions.is_open(&agent) {
-            self.held.entry(agent.clone()).or_default().push(Held {
-                reviewer: author.login.clone(),
-                message,
-            });
             self.line(&agent, &format!("review from @{} held", author.login));
             return;
         }
-        self.deliver_review(&agent, &author.login, message).await;
+        self.release_held(&agent).await;
     }
 
     async fn deliver_review(&mut self, agent: &str, reviewer: &str, message: String) {
@@ -2613,10 +2631,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_review_renders_one_message_and_waits_behind_an_open_question() {
+    /// A PR session on acme/api#34 with one inline comment on review 9,
+    /// the way the review tests need it.
+    const PR_AGENT: &str = "gh-acme-api/repo/pr-34";
+
+    async fn pr_session() -> (FakeHost, FakePort, Actor<FakePort>) {
         use crate::github::ReviewComment;
-        use balerix_plugin_common::question::fixtures::{color, input};
         let (fake, port, mut a) = actor().await;
         let pr = Command::Webhook(WebhookEvent::PrOpened {
             repo: "acme/api".into(),
@@ -2631,13 +2651,12 @@ mod tests {
             base: "main".into(),
         });
         a.handle(pr).await;
-        let agent = "gh-acme-api/repo/pr-34";
         a.handle(Command::Activate {
-            agent: agent.into(),
+            agent: PR_AGENT.into(),
             config: crate::config::parse_agent(&json!({ "kind": "pr", "number": 34 })).unwrap(),
         })
         .await;
-        let mut e = event(agent, "SessionStart", json!({ "source": "startup" }));
+        let mut e = event(PR_AGENT, "SessionStart", json!({ "source": "startup" }));
         e.session_id = Some("s".into());
         a.handle(Command::Events(vec![e])).await;
         port.set_review_comments(
@@ -2652,18 +2671,28 @@ mod tests {
                 body: "panics".into(),
             }],
         );
-        let review = || {
-            Command::Webhook(WebhookEvent::ReviewSubmitted {
-                repo: "acme/api".into(),
-                installation: 7,
-                number: 34,
-                author: user("bob"),
-                review_id: 9,
-                state: "changes_requested".into(),
-                body: "Close.".into(),
-                commit: "3f9c2a1dead".into(),
-            })
-        };
+        (fake, port, a)
+    }
+
+    fn review_by(reviewer: &str, review_id: u64) -> Command {
+        Command::Webhook(WebhookEvent::ReviewSubmitted {
+            repo: "acme/api".into(),
+            installation: 7,
+            number: 34,
+            author: user(reviewer),
+            review_id,
+            state: "changes_requested".into(),
+            body: "Close.".into(),
+            commit: "3f9c2a1dead".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_review_renders_one_message_and_waits_behind_an_open_question() {
+        use balerix_plugin_common::question::fixtures::{color, input};
+        let (fake, _port, mut a) = pr_session().await;
+        let agent = PR_AGENT;
+        let review = || review_by("bob", 9);
         a.handle(review()).await;
         let sent = fake.actions_for(agent);
         let text = actions_text(sent.last().unwrap());
@@ -2714,6 +2743,65 @@ mod tests {
         }))
         .await;
         assert_eq!(fake.actions_for(agent).len(), before + 1);
+    }
+
+    /// #96: a redelivered opening (GitHub's "Redeliver" button, or a
+    /// retry past the delivery ring) on a live row is a duplicate: the
+    /// agent already holds the body as its first prompt.
+    /// #96: reviews reach the agent in arrival order. A `SessionStart`
+    /// clears the question without releasing what it held; the next
+    /// review must not pass the held one.
+    #[tokio::test]
+    async fn a_review_after_a_held_one_is_delivered_behind_it() {
+        use balerix_plugin_common::question::fixtures::{color, input};
+        let (fake, port, mut a) = pr_session().await;
+        let agent = PR_AGENT;
+        port.set_review_comments("acme/api", 10, Vec::new());
+        let mut q = event(
+            agent,
+            "PreToolUse",
+            json!({ "tool_name": "AskUserQuestion", "tool_input": input(&[color()]) }),
+        );
+        q.session_id = Some("s".into());
+        a.handle(Command::Events(vec![q])).await;
+        let before = fake.actions_for(agent).len();
+        a.handle(review_by("bob", 9)).await;
+        assert_eq!(fake.actions_for(agent).len(), before, "held");
+        let mut restart = event(agent, "SessionStart", json!({ "source": "resume" }));
+        restart.session_id = Some("s2".into());
+        a.handle(Command::Events(vec![restart])).await;
+        a.handle(review_by("alice", 10)).await;
+        let texts: Vec<String> = fake.actions_for(agent)[before..]
+            .iter()
+            .map(actions_text)
+            .collect();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(texts[0].starts_with("Review by @bob"), "{texts:?}");
+        assert!(texts[1].starts_with("Review by @alice"), "{texts:?}");
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_opening_on_a_live_row_is_ignored() {
+        let (fake, port, mut a) = started().await;
+        let sent = fake.actions_for(AGENT).len();
+        a.handle(Command::Webhook(WebhookEvent::IssueOpened {
+            repo: "acme/api".into(),
+            installation: 7,
+            number: 12,
+            author: user("alice"),
+            title: "Bug".into(),
+            body: "@balerix please look".into(),
+            url: "u".into(),
+        }))
+        .await;
+        assert_eq!(fake.applied_fleets().len(), 1, "no second apply");
+        assert_eq!(fake.actions_for(AGENT).len(), sent, "nothing sent");
+        assert!(a.first_prompts.is_empty(), "first prompt not re-armed");
+        assert!(reactions(&port.calls()).is_empty());
+        assert_eq!(
+            a.counters.inbound.with_label_values(&["duplicate"]).get(),
+            1
+        );
     }
 
     #[tokio::test]

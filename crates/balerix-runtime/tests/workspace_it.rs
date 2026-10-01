@@ -1525,6 +1525,12 @@ fn a_clone_rewritten_after_the_checks_serves_nothing_foreign() {
     git(&foreign, &["repack", "-q", "-a", "-d"]);
     let foreign_sha = git(&foreign, &["rev-parse", "HEAD"]).trim().to_string();
     let foreign_git = foreign.join(".git");
+    // the branches the harvest asks for in vectors B and D, where the
+    // clone's refs come from the foreign repository itself: with them an
+    // unsandboxed `upload-pack` would serve the foreign commit
+    for name in ["b", "d"] {
+        git(&foreign, &["branch", &format!("balerix/f/c/{name}")]);
+    }
 
     let ran = root.join("uploadpack-ran");
     let script = root.join("uploadpack.sh");

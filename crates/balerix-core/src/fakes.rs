@@ -293,7 +293,9 @@ impl Drop for FakePty {
 #[derive(Default)]
 pub struct FakeRunner {
     rec: Mutex<Recorder>,
-    state: Mutex<ObservedState>,
+    /// Per fleet, as tmux keeps it: a session is `fleet/crew`, and
+    /// `observe` answers for one fleet's sessions only.
+    state: Mutex<BTreeMap<FleetName, ObservedState>>,
     next_pid: Mutex<u32>,
     /// While set, every `observe()` call fails (spec §3.2: a failed
     /// `observe()` is logged, counted, leaves status unchanged, and the
@@ -315,10 +317,24 @@ impl FakeRunner {
             .push((method.into(), id.into(), stderr.into()));
     }
     pub fn set_state(&self, id: &AgentId, s: ProcessState) {
-        lock(&self.state).set(id, s);
+        lock(&self.state)
+            .entry(id.fleet.clone())
+            .or_default()
+            .set(id, s);
     }
+    /// Every fleet's crews in one view; a test with a single fleet reads
+    /// its state here without naming it.
     pub fn observed(&self) -> ObservedState {
-        lock(&self.state).clone()
+        let mut all = ObservedState::default();
+        for fleet in lock(&self.state).values() {
+            for (crew, agents) in &fleet.crews {
+                all.crews
+                    .entry(crew.clone())
+                    .or_default()
+                    .extend(agents.clone());
+            }
+        }
+        all
     }
     /// Makes every subsequent `observe()` fail (or, passed `false`, stops
     /// failing) until changed again.
@@ -360,6 +376,8 @@ impl AgentRunner for FakeRunner {
     fn ensure_crew(&self, crew: &CrewRef) -> Result<(), RunnerError> {
         self.check("ensure_crew", &crew.to_string())?;
         lock(&self.state)
+            .entry(crew.fleet.clone())
+            .or_default()
             .crews
             .entry(crew.crew.clone())
             .or_default();
@@ -372,17 +390,21 @@ impl AgentRunner for FakeRunner {
             *p += 1;
             *p
         };
-        lock(&self.state).set(agent, ProcessState::Running { pid });
+        self.set_state(agent, ProcessState::Running { pid });
         Ok(())
     }
     fn stop_agent(&self, agent: &AgentId) -> Result<(), RunnerError> {
         self.check("stop_agent", &agent.to_string())?;
-        lock(&self.state).remove(agent);
+        if let Some(fleet) = lock(&self.state).get_mut(&agent.fleet) {
+            fleet.remove(agent);
+        }
         Ok(())
     }
     fn stop_crew(&self, crew: &CrewRef) -> Result<(), RunnerError> {
         self.check("stop_crew", &crew.to_string())?;
-        lock(&self.state).crews.remove(&crew.crew);
+        if let Some(fleet) = lock(&self.state).get_mut(&crew.fleet) {
+            fleet.crews.remove(&crew.crew);
+        }
         Ok(())
     }
     fn observe(&self, fleet: &FleetName) -> Result<ObservedState, RunnerError> {
@@ -395,7 +417,7 @@ impl AgentRunner for FakeRunner {
                 stderr: "fake observe failure".into(),
             });
         }
-        Ok(self.observed())
+        Ok(lock(&self.state).get(fleet).cloned().unwrap_or_default())
     }
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
         self.check("send_text", &format!("{agent} {text:?} submit={submit}"))
@@ -792,6 +814,39 @@ mod tests {
         assert!(
             pty.reader().is_ok() && pty.reader().is_ok(),
             "readers clone"
+        );
+    }
+
+    /// tmux names a session `fleet/crew` and `TmuxRunner::observe` reads
+    /// one fleet's prefix; a fake that answered with every fleet's crews
+    /// had two fleets on one runner stop each other's agents as orphans
+    /// (#113).
+    #[test]
+    fn observe_answers_for_the_fleet_asked_and_no_other() {
+        let r = FakeRunner::default();
+        r.set_state(&id("f/c/a"), ProcessState::Running { pid: 1 });
+        r.set_state(&id("g/c/a"), ProcessState::Running { pid: 2 });
+        r.set_state(&id("g/d/b"), ProcessState::Running { pid: 3 });
+        let f = r.observe(&"f".parse().unwrap()).unwrap();
+        assert_eq!(f.agent_ids(&"f".parse().unwrap()), vec![id("f/c/a")]);
+        assert_eq!(
+            f.get(&id("f/c/a")),
+            Some(&ProcessState::Running { pid: 1 }),
+            "a crew name two fleets share is two crews"
+        );
+
+        r.stop_agent(&id("g/c/a")).unwrap();
+        r.stop_crew(&"g/d".parse().unwrap()).unwrap();
+        assert_eq!(
+            r.observe(&"f".parse().unwrap()).unwrap(),
+            f,
+            "stopping in one fleet leaves the other alone"
+        );
+        assert!(
+            r.observe(&"g".parse().unwrap())
+                .unwrap()
+                .agent_ids(&"g".parse().unwrap())
+                .is_empty()
         );
     }
 

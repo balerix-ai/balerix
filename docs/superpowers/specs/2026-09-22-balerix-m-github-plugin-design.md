@@ -845,3 +845,12 @@ credentials or the gh token (Spec L-3).
   agent already holds the body as its first prompt, so it is counted as
   `inbound_total{outcome="duplicate"}` and nothing else happens. An
   opening on a closed row resumes, as a mentioning comment does (#96).
+- `end` writes the closed row to KV before it returns, as it flushes the
+  final status line: left to the next tick, a restart in between reloaded
+  the row open for an agent the daemon had already removed. It also sets
+  `last_activity` to the closing time. `Tick` prunes a closed row seven
+  days after that (`CLOSED_RETENTION`, a constant, not configuration):
+  the row, its status and its ended notice go. A mention afterwards is a
+  fresh start (a new status comment, no branch line in the prompt) and a
+  comment without one is ignored. §10's "row kept" holds for those seven
+  days (#97).

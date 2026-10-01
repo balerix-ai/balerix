@@ -85,6 +85,12 @@ impl CrewPaths {
     pub fn cache_objects(&self) -> PathBuf {
         self.repo.join(".git").join("objects")
     }
+
+    /// The empty directory `core.hooksPath` names on every git call the
+    /// daemon makes in an agent's clone, so no hook the agent wrote runs.
+    pub fn no_hooks(&self) -> PathBuf {
+        self.root.join("no-hooks")
+    }
 }
 
 impl StateLayout {
@@ -250,6 +256,14 @@ impl AgentPaths {
     /// every sandbox grant.
     pub fn branch_marker(&self) -> PathBuf {
         self.root.join(".branch")
+    }
+
+    /// The nono profile the daemon's own git runs under in this agent's
+    /// clone (Spec N amendment 2026-10-01 §4). Daemon-owned: the agent
+    /// root is outside every sandbox grant, so the agent can neither read
+    /// nor change it.
+    pub fn git_profile(&self) -> PathBuf {
+        self.root.join("nono-git-profile.json")
     }
 
     pub fn claude_dir(&self) -> PathBuf {

@@ -56,7 +56,7 @@ pub(crate) fn scrub_git_env(mut cmd: Cmd) -> Cmd {
 /// the clone step, `refuse_filters` for the workspace reader, #67), on
 /// any git.
 pub(crate) fn harden_agent_git(cmd: Cmd, crew: &CrewPaths, agent_root: &Path) -> Cmd {
-    let no_hooks = crew.root.join("no-hooks");
+    let no_hooks = crew.no_hooks();
     let _ = std::fs::create_dir_all(&no_hooks);
     let ceiling = agent_root
         .canonicalize()

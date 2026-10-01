@@ -122,6 +122,18 @@ pub fn decide_clone<E>(
     })
 }
 
+/// Whether an exit code `agent_git` accepted is git's own answer. The
+/// yes/no probes (`config --get-regexp`, `rev-parse --verify --quiet`,
+/// `symbolic-ref -q`) print nothing when they exit 1. nono's own failure
+/// also exits 1, after the canary as well as before it, and prints
+/// `nono: …`; read as "no", that skips the harvest and the clone is
+/// deleted unharvested (#109). So a non-zero exit that printed anything
+/// is a failure. That fails closed for a git warning beside a real "no"
+/// too, as any git error does (#74). Exit 0 is not inspected.
+fn is_gits_answer(out: &CmdOutput) -> bool {
+    out.code == 0 || out.stderr.trim().is_empty()
+}
+
 /// `remove_dir_all` that treats a missing path as done. Not `Runtime::rm_rf`:
 /// that one waits out nono's ledger writes, and no process writes a clone
 /// while the daemon materializes or removes it.
@@ -526,9 +538,9 @@ impl Workspace<'_> {
     /// before any probe's exit code is trusted. The yes/no probes after
     /// this (`config --get-regexp`, `rev-parse --verify --quiet`) accept
     /// exit 1 as git's answer, and nono's own failure to run also exits 1;
-    /// a `version` that must exit 0 tells the two apart, so a nono that
-    /// validates but cannot run fails the step instead of reading as "no
-    /// promisor keys" or "branch absent".
+    /// a `version` that must exit 0 tells the two apart for a nono that
+    /// validates but cannot run at all, and names the log to read. A
+    /// failure on a later call is caught by `is_gits_answer`.
     fn prepare_sandbox(
         &self,
         id: &str,
@@ -538,6 +550,26 @@ impl Workspace<'_> {
         write_git_profile(self.tools, id, agent, crew)?;
         self.agent_git(id, crew, agent, &["version"], &[0])
             .map(|_| ())
+            .map_err(|e| match e {
+                // a prefix, not a line: the error displays the first line
+                MaterializeError::Tool {
+                    id,
+                    tool,
+                    subcommand,
+                    args,
+                    stderr,
+                } => MaterializeError::Tool {
+                    id,
+                    tool,
+                    subcommand,
+                    args,
+                    stderr: format!(
+                        "the sandbox did not start; see {}: {stderr}",
+                        agent.logs.join("nono-git.log").display()
+                    ),
+                },
+                other => other,
+            })
     }
 
     /// `nono`'s arguments up to and including the git binary, for a git
@@ -573,6 +605,8 @@ impl Workspace<'_> {
     /// deleted) makes git take `workspace/` itself for a bare repository.
     /// `accepted` are the exit codes that count as success (0 included).
     /// A failure is reported as git's, with git's subcommand, not nono's.
+    /// An accepted non-zero exit that printed anything on stderr is a
+    /// failure too (`is_gits_answer`).
     fn agent_git(
         &self,
         id: &str,
@@ -597,15 +631,21 @@ impl Workspace<'_> {
                 format!("--work-tree={}", agent.workspace.display()),
             ])
             .args(args.iter().copied());
-        cmd.run_with_exit_codes(accepted)
-            .map(|o| o.stdout)
-            .map_err(|f| MaterializeError::Tool {
-                id: id.to_string(),
-                tool: "git".into(),
-                subcommand: args.first().copied().unwrap_or_default().to_string(),
-                args: f.args,
-                stderr: f.stderr,
-            })
+        let tool_error = |argv: Vec<String>, stderr: String| MaterializeError::Tool {
+            id: id.to_string(),
+            tool: "git".into(),
+            subcommand: args.first().copied().unwrap_or_default().to_string(),
+            args: argv,
+            stderr,
+        };
+        let out = cmd
+            .run_with_exit_codes(accepted)
+            .map_err(|f| tool_error(f.args, f.stderr))?;
+        if !is_gits_answer(&out) {
+            let argv = args.iter().map(|a| (*a).to_string()).collect();
+            return Err(tool_error(argv, out.stderr));
+        }
+        Ok(out.stdout)
     }
 
     /// The agent's private clone on `branch` (Spec N §4): a clone of
@@ -1006,10 +1046,36 @@ impl Workspace<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::tools::Cmd;
+    use crate::tools::{Cmd, CmdOutput};
     use crate::workspace::{
-        CloneDecision, decide_clone, file_url, harden_agent_git, scrub_git_env,
+        CloneDecision, decide_clone, file_url, harden_agent_git, is_gits_answer, scrub_git_env,
     };
+
+    /// Spec N amendment §12.2 (#109): git's yes/no probes are silent on
+    /// exit 1; nono's own failure also exits 1 and prints `nono: …`.
+    #[test]
+    fn an_accepted_exit_is_gits_answer_only_when_silent() {
+        let out = |code: i32, stderr: &str| CmdOutput {
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+            code,
+        };
+        assert!(is_gits_answer(&out(0, "")));
+        assert!(
+            is_gits_answer(&out(0, "warning: something\n")),
+            "exit 0 is never inspected"
+        );
+        assert!(is_gits_answer(&out(1, "")));
+        assert!(is_gits_answer(&out(1, " \n")), "blank is silent");
+        assert!(!is_gits_answer(&out(
+            1,
+            "nono: Profile read error at /x: profile file not found\n"
+        )));
+        assert!(
+            !is_gits_answer(&out(1, "warning: something\n")),
+            "a git warning beside a no fails closed too"
+        );
+    }
 
     fn clean() -> Result<bool, ()> {
         Ok(false)

@@ -62,6 +62,10 @@ pub(crate) struct Cmd {
 #[derive(Debug)]
 pub(crate) struct CmdOutput {
     pub stdout: String,
+    /// What the child printed on stderr. A caller that accepts a non-zero
+    /// exit as an answer reads it to tell the tool's silent "no" from a
+    /// wrapper's failure with the same code (`Workspace::agent_git`).
+    pub stderr: String,
     /// The exit code, one of the accepted ones: how a caller that accepts
     /// `[0, 1]` tells a "no" (1) from a "yes" (0).
     pub code: i32,
@@ -331,7 +335,11 @@ impl Cmd {
                 stderr
             }));
         };
-        Ok(CmdOutput { stdout, code })
+        Ok(CmdOutput {
+            stdout,
+            stderr,
+            code,
+        })
     }
 }
 

@@ -72,6 +72,9 @@ fn materialize_then_remove_round_trip() {
         return;
     };
     let root = support::temp_root("materialize");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     // system table: only gh, seeded from the host so mise install is offline
     let gh_version = embedded_system_tools()["gh"].clone();
@@ -344,6 +347,9 @@ fn a_purge_deletes_a_broken_clone_without_harvesting() {
         return;
     };
     let root = support::temp_root("materialize-purge-broken");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     std::fs::create_dir_all(&layout.config_root).unwrap();
     std::fs::write(layout.system_mise_toml(), "[tools]\n").unwrap();

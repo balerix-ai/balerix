@@ -7,7 +7,10 @@ use balerix_core::{MaterializeError, RepoRef};
 
 use crate::fsutil::write_atomic;
 use crate::home::render_hosts_yml;
+use crate::launch::outer_path;
 use crate::layout::{AgentPaths, CrewPaths};
+use crate::quote::sh_quote;
+use crate::sandbox::write_git_profile;
 use crate::tools::{Cmd, CmdOutput, ToolPaths};
 
 /// The environment of every git call balerix makes. `git` honours
@@ -34,8 +37,9 @@ pub(crate) fn scrub_git_env(mut cmd: Cmd) -> Cmd {
 }
 
 /// Config and environment for a git call in a repository the agent can
-/// write to (its private clone), shared by the workspace reader
-/// (`inspect.rs`) and the clone step (Spec N §4 step 1, #62). Command-line
+/// write to (its private clone), for the workspace reader (`inspect.rs`);
+/// the clone step runs under the git profile instead, whose `set_vars`
+/// carry the same variables (`sandbox::render_git_profile`). Command-line
 /// config beats every config file, so nothing the agent wrote into its
 /// `.git/config` runs as the daemon: fsmonitor off, hooks pointed at an
 /// empty directory, no optional locks, no prompt, and the `GIT_*` scrub.
@@ -193,10 +197,11 @@ fn discard_half_made(id: &str, path: &Path, failed: MaterializeError) -> Materia
 /// `agent_git` names it with `--git-dir` and the harvest fetches with
 /// `upload-pack --strict`, so neither falls back to `workspace/` itself.
 /// `GIT_CEILING_DIRECTORIES` bounds upward discovery only and helps with
-/// none of this. The session is stopped before both callers run
-/// (`reconcile::plan` orders stops before removals and before a
-/// changed-hash materialize), so no live writer races this check and the
-/// git calls after it. Filesystem only: no git call.
+/// none of this. The session is stopped before both callers run, but a process the
+/// agent detached can outlive the tmux kill and rewrite the clone after
+/// this check (#70). That is why the git calls after it run under the
+/// git profile (`agent_git`): this check names the problem for the
+/// operator, the profile is what holds. Filesystem only: no git call.
 fn check_clone(id: &str, crew: &CrewPaths, agent: &AgentPaths) -> Result<(), MaterializeError> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -498,14 +503,39 @@ impl Workspace<'_> {
         }
     }
 
-    /// One git call inside the agent's clone, hardened by
-    /// `harden_agent_git` because the clone is agent-writable, and made
-    /// only after `check_clone`. `--git-dir` names `workspace/.git`
+    /// `nono`'s arguments up to and including the git binary, for a git
+    /// call in `agent`'s existing clone: `-s --log-file <logs>/nono-git.log
+    /// run --profile <git profile> -- <git>`. The profile is
+    /// `sandbox::render_git_profile`; `write_git_profile` must have run.
+    fn sandbox_args(&self, agent: &AgentPaths) -> Vec<String> {
+        vec![
+            "-s".into(),
+            "--log-file".into(),
+            agent.logs.join("nono-git.log").display().to_string(),
+            "run".into(),
+            "--profile".into(),
+            agent.git_profile().display().to_string(),
+            "--".into(),
+            self.tools.git.display().to_string(),
+        ]
+    }
+
+    /// One git call inside the agent's existing clone, run under the git
+    /// profile (`sandbox::render_git_profile`; Spec N amendment
+    /// 2026-10-01, #68, #70): it reads the clone and the crew cache's
+    /// objects, writes nothing and has no network, so whatever the clone
+    /// points at, git sees no more than the agent could. The checks
+    /// before it give the operator a readable refusal; the profile is the
+    /// boundary, and holds even when the clone changes after the checks.
+    ///
+    /// nono starts from an empty environment (`HOME` is the agent's
+    /// `nono/`, as for `launch.sh`), and the profile's `set_vars` carry
+    /// the hardening `harden_agent_git` sets for the workspace reader;
+    /// the `-c` pairs are the same. `--git-dir` names `workspace/.git`
     /// exactly: with `-C` alone, a `.git` git rejects (say, its `HEAD`
-    /// deleted) makes git take `workspace/` itself for a bare repository,
-    /// which the agent can fill with any `objects/info/alternates` it
-    /// likes. `accepted` are the exit codes that count as success (0
-    /// included).
+    /// deleted) makes git take `workspace/` itself for a bare repository.
+    /// `accepted` are the exit codes that count as success (0 included).
+    /// A failure is reported as git's, with git's subcommand, not nono's.
     fn agent_git(
         &self,
         id: &str,
@@ -514,24 +544,28 @@ impl Workspace<'_> {
         args: &[&str],
         accepted: &[i32],
     ) -> Result<String, MaterializeError> {
-        let cmd = harden_agent_git(
-            Cmd::new(&self.tools.git).log(&crew.root.join("logs").join("git.log")),
-            crew,
-            &agent.root,
-        )
-        .args([
-            "-C".to_string(),
-            agent.workspace.display().to_string(),
-            format!("--git-dir={}", agent.workspace.join(".git").display()),
-            format!("--work-tree={}", agent.workspace.display()),
-        ])
-        .args(args.iter().copied());
+        let cmd = Cmd::new(&self.tools.nono)
+            .env_clear()
+            .env("HOME", agent.nono_home.display().to_string())
+            .env("PATH", outer_path(self.tools))
+            .log(&crew.root.join("logs").join("git.log"))
+            .args(self.sandbox_args(agent))
+            .args(["-c", "core.fsmonitor=false"])
+            .args([
+                "-c".to_string(),
+                format!("core.hooksPath={}", crew.no_hooks().display()),
+                "-C".to_string(),
+                agent.workspace.display().to_string(),
+                format!("--git-dir={}", agent.workspace.join(".git").display()),
+                format!("--work-tree={}", agent.workspace.display()),
+            ])
+            .args(args.iter().copied());
         cmd.run_with_exit_codes(accepted)
             .map(|o| o.stdout)
             .map_err(|f| MaterializeError::Tool {
                 id: id.to_string(),
-                tool: f.tool,
-                subcommand: f.subcommand,
+                tool: "git".into(),
+                subcommand: args.first().copied().unwrap_or_default().to_string(),
                 args: f.args,
                 stderr: f.stderr,
             })
@@ -583,6 +617,7 @@ impl Workspace<'_> {
                 // call; `decide_clone` agrees (`Reuse`)
                 return Ok(());
             }
+            write_git_profile(self.tools, id, agent, crew)?;
             self.check_clone_config(id, crew, agent)?;
             let head = self.head_branch(id, crew, agent)?;
             let decision = decide_clone(marker.as_deref(), head.as_deref(), branch, || {
@@ -761,9 +796,9 @@ impl Workspace<'_> {
     /// Spec N §5: the clone's `refs/heads/<branch>` into the cache, by a
     /// fetch run *in the cache*. A push run in the clone would honour the
     /// clone's config (an `url.<x>.insteadOf` there could aim it at
-    /// another crew's cache); `upload-pack` in the clone takes no
-    /// repo-local hook or program config, and the only write is into the
-    /// daemon-owned cache. The `+` is intended: the clone was seeded from
+    /// another crew's cache); `upload-pack` runs in the clone under the
+    /// git profile (`agent_git`), so it serves only what the agent could
+    /// read, and the only write is into the daemon-owned cache. The `+` is intended: the clone was seeded from
     /// the cache's copy, so the clone's is the newer state even after a
     /// rebase. A branch the clone does not have (deleted by the agent) is
     /// skipped.
@@ -795,6 +830,19 @@ impl Workspace<'_> {
         if present.trim().is_empty() {
             return Ok(());
         }
+        // Run by a shell on the fetch's serving side: every word quoted.
+        // `env -i` for the same reason `agent_git` clears its environment.
+        let mut upload_pack = format!(
+            "--upload-pack=env -i HOME={} PATH={} {}",
+            sh_quote(&agent.nono_home.display().to_string()),
+            sh_quote(&outer_path(self.tools)),
+            sh_quote(&self.tools.nono.display().to_string()),
+        );
+        for word in self.sandbox_args(agent) {
+            upload_pack.push(' ');
+            upload_pack.push_str(&sh_quote(&word));
+        }
+        upload_pack.push_str(" upload-pack --strict");
         self.git(
             id,
             crew,
@@ -804,10 +852,7 @@ impl Workspace<'_> {
                 "fetch",
                 "--quiet",
                 "--no-auto-gc",
-                &format!(
-                    "--upload-pack='{}' upload-pack --strict",
-                    self.tools.git.display().to_string().replace('\'', "'\\''")
-                ),
+                &upload_pack,
                 &agent.workspace.join(".git").display().to_string(),
                 &format!("+{refname}:{refname}"),
             ],
@@ -842,9 +887,27 @@ impl Workspace<'_> {
         crew: &CrewPaths,
         agent: &AgentPaths,
     ) -> Result<(), MaterializeError> {
+        self.harvest_and_remove_after(id, crew, agent, || {})
+    }
+
+    /// `harvest_and_remove`, calling `after_checks` once both checks have
+    /// passed and before any git reads the clone's objects. Production
+    /// passes a no-op. `testing::harvest_and_remove_racing` passes a
+    /// rewrite of the clone: #70's race, a process the agent detached
+    /// past the tmux kill changing the clone under a verdict already
+    /// given. The checks always run; nothing here skips them.
+    pub(crate) fn harvest_and_remove_after(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        agent: &AgentPaths,
+        after_checks: impl FnOnce(),
+    ) -> Result<(), MaterializeError> {
         if crew.repo.join(".git").is_dir() && agent.workspace.join(".git").is_dir() {
             check_clone(id, crew, agent)?;
+            write_git_profile(self.tools, id, agent, crew)?;
             self.check_clone_config(id, crew, agent)?;
+            after_checks();
             if let Some(branch) = self.assigned_branch(id, crew, agent)? {
                 self.harvest(id, crew, agent, &branch)?;
             }

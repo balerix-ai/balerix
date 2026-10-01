@@ -293,6 +293,9 @@ fn a_changed_branch_moves_a_clean_clone_and_keeps_the_old_branch() {
         return;
     };
     let root = support::temp_root("workspace-rebranch");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let tip = push_branch(&root, "feature/issue-12");
@@ -404,6 +407,9 @@ fn a_changed_branch_on_a_dirty_clone_fails_and_keeps_the_tree() {
         return;
     };
     let root = support::temp_root("workspace-rebranch-dirty");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     push_branch(&root, "feature/issue-12");
@@ -581,6 +587,9 @@ fn an_agent_switching_branches_itself_is_left_alone_on_an_unchanged_setting() {
         return;
     };
     let root = support::temp_root("workspace-self-switch");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
@@ -639,6 +648,9 @@ fn a_clone_without_a_marker_is_judged_by_head_once_then_recorded() {
         return;
     };
     let root = support::temp_root("workspace-no-marker");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
@@ -690,6 +702,9 @@ fn a_changed_branch_the_clone_already_sits_on_is_recorded_without_a_move() {
         return;
     };
     let root = support::temp_root("workspace-already-there");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     push_branch(&root, "feature/issue-12");
@@ -863,6 +878,9 @@ fn the_clone_step_runs_no_program_from_the_clone_config() {
         return;
     };
     let root = support::temp_root("workspace-hardened");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     push_branch(&root, "feature/issue-12");
@@ -924,6 +942,9 @@ fn an_unpushed_commit_survives_removal_and_seeds_the_next_clone() {
         return;
     };
     let root = support::temp_root("workspace-harvest");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
@@ -1008,6 +1029,9 @@ fn removal_harvests_head_without_a_marker_and_skips_what_is_not_there() {
         return;
     };
     let root = support::temp_root("workspace-harvest-edge");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let crew = layout.crew(&"f/c".parse().unwrap());
@@ -1090,6 +1114,9 @@ fn a_branch_the_cache_has_checked_out_is_harvested_too() {
         return;
     };
     let root = support::temp_root("workspace-harvest-default-branch");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let crew = layout.crew(&"f/c".parse().unwrap());
@@ -1143,6 +1170,9 @@ fn a_broken_clone_fails_the_removal_and_stays() {
         return;
     };
     let root = support::temp_root("workspace-harvest-broken");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
@@ -1179,6 +1209,9 @@ fn a_worktree_from_0_1_is_refused_and_keep_repos_migrates_it() {
         return;
     };
     let root = support::temp_root("workspace-0-1-migrate");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
@@ -1268,6 +1301,9 @@ fn a_clone_pointed_at_another_repository_is_refused_and_nothing_is_harvested() {
         return;
     };
     let root = support::temp_root("workspace-foreign");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let crew = layout.crew(&"f/c".parse().unwrap());
@@ -1451,6 +1487,156 @@ fn a_clone_pointed_at_another_repository_is_refused_and_nothing_is_harvested() {
     ));
 }
 
+/// #70 and #68: the checks are a verdict on the clone as it was. A
+/// process the agent detached past the tmux kill can rewrite the clone
+/// after they pass. Each vector the checks refuse is applied here
+/// *between* the checks and the harvest; the daemon's git runs under the
+/// git profile, which cannot read the foreign repository, so nothing of
+/// it reaches the cache whatever the clone says.
+#[test]
+fn a_clone_rewritten_after_the_checks_serves_nothing_foreign() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use balerix_runtime::testing::harvest_and_remove_racing;
+
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-raced");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let crew = layout.crew(&"f/c".parse().unwrap());
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+
+    let foreign = root.join("foreign");
+    std::fs::create_dir_all(&foreign).unwrap();
+    git(&foreign, &["init", "-q", "-b", "main"]);
+    std::fs::write(foreign.join("SECRET"), "another crew's code\n").unwrap();
+    git(&foreign, &["add", "."]);
+    git(&foreign, &["commit", "-q", "-m", "foreign"]);
+    git(&foreign, &["repack", "-q", "-a", "-d"]);
+    let foreign_sha = git(&foreign, &["rev-parse", "HEAD"]).trim().to_string();
+    let foreign_git = foreign.join(".git");
+
+    let ran = root.join("uploadpack-ran");
+    let script = root.join("uploadpack.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ntouch {}\nexec git-upload-pack \"$@\"\n",
+            ran.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let raced = |name: &str, rewrite: &dyn Fn(&balerix_runtime::AgentPaths)| {
+        let id = format!("f/c/{name}");
+        let paths = layout.agent(&id.parse().unwrap());
+        ws.ensure_clone(&id, &crew, &paths, &repo, &format!("balerix/{id}"), "main")
+            .unwrap();
+        let outcome = harvest_and_remove_racing(&ws, &id, &crew, &paths, || rewrite(&paths));
+        assert!(
+            !git_ok(&crew.repo, &["cat-file", "-e", &foreign_sha]),
+            "{id}: the foreign commit reached the cache"
+        );
+        assert!(!ran.exists(), "{id}: remote.evil.uploadpack ran");
+        let e = outcome.unwrap_err().to_string();
+        assert!(e.starts_with(&format!("{id}: git ")), "{e}");
+        assert!(
+            paths.workspace.exists(),
+            "{id}: a failed harvest deletes nothing"
+        );
+    };
+    let point_ref = |paths: &balerix_runtime::AgentPaths, name: &str| {
+        std::fs::write(
+            paths
+                .workspace
+                .join(format!(".git/refs/heads/balerix/f/c/{name}")),
+            format!("{foreign_sha}\n"),
+        )
+        .unwrap();
+    };
+
+    // (A) alternates appended, the assigned ref written by hand
+    raced("a", &|p| {
+        let alternates = p.workspace.join(".git/objects/info/alternates");
+        let mut lines = std::fs::read_to_string(&alternates).unwrap();
+        lines.push_str(&format!("{}\n", foreign_git.join("objects").display()));
+        std::fs::write(&alternates, lines).unwrap();
+        point_ref(p, "a");
+    });
+
+    // (B) `.git` swapped for a symlink to the foreign repository's
+    raced("b", &|p| {
+        std::fs::remove_dir_all(p.workspace.join(".git")).unwrap();
+        symlink(&foreign_git, p.workspace.join(".git")).unwrap();
+    });
+
+    // (B') a pack symlinked to the foreign pack
+    raced("c", &|p| {
+        for entry in std::fs::read_dir(foreign_git.join("objects/pack")).unwrap() {
+            let path = entry.unwrap().path();
+            symlink(
+                &path,
+                p.workspace
+                    .join(".git/objects/pack")
+                    .join(path.file_name().unwrap()),
+            )
+            .unwrap();
+        }
+        point_ref(p, "c");
+    });
+
+    // (C) `.git/commondir`
+    raced("d", &|p| {
+        std::fs::write(
+            p.workspace.join(".git/commondir"),
+            foreign_git.display().to_string(),
+        )
+        .unwrap();
+    });
+
+    // (E) a promisor remote with its own upload-pack program
+    raced("e", &|p| {
+        for (k, v) in [
+            ("core.repositoryformatversion", "1"),
+            ("extensions.partialClone", "evil"),
+            ("remote.evil.promisor", "true"),
+            ("remote.evil.url", &foreign.display().to_string()),
+            ("remote.evil.uploadpack", &script.display().to_string()),
+        ] {
+            git(&p.workspace, &["config", k, v]);
+        }
+        point_ref(p, "e");
+    });
+
+    // an honest clone goes through the same path untouched
+    let id = "f/c/f";
+    let paths = layout.agent(&id.parse().unwrap());
+    ws.ensure_clone(id, &crew, &paths, &repo, "balerix/f/c/f", "main")
+        .unwrap();
+    harvest_and_remove_racing(&ws, id, &crew, &paths, || {}).unwrap();
+    assert!(!paths.workspace.exists());
+    assert!(git_ok(
+        &crew.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/balerix/f/c/f"
+        ]
+    ));
+}
+
 /// Review finding 3: `branch: <default branch>`. A fresh `--no-checkout`
 /// clone already has `main` with HEAD on it, so the create path needs
 /// `checkout -B` and the seed fetch `--update-head-ok`; without them the
@@ -1462,6 +1648,9 @@ fn an_agent_on_the_default_branch_materializes() {
         return;
     };
     let root = support::temp_root("workspace-default-branch");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
@@ -1623,6 +1812,9 @@ fn a_promisor_remote_in_the_clone_fetches_nothing_and_runs_nothing() {
         return;
     };
     let root = support::temp_root("workspace-promisor");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let id: balerix_core::AgentId = "f/c/p".parse().unwrap();
@@ -1729,7 +1921,10 @@ fn a_promisor_remote_in_the_clone_fetches_nothing_and_runs_nothing() {
         &paths.workspace,
         &["config", "--unset", "remote.evil.promisor"],
     );
-    let included = root.join("included.config");
+    // inside the clone: the git profile reads the clone, so this is what
+    // an include the agent could use looks like; one outside it is
+    // unreadable under the profile and fails the probe closed
+    let included = paths.workspace.join(".git/included.config");
     std::fs::write(&included, "[remote \"inc\"]\n\tpromisor = true\n").unwrap();
     git(
         &paths.workspace,
@@ -1832,6 +2027,9 @@ fn an_unreadable_head_without_a_marker_fails_the_removal() {
         return;
     };
     let root = support::temp_root("workspace-head-error");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
@@ -1870,6 +2068,9 @@ fn an_unreadable_head_fails_a_branch_change() {
         return;
     };
     let root = support::temp_root("workspace-head-error-change");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     push_branch(&root, "feature/issue-74");
@@ -1939,4 +2140,162 @@ fn a_failed_harvest_probe_fails_the_clone() {
     .to_string();
     assert!(e.contains("rev-parse refused"), "{e}");
     assert!(!paths.workspace.exists(), "the half-made clone is removed");
+}
+
+/// Spec N amendment §5: every git call in an existing clone, and the
+/// harvest's `upload-pack`, goes through `nono run --profile <git
+/// profile>`; the profile is rewritten before use whatever was there.
+#[test]
+fn daemon_git_in_a_clone_runs_under_the_git_profile() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-sandboxed");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    assert!(
+        !paths.git_profile().exists(),
+        "a fresh clone needs no git profile: the agent has not touched it"
+    );
+    std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();
+    git(&paths.workspace, &["add", "."]);
+    git(&paths.workspace, &["commit", "-q", "-m", "agent work"]);
+    let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
+
+    // whatever sits at the profile's path is replaced before use
+    std::fs::write(paths.git_profile(), "{\"filesystem\":{\"allow\":[\"/\"]}}").unwrap();
+    ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap();
+
+    assert_eq!(
+        git(&crew.repo, &["rev-parse", "refs/heads/balerix/f/c/a"]),
+        sha,
+        "the harvest still works through the sandbox"
+    );
+    let profile: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(paths.git_profile()).unwrap()).unwrap();
+    assert!(profile["filesystem"].get("allow").is_none(), "{profile}");
+    assert_eq!(profile["network"]["block"], true);
+
+    let log = std::fs::read_to_string(crew.root.join("logs/git.log")).unwrap();
+    let profile_arg = format!("run --profile {}", paths.git_profile().display());
+    let in_clone: Vec<&str> = log
+        .lines()
+        .filter(|l| l.starts_with("$ ") && l.contains(&paths.workspace.display().to_string()))
+        .filter(|l| !l.contains(" clone ") && !l.contains("checkout"))
+        .collect();
+    assert!(!in_clone.is_empty(), "{log}");
+    for line in in_clone {
+        assert!(
+            line.contains(&profile_arg) || line.contains("--upload-pack=env -i "),
+            "a git call in the existing clone ran outside the git profile: {line}"
+        );
+    }
+    assert!(
+        log.contains("--upload-pack=env -i ") && log.contains("upload-pack --strict"),
+        "{log}"
+    );
+}
+
+/// Review focus 1: the `--upload-pack` string is run by a shell, and the
+/// state root is the operator's to name.
+#[test]
+fn a_state_root_with_a_space_and_a_quote_is_harvested() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-quoting");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let layout = support::layout(&root.join("it's a root"));
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();
+    git(&paths.workspace, &["add", "."]);
+    git(&paths.workspace, &["commit", "-q", "-m", "agent work"]);
+    let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
+    ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap();
+    assert_eq!(
+        git(&crew.repo, &["rev-parse", "refs/heads/balerix/f/c/a"]),
+        sha
+    );
+}
+
+/// NS-5: no fallback. Without a nono that runs, the removal fails, the
+/// clone stays and nothing is harvested.
+#[test]
+fn a_harvest_without_a_working_nono_fails_and_keeps_the_clone() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-no-nono");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    }
+    .ensure_repo("f/c", &crew, &repo, "main")
+    .unwrap();
+    Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    }
+    .ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+    .unwrap();
+
+    let no_nono = balerix_runtime::ToolPaths {
+        nono: root.join("no-such-nono"),
+        ..tools.clone()
+    };
+    let e = Workspace {
+        tools: &no_nono,
+        gh_config_dir: None,
+    }
+    .harvest_and_remove("f/c/a", &crew, &paths)
+    .unwrap_err()
+    .to_string();
+    assert!(e.starts_with("f/c/a: "), "{e}");
+    assert!(
+        e.contains("no-such-nono"),
+        "the message names what is missing: {e}"
+    );
+    assert!(paths.workspace.exists(), "a failed removal deletes nothing");
+    assert!(!git_ok(
+        &crew.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/balerix/f/c/a"
+        ]
+    ));
 }

@@ -52,6 +52,7 @@ pub(crate) struct Cmd {
     args: Vec<String>,
     env: BTreeMap<String, String>,
     env_removals: Vec<String>,
+    env_clear: bool,
     cwd: Option<PathBuf>,
     log: Option<PathBuf>,
     log_stdout: bool,
@@ -93,6 +94,7 @@ impl Cmd {
             args: Vec::new(),
             env: BTreeMap::new(),
             env_removals: Vec::new(),
+            env_clear: false,
             cwd: None,
             log: None,
             log_stdout: true,
@@ -118,6 +120,14 @@ impl Cmd {
     /// if `env`/`envs` for it was called first.
     pub(crate) fn env_remove(mut self, k: impl Into<String>) -> Self {
         self.env_removals.push(k.into());
+        self
+    }
+    /// Starts the child from an empty environment: only what `env`/`envs`
+    /// set on this `Cmd` reaches it. For a `nono run` the daemon makes on
+    /// its own behalf, where an inherited `NONO_ALLOW` would widen the
+    /// sandbox.
+    pub(crate) fn env_clear(mut self) -> Self {
+        self.env_clear = true;
         self
     }
     pub(crate) fn cwd(mut self, d: &Path) -> Self {
@@ -196,7 +206,11 @@ impl Cmd {
 
     fn exec(&self, accepted: &[i32], stdin: Option<&[u8]>) -> Result<CmdOutput, CmdFailure> {
         let mut c = Command::new(&self.program);
-        c.args(&self.args).envs(&self.env);
+        c.args(&self.args);
+        if self.env_clear {
+            c.env_clear();
+        }
+        c.envs(&self.env);
         for k in &self.env_removals {
             c.env_remove(k);
         }
@@ -324,6 +338,18 @@ impl Cmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sandboxed git call starts from nothing the daemon inherited
+    /// (`NONO_ALLOW`, `GIT_DIR`, …): only what the call sets.
+    #[test]
+    fn env_clear_drops_the_inherited_environment() {
+        let out = Cmd::new(Path::new("/usr/bin/env"))
+            .env_clear()
+            .env("ONLY", "this")
+            .run()
+            .unwrap();
+        assert_eq!(out.stdout, "ONLY=this\n");
+    }
 
     #[test]
     fn discover_finds_tools_on_path_and_names_the_missing_one() {

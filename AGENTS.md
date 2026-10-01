@@ -166,6 +166,19 @@ credentials, hook input, or sandbox rules.
   fixtures do the same — the pre-commit hook exports them, and a git
   subprocess that inherits them operates on this repository instead of the
   test's.
+- The clone step's git (`Workspace::agent_git` and the harvest's
+  `upload-pack`) runs inside `nono run --profile nono-git-profile.json`
+  from an empty environment. Its hardening variables live in that
+  profile's `set_vars` (`sandbox::render_git_profile`), not on the
+  command: a variable added to `harden_agent_git` alone reaches the
+  workspace reader and not these calls. Tests that run git in an existing
+  clone need Landlock and gate on `support::landlock_works`. Go through
+  `Workspace::prepare_sandbox` before the first sandboxed call: it writes
+  the profile, then runs one `git version` that must exit 0. The yes/no
+  probes accept exit 1 as git's "no", and nono's own start-up failure also
+  exits 1, so without it a nono that cannot run reads as "branch absent"
+  and the clone is deleted unharvested
+  (`a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone`).
 - The e2e overrides the system tool table with an empty `[tools]` in its scratch
   `$XDG_CONFIG_HOME/balerix/mise.toml` so nothing downloads; the real embedded
   table pins `claude`, and a fresh `up` on a real host installs it.

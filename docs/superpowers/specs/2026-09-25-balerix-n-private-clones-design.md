@@ -362,3 +362,12 @@ directory, not a repository.
   extension, on a promisor remote alone and through an included file;
   `inspect_it` the reader's; a unit test that both builders set the
   variable over an inherited `0`.
+- 2026-10-01 (#68, #70): the durable alternative named above landed, as
+  `2026-10-01-balerix-n-sandboxed-daemon-git-design.md`. Every git call
+  in an existing clone at removal and branch change, and the harvest's
+  `upload-pack`, runs under a daemon-rendered read-only nono profile
+  (`nono-git-profile.json`), not the agent's own. "The session is
+  stopped before both call sites, so nothing races the check" was wrong:
+  a detached process survives the tmux kill; the profile, not the check,
+  is now what a rewritten clone cannot get past. §5 and §7 are read with
+  that amendment.

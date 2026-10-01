@@ -72,7 +72,7 @@ With a hand-written profile of the shape in §4:
 | Key | Value |
 |-----|-------|
 | `meta` | name `balerix-git-<fleet>-<crew>-<agent>` |
-| `filesystem.read` | `SYSTEM_READ`; `crew.cache_objects()`; `paths.workspace`; the crew's `no-hooks/` directory (what `core.hooksPath` names); the canonical path of the `git` binary `ToolPaths` discovered (a single file, as the agent's profile grants `mise`: git comes from the host and need not sit under `/usr`) |
+| `filesystem.read` | `SYSTEM_READ`; `crew.cache_objects()`; `paths.workspace`; the crew's `no-hooks/` directory (what `core.hooksPath` names); the canonical path of the `git` binary `ToolPaths` discovered (a single file, as the agent's profile grants `mise`); the canonical `git --exec-path` directory (§12.1). A git whose libraries sit outside `SYSTEM_READ` cannot run under it (§12.1) |
 | `filesystem.allow` | absent |
 | `workdir` | `access: none` |
 | `network` | `block: true`; no `open_port` |
@@ -231,3 +231,122 @@ every git call in the cache, and `inspect.rs` are untouched.
 4. `docs/THREAT-MODEL.md`, `ARCHITECTURE.md`, `AGENTS.md` and Spec N §12
    read as §7 and §9 say; #68 and #70 are closed and the two follow-up
    issues exist.
+
+## 12. Amendment 2026-10-01: the profile's limits (#109)
+
+**Status:** Approved in brainstorm 2026-10-01. Found by the final review
+of the work above. Two limits of the sandboxed calls, and three tool
+bumps that ride in the same PR.
+
+### 12.1 The exec-path grant
+
+The profile of §4 grants the git binary as one file. A git installed
+outside `SYSTEM_READ` (`/usr`, `/lib`, `/lib64`, `/bin`) also needs its
+`libexec/git-core`: `upload-pack` spawns `git pack-objects` through it.
+
+- `write_git_profile` runs `<git> --exec-path` before it renders: as the
+  daemon, unsandboxed, through `scrub_git_env`, with no repository
+  argument. It is the host's git answering about itself; nothing the
+  agent wrote is read. The answer is canonicalized (Landlock rules bind
+  to what a path resolves to) and passed to `render_git_profile`, which
+  adds it to `filesystem.read`.
+- A `--exec-path` that fails, or names a directory that does not exist,
+  fails the step as a `MaterializeError::Tool`. No profile is written
+  without the grant (NS-5).
+- On a host whose git sits under `/usr` the directory is already inside
+  `SYSTEM_READ` and the profile grants nothing new in effect.
+
+| # | Decision | Rationale |
+|---|----------|-----------|
+| NS-6 | Library prefixes are **not** granted, by setting or by derivation. | A git from nix or Linuxbrew needs its loader and libraries from its own prefix, and a mise shim resolves to the mise binary. Nobody has reproduced the failure on such a host; a daemon-level setting is a new configuration surface on a sandbox boundary, and deriving the directories from the binary widens the grant without the operator choosing to. The limit stays documented and fails closed: removal, `down` without `--purge` and a branch change fail there, and `--purge` is the way past. A follow-up issue tracks the setting. |
+
+What this covers: a git under a prefix such as `/opt` or `/usr/local`
+that links the system's libraries.
+
+### 12.2 A sandbox failure is never git's "no"
+
+Three calls through `agent_git` accept exit 1 as an answer: the promisor
+probe (`config --get-regexp`), `rev-parse --verify --quiet` before the
+harvest, and `symbolic-ref -q` in `head_branch`. `prepare_sandbox` proves
+once that nono starts, but nono's own failure on a later call also exits
+1 and read as "no keys", "branch absent" or "detached": the harvest was
+skipped and the clone deleted unharvested.
+
+- `CmdOutput` carries `stderr`. In `agent_git`, an accepted non-zero exit
+  whose stderr is not empty is a `MaterializeError::Tool` with that
+  stderr. Git is silent on exit 1 for all three probes; nono prints
+  `nono: …`.
+- The rule fails closed both ways: a git warning beside a real "no" also
+  fails the step, as any git error already does (#74).
+- Exit 0 is untouched; stderr there is not inspected.
+- When the canary in `prepare_sandbox` fails, the error's stderr gains
+  the line `the sandbox did not start; see <agent>/logs/nono-git.log`.
+
+Re-running the canary after each "no" was rejected: it doubles the
+sandboxed calls (about 55 ms each, §3) and leaves a window between the
+answer and the check.
+
+### 12.3 Tests
+
+- `sandbox.rs` unit: the rendered profile's `read` holds the exec-path
+  given; §8's "every `read` path" assertion admits it.
+- The exec-path fixture is a wrapper script under `target/tmp` used as
+  `ToolPaths::git`: `exec <host git> --exec-path=<dir under target/tmp>
+  "$@"`, so `--exec-path` answers that directory. A harvest through it
+  would not tell a granted exec-path from a denied one, because git
+  falls back to the host `git` on `PATH` for its helpers; so the grant
+  is asserted directly:
+  - `sandbox_it`: `write_git_profile` with the wrapper writes a profile
+    whose `read` holds the canonical directory, and a file in it reads
+    inside the sandbox (the existing case proves a path outside the
+    grants does not);
+  - `sandbox_it`: a wrapper whose `--exec-path` exits non-zero, and one
+    naming a missing directory, fail `write_git_profile` and leave no
+    profile.
+- `workspace_it`, removal: a nono shim that passes `validate` and the
+  canary, then exits 1 printing `nono: …` on later calls;
+  `harvest_and_remove` fails, the clone stays, the cache has no branch.
+- `workspace_it`, branch change: the same shim under `ensure_clone` with
+  a changed `branch`; it fails and the clone stays.
+- The existing "branch absent", "no promisor keys" and detached-HEAD
+  cases prove that git's own exit 1 is silent and still a "no".
+- The canary's hint: asserted in
+  `a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone`.
+
+### 12.4 Tool bumps in the same PR
+
+`mise.toml`: rust 1.98.1 → 1.99.0, claude 2.1.286 → 2.1.287, trivy
+0.74.0 → 0.75.0.
+
+- rust: `mise run check` and `mise run plugins` pass, new lints fixed.
+- claude: the embedded tool table changes what agents get, so
+  `mise run verify-claude` and `mise run verify-questions` are run and
+  their results stated in the PR.
+- trivy: CI only.
+
+### 12.5 Documents and issues
+
+- `render_git_profile`'s doc comment loses "need not sit under `/usr`"
+  and states §12.1 and NS-6.
+- `AGENTS.md` (the clone-step gotcha) and the README's limit: the
+  exec-path is granted, library prefixes are not; an accepted exit 1
+  with stderr is a failure.
+- `docs/THREAT-MODEL.md`: the clone-step row names the exec-path grant
+  as part of what the profile reads.
+- PR title `fix(runtime): grant git's exec-path in the git profile; a
+  sandbox failure is never git's "no" (#109)`; it closes #109, the bumps
+  named in the body.
+- New issue, opened with the PR: a daemon-level setting for read-only
+  library prefixes in the git profile (NS-6).
+
+### 12.6 Done when
+
+1. The git profile grants the canonical exec-path, and no profile is
+   written without it.
+2. No accepted exit 1 with stderr reads as "no"; the two shim tests and
+   the exec-path tests pass.
+3. `mise run check`, `mise run plugins`, `mise run test-it` and
+   `mise run e2e` pass on rust 1.99.0; `verify-claude` and
+   `verify-questions` pass on claude 2.1.287.
+4. The documents read as §12.5 says; #109 is closed and the follow-up
+   issue exists.

@@ -503,6 +503,24 @@ impl Workspace<'_> {
         }
     }
 
+    /// Writes the git profile and proves the sandbox starts under it,
+    /// before any probe's exit code is trusted. The yes/no probes after
+    /// this (`config --get-regexp`, `rev-parse --verify --quiet`) accept
+    /// exit 1 as git's answer, and nono's own failure to run also exits 1;
+    /// a `version` that must exit 0 tells the two apart, so a nono that
+    /// validates but cannot run fails the step instead of reading as "no
+    /// promisor keys" or "branch absent".
+    fn prepare_sandbox(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        agent: &AgentPaths,
+    ) -> Result<(), MaterializeError> {
+        write_git_profile(self.tools, id, agent, crew)?;
+        self.agent_git(id, crew, agent, &["version"], &[0])
+            .map(|_| ())
+    }
+
     /// `nono`'s arguments up to and including the git binary, for a git
     /// call in `agent`'s existing clone: `-s --log-file <logs>/nono-git.log
     /// run --profile <git profile> -- <git>`. The profile is
@@ -617,7 +635,7 @@ impl Workspace<'_> {
                 // call; `decide_clone` agrees (`Reuse`)
                 return Ok(());
             }
-            write_git_profile(self.tools, id, agent, crew)?;
+            self.prepare_sandbox(id, crew, agent)?;
             self.check_clone_config(id, crew, agent)?;
             let head = self.head_branch(id, crew, agent)?;
             let decision = decide_clone(marker.as_deref(), head.as_deref(), branch, || {
@@ -905,7 +923,7 @@ impl Workspace<'_> {
     ) -> Result<(), MaterializeError> {
         if crew.repo.join(".git").is_dir() && agent.workspace.join(".git").is_dir() {
             check_clone(id, crew, agent)?;
-            write_git_profile(self.tools, id, agent, crew)?;
+            self.prepare_sandbox(id, crew, agent)?;
             self.check_clone_config(id, crew, agent)?;
             after_checks();
             if let Some(branch) = self.assigned_branch(id, crew, agent)? {

@@ -2305,3 +2305,66 @@ fn a_harvest_without_a_working_nono_fails_and_keeps_the_clone() {
         ]
     ));
 }
+
+/// NS-5, the other way a nono fails: it starts, validates the profile and
+/// then exits 1 on `run`, the same status git's yes/no probes use for
+/// "no". The removal must fail, not read that as "no promisor keys" and
+/// "branch absent", skip the harvest and delete the clone.
+#[test]
+fn a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-nono-exit-1");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();
+    git(&paths.workspace, &["add", "."]);
+    git(&paths.workspace, &["commit", "-q", "-m", "agent work"]);
+
+    let shim = root.join("nono-cannot-run.sh");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = validate ]; then exec {} \"$@\"; fi\ndone\nexit 1\n",
+            tools.nono.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let broken = balerix_runtime::ToolPaths {
+        nono: shim,
+        ..tools.clone()
+    };
+    let e = Workspace {
+        tools: &broken,
+        gh_config_dir: None,
+    }
+    .harvest_and_remove("f/c/a", &crew, &paths)
+    .expect_err("a nono that cannot run must fail the removal")
+    .to_string();
+    assert!(e.starts_with("f/c/a: git "), "{e}");
+    assert!(paths.workspace.exists(), "a failed removal deletes nothing");
+    assert!(!git_ok(
+        &crew.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/balerix/f/c/a"
+        ]
+    ));
+}

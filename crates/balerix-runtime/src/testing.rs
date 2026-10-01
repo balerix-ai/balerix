@@ -4,8 +4,9 @@
 //! garbage — and, for the e2e, a marker that its detached daemon and tmux
 //! server may still be alive. A library module (not `#[cfg(test)]`) for
 //! the same reason as `balerix_server::testing`: two crates' integration
-//! tests share it. Also the one hook integration tests need inside the
-//! clone step (`harvest_and_remove_racing`).
+//! tests share it. Also the two hooks integration tests need inside the
+//! clone step (`harvest_and_remove_racing`,
+//! `harvest_and_remove_racing_the_fetch`).
 
 use std::ops::Deref;
 use std::os::unix::fs::MetadataExt;
@@ -226,7 +227,22 @@ pub fn harvest_and_remove_racing(
     agent: &crate::AgentPaths,
     rewrite: impl FnOnce(),
 ) -> Result<(), balerix_core::MaterializeError> {
-    ws.harvest_and_remove_after(id, crew, agent, rewrite)
+    ws.harvest_and_remove_after(id, crew, agent, rewrite, || {})
+}
+
+/// `harvest_and_remove_racing` with `rewrite` run later: after the
+/// harvest's last sandboxed probe (`rev-parse` of the branch) and before
+/// its fetch, the one call that reaches the clone from outside the git
+/// profile. A rewrite the probes would trip over (`.git` no longer a
+/// repository) gets past them only here.
+pub fn harvest_and_remove_racing_the_fetch(
+    ws: &crate::Workspace<'_>,
+    id: &str,
+    crew: &crate::CrewPaths,
+    agent: &crate::AgentPaths,
+    rewrite: impl FnOnce(),
+) -> Result<(), balerix_core::MaterializeError> {
+    ws.harvest_and_remove_after(id, crew, agent, || {}, rewrite)
 }
 
 #[cfg(test)]

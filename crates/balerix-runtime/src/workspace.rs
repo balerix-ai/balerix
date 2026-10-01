@@ -197,11 +197,12 @@ fn discard_half_made(id: &str, path: &Path, failed: MaterializeError) -> Materia
 /// `agent_git` names it with `--git-dir` and the harvest fetches with
 /// `upload-pack --strict`, so neither falls back to `workspace/` itself.
 /// `GIT_CEILING_DIRECTORIES` bounds upward discovery only and helps with
-/// none of this. The session is stopped before both callers run, but a process the
-/// agent detached can outlive the tmux kill and rewrite the clone after
-/// this check (#70). That is why the git calls after it run under the
-/// git profile (`agent_git`): this check names the problem for the
-/// operator, the profile is what holds. Filesystem only: no git call.
+/// none of this. The session is stopped before both callers run, but a
+/// process the agent detached can outlive the tmux kill and rewrite the
+/// clone after this check (#70). That is why the git calls after it run
+/// under the git profile (`agent_git`, and the harvest's `upload-pack`):
+/// this check names the problem for the operator, the profile is what
+/// holds. Filesystem only: no git call.
 fn check_clone(id: &str, crew: &CrewPaths, agent: &AgentPaths) -> Result<(), MaterializeError> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -286,6 +287,24 @@ const CLONE_STORE: &str = "the clone's objects may be another repository's; \
                      balerix runs no git in it and harvests nothing from it";
 const CACHE_STORE: &str = "the crew cache's objects may be another repository's; \
                      balerix runs no git in the clone and harvests nothing into the cache";
+
+/// `path` as a `file://` URL that git decodes back to exactly its bytes:
+/// every byte but an unreserved URL character or `/` is percent-encoded,
+/// `%` itself included, so a `%20` in a path stays `%20`.
+fn file_url(path: &Path) -> String {
+    use std::fmt::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut url = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            url.push(char::from(b));
+        } else {
+            let _ = write!(url, "%{b:02X}");
+        }
+    }
+    url
+}
 
 /// The first symlink at or under `root`, found without following any.
 /// A work list, not recursion: the agent decides how deep the tree goes.
@@ -657,7 +676,7 @@ impl Workspace<'_> {
                     });
                 }
                 CloneDecision::Recreate { old } => {
-                    self.harvest(id, crew, agent, &old)?;
+                    self.harvest(id, crew, agent, &old, || {})?;
                     remove_tree(id, &agent.workspace)?;
                 }
             }
@@ -815,27 +834,32 @@ impl Workspace<'_> {
     /// fetch run *in the cache*. A push run in the clone would honour the
     /// clone's config (an `url.<x>.insteadOf` there could aim it at
     /// another crew's cache); `upload-pack` runs in the clone under the
-    /// git profile (`agent_git`), so it serves only what the agent could
-    /// read, and the only write is into the daemon-owned cache. The `+` is intended: the clone was seeded from
-    /// the cache's copy, so the clone's is the newer state even after a
-    /// rebase. A branch the clone does not have (deleted by the agent) is
-    /// skipped.
+    /// git profile (`sandbox_args`), so it serves only what the agent
+    /// could read, and the only write is into the daemon-owned cache. The
+    /// `+` is intended: the clone was seeded from the cache's copy, so the
+    /// clone's is the newer state even after a rebase. A branch the clone
+    /// does not have (deleted by the agent) is skipped.
     ///
     /// The cache's HEAD is detached (`ensure_repo`), so a harvest of the
     /// default branch is a fetch like any other: git refuses to fetch into
     /// the branch HEAD names, and there is none.
     ///
-    /// The remote is `workspace/.git`, served by `upload-pack --strict`:
-    /// without `--strict`, upload-pack tries `<path>/.git` before `<path>`,
-    /// and falls back to `workspace/` itself when `.git` is not a
-    /// repository — either way a repository the agent assembled rather
-    /// than the one `check_clone` inspected.
+    /// The remote is `workspace/.git` as a `file://` URL (`file_url`),
+    /// served by `upload-pack --strict`. Not a plain path: git reads a
+    /// local path that is a bundle file (say, `.git` swapped for a symlink
+    /// to one) with its bundle transport, itself, as the daemon, and
+    /// ignores `--upload-pack`. Without `--strict`, upload-pack tries
+    /// `<path>/.git` before `<path>`, and falls back to `workspace/` itself
+    /// when `.git` is not a repository — either way a repository the agent
+    /// assembled rather than the one `check_clone` inspected.
+    /// `before_fetch` runs just before the fetch (a no-op but in `testing`).
     fn harvest(
         &self,
         id: &str,
         crew: &CrewPaths,
         agent: &AgentPaths,
         branch: &str,
+        before_fetch: impl FnOnce(),
     ) -> Result<(), MaterializeError> {
         let refname = format!("refs/heads/{branch}");
         let present = self.agent_git(
@@ -861,6 +885,7 @@ impl Workspace<'_> {
             upload_pack.push_str(&sh_quote(&word));
         }
         upload_pack.push_str(" upload-pack --strict");
+        before_fetch();
         self.git(
             id,
             crew,
@@ -871,7 +896,7 @@ impl Workspace<'_> {
                 "--quiet",
                 "--no-auto-gc",
                 &upload_pack,
-                &agent.workspace.join(".git").display().to_string(),
+                &file_url(&agent.workspace.join(".git")),
                 &format!("+{refname}:{refname}"),
             ],
         )
@@ -905,13 +930,14 @@ impl Workspace<'_> {
         crew: &CrewPaths,
         agent: &AgentPaths,
     ) -> Result<(), MaterializeError> {
-        self.harvest_and_remove_after(id, crew, agent, || {})
+        self.harvest_and_remove_after(id, crew, agent, || {}, || {})
     }
 
     /// `harvest_and_remove`, calling `after_checks` once both checks have
-    /// passed and before any git reads the clone's objects. Production
-    /// passes a no-op. `testing::harvest_and_remove_racing` passes a
-    /// rewrite of the clone: #70's race, a process the agent detached
+    /// passed and before any git reads the clone's objects, and
+    /// `before_fetch` after the harvest's last sandboxed probe and before
+    /// its fetch. Production passes no-ops. `testing` passes a rewrite of
+    /// the clone to one of them: #70's race, a process the agent detached
     /// past the tmux kill changing the clone under a verdict already
     /// given. The checks always run; nothing here skips them.
     pub(crate) fn harvest_and_remove_after(
@@ -920,6 +946,7 @@ impl Workspace<'_> {
         crew: &CrewPaths,
         agent: &AgentPaths,
         after_checks: impl FnOnce(),
+        before_fetch: impl FnOnce(),
     ) -> Result<(), MaterializeError> {
         if crew.repo.join(".git").is_dir() && agent.workspace.join(".git").is_dir() {
             check_clone(id, crew, agent)?;
@@ -927,7 +954,7 @@ impl Workspace<'_> {
             self.check_clone_config(id, crew, agent)?;
             after_checks();
             if let Some(branch) = self.assigned_branch(id, crew, agent)? {
-                self.harvest(id, crew, agent, &branch)?;
+                self.harvest(id, crew, agent, &branch, before_fetch)?;
             }
         }
         remove_tree(id, &agent.workspace)
@@ -980,7 +1007,9 @@ impl Workspace<'_> {
 #[cfg(test)]
 mod tests {
     use crate::tools::Cmd;
-    use crate::workspace::{CloneDecision, decide_clone, harden_agent_git, scrub_git_env};
+    use crate::workspace::{
+        CloneDecision, decide_clone, file_url, harden_agent_git, scrub_git_env,
+    };
 
     fn clean() -> Result<bool, ()> {
         Ok(false)
@@ -1011,6 +1040,31 @@ mod tests {
         let layout = crate::StateLayout::from_env(dir.path(), |_| None);
         let crew = layout.crew(&"f/c".parse().unwrap());
         assert_eq!(sees(harden_agent_git(inherited(), &crew, dir.path())), "1");
+    }
+
+    /// #70: the harvest names the clone by URL; git percent-decodes it,
+    /// so every byte that is not plainly safe is encoded, `%` included.
+    #[test]
+    fn file_url_encodes_every_byte_git_would_decode_or_misread() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(
+            file_url(std::path::Path::new("/a/b-c_d.e~f/.git")),
+            "file:///a/b-c_d.e~f/.git"
+        );
+        assert_eq!(
+            file_url(std::path::Path::new("/it's a 100%20 root/#x?y")),
+            "file:///it%27s%20a%20100%2520%20root/%23x%3Fy"
+        );
+        assert_eq!(
+            file_url(std::path::Path::new("/r\u{e9}pertoire")),
+            "file:///r%C3%A9pertoire"
+        );
+        assert_eq!(
+            file_url(std::path::Path::new(std::ffi::OsStr::from_bytes(b"/\xff"))),
+            "file:///%FF",
+            "a path that is not UTF-8 is encoded byte by byte"
+        );
     }
 
     /// Spec L §12's marker rule over the clone (Spec N §4 step 1).

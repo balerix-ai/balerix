@@ -1490,14 +1490,17 @@ fn a_clone_pointed_at_another_repository_is_refused_and_nothing_is_harvested() {
 /// #70 and #68: the checks are a verdict on the clone as it was. A
 /// process the agent detached past the tmux kill can rewrite the clone
 /// after they pass. Each vector the checks refuse is applied here
-/// *between* the checks and the harvest; the daemon's git runs under the
-/// git profile, which cannot read the foreign repository, so nothing of
-/// it reaches the cache whatever the clone says.
+/// *between* the checks and the harvest (F, which the harvest's probes
+/// would trip over, just before its fetch); the daemon's git runs under
+/// the git profile, which cannot read the foreign repository, so nothing
+/// of it reaches the cache whatever the clone says.
 #[test]
 fn a_clone_rewritten_after_the_checks_serves_nothing_foreign() {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    use balerix_runtime::testing::harvest_and_remove_racing;
+    use balerix_runtime::testing::{
+        harvest_and_remove_racing, harvest_and_remove_racing_the_fetch,
+    };
 
     let Some(tools) = support::tools() else {
         assert!(!support::require_or_skip("git", false));
@@ -1544,12 +1547,17 @@ fn a_clone_rewritten_after_the_checks_serves_nothing_foreign() {
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let raced = |name: &str, rewrite: &dyn Fn(&balerix_runtime::AgentPaths)| {
+    let raced_at = |name: &str, at_fetch: bool, rewrite: &dyn Fn(&balerix_runtime::AgentPaths)| {
         let id = format!("f/c/{name}");
         let paths = layout.agent(&id.parse().unwrap());
         ws.ensure_clone(&id, &crew, &paths, &repo, &format!("balerix/{id}"), "main")
             .unwrap();
-        let outcome = harvest_and_remove_racing(&ws, &id, &crew, &paths, || rewrite(&paths));
+        let race = if at_fetch {
+            harvest_and_remove_racing_the_fetch
+        } else {
+            harvest_and_remove_racing
+        };
+        let outcome = race(&ws, &id, &crew, &paths, &|| rewrite(&paths));
         assert!(
             !git_ok(&crew.repo, &["cat-file", "-e", &foreign_sha]),
             "{id}: the foreign commit reached the cache"
@@ -1562,6 +1570,8 @@ fn a_clone_rewritten_after_the_checks_serves_nothing_foreign() {
             "{id}: a failed harvest deletes nothing"
         );
     };
+    let raced =
+        |name: &str, rewrite: &dyn Fn(&balerix_runtime::AgentPaths)| raced_at(name, false, rewrite);
     let point_ref = |paths: &balerix_runtime::AgentPaths, name: &str| {
         std::fs::write(
             paths
@@ -1623,6 +1633,28 @@ fn a_clone_rewritten_after_the_checks_serves_nothing_foreign() {
             git(&p.workspace, &["config", k, v]);
         }
         point_ref(p, "e");
+    });
+
+    // (F) `.git` swapped for a symlink to a bundle of the foreign
+    // repository carrying the branch the harvest asks for: git reads a
+    // local path that is a bundle file itself, as the daemon, without
+    // running any `upload-pack`. The sandboxed probes cannot read such a
+    // `.git` and fail first, so the swap comes after the last of them
+    let bundle = root.join("foreign.bundle");
+    git(&foreign, &["branch", "balerix/f/c/g"]);
+    git(
+        &foreign,
+        &[
+            "bundle",
+            "create",
+            "-q",
+            &bundle.display().to_string(),
+            "balerix/f/c/g",
+        ],
+    );
+    raced_at("g", true, &|p| {
+        std::fs::remove_dir_all(p.workspace.join(".git")).unwrap();
+        symlink(&bundle, p.workspace.join(".git")).unwrap();
     });
 
     // an honest clone goes through the same path untouched
@@ -1939,6 +1971,33 @@ fn a_promisor_remote_in_the_clone_fetches_nothing_and_runs_nothing() {
     refused("remote.inc.promisor");
     git(&paths.workspace, &["config", "--unset", "include.path"]);
 
+    // an include outside the clone: unreadable under the git profile, so
+    // the probe fails closed, before any git reads an object
+    let outside = root.join("included.config");
+    std::fs::write(&outside, "[remote \"out\"]\n\tpromisor = true\n").unwrap();
+    git(
+        &paths.workspace,
+        &["config", "include.path", &outside.display().to_string()],
+    );
+    let e = ws
+        .harvest_and_remove("f/c/p", &crew, &paths)
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("f/c/p: git config"), "{e}");
+    assert!(paths.workspace.exists(), "a failed removal deletes nothing");
+    assert!(!ran.exists(), "remote.evil.uploadpack ran as the daemon");
+    assert!(!git_ok(&crew.repo, &["cat-file", "-e", &foreign_sha]));
+    assert!(!git_ok(
+        &crew.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/balerix/f/c/p"
+        ]
+    ));
+    git(&paths.workspace, &["config", "--unset", "include.path"]);
+
     // an `alternates` file in the cache itself is refused, by name: the
     // message says the cache's objects are the suspect ones, not the clone's
     let cache_alternates = crew.cache_objects().join("info/alternates");
@@ -2217,7 +2276,8 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
 }
 
 /// Review focus 1: the `--upload-pack` string is run by a shell, and the
-/// state root is the operator's to name.
+/// state root is the operator's to name. The `%` is for the remote, a
+/// `file://` URL git percent-decodes (#70).
 #[test]
 fn a_state_root_with_a_space_and_a_quote_is_harvested() {
     let Some(tools) = support::tools() else {
@@ -2228,7 +2288,7 @@ fn a_state_root_with_a_space_and_a_quote_is_harvested() {
     if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
         return;
     }
-    let layout = support::layout(&root.join("it's a root"));
+    let layout = support::layout(&root.join("it's a 100%20 root"));
     let repo = bare_repo(&root);
     let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
     let crew = layout.crew(&id.crew_ref());

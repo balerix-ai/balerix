@@ -245,9 +245,12 @@ outside `SYSTEM_READ` (`/usr`, `/lib`, `/lib64`, `/bin`) also needs its
 `libexec/git-core`: `upload-pack` spawns `git pack-objects` through it.
 
 - `write_git_profile` runs `<git> --exec-path` before it renders: as the
-  daemon, unsandboxed, through `scrub_git_env`, with no repository
-  argument. It is the host's git answering about itself; nothing the
-  agent wrote is read. The answer is canonicalized (Landlock rules bind
+  daemon, unsandboxed, with no repository argument, from an empty
+  environment but `PATH` (the outer path), as the sandboxed call
+  starts: a `GIT_EXEC_PATH` the daemon inherited would otherwise make
+  the grant name a directory the sandboxed git never uses. It is the
+  host's git answering about itself; nothing the agent wrote is read.
+  The answer is canonicalized (Landlock rules bind
   to what a path resolves to) and passed to `render_git_profile`, which
   adds it to `filesystem.read`.
 - A `--exec-path` that fails, or names a directory that does not exist,
@@ -279,8 +282,10 @@ skipped and the clone deleted unharvested.
 - The rule fails closed both ways: a git warning beside a real "no" also
   fails the step, as any git error already does (#74).
 - Exit 0 is untouched; stderr there is not inspected.
-- When the canary in `prepare_sandbox` fails, the error's stderr gains
-  the line `the sandbox did not start; see <agent>/logs/nono-git.log`.
+- When the canary in `prepare_sandbox` fails, the error's stderr is
+  prefixed with `the sandbox did not start; see
+  <agent>/logs/nono-git.log: `. A prefix, not a line of its own: the
+  error's display is the first stderr line.
 
 Re-running the canary after each "no" was rejected: it doubles the
 sandboxed calls (about 55 ms each, §3) and leaves a window between the

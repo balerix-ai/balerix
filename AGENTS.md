@@ -179,6 +179,13 @@ credentials, hook input, or sandbox rules.
   exits 1, so without it a nono that cannot run reads as "branch absent"
   and the clone is deleted unharvested
   (`a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone`).
+  The profile grants the system prefixes (`/usr`, `/lib`, `/lib64`,
+  `/bin`) and the `git` binary as a single file, not its shared libraries
+  or `libexec/git-core`, so a `git` installed elsewhere (nix, Linuxbrew,
+  a mise shim) cannot run under it. That fails closed: `down` without
+  `--purge`, `remove` and a branch change fail on such a host, `--purge`
+  is the way past, and the user `sandbox` block does not reach this
+  profile.
 - The e2e overrides the system tool table with an empty `[tools]` in its scratch
   `$XDG_CONFIG_HOME/balerix/mise.toml` so nothing downloads; the real embedded
   table pins `claude`, and a fresh `up` on a real host installs it.
@@ -450,7 +457,10 @@ credentials, hook input, or sandbox rules.
   cache. `agent_git` passes `--git-dir=<ws>/.git` and the harvest fetches
   `<ws>/.git` with `upload-pack --strict`: without them a `.git` git
   rejects (no `HEAD`) makes git serve `workspace/` itself as a bare
-  repository. Keep all three when touching either call. It also refuses
+  repository. Keep all three when touching either call, and keep the
+  harvest's remote a percent-encoded `file://` URL (`file_url`): given a
+  plain path that is a bundle file, git reads it as the daemon and skips
+  `upload-pack`. It also refuses
   an `alternates` file in the *cache's* `objects/info/` (never legitimate).
   A promisor remote the agent writes into its clone's config
   (`extensions.partialClone`, or any `remote.<x>.promisor`) would make
@@ -461,8 +471,10 @@ credentials, hook input, or sandbox rules.
   refuse those keys, read with `config --local --includes` so includes
   count as git counts them. `scrub_git_env` sets `GIT_NO_LAZY_FETCH=1` on
   every git call as the second layer; git honours it from 2.45.1 (and
-  the patched maintenance releases from 2.39.4), which is why the
-  refusal, not the variable, is what the guard rests on (#67).
+  the patched maintenance releases from 2.39.4), so for the workspace
+  reader the refusal, not the variable, is what the guard rests on (#67);
+  for the clone step the git profile (network blocked) is what holds, and
+  the refusal is the operator's message.
 - `dev fake-plugin` applies a fleet when its `plugins.yaml` entry has
   `config: { manage: { fleet, file } }` (the e2e's managed journey) and
   writes the outcome to `scratch/fake-plugin.manage`. The SDK's

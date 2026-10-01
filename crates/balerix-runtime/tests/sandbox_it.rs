@@ -176,7 +176,10 @@ fn a_user_network_block_validates_and_a_bogus_key_does_not() {
 
 /// Spec N amendment §4: under the git profile the clone and the cache's
 /// objects read; the clone cannot be written, the agent's home cannot be
-/// read, nothing outside can be read, and there is no network.
+/// read, nothing outside can be read, and the environment is the
+/// profile's alone. The network block is not probed here; `workspace_it`
+/// asserts it on the profile as written
+/// (`daemon_git_in_a_clone_runs_under_the_git_profile`).
 #[test]
 fn the_git_profile_reads_the_clone_and_the_cache_and_writes_nothing() {
     let Some(tools) = support::tools() else {

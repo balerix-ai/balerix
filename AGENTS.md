@@ -179,6 +179,11 @@ credentials, hook input, or sandbox rules.
   exits 1, so without it a nono that cannot run reads as "branch absent"
   and the clone is deleted unharvested
   (`a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone`).
+  The canary covers a nono that cannot run at all; for one that fails
+  later, `agent_git` treats an accepted non-zero exit that printed
+  anything on stderr as a failure (`is_gits_answer`, #109): git's three
+  probes are silent on a "no", nono prints `nono: …`. A git warning
+  beside a real "no" fails the step too, on purpose.
   The profile grants the system prefixes (`/usr`, `/lib`, `/lib64`,
   `/bin`), the `git` binary as a single file and the directory `git
   --exec-path` names (asked from an empty environment by

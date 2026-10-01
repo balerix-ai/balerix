@@ -2417,6 +2417,11 @@ fn a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone() {
     .expect_err("a nono that cannot run must fail the removal")
     .to_string();
     assert!(e.starts_with("f/c/a: git "), "{e}");
+    assert!(
+        e.starts_with("f/c/a: git version: the sandbox did not start; see ")
+            && e.contains("/logs/nono-git.log: "),
+        "{e}"
+    );
     assert!(paths.workspace.exists(), "a failed removal deletes nothing");
     assert!(!git_ok(
         &crew.repo,
@@ -2427,4 +2432,229 @@ fn a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone() {
             "refs/heads/balerix/f/c/a"
         ]
     ));
+}
+
+/// `tools` with `nono` replaced by a shim that runs the real nono for
+/// `profile validate` and for the canary (an argv ending in `version`),
+/// and on every other call fails the way nono itself does: a `nono: …`
+/// line on stderr and exit 1, which a yes/no probe accepts as an exit
+/// code (#109).
+fn nono_failing_after_the_canary(
+    root: &Path,
+    tools: &balerix_runtime::ToolPaths,
+) -> balerix_runtime::ToolPaths {
+    use std::os::unix::fs::PermissionsExt;
+
+    let shim = root.join("nono-fails-after-canary.sh");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nlast=\nfor a in \"$@\"; do\n  if [ \"$a\" = validate ]; then exec {nono} \"$@\"; fi\n  last=$a\ndone\nif [ \"$last\" = version ]; then exec {nono} \"$@\"; fi\necho 'nono: sandbox initialization failed' >&2\nexit 1\n",
+            nono = tools.nono.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    balerix_runtime::ToolPaths {
+        nono: shim,
+        ..tools.clone()
+    }
+}
+
+/// `tools` with `git` replaced by a shim that prints a warning on stderr
+/// on any call whose argv holds `subcommand` as a word, then runs the real
+/// git either way.
+fn noisy_git(
+    root: &Path,
+    tools: &balerix_runtime::ToolPaths,
+    subcommand: &str,
+) -> balerix_runtime::ToolPaths {
+    use std::os::unix::fs::PermissionsExt;
+
+    let shim = root.join(format!("git-noisy-{subcommand}.sh"));
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"{subcommand}\" ]; then\n    echo 'warning: shim noise' >&2\n  fi\ndone\nexec {} \"$@\"\n",
+            tools.git.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    balerix_runtime::ToolPaths {
+        git: shim,
+        ..tools.clone()
+    }
+}
+
+/// A cache, and `f/c/a`'s clone on `balerix/f/c/a` holding one commit
+/// origin lacks.
+fn clone_with_unpushed_work(
+    tools: &balerix_runtime::ToolPaths,
+    root: &Path,
+) -> (
+    RepoRef,
+    balerix_runtime::CrewPaths,
+    balerix_runtime::AgentPaths,
+) {
+    let layout = support::layout(root);
+    let repo = bare_repo(root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools,
+        gh_config_dir: None,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();
+    git(&paths.workspace, &["add", "."]);
+    git(&paths.workspace, &["commit", "-q", "-m", "agent work"]);
+    (repo, crew, paths)
+}
+
+/// #109: nono proved it starts (the canary), then fails on a probe. Its
+/// exit 1 is not "no promisor keys", "branch absent" or "detached": the
+/// removal fails and the clone, with its unharvested commit, stays.
+#[test]
+fn a_nono_failure_after_the_canary_fails_the_removal_and_keeps_the_clone() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-nono-after-canary");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (_repo, crew, paths) = clone_with_unpushed_work(&tools, &root);
+
+    let broken = nono_failing_after_the_canary(&root, &tools);
+    let e = Workspace {
+        tools: &broken,
+        gh_config_dir: None,
+    }
+    .harvest_and_remove("f/c/a", &crew, &paths)
+    .expect_err("a nono failure must not read as git's no")
+    .to_string();
+    assert_eq!(e, "f/c/a: git config: nono: sandbox initialization failed");
+    assert!(
+        paths.workspace.join("work.txt").exists(),
+        "a failed removal deletes nothing"
+    );
+    assert!(!git_ok(
+        &crew.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/balerix/f/c/a"
+        ]
+    ));
+}
+
+/// #109: the same failure on a branch change is not a detached HEAD to
+/// reuse; the pass fails and the clone is left as it was.
+#[test]
+fn a_nono_failure_after_the_canary_fails_a_branch_change() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-nono-after-canary-change");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (repo, crew, paths) = clone_with_unpushed_work(&tools, &root);
+    push_branch(&root, "feature/issue-109");
+
+    let broken = nono_failing_after_the_canary(&root, &tools);
+    let e = Workspace {
+        tools: &broken,
+        gh_config_dir: None,
+    }
+    .ensure_clone(
+        "f/c/a",
+        &crew,
+        &paths,
+        &repo,
+        "feature/issue-109",
+        "feature/issue-109",
+    )
+    .expect_err("a nono failure must not read as a detached HEAD")
+    .to_string();
+    assert_eq!(e, "f/c/a: git config: nono: sandbox initialization failed");
+    assert_eq!(
+        git(&paths.workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "balerix/f/c/a",
+        "the clone is left as it was"
+    );
+    assert_eq!(
+        std::fs::read_to_string(paths.branch_marker())
+            .unwrap()
+            .trim(),
+        "balerix/f/c/a"
+    );
+}
+
+/// §12.2: exit 0 is never inspected. A git that warns on a probe that
+/// answers "yes" still harvests.
+#[test]
+fn a_git_warning_on_a_successful_probe_does_not_fail_the_harvest() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-noisy-yes");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (_repo, crew, paths) = clone_with_unpushed_work(&tools, &root);
+
+    // the harvest's `rev-parse --verify` answers "yes" (exit 0) here
+    let noisy = noisy_git(&root, &tools, "rev-parse");
+    Workspace {
+        tools: &noisy,
+        gh_config_dir: None,
+    }
+    .harvest_and_remove("f/c/a", &crew, &paths)
+    .unwrap();
+    assert!(!paths.workspace.exists());
+    assert!(git_ok(
+        &crew.repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/balerix/f/c/a"
+        ]
+    ));
+}
+
+/// §12.2: the rule fails closed both ways. A warning beside a real "no"
+/// (the promisor probe finds no key and exits 1) fails the step, as any
+/// git error does (#74); nothing is deleted.
+#[test]
+fn a_git_warning_beside_a_no_fails_the_removal_and_keeps_the_clone() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-noisy-no");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (_repo, crew, paths) = clone_with_unpushed_work(&tools, &root);
+
+    let noisy = noisy_git(&root, &tools, "config");
+    let e = Workspace {
+        tools: &noisy,
+        gh_config_dir: None,
+    }
+    .harvest_and_remove("f/c/a", &crew, &paths)
+    .unwrap_err()
+    .to_string();
+    assert_eq!(e, "f/c/a: git config: warning: shim noise");
+    assert!(paths.workspace.join("work.txt").exists());
 }

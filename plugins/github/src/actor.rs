@@ -33,8 +33,11 @@ pub use balerix_plugin_common::queue::{Health, QUEUE};
 pub type Queue = balerix_plugin_common::queue::Queue<Command>;
 
 /// `main` pushes `Tick` this often: delivery expiry, status flushes, the
-/// idle check, row write-back (§8.7, §8.3, §10).
+/// idle check, the pruning of closed rows, row write-back (§8.7, §8.3, §10).
 pub const TICK: Duration = Duration::from_secs(5);
+/// A closed row is kept this long after its session ended, for the ended
+/// reply and the resume; a mention after that starts afresh (#97).
+pub const CLOSED_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
 /// A status edit waits this long for more lines (§8.3).
 pub const STATUS_COALESCE: Duration = Duration::from_secs(2);
 /// What the first prompt waits beyond `confirmWindow` before it is
@@ -1558,10 +1561,24 @@ impl<G: GitHubPort> Actor<G> {
         // The apply makes the daemon deactivate the agent, which drops its
         // status: the final line goes out now, not on a later tick.
         self.flush_status(agent).await;
-        if let Some(r) = self.sessions.get_mut(agent) {
-            r.closed = true;
+        // The row is written now too: reloaded open after a restart, it
+        // would stand for an agent the daemon no longer runs (#97).
+        // `last_activity` becomes the closing time, which the retention
+        // counts from.
+        let now = (self.now_secs)();
+        if let Some(mut closed) = self.sessions.get(agent).cloned() {
+            closed.closed = true;
+            closed.last_activity = now;
+            self.rows_dirty.remove(agent);
+            if let Err(e) = self.sessions.set(&self.host, agent, closed).await {
+                tracing::warn!("github: writing closed row for {agent}: {e}");
+                if let Some(r) = self.sessions.get_mut(agent) {
+                    r.closed = true;
+                    r.last_activity = now;
+                }
+                self.rows_dirty.insert(agent.to_string(), ());
+            }
         }
-        self.rows_dirty.insert(agent.to_string(), ());
         self.deliveries.forget(agent);
         self.held.remove(agent);
         self.questions.clear(&self.host, agent).await;
@@ -1611,6 +1628,28 @@ impl<G: GitHubPort> Actor<G> {
                 );
                 self.end(&agent, installation, &reason).await;
             }
+        }
+        // closed rows past their retention (#97)
+        let now = (self.now_secs)();
+        let expired: Vec<String> = self
+            .sessions
+            .agents()
+            .into_iter()
+            .filter(|a| {
+                self.sessions.get(a).is_some_and(|r| {
+                    r.closed && now.saturating_sub(r.last_activity) > CLOSED_RETENTION.as_secs()
+                })
+            })
+            .collect();
+        for agent in expired {
+            if let Err(e) = self.sessions.remove(&self.host, &agent).await {
+                tracing::warn!("github: pruning row for {agent}: {e}");
+                continue;
+            }
+            self.statuses.remove(&agent);
+            self.status_dirty.remove(&agent);
+            self.ended_notice.remove(&agent);
+            self.rows_dirty.remove(&agent);
         }
         // status flushes (§8.3)
         let now = Instant::now();
@@ -3033,6 +3072,77 @@ mod tests {
         .await;
         let text = actions_text(fake.actions_for(AGENT).last().unwrap());
         assert!(text.contains("Earlier work on this issue is on branch balerix/gh-acme-api/repo/issue-12; continue from it."), "{text}");
+    }
+
+    fn close() -> Command {
+        Command::Webhook(WebhookEvent::Closed {
+            repo: "acme/api".into(),
+            installation: 7,
+            number: 12,
+            merged: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn end_writes_the_closed_row_without_a_tick() {
+        let (fake, _port, mut a) = started().await;
+        a.now_secs = || 14 * 3600 + 2 * 60 + 600;
+        a.handle(close()).await;
+        let row = fake.kv_json("session/gh-acme-api/repo/issue-12").unwrap();
+        assert_eq!(row["closed"], true, "{row}");
+        assert_eq!(
+            row["last_activity"],
+            14 * 3600 + 2 * 60 + 600,
+            "the retention counts from the close"
+        );
+        assert!(!a.rows_dirty.contains_key(AGENT));
+        // what a restart in the next five seconds would load
+        let host = Host::new(fake.env("github", std::path::Path::new("scratch"))).unwrap();
+        let again = Sessions::load(&host).await.unwrap();
+        assert!(again.get(AGENT).unwrap().closed);
+    }
+
+    #[tokio::test]
+    async fn a_closed_row_is_pruned_once_the_retention_has_passed() {
+        let (fake, port, mut a) = started().await;
+        a.handle(close()).await;
+        a.handle(comment(12, "bob", 30, "one more thing")).await;
+        a.now_secs = || 14 * 3600 + 2 * 60 + 7 * 24 * 3600;
+        a.handle(Command::Tick).await;
+        assert!(
+            fake.kv_json("session/gh-acme-api/repo/issue-12").is_some(),
+            "kept up to the retention"
+        );
+        assert!(a.sessions.get(AGENT).is_some());
+        a.now_secs = || 14 * 3600 + 2 * 60 + 7 * 24 * 3600 + 1;
+        a.handle(Command::Tick).await;
+        assert!(fake.kv_json("session/gh-acme-api/repo/issue-12").is_none());
+        assert!(a.sessions.get(AGENT).is_none());
+        assert_eq!(a.sessions.by_number("acme/api", 12), None);
+        assert!(!a.statuses.contains_key(AGENT));
+        assert!(!a.ended_notice.contains_key(AGENT));
+        // a comment without a mention is now silent; a mention starts afresh
+        port.take_calls();
+        a.handle(comment(12, "bob", 31, "and another")).await;
+        assert!(
+            port.calls()
+                .iter()
+                .all(|c| matches!(c, Call::Permission { .. }))
+        );
+        a.handle(comment(12, "alice", 32, "@balerix again")).await;
+        let c = comments(&port.calls());
+        assert!(c[0].1.contains("- 14:02 starting"), "a new status: {c:?}");
+        assert!(!a.sessions.get(AGENT).unwrap().closed);
+    }
+
+    #[tokio::test]
+    async fn an_open_row_is_never_pruned() {
+        let (fake, _port, mut a) = started().await;
+        a.config.as_mut().unwrap().idle_timeout = Duration::ZERO;
+        a.now_secs = || 14 * 3600 + 2 * 60 + 30 * 24 * 3600;
+        a.handle(Command::Tick).await;
+        assert!(fake.kv_json("session/gh-acme-api/repo/issue-12").is_some());
+        assert!(!a.sessions.get(AGENT).unwrap().closed);
     }
 
     #[tokio::test]

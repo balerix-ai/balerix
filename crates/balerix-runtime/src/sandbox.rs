@@ -106,7 +106,8 @@ pub fn render_profile(
 /// amendment 2026-10-01 §4, #68, #70). The daemon reads every repository
 /// its uid can; the agent reads its own clone and the crew cache. Under
 /// this profile git reads exactly those two (plus the empty hooks
-/// directory and its own binary), writes nothing and has no network, so
+/// directory, its own binary and its exec-path), writes nothing and
+/// has no network, so
 /// a clone pointed at another repository serves nothing the agent could
 /// not already read, and a promisor remote fetches nothing on any git.
 ///

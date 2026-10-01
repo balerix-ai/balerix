@@ -59,13 +59,15 @@ pub fn first(s: &Start<'_>) -> String {
 }
 
 /// Spec M §9: `Review by @bob: changes requested, at 3f9c2a1` over
-/// common's rendering. `None` when there is nothing to deliver.
+/// common's rendering. `None` when there is nothing to deliver. `more`
+/// says the review holds inline comments beyond `comments`.
 pub fn review(
     reviewer: &str,
     state: &str,
     commit: &str,
     body: &str,
     comments: &[ReviewComment],
+    more: bool,
     base: &str,
 ) -> Option<String> {
     if body.trim().is_empty() && comments.is_empty() {
@@ -103,10 +105,18 @@ pub fn review(
             "Review by @{reviewer}: {verdict}, at {short}\n(not rendered: {e})"
         ));
     }
-    Some(format!(
+    let mut out = format!(
         "Review by @{reviewer}: {verdict}, at {short}\n{}",
         review::render_message(&r)
-    ))
+    );
+    if more {
+        out.truncate(out.trim_end().len());
+        out.push_str(&format!(
+            "\n\n(the first {} inline comments; the rest are on GitHub)",
+            comments.len()
+        ));
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -151,7 +161,15 @@ mod tests {
     #[test]
     fn a_review_renders_once_with_the_header_and_skips_an_empty_one() {
         assert_eq!(
-            review("bob", "APPROVED", "3f9c2a1deadbeef", "  ", &[], "main"),
+            review(
+                "bob",
+                "APPROVED",
+                "3f9c2a1deadbeef",
+                "  ",
+                &[],
+                false,
+                "main"
+            ),
             None
         );
         let comments = vec![ReviewComment {
@@ -168,9 +186,27 @@ mod tests {
             "3f9c2a1deadbeef",
             "Close.",
             &comments,
+            false,
             "main",
         )
         .unwrap();
+        let truncated = review(
+            "bob",
+            "changes_requested",
+            "3f9c2a1deadbeef",
+            "Close.",
+            &comments,
+            true,
+            "main",
+        )
+        .unwrap();
+        assert_eq!(
+            truncated,
+            format!(
+                "{}\n\n(the first 1 inline comments; the rest are on GitHub)",
+                m.trim_end()
+            )
+        );
         insta::assert_snapshot!(m);
         assert!(m.starts_with("Review by @bob: changes requested, at 3f9c2a1\n"));
         assert!(m.contains("src/lib.rs line 42 (new)"));

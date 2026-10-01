@@ -262,6 +262,18 @@ makes an existing remote branch its clone's branch and start point
   cache. A new clone for a branch the cache holds seeds from it, so
   unpushed work survives `down --keep-repos` and agent removal. Only the
   assigned branch is harvested.
+- **Daemon git in an agent's clone runs under a read-only nono profile.**
+  The harvest's `upload-pack` and the probes around it (`config`,
+  `symbolic-ref`, `rev-parse`, `status`) read a repository the agent
+  wrote. Run as the daemon they are a confused deputy: a clone pointed at
+  another repository would have the daemon copy it into the cache. So
+  they run under `agents/<a>/nono-git-profile.json`, rendered by the
+  daemon just before use: read on the clone and the cache's objects, no
+  write, no network, none of the user's `sandbox` block or the agent's
+  `env`. Not the agent's own profile, which grants more than git needs.
+  `check_clone` stays for the message it gives; the profile is what
+  holds when the clone changes after the check (#70). The workspace
+  reader is not yet under it.
 - **The planner is pure; the executor is dumb.** Every decision is in
   `reconcile::plan` (a total function) so the model-based test compares plans
   structurally and `cargo mutants` has something to bite.

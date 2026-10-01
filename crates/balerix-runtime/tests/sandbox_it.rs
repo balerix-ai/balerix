@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 mod support;
 
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use balerix_core::AgentId;
@@ -171,4 +172,86 @@ fn a_user_network_block_validates_and_a_bogus_key_does_not() {
         log.contains("unknown field `mode`"),
         "the log must keep the detail nono printed: {log}"
     );
+}
+
+/// Spec N amendment §4: under the git profile the clone and the cache's
+/// objects read; the clone cannot be written, the agent's home cannot be
+/// read, nothing outside can be read, and the environment is the
+/// profile's alone. The network block is not probed here; `workspace_it`
+/// asserts it on the profile as written
+/// (`daemon_git_in_a_clone_runs_under_the_git_profile`).
+#[test]
+fn the_git_profile_reads_the_clone_and_the_cache_and_writes_nothing() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("nono", false));
+        return;
+    };
+    let root = support::temp_root("sandbox-git");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let layout = support::layout(&root);
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let paths = layout.agent(&id);
+    let crew = layout.crew(&id.crew_ref());
+    let objects = crew.cache_objects();
+    for d in [&paths.home, &paths.workspace, &objects.join("ab")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(paths.workspace.join("tracked"), "clone-ok\n").unwrap();
+    std::fs::write(objects.join("ab/probe"), "cache-ok\n").unwrap();
+    std::fs::write(paths.home.join("secret"), "home\n").unwrap();
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret"), "outside\n").unwrap();
+
+    balerix_runtime::write_git_profile(&tools, "f/c/a", &paths, &crew).unwrap();
+    assert_eq!(
+        std::fs::metadata(paths.git_profile())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let script = format!(
+        "cat {ws}/tracked && cat {objects}/ab/probe \
+         && (echo x > {ws}/nope 2>/dev/null && echo CLONE_WRITABLE || echo clone-denied) \
+         && (cat {home}/secret 2>/dev/null && echo HOME_READABLE || echo home-denied) \
+         && (cat {outside}/secret 2>/dev/null && echo OUTSIDE_READABLE || echo outside-denied) \
+         && echo LOCKS=$GIT_OPTIONAL_LOCKS LAZY=$GIT_NO_LAZY_FETCH FOO=$FOO",
+        ws = paths.workspace.display(),
+        objects = objects.display(),
+        home = paths.home.display(),
+        outside = outside.display(),
+    );
+    let out = Command::new(&tools.nono)
+        .args([
+            "-s",
+            "run",
+            "--profile",
+            &paths.git_profile().display().to_string(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &paths.nono_home)
+        .env("FOO", "leak")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "nono run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout,
+        "clone-ok\ncache-ok\nclone-denied\nhome-denied\noutside-denied\nLOCKS=0 LAZY=1 FOO=\n"
+    );
+    assert!(!paths.workspace.join("nope").exists());
 }

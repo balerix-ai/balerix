@@ -18,7 +18,12 @@ asset is attested (`gh attestation verify <file> --repo balerix-ai/balerix`).
   git 2.45.1 or newer is recommended: from there git honours
   `GIT_NO_LAZY_FETCH`, balerix's second layer against a promisor remote
   an agent writes into its clone's config (the first, a refusal of that
-  config, needs no particular version).
+  config, needs no particular version). That `git` must live under
+  `/usr`, `/lib`, `/lib64` or `/bin`: one installed elsewhere (nix,
+  Linuxbrew, a mise shim) cannot run in the sandbox balerix's own git
+  calls in an agent's clone use, so `down` (without `--purge`), `remove`
+  and a branch change fail on such a host for now; `down --purge` is the
+  way past.
 - **Container:** `docker run -d --name balerix -v balerix:/home/balerix
   ghcr.io/balerix-ai/balerix:<ver>` runs the daemon with its tools. It listens on
   loopback inside the container only, so run the client there too:

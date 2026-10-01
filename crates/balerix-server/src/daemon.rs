@@ -735,8 +735,22 @@ impl Daemon {
                 }
             }
         };
+        // The rows are written before the actor hears of the spec: every
+        // snapshot it publishes ticks `fleets/watch`, and a frame that
+        // shows one of these agents must already carry its row (#113).
+        // The overlay skips an agent the record does not have yet.
+        for (p, activation) in &rows {
+            self.registry.set_row(
+                &p.agent,
+                &p.plugin,
+                ActivationRow {
+                    config: p.config.clone(),
+                    activation: activation.clone(),
+                },
+            );
+        }
         let (reply, rx) = oneshot::channel();
-        handle
+        let sent = handle
             .tx
             .send(Msg::Apply {
                 spec,
@@ -744,25 +758,40 @@ impl Daemon {
                 reply,
             })
             .await
-            .map_err(|_| DaemonError::Internal("fleet task is gone".into()))?;
-        let record = rx
-            .await
-            .map_err(|_| DaemonError::Internal("fleet task dropped the request".into()))?;
+            .map_err(|_| DaemonError::Internal("fleet task is gone".into()));
+        let answered = match sent {
+            Ok(()) => rx
+                .await
+                .map_err(|_| DaemonError::Internal("fleet task dropped the request".into())),
+            Err(e) => Err(e),
+        };
+        let record = match answered {
+            Ok(r) => r,
+            Err(e) => {
+                // The actor never took the spec: the rows go back to what
+                // they were, a new pair's row away and a changed one's old.
+                for (p, _) in &rows {
+                    let was = rows_now
+                        .iter()
+                        .find(|(a, pl, _)| a == &p.agent && pl == &p.plugin);
+                    match was {
+                        Some((_, _, row)) => {
+                            self.registry.set_row(&p.agent, &p.plugin, row.clone());
+                        }
+                        None => {
+                            self.registry.remove_row(&p.agent, &p.plugin);
+                        }
+                    }
+                }
+                self.bump();
+                return Err(e);
+            }
+        };
         // only the pairs the new spec dropped: a changed pair kept its row
         // and was replaced in place above
         for (agent, plugin) in &d.deactivate {
             self.deactivate_pair(agent, plugin).await;
             self.registry.remove_row(agent, plugin);
-        }
-        for (p, activation) in rows {
-            self.registry.set_row(
-                &p.agent,
-                &p.plugin,
-                ActivationRow {
-                    config: p.config,
-                    activation,
-                },
-            );
         }
         self.bump();
         Ok(self.overlay(record))
@@ -1578,6 +1607,57 @@ mod tests {
         assert_eq!(
             w.daemon.get(&name).await.unwrap().status.agents["f/c/a"].plugins["flow"].state,
             ActivationState::Active
+        );
+    }
+
+    /// The rows are written before the actor hears of the spec (#113), so
+    /// an apply the actor never takes has to put them back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_apply_the_actor_never_takes_leaves_the_rows_as_they_were() {
+        let w = world().await;
+        let stub = stub_plugin(StubScript {
+            health_ok: true,
+            ..StubScript::default()
+        })
+        .await;
+        hello(&w, &stub.listen).await;
+        let name: FleetName = "f".parse().unwrap();
+        w.daemon
+            .apply(
+                &name,
+                spec(&[("a", &[("flow", json!({ "v": 1 }))])]),
+                Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        wait_gen(&w.daemon, 1).await;
+        let before = w.daemon.registry().rows_for_fleet(&name);
+        // a handle whose task is gone: the receiver is dropped at once
+        {
+            let (tx, _) = mpsc::channel(1);
+            let mut fleets = w.daemon.fleets.write().await;
+            let status = fleets[&name].status.clone();
+            fleets.insert(name.clone(), FleetHandle { tx, status });
+        }
+        let e = w
+            .daemon
+            .apply(
+                &name,
+                spec(&[
+                    ("a", &[("flow", json!({ "v": 2 }))]),
+                    ("b", &[("flow", json!({}))]),
+                ]),
+                Default::default(),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e, DaemonError::Internal("fleet task is gone".into()));
+        assert_eq!(
+            w.daemon.registry().rows_for_fleet(&name),
+            before,
+            "the changed pair has its old row and the new pair has none"
         );
     }
 

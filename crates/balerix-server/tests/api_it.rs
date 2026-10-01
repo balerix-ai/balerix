@@ -74,6 +74,54 @@ impl Api {
     }
 }
 
+/// A `POST` whose body crosses `limit` by its last byte, on a connection
+/// of its own; the status and the body of the answer.
+///
+/// The server answers 413 the moment it has read past the limit and then
+/// closes with the rest of the body unread. A client still writing then
+/// gets EPIPE in place of the answer, and a pooled client that did get it
+/// hands the dead connection to its next request (#79, #113). So the
+/// request declares 2 MiB and sends `limit + 1` bytes: the server cannot
+/// refuse before the last of them has arrived, and nothing is left unread.
+fn one_byte_over(port: u16, path: &str, token: &str, limit: usize) -> (u16, Value) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(
+        s,
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        2 << 20
+    )
+    .unwrap();
+    s.write_all(&vec![b'x'; limit + 1]).unwrap();
+    let mut answer = Vec::new();
+    let (head, body) = loop {
+        let mut buf = [0u8; 4096];
+        let n = s.read(&mut buf).unwrap();
+        assert!(n > 0, "closed before a whole answer");
+        answer.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&answer);
+        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+            continue;
+        };
+        let length: usize = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse().unwrap())
+            })
+            .expect("an answer with a content-length");
+        if body.len() >= length {
+            break (head.to_string(), body.to_string());
+        }
+    };
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    let v = serde_json::from_str(&body).unwrap_or(Value::String(body));
+    (status, v)
+}
+
 async fn wait_for(daemon: &Daemon, pred: impl Fn(Option<&FleetRecord>) -> bool) {
     let name: FleetName = "f".parse().unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -289,15 +337,12 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
     .await;
     assert_eq!(st, 400);
     assert_eq!(v["error"], "body must be a JSON object");
-    let big = json!({ "hook_event_name": "PreToolUse", "blob": "x".repeat(2 << 20) });
-    let (st, v) = call(
-        api.clone(),
-        "POST",
-        events.clone(),
-        Some(secret.clone()),
-        Some(big),
-    )
-    .await;
+    let (st, v) = tokio::task::spawn_blocking({
+        let (events, secret) = (events.clone(), secret.clone());
+        move || one_byte_over(port, &events, &secret, 1 << 20)
+    })
+    .await
+    .unwrap();
     assert_eq!(st, 413);
     // axum's own body-limit rejection is plain text; the handler must
     // render it as `ApiError`'s `{ "error": "<message>" }` JSON instead.

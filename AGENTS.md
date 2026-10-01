@@ -218,6 +218,12 @@ credentials, hook input, or sandbox rules.
   `tmux -L balerix-e2e-<pid> kill-server` and `kill` the `balerix serve`
   whose argv carries that `--tmux-socket` (the plugin e2e uses socket
   `balerix-e2e-plugins-<pid>`, the flow e2e `balerix-e2e-flow-<pid>`).
+- A body over a route's limit is answered 413 the moment the server has
+  read past the limit, and the connection is closed with the rest unread:
+  a client still writing gets EPIPE in place of the answer, and a pooled
+  client hands the dead connection to its next request. A test of a 413
+  sends exactly one byte over, on a connection of its own
+  (`api_it.rs::one_byte_over`; #79, #113).
 - `balerix` is a reserved fleet name (the plugin fleet). `FleetName` still
   parses it — the reservation lives in `Daemon::apply`/`down` and
   `balerix_config::resolve`.

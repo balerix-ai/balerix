@@ -83,6 +83,14 @@ pub struct ReviewComment {
     pub body: String,
 }
 
+/// What `review_comments` answers: the review's inline comments in
+/// GitHub's order, and whether the review holds more than were read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewComments {
+    pub comments: Vec<ReviewComment>,
+    pub more: bool,
+}
+
 /// What `issue` answers: the issue or PR a comment was left on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IssueInfo {
@@ -145,7 +153,7 @@ pub trait GitHubPort: Send + Sync + 'static {
         repo: &str,
         number: u64,
         review_id: u64,
-    ) -> impl Future<Output = Result<Vec<ReviewComment>, GitHubError>> + Send;
+    ) -> impl Future<Output = Result<ReviewComments, GitHubError>> + Send;
     /// Title, body, URL and, for a PR, `(head, head_repo, base)`.
     fn issue(
         &self,
@@ -161,7 +169,9 @@ pub mod fake {
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
-    use super::{GitHubError, GitHubPort, IssueInfo, Permission, ReviewComment, Target};
+    use super::{
+        GitHubError, GitHubPort, IssueInfo, Permission, ReviewComment, ReviewComments, Target,
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Call {
@@ -213,7 +223,7 @@ pub mod fake {
         files: HashMap<(String, String, String), String>,
         permissions: HashMap<(String, String), Permission>,
         default_branches: HashMap<String, String>,
-        reviews: HashMap<(String, u64), Vec<ReviewComment>>,
+        reviews: HashMap<(String, u64), ReviewComments>,
         deleted: HashSet<u64>,
         issues: HashMap<(String, u64), IssueInfo>,
     }
@@ -268,9 +278,21 @@ pub mod fake {
             review_id: u64,
             comments: Vec<ReviewComment>,
         ) {
+            self.lock().reviews.insert(
+                (repo.into(), review_id),
+                ReviewComments {
+                    comments,
+                    more: false,
+                },
+            );
+        }
+        /// The review holds more comments than `review_comments` answers.
+        pub fn set_review_more(&self, repo: &str, review_id: u64) {
             self.lock()
                 .reviews
-                .insert((repo.into(), review_id), comments);
+                .entry((repo.into(), review_id))
+                .or_default()
+                .more = true;
         }
         /// What `issue` answers for `number`; unset, an empty title and
         /// body, the issue's URL, and no PR.
@@ -405,7 +427,7 @@ pub mod fake {
             repo: &str,
             number: u64,
             review_id: u64,
-        ) -> Result<Vec<ReviewComment>, GitHubError> {
+        ) -> Result<ReviewComments, GitHubError> {
             self.check()?;
             self.record(Call::ReviewComments {
                 repo: repo.into(),

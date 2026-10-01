@@ -1438,21 +1438,28 @@ impl<G: GitHubPort> Actor<G> {
         {
             return;
         }
-        let comments = match retry_once(|| {
+        let review = match retry_once(|| {
             self.port
                 .review_comments(installation, repo, number, review_id)
         })
         .await
         {
-            Ok(c) => c,
+            Ok(r) => r,
             Err(e) => {
                 self.github_failed("review_comments", &e);
                 return;
             }
         };
         let base = row.base.clone().unwrap_or_else(|| "main".into());
-        let Some(message) = prompt::review(&author.login, state, commit, body, &comments, &base)
-        else {
+        let Some(message) = prompt::review(
+            &author.login,
+            state,
+            commit,
+            body,
+            &review.comments,
+            review.more,
+            &base,
+        ) else {
             return;
         };
         // Always behind what is already held, so reviews reach the agent
@@ -2944,6 +2951,20 @@ mod tests {
         }))
         .await;
         assert_eq!(fake.actions_for(agent).len(), before + 1);
+    }
+
+    /// #95: past the client's cap the agent is told the review goes on.
+    #[tokio::test]
+    async fn a_review_with_more_comments_than_were_read_says_so() {
+        let (fake, port, mut a) = pr_session().await;
+        port.set_review_more("acme/api", 9);
+        a.handle(review_by("bob", 9)).await;
+        let sent = fake.actions_for(PR_AGENT);
+        let text = actions_text(sent.last().unwrap());
+        assert!(
+            text.ends_with("(the first 1 inline comments; the rest are on GitHub)"),
+            "{text}"
+        );
     }
 
     /// #96: a redelivered opening (GitHub's "Redeliver" button, or a

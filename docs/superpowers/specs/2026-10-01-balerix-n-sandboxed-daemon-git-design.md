@@ -72,7 +72,7 @@ With a hand-written profile of the shape in §4:
 | Key | Value |
 |-----|-------|
 | `meta` | name `balerix-git-<fleet>-<crew>-<agent>` |
-| `filesystem.read` | `SYSTEM_READ`; `crew.cache_objects()`; `paths.workspace`; the crew's `no-hooks/` directory (what `core.hooksPath` names) |
+| `filesystem.read` | `SYSTEM_READ`; `crew.cache_objects()`; `paths.workspace`; the crew's `no-hooks/` directory (what `core.hooksPath` names); the canonical path of the `git` binary `ToolPaths` discovered (a single file, as the agent's profile grants `mise`: git comes from the host and need not sit under `/usr`) |
 | `filesystem.allow` | absent |
 | `workdir` | `access: none` |
 | `network` | `block: true`; no `open_port` |
@@ -172,24 +172,26 @@ every git call in the cache, and `inspect.rs` are untouched.
 - `sandbox.rs` unit: the git profile has no `allow`, has `network.block`,
   no `open_port`, and exactly the five `set_vars`; every `read` path is
   in `balerix_grants(…).read` or `.allow`, or is the `no-hooks`
-  directory.
+  directory or the `git` binary.
+- `sandbox_it`: inside the git profile, the clone and the cache's
+  objects read; a write to the clone, a read of the agent's `home/` and
+  a read outside both are denied.
 - `workspace_it`:
   - the existing cases pass through the sandboxed calls unchanged in what
     they assert (harvest, seed, branch change, dirty refusal, the error
     shape, the unreadable-HEAD cases);
   - `a_clone_pointed_at_another_repository_is_refused_and_nothing_is_harvested`
-    runs each vector twice: with the checks, asserting today's message;
-    with the checks off, asserting the foreign commit is absent from the
-    cache (#68's third checkbox);
-  - the promisor case with the checks off: nothing foreign reaches the
-    cache, and the planted `uploadpack` program, if it runs at all,
-    reaches no network and writes no file;
-  - new, for #70: the clone is rewritten after `check_clone` has passed
-    and before the fetch; nothing foreign is harvested;
-  - new: a daemon git call cannot write the clone (a config that would
-    make `status` write leaves the tree byte-identical).
-- "Checks off" is a test-only constructor in `balerix-runtime`'s existing
-  `testing` module; production code cannot disable the checks.
+    keeps asserting today's messages with the checks in place;
+  - new, for #70 and #68's third checkbox: each vector (alternates, a
+    symlinked `.git`, a symlinked pack, `commondir`, a promisor remote)
+    is applied *after* both checks have passed and before the harvest,
+    which is the race itself and equivalent to the checks being off for
+    that vector; the foreign commit is absent from the cache, and the
+    planted `uploadpack` program has not run.
+- The hook that runs between the checks and the harvest is reachable
+  only through `balerix-runtime`'s existing `testing` module; the public
+  `harvest_and_remove` passes a no-op, and no code path skips the
+  checks.
 - The sandboxed cases need Landlock and follow the existing rule: skip
   with a printed reason, fail under `BALERIX_REQUIRE_TOOLS=1`.
 - `materialize_it`, `e2e`: unchanged in what they assert.
@@ -199,8 +201,7 @@ every git call in the cache, and `inspect.rs` are untouched.
 - Spec N gains a dated bullet in §12 pointing here; §5 and §7 are read
   with this amendment.
 - `ARCHITECTURE.md`: a non-obvious decision, *Daemon git in an agent's
-  clone runs under a read-only nono profile*; the agent-root layout
-  lists `nono-git-profile.json`.
+  clone runs under a read-only nono profile*.
 - `AGENTS.md`: one gotcha: for the clone step the hardening variables
   live in the git profile's `set_vars`, not the command's environment;
   adding one to `harden_agent_git` alone does not reach those calls.

@@ -214,7 +214,7 @@ every git call in the cache, and `inspect.rs` are untouched.
 
 ## 10. Deliberately deferred
 
-- Killing survivors (NS-1) and the workspace reader (NS-2).
+- Killing survivors (NS-1; done in §13) and the workspace reader (NS-2).
 - Removing `check_clone` or `check_clone_config`. They cost one
   filesystem walk and one sandboxed call and give the operator the
   message.
@@ -401,7 +401,9 @@ the cgroup v2 root owned by root.
 ### 13.3 The wrapper: `balerix agent-supervise -- <argv…>`
 
 A hidden subcommand beside `hook-relay`. The logic is a new
-`balerix-runtime` module, `supervise.rs`; the subcommand only calls it.
+`balerix-runtime` module, `supervise.rs`; the subcommand installs the
+signal handlers (tokio, before the child exists) and hands the module a
+channel that carries one message per signal.
 `rustix` (already in the lockfile) becomes a direct dependency of
 `balerix-runtime` for `set_child_subreaper`, `kill_process` and
 `waitpid`. No `unsafe`.
@@ -456,8 +458,9 @@ All in `TmuxRunner`. The port and `FakeRunner` do not change.
   Today it respawns over the live process, and the new agent would start
   while the old tree is dying.
 - The bound is 5 s (`STOP_WAIT`): the grace plus a margin. Past it the
-  call returns a `RunnerError` for that agent or crew whose message is
-  `agent processes still running after stop (pid <n>)`. Nothing is
+  call returns a new `RunnerError::StillRunning` for that agent or crew,
+  whose message is `agent processes still running after stop (pid <n>)`.
+  The bound is a field of `TmuxRunner` so a test can shorten it. Nothing is
   rolled back; the next reconcile pass calls stop again, which finds no
   window and waits on nothing. So the error is reported once and the
   retry can succeed while survivors remain. That is acceptable only
@@ -482,8 +485,13 @@ Stated in `docs/THREAT-MODEL.md`:
 
 ### 13.7 Tests
 
-- `supervise.rs` unit, with real processes and no nono or tmux; each
-  test finds its processes by a marker unique to the test:
+- `supervise.rs` unit: the `/proc/<pid>/stat` parser (a command name
+  holding `) `), the descendant walk, and a process's identity (a zombie
+  and a reaped pid are both gone).
+- `crates/balerix/tests/cli_supervise.rs`, the real binary against real
+  processes, no nono. A subreaper must be its own process: set in a test
+  process it would adopt, and kill, other tests' children. Each test
+  finds its processes by a marker unique to the test:
   - after SIGHUP, a `setsid` sleeper and a double-forked one are dead
     when the wrapper returns;
   - a main child that exits on SIGHUP ends the wrapper well inside the
@@ -493,15 +501,22 @@ Stated in `docs/THREAT-MODEL.md`:
   - a chain in which each generation detaches the next and exits is
     emptied.
 - `launch.rs` unit: the script and `argv` start with the wrapper.
-- `tmux_it.rs`, with the test binary's wrapper in front of a script:
-  - #107's case: an agent that `setsid`s a sleeper; when `stop_agent`
-    returns, no process of it is alive;
-  - the same through `stop_crew`, and through `ensure_agent` on a
-    running window;
-  - a pane process that ignores the hangup and has no wrapper: the call
-    fails after `STOP_WAIT` with the message of §13.5.
-- `sandbox_it.rs`, real nono: a sandboxed process that signals the
-  wrapper is refused.
+  - a main child that ignores the hangup is killed after the grace, and
+    a second signal during the grace changes nothing;
+  - a command that does not exist fails with a message, and the child's
+    stdin and stdout pass through.
+- `cli_supervise.rs`, with tmux and the wrapper in front of a script:
+  #107's case, an agent that `setsid`s a sleeper; when `stop_agent`
+  returns, no process of it is alive. The same through `stop_crew`, and
+  through `ensure_agent` on a running window.
+- `tmux_it.rs`, no wrapper: `stop_agent`, `stop_crew` and a restart
+  return only when a pane process that takes half a second to die is
+  gone; a pane process that ignores the hangup fails the call after the
+  bound with the message of §13.5; a window whose pane already exited
+  stops at once.
+- `sandbox_it.rs`, real nono, the agent's generated profile: a sandboxed
+  process that signals a process outside the sandbox (the test process,
+  same user) is refused.
 - By hand: `mise run verify-claude`, because the wrapper now sits
   between tmux and nono's terminal handling. Its result is stated in the
   PR.

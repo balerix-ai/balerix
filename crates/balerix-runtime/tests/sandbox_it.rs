@@ -255,3 +255,186 @@ fn the_git_profile_reads_the_clone_and_the_cache_and_writes_nothing() {
     );
     assert!(!paths.workspace.join("nope").exists());
 }
+
+/// `tools` with `git` replaced by a shell script: `#!/bin/sh` and `body`.
+fn git_shim(
+    root: &std::path::Path,
+    tools: &balerix_runtime::ToolPaths,
+    name: &str,
+    body: &str,
+) -> balerix_runtime::ToolPaths {
+    let shim = root.join(name);
+    std::fs::write(&shim, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    balerix_runtime::ToolPaths {
+        git: shim,
+        ..tools.clone()
+    }
+}
+
+/// Spec N amendment §12.1 (#109): the profile grants the directory git
+/// names as its exec-path, resolved, wherever it is. The fixture's is a
+/// symlink to a directory with a space in its name, outside every other
+/// grant. A harvest through such a git would not prove the grant (git
+/// falls back to the host `git` on `PATH` for its helpers), so the read
+/// is asserted directly.
+#[test]
+fn the_git_profile_grants_gits_exec_path() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("nono", false));
+        return;
+    };
+    let root = support::temp_root("sandbox-git-exec-path");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let layout = support::layout(&root);
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let paths = layout.agent(&id);
+    let crew = layout.crew(&id.crew_ref());
+    for d in [&paths.workspace, &crew.cache_objects()] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let real = root.join("git core");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("helper"), "helper-ok\n").unwrap();
+    let link = root.join("exec-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let shimmed = git_shim(
+        &root,
+        &tools,
+        "git-exec-path.sh",
+        &format!(
+            "exec {} --exec-path='{}' \"$@\"",
+            tools.git.display(),
+            link.display()
+        ),
+    );
+
+    balerix_runtime::write_git_profile(&shimmed, "f/c/a", &paths, &crew).unwrap();
+    let granted = std::fs::canonicalize(&real).unwrap();
+    let profile = std::fs::read_to_string(paths.git_profile()).unwrap();
+    assert!(
+        profile.contains(&format!("\"{}\"", granted.display())),
+        "the resolved exec-path is granted: {profile}"
+    );
+    assert!(
+        !profile.contains("exec-link"),
+        "Landlock binds to what the path resolves to: {profile}"
+    );
+
+    let out = Command::new(&tools.nono)
+        .args([
+            "-s",
+            "run",
+            "--profile",
+            &paths.git_profile().display().to_string(),
+            "--",
+            "/bin/cat",
+            &granted.join("helper").display().to_string(),
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &paths.nono_home)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "nono run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "helper-ok\n");
+}
+
+/// §12.1: a git that cannot name an existing exec-path directory fails the
+/// step, and no profile is written without the grant (NS-5).
+#[test]
+fn a_git_that_cannot_name_its_exec_path_writes_no_profile() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("nono", false));
+        return;
+    };
+    let root = support::temp_root("sandbox-git-no-exec-path");
+    let layout = support::layout(&root);
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let paths = layout.agent(&id);
+    let crew = layout.crew(&id.crew_ref());
+
+    let refusing = git_shim(
+        &root,
+        &tools,
+        "git-refusing.sh",
+        "echo 'shim: no exec path' >&2\nexit 3",
+    );
+    let e = balerix_runtime::write_git_profile(&refusing, "f/c/a", &paths, &crew)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(e, "f/c/a: git --exec-path: shim: no exec path");
+    assert!(!paths.git_profile().exists());
+
+    let missing = root.join("missing");
+    let lost = git_shim(
+        &root,
+        &tools,
+        "git-lost.sh",
+        &format!("echo '{}'", missing.display()),
+    );
+    let e = balerix_runtime::write_git_profile(&lost, "f/c/a", &paths, &crew)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.starts_with(&format!("f/c/a: git --exec-path: {}: ", missing.display())),
+        "{e}"
+    );
+    assert!(!paths.git_profile().exists());
+
+    let file = root.join("a-file");
+    std::fs::write(&file, "").unwrap();
+    let wrong = git_shim(
+        &root,
+        &tools,
+        "git-wrong.sh",
+        &format!("echo '{}'", file.display()),
+    );
+    let e = balerix_runtime::write_git_profile(&wrong, "f/c/a", &paths, &crew)
+        .unwrap_err()
+        .to_string();
+    assert!(e.ends_with(": not a directory"), "{e}");
+    assert!(!paths.git_profile().exists());
+}
+
+/// §12.1: the query runs from an empty environment, as the sandboxed git
+/// starts. A `GIT_EXEC_PATH` the daemon inherited would otherwise make the
+/// grant name a directory the sandboxed git never uses. The workspace
+/// forbids `set_var`, so the shim refuses when it sees `HOME`, which this
+/// test process has.
+#[test]
+fn the_exec_path_query_starts_from_an_empty_environment() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("nono", false));
+        return;
+    };
+    assert!(
+        std::env::var_os("HOME").is_some(),
+        "this test proves nothing without HOME in its own environment"
+    );
+    let root = support::temp_root("sandbox-git-exec-path-env");
+    let layout = support::layout(&root);
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let paths = layout.agent(&id);
+    let crew = layout.crew(&id.crew_ref());
+    for d in [&paths.workspace, &crew.cache_objects()] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let strict = git_shim(
+        &root,
+        &tools,
+        "git-strict-env.sh",
+        &format!(
+            "if [ -n \"${{HOME+x}}\" ]; then\n  echo 'shim: inherited environment' >&2\n  exit 3\nfi\nexec {} \"$@\"",
+            tools.git.display()
+        ),
+    );
+    balerix_runtime::write_git_profile(&strict, "f/c/a", &paths, &crew).unwrap();
+    assert!(paths.git_profile().exists());
+}

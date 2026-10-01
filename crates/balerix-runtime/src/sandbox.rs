@@ -7,6 +7,7 @@ use balerix_core::{AgentId, MaterializeError};
 use serde_json::{Value, json};
 
 use crate::fsutil::write_atomic;
+use crate::launch::outer_path;
 use crate::layout::{AgentPaths, CrewPaths, StateLayout};
 use crate::tools::{Cmd, ToolPaths};
 
@@ -113,12 +114,24 @@ pub fn render_profile(
 /// open network, the user's `sandbox` block and the agent's `env`, none
 /// of which the daemon's git should have. `set_vars` holds the hardening
 /// `harden_agent_git` puts on a command's environment, since nono drops
-/// every variable this list does not name. `git` comes from the host and
-/// need not sit under `/usr`; granted as a single file, canonical since
-/// Landlock rules bind to what the path resolves to.
-pub fn render_git_profile(id: &AgentId, paths: &AgentPaths, crew: &CrewPaths, git: &Path) -> Value {
+/// every variable this list does not name. `git` comes from the host:
+/// the binary is granted as a single file, canonical since Landlock rules
+/// bind to what the path resolves to, and `exec_path` (`git_exec_path`)
+/// as a directory, since `upload-pack` spawns `pack-objects` through it
+/// (#109). Its libraries are not granted: a git that loads them from
+/// outside `SYSTEM_READ` (nix, Linuxbrew), or a mise shim, cannot run
+/// under this profile and the calls fail closed (Spec N amendment §12.1,
+/// NS-6).
+pub fn render_git_profile(
+    id: &AgentId,
+    paths: &AgentPaths,
+    crew: &CrewPaths,
+    git: &Path,
+    exec_path: &Path,
+) -> Value {
     let mut read: Vec<PathBuf> = SYSTEM_READ.iter().map(PathBuf::from).collect();
     read.push(std::fs::canonicalize(git).unwrap_or_else(|_| git.to_path_buf()));
+    read.push(exec_path.to_path_buf());
     read.push(crew.cache_objects());
     read.push(crew.no_hooks());
     read.push(paths.workspace.clone());
@@ -148,6 +161,36 @@ pub fn render_git_profile(id: &AgentId, paths: &AgentPaths, crew: &CrewPaths, gi
     })
 }
 
+/// The directory the host git runs its helpers from, resolved. Asked of
+/// git itself, unsandboxed: it names no repository and reads nothing the
+/// agent wrote. From an empty environment but `PATH`, as the sandboxed
+/// call starts: a `GIT_EXEC_PATH` the daemon inherited would make the
+/// grant name a directory the sandboxed git never uses. A git that
+/// cannot answer, or names something that is not a directory, fails the
+/// step: no profile is written without the grant.
+fn git_exec_path(tools: &ToolPaths, id: &str) -> Result<PathBuf, MaterializeError> {
+    let tool_error = |stderr: String| MaterializeError::Tool {
+        id: id.to_string(),
+        tool: "git".into(),
+        subcommand: "--exec-path".into(),
+        args: vec!["--exec-path".into()],
+        stderr,
+    };
+    let out = Cmd::new(&tools.git)
+        .env_clear()
+        .env("PATH", outer_path(tools))
+        .args(["--exec-path"])
+        .run()
+        .map_err(|f| tool_error(f.stderr))?;
+    let named = PathBuf::from(out.stdout.trim_end_matches(['\r', '\n']));
+    let dir = std::fs::canonicalize(&named)
+        .map_err(|e| tool_error(format!("{}: {e}", named.display())))?;
+    if !dir.is_dir() {
+        return Err(tool_error(format!("{}: not a directory", named.display())));
+    }
+    Ok(dir)
+}
+
 /// Writes the git profile just before the daemon uses it, so nothing
 /// depends on the order of the materialize steps or on a file an earlier
 /// pass (or anything else) left there. Validated only when the bytes
@@ -170,7 +213,8 @@ pub fn write_git_profile(
             message: e.to_string(),
         })?;
     }
-    let profile = render_git_profile(&agent_id, paths, crew, &tools.git);
+    let exec_path = git_exec_path(tools, id)?;
+    let profile = render_git_profile(&agent_id, paths, crew, &tools.git, &exec_path);
     let path = paths.git_profile();
     if write_profile_at(&agent_id, &path, &profile)? {
         validate_profile_at(
@@ -597,7 +641,8 @@ mod tests {
         let paths = layout.agent(&id);
         let crew = layout.crew(&id.crew_ref());
         let git = Path::new("/opt/git/bin/git");
-        let p = render_git_profile(&id, &paths, &crew, git);
+        let exec_path = Path::new("/opt/git/libexec/git-core");
+        let p = render_git_profile(&id, &paths, &crew, git, exec_path);
 
         assert_eq!(p["meta"]["name"], "balerix-git-f-c-a");
         let fs = p["filesystem"].as_object().unwrap();
@@ -621,7 +666,7 @@ mod tests {
         );
 
         // a subset of what the agent itself can read, plus the empty
-        // hooks directory and the git binary
+        // hooks directory, the git binary and git's exec-path
         let agent = balerix_grants(
             &id,
             &paths,
@@ -641,13 +686,18 @@ mod tests {
                 agent.read.contains(path)
                     || agent.allow.contains(path)
                     || *path == crew.no_hooks()
-                    || path == git,
+                    || path == git
+                    || path == exec_path,
                 "{} is not something the agent can read",
                 path.display()
             );
         }
         assert!(read.contains(&paths.workspace));
         assert!(read.contains(&crew.cache_objects()));
+        assert!(
+            read.contains(&exec_path.to_path_buf()),
+            "upload-pack spawns pack-objects through git's exec-path (#109)"
+        );
         assert!(!read.contains(&paths.home), "the agent's home is not git's");
     }
 }

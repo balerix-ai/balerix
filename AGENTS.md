@@ -180,9 +180,12 @@ credentials, hook input, or sandbox rules.
   and the clone is deleted unharvested
   (`a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone`).
   The profile grants the system prefixes (`/usr`, `/lib`, `/lib64`,
-  `/bin`) and the `git` binary as a single file, not its shared libraries
-  or `libexec/git-core`, so a `git` installed elsewhere (nix, Linuxbrew,
-  a mise shim) cannot run under it. That fails closed: `down` without
+  `/bin`), the `git` binary as a single file and the directory `git
+  --exec-path` names (asked from an empty environment by
+  `sandbox::git_exec_path`; a git that cannot answer fails the step),
+  not its shared libraries, so a `git` that loads them from elsewhere
+  (nix, Linuxbrew) or is a mise shim cannot run under it (#109, Spec N
+  amendment NS-6). That fails closed: `down` without
   `--purge`, `remove` and a branch change fail on such a host, `--purge`
   is the way past, and the user `sandbox` block does not reach this
   profile.

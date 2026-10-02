@@ -832,6 +832,40 @@ fn stop_crew_waits_for_every_pane_process() {
     p.r.stop_crew(&p.id.crew_ref()).unwrap(); // absent → ok
 }
 
+/// Spec N amendment §13.5: the wait covers the panes of every session of
+/// the group, so a window reachable only through a grouped attach session
+/// (the crew session already gone) is still waited for.
+#[test]
+fn stop_crew_waits_for_a_pane_left_only_in_a_grouped_session() {
+    let Some(p) = pane("stopgroup", SLOW_TO_DIE) else {
+        return;
+    };
+    let pid = running_pid(&p);
+    let tmux = |args: &[&str]| {
+        let out = std::process::Command::new(&p.r.tmux)
+            .args(["-L", &p.r.socket])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "tmux {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let attach = format!("{ATTACH_SESSION_PREFIX}0000beef");
+    tmux(&["new-session", "-d", "-s", &attach, "-t", "=f/c"]);
+    tmux(&["kill-session", "-t", "=f/c"]);
+    assert_eq!(
+        tmux(&["list-sessions", "-F", "#{session_name}\t#{session_group}"]).trim(),
+        format!("{attach}\tf/c"),
+        "only the grouped session is left, still in the crew's group"
+    );
+    assert!(pid_alive(pid), "the window lives on in the grouped session");
+    p.r.stop_crew(&p.id.crew_ref()).unwrap();
+    assert!(
+        !pid_alive(pid),
+        "the pane process outlived stop_crew through the grouped session"
+    );
+}
+
 /// A restart must not start the new agent while the old one's processes
 /// are still dying.
 #[test]

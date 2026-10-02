@@ -301,8 +301,8 @@ impl TmuxRunner {
                 IDLE_ARGV[1],
                 IDLE_ARGV[2],
             ],
-        )?;
-        Ok(())
+        )
+        .map(|_| ())
     }
 
     fn windows(
@@ -511,25 +511,6 @@ impl AgentRunner for TmuxRunner {
         // windows linked into it while `observe` reports the crew gone;
         // the reconciler's next pass finds and stops it. tmux has no
         // "kill the group" command to make this one step.
-        // Grouped sessions share the crew's windows, so the crew
-        // session's panes are all of them.
-        let panes: Vec<ProcIdentity> = self
-            .run_optional(
-                &name,
-                &[
-                    "list-panes",
-                    "-s",
-                    "-t",
-                    &Self::session_target(crew),
-                    "-F",
-                    PANE_FORMAT,
-                ],
-            )?
-            .map(|text| parse_live_panes(&text))
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(ProcIdentity::of)
-            .collect();
         let Some(text) = self.run_optional(
             &name,
             &["list-sessions", "-F", "#{session_name}\t#{session_group}"],
@@ -537,7 +518,36 @@ impl AgentRunner for TmuxRunner {
         else {
             return Ok(());
         };
-        for session in sessions_in_group(&text, &name) {
+        let sessions = sessions_in_group(&text, &name);
+        // Grouped sessions share the crew's windows, but the crew session
+        // may already be gone with an attach still holding them: the panes
+        // of every session of the group, each process once, are what the
+        // stop waits on.
+        let mut panes: Vec<ProcIdentity> = Vec::new();
+        for session in &sessions {
+            let found = self
+                .run_optional(
+                    &name,
+                    &[
+                        "list-panes",
+                        "-s",
+                        "-t",
+                        &format!("={session}"),
+                        "-F",
+                        PANE_FORMAT,
+                    ],
+                )?
+                .map(|text| parse_live_panes(&text))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(ProcIdentity::of);
+            for p in found {
+                if !panes.contains(&p) {
+                    panes.push(p);
+                }
+            }
+        }
+        for session in &sessions {
             self.run_optional(&name, &["kill-session", "-t", &format!("={session}")])?;
         }
         self.wait_gone(&name, &panes)

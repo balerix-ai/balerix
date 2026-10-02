@@ -58,13 +58,17 @@ fn generated_profile_validates_and_enforces_isolation() {
 
     let outside = root.join("outside");
     std::fs::create_dir_all(&outside).unwrap();
+    // Spec N amendment §13.6: the supervisor sits outside the sandbox as
+    // the same user. This test process stands in for it.
     let script = format!(
         "echo in > \"$HOME/ok\" && echo HOME=$HOME && echo FOO=$FOO \
          && (echo x > {outside}/nope 2>/dev/null && echo ESCAPED || echo denied) \
          && (cat {objects}/ab/probe 2>/dev/null || echo CACHE_UNREADABLE) \
-         && (echo x > {objects}/nope 2>/dev/null && echo CACHE_WRITABLE || echo cache-denied)",
+         && (echo x > {objects}/nope 2>/dev/null && echo CACHE_WRITABLE || echo cache-denied) \
+         && (kill -0 {outside_pid} 2>/dev/null && echo SIGNALLED || echo signal-denied)",
         outside = outside.display(),
-        objects = objects.display()
+        objects = objects.display(),
+        outside_pid = std::process::id()
     );
     let out = Command::new(&tools.nono)
         .args([
@@ -111,6 +115,10 @@ fn generated_profile_validates_and_enforces_isolation() {
     assert!(
         stdout.contains("cache-denied") && !stdout.contains("CACHE_WRITABLE"),
         "a write into the cache must be denied: {stdout}"
+    );
+    assert!(
+        stdout.contains("signal-denied") && !stdout.contains("SIGNALLED"),
+        "a sandboxed process must not be able to signal one outside: {stdout}"
     );
     assert!(!objects.join("nope").exists());
 }

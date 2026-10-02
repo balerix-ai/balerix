@@ -134,6 +134,10 @@ pub enum RunnerError {
     },
     #[error("{id}: cannot parse tmux output: {message}")]
     Parse { id: String, message: String },
+    /// A stop that timed out: the pane's process is still there (Spec N
+    /// amendment §13.5).
+    #[error("{id}: agent processes still running after stop (pid {pid})")]
+    StillRunning { id: String, pid: u32 },
 }
 
 /// Why a workspace read failed (Spec C §3.1). `Display` is what the

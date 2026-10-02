@@ -52,6 +52,13 @@ pub enum Command {
     /// prints the reply; on any failure prints `{}` and exits 0.
     #[command(hide = true)]
     HookRelay,
+    /// Runs an agent's command as a child subreaper and ends its whole
+    /// process tree on stop (Spec N amendment §13). `launch.sh` calls it.
+    #[command(hide = true)]
+    AgentSupervise {
+        #[arg(last = true, required = true, value_name = "ARGV")]
+        argv: Vec<std::ffi::OsString>,
+    },
 }
 
 #[derive(Debug, Args)]

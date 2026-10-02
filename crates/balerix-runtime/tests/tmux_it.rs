@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use balerix_core::{AgentId, AgentRunner, LaunchPlan, ProcessState};
+use balerix_runtime::testing::pid_alive;
 use balerix_runtime::tmux::ATTACH_SESSION_PREFIX;
 use balerix_runtime::{ANCHOR_WINDOW, TmuxRunner};
 
@@ -726,4 +727,175 @@ fn a_send_text_never_lands_inside_a_running_send_keys() {
     let got = std::fs::read_to_string(&stdin_log).unwrap();
     assert_eq!(got, "k0k1k2k3k4k5k6k7k8k9TEXT\n", "{got:?}");
     r.stop_crew(&id.crew_ref()).unwrap();
+}
+
+/// One agent window running `body` as its `launch.sh`, on its own server.
+struct Pane {
+    r: TmuxRunner,
+    id: AgentId,
+    plan: LaunchPlan,
+    _server: KillServer,
+    _root: balerix_runtime::testing::TempRoot,
+}
+
+fn pane(label: &str, body: &str) -> Option<Pane> {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("tmux", false));
+        return None;
+    };
+    let root = support::temp_root(label);
+    let socket = format!("balerix-test-{label}-{}", std::process::id());
+    let guard = KillServer {
+        tmux: tools.tmux.clone(),
+        socket: socket.clone(),
+    };
+    let r = TmuxRunner::new(tools.tmux.clone(), socket);
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let agent_dir = root.join("a");
+    std::fs::create_dir_all(agent_dir.join("logs")).unwrap();
+    let script = agent_dir.join("launch.sh");
+    std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plan = LaunchPlan {
+        cwd: agent_dir,
+        env: BTreeMap::new(),
+        argv: vec![],
+        script,
+    };
+    r.ensure_crew(&id.crew_ref()).unwrap();
+    r.ensure_agent(&id, &plan).unwrap();
+    Some(Pane {
+        r,
+        id,
+        plan,
+        _server: guard,
+        _root: root,
+    })
+}
+
+fn running_pid(p: &Pane) -> u32 {
+    match p.r.observe(&p.id.fleet).unwrap().get(&p.id) {
+        Some(ProcessState::Running { pid }) => *pid,
+        other => panic!("expected running, got {other:?}"),
+    }
+}
+
+/// A pane process that takes half a second to die after the hangup: a
+/// stand-in for the supervisor emptying its tree.
+const SLOW_TO_DIE: &str = "trap 'sleep 0.5; exit 0' HUP\nwhile :; do sleep 0.1; done";
+
+/// Spec N amendment §13.5: `stop_agent` returns when the pane's process
+/// is gone, not when tmux has dropped the window.
+#[test]
+fn stop_waits_for_the_pane_process_and_a_dead_pane_stops_at_once() {
+    let Some(p) = pane("stopwait", SLOW_TO_DIE) else {
+        return;
+    };
+    let pid = running_pid(&p);
+    p.r.stop_agent(&p.id).unwrap();
+    assert!(!pid_alive(pid), "the pane process outlived stop_agent");
+
+    // a window whose pane already exited has nothing to wait for
+    p.r.ensure_agent(&p.id, &p.plan).unwrap();
+    let pid = running_pid(&p);
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_for(|| {
+        matches!(
+            p.r.observe(&p.id.fleet).unwrap().get(&p.id),
+            Some(ProcessState::Exited { .. })
+        )
+    });
+    let start = Instant::now();
+    p.r.stop_agent(&p.id).unwrap();
+    p.r.stop_agent(&p.id).unwrap(); // absent → ok
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn stop_crew_waits_for_every_pane_process() {
+    let Some(p) = pane("stopcrew", SLOW_TO_DIE) else {
+        return;
+    };
+    let pid = running_pid(&p);
+    p.r.stop_crew(&p.id.crew_ref()).unwrap();
+    assert!(!pid_alive(pid), "the pane process outlived stop_crew");
+    p.r.stop_crew(&p.id.crew_ref()).unwrap(); // absent → ok
+}
+
+/// Spec N amendment §13.5: the wait covers the panes of every session of
+/// the group, so a window reachable only through a grouped attach session
+/// (the crew session already gone) is still waited for.
+#[test]
+fn stop_crew_waits_for_a_pane_left_only_in_a_grouped_session() {
+    let Some(p) = pane("stopgroup", SLOW_TO_DIE) else {
+        return;
+    };
+    let pid = running_pid(&p);
+    let tmux = |args: &[&str]| {
+        let out = std::process::Command::new(&p.r.tmux)
+            .args(["-L", &p.r.socket])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "tmux {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let attach = format!("{ATTACH_SESSION_PREFIX}0000beef");
+    tmux(&["new-session", "-d", "-s", &attach, "-t", "=f/c"]);
+    tmux(&["kill-session", "-t", "=f/c"]);
+    assert_eq!(
+        tmux(&["list-sessions", "-F", "#{session_name}\t#{session_group}"]).trim(),
+        format!("{attach}\tf/c"),
+        "only the grouped session is left, still in the crew's group"
+    );
+    assert!(pid_alive(pid), "the window lives on in the grouped session");
+    p.r.stop_crew(&p.id.crew_ref()).unwrap();
+    assert!(
+        !pid_alive(pid),
+        "the pane process outlived stop_crew through the grouped session"
+    );
+}
+
+/// A restart must not start the new agent while the old one's processes
+/// are still dying.
+#[test]
+fn a_restart_waits_for_the_old_pane_process() {
+    let Some(p) = pane("restartwait", SLOW_TO_DIE) else {
+        return;
+    };
+    let old = running_pid(&p);
+    p.r.ensure_agent(&p.id, &p.plan).unwrap();
+    assert!(!pid_alive(old), "the old pane process outlived the restart");
+    assert_ne!(running_pid(&p), old);
+}
+
+/// NS-12: past the bound the call fails and names the pid.
+#[test]
+fn a_pane_process_that_ignores_the_hangup_fails_the_stop_after_the_bound() {
+    let Some(mut p) = pane("stopbound", "trap '' HUP\nwhile :; do sleep 0.2; done") else {
+        return;
+    };
+    p.r.stop_wait = Duration::from_millis(300);
+    let pid = running_pid(&p);
+    let start = Instant::now();
+    let err = p.r.stop_agent(&p.id).unwrap_err();
+    assert!(start.elapsed() >= Duration::from_millis(300));
+    assert_eq!(
+        err.to_string(),
+        format!("f/c/a: agent processes still running after stop (pid {pid})")
+    );
+    assert!(pid_alive(pid));
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status();
 }

@@ -14,7 +14,11 @@ use clap::Parser;
 use cli::{Cli, Command, ConfigCommand, DevCommand, PluginCommand};
 
 fn main() -> ExitCode {
-    match run() {
+    let cli = Cli::parse();
+    if let Command::AgentSupervise { argv } = &cli.command {
+        return commands::supervise::agent_supervise_command(argv);
+    }
+    match run(cli) {
         Ok(out) => {
             print!("{out}");
             ExitCode::SUCCESS
@@ -26,8 +30,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> anyhow::Result<String> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> anyhow::Result<String> {
     match cli.command {
         Command::Serve(args) => commands::serve::serve_command(&args),
         Command::Config {
@@ -66,5 +69,8 @@ fn run() -> anyhow::Result<String> {
             command: PluginCommand::Open(args),
         } => commands::plugin::open_command(&args),
         Command::HookRelay => commands::relay::hook_relay_command(),
+        Command::AgentSupervise { .. } => {
+            anyhow::bail!("agent-supervise is handled in main")
+        }
     }
 }

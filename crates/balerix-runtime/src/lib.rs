@@ -12,6 +12,7 @@ pub mod materializer;
 pub mod plugin;
 pub mod quote;
 pub mod sandbox;
+pub mod supervise;
 pub mod testing;
 pub mod tmux;
 pub mod toolchain;
@@ -31,7 +32,7 @@ pub use sandbox::{
     Grants, balerix_grants, check_conflicts, merge_profile, render_git_profile, render_profile,
     validate_profile, validate_profile_at, write_git_profile, write_profile, write_profile_at,
 };
-pub use tmux::{ANCHOR_WINDOW, ATTACH_SESSION_PREFIX, TmuxAttach, TmuxRunner};
+pub use tmux::{ANCHOR_WINDOW, ATTACH_SESSION_PREFIX, STOP_WAIT, TmuxAttach, TmuxRunner};
 pub use toolchain::{
     Toolchain, embedded_system_tools, level_env, mise_env, render_level_toml, render_mise_toml,
     system_tools,

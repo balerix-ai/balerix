@@ -214,7 +214,7 @@ every git call in the cache, and `inspect.rs` are untouched.
 
 ## 10. Deliberately deferred
 
-- Killing survivors (NS-1) and the workspace reader (NS-2).
+- Killing survivors (NS-1; done in §13) and the workspace reader (NS-2).
 - Removing `check_clone` or `check_clone_config`. They cost one
   filesystem walk and one sandboxed call and give the operator the
   message.
@@ -355,3 +355,201 @@ answer and the check.
    `verify-questions` pass on claude 2.1.287.
 4. The documents read as §12.5 says; #109 is closed and the follow-up
    issue exists.
+
+## 13. Amendment 2026-10-01: `stop` ends the whole process tree (#107)
+
+**Status:** Approved in brainstorm 2026-10-01. Takes up NS-1's deferred
+half: a process an agent detached with `setsid` or a double fork
+outlives `tmux kill-window`, keeps running in the agent's sandbox with
+network after `down`, and can write into `workspace/` while the daemon
+deletes it.
+
+**Outcome:** when `stop_agent`, `stop_crew` or a restart returns `Ok`,
+no process the agent started is alive.
+
+### 13.1 Feasibility (probed 2026-10-01, nono 0.79.0, throwaway)
+
+On the development host: an unprivileged container, pid 1 not systemd,
+the cgroup v2 root owned by root.
+
+| Candidate | `setsid` sleeper | double-forked sleeper | Runs here |
+|---|---|---|---|
+| `tmux kill-window` (today) | survives | survives | yes |
+| `nono stop --force <session>` | survives | survives | yes |
+| nono's cgroup (`--max-processes`) | not reached | not reached | no: `no delegated cgroup v2 subtree for this session` |
+| A subreaper wrapper in front of nono | killed | killed | yes |
+
+- nono is not a subreaper: the orphans re-parent to pid 1.
+- The wrapper emptied the tree about 10 ms after the hangup, and was
+  gone 35–65 ms after `kill-window`, in 4 of 4 runs; three of them had a
+  chain in which each generation detaches the next and exits, every
+  1–10 ms.
+- From inside the sandbox, `kill -0 <wrapper>` fails with `Operation not
+  permitted`.
+
+### 13.2 Decisions
+
+| # | Decision | Rationale |
+|---|----------|-----------|
+| NS-7 | The tree is tracked by a **child subreaper** in front of nono, not by a cgroup or by nono's session. | It is the only candidate that killed the survivors and the only one that needs no delegation from the host. A cgroup is the stronger mechanism where it exists; nono refuses to start with one in an unprivileged container. |
+| NS-8 | The wrapper is a hidden `balerix` subcommand, not a second binary. | `ToolPaths` already carries the `balerix` path; the wrapper always matches the daemon that wrote `launch.sh`; nothing new to ship or discover. |
+| NS-9 | On stop: hangup to the main child, a fixed 2 s grace, then SIGKILL until empty. Not configurable. | claude and nono get the signal they get today and time to flush (nono's audit ledger). Nobody has asked to tune the value. |
+| NS-10 | When the main child exits on its own, the rest of the tree is killed at once. | One rule: no agent process outlives its main process. Leaving the wrapper alive to hold survivors would make `observe` report a dead agent as `Running`. |
+| NS-11 | `stop` learns the tree is empty from the wrapper's exit: the pane's pid and its start time, polled. | The wrapper exits only when it has no children. Everything stays inside `TmuxRunner`; the `AgentRunner` port does not change. A lock file in the agent's directory was rejected: the runner knows no agent path at `stop`. |
+| NS-12 | A wrapper still alive after 5 s fails the call. | The reconciler reports and retries it; removal never reaches the workspace delete with the agent's processes alive. |
+
+### 13.3 The wrapper: `balerix agent-supervise -- <argv…>`
+
+A hidden subcommand beside `hook-relay`. The logic is a new
+`balerix-runtime` module, `supervise.rs`; the subcommand installs the
+signal handlers (tokio, before the child exists) and hands the module a
+channel that carries one message per signal.
+`rustix` (already in the lockfile) becomes a direct dependency of
+`balerix-runtime` for `set_child_subreaper`, `kill_process` and
+`wait` (any child, wait4(-1): rustix 1.1.4's `waitpid(None, …)` only sees children in the caller's process group, and a `setsid` orphan is in another). No `unsafe`.
+
+1. Mark the process a child subreaper. A failure is fatal: exit
+   non-zero with the error on stderr, nothing spawned.
+2. Spawn `<argv>` with stdin, stdout, stderr and the environment
+   inherited unchanged.
+3. Wait for the first of: the main child exits; SIGHUP, SIGTERM or
+   SIGINT arrives.
+4. On a signal: send SIGHUP to the main child, then wait up to 2 s
+   (`STOP_GRACE`) for the wrapper to have no children. A further signal
+   during the grace changes nothing.
+5. On the main child's own exit: no grace.
+6. The kill loop, in both cases: list every descendant from `/proc`
+   (parent pids, starting at the wrapper's own pid), SIGKILL each, reap
+   with `wait` (not `waitpid`, for the reason in the dependency sentence), repeat until `wait` reports no children. It does
+   not give up; the caller's bound (§13.5) reports a stuck one.
+7. Exit status: the main child's (128+n if a signal killed it), so
+   `pane_dead_status` keeps its meaning; 143 if the wrapper was stopped
+   before the main child exited.
+
+A descendant is any process whose chain of parents reaches the wrapper.
+Because the wrapper is a subreaper, an orphan anywhere below it
+re-parents to it, never to pid 1, whatever session or process group the
+orphan joined.
+
+### 13.4 `launch.sh`
+
+`render_launch` puts `<balerix> agent-supervise --` in front of the nono
+argv; `LaunchPlan::argv` carries the same prefix. Environment, cwd and
+"safe to run by hand" are unchanged: Ctrl-C by hand tears the tree down
+through step 4. The wrapper runs outside the sandbox; the nono profile
+does not change.
+
+### 13.5 The runner waits
+
+All in `TmuxRunner`. The port and `FakeRunner` do not change.
+
+- A helper reads a process's identity: pid, and the start time from
+  field 22 of `/proc/<pid>/stat`. "Gone" means the stat file is absent
+  or its start time differs (the pid was reused).
+- `stop_agent`: read the pane's pid and identity, `kill-window`, then
+  poll every 10 ms until it is gone. A window that does not exist, or a
+  pane already dead, is `Ok` as today.
+- `stop_crew`: collect the identities of every pane in the group's
+  sessions before the kills, then wait for all of them against one
+  deadline. The anchor's idle shell is one of them.
+- `ensure_agent` on a window in `Running`: `respawn-window -k` into the
+  idle placeholder, wait for the old pane's identity to be gone, then
+  `pipe-pane` and `respawn-window` into the script as the other arms do.
+  Today it respawns over the live process, and the new agent would start
+  while the old tree is dying.
+- The bound is 5 s (`STOP_WAIT`): the grace plus a margin. Past it the
+  call returns a new `RunnerError::StillRunning` for that agent or crew,
+  whose message is `agent processes still running after stop (pid <n>)`.
+  The bound is a field of `TmuxRunner` so a test can shorten it. Nothing is
+  rolled back; the next reconcile pass calls stop again, which finds no
+  window and waits on nothing. So the error is reported once and the
+  retry can succeed while survivors remain. That is acceptable only
+  because the wrapper's loop does not give up; §13.6 names the case
+  where there is no wrapper.
+
+### 13.6 Limits
+
+Stated in `docs/THREAT-MODEL.md`:
+
+- A wrapper that is itself SIGKILLed (the OOM killer, an operator)
+  leaves its orphans to pid 1, as before this amendment. The sandboxed
+  agent cannot do it while nono's default signal isolation holds:
+  signalling the wrapper from inside the sandbox is refused (§13.1), and
+  `sandbox_it` asserts that for the generated profile with an empty user
+  `sandbox` block on the test kernel. balerix does not pin it: a user
+  `sandbox` block that loosens it (`security.signal_mode: allow_all`,
+  checked against nono 0.79.0) or a kernel where nono cannot enforce it
+  (Landlock below ABI v6, i.e. before Linux 6.12) removes it. Pinning it
+  is a follow-up.
+- The kill loop races a process that forks faster than one `/proc` scan.
+  It won every probe run; it is not a proof. A cgroup would be one, and
+  is not available in an unprivileged container.
+- An agent launched before the upgrade has no wrapper until its next
+  launch. `stop` waits for nono's pid and otherwise behaves as before:
+  survivors are not found. No restart is forced.
+- Plugin windows (`render_plugin_launch`, unchanged) have no wrapper:
+  the pane's process is nono itself, so a plugin process that ignores the
+  hangup or detaches survives the stop as before this amendment; the stop
+  fails once with `StillRunning` and the retry returns `Ok`. Plugins
+  under the wrapper: a follow-up.
+- Linux only, like the sandbox.
+
+### 13.7 Tests
+
+- `supervise.rs` unit: the `/proc/<pid>/stat` parser (a command name
+  holding `) `), the descendant walk, and a process's identity (a zombie
+  and a reaped pid are both gone).
+- `crates/balerix/tests/cli_supervise.rs`, the real binary against real
+  processes, no nono. A subreaper must be its own process: set in a test
+  process it would adopt, and kill, other tests' children. Each test
+  finds its processes by a marker unique to the test:
+  - after SIGHUP, a `setsid` sleeper and a double-forked one are dead
+    when the wrapper returns;
+  - a main child that exits on SIGHUP ends the wrapper well inside the
+    grace;
+  - the main child's own exit kills the rest, and its status is the
+    wrapper's;
+  - a chain in which each generation detaches the next and exits is
+    emptied.
+- `launch.rs` unit: the script and `argv` start with the wrapper.
+  - a main child that ignores the hangup is killed after the grace, and
+    a second signal during the grace changes nothing;
+  - a command that does not exist fails with a message, and the child's
+    stdin and stdout pass through.
+- `cli_supervise.rs`, with tmux and the wrapper in front of a script:
+  #107's case, an agent that `setsid`s a sleeper; when `stop_agent`
+  returns, no process of it is alive. The same through `stop_crew`, and
+  through `ensure_agent` on a running window.
+- `tmux_it.rs`, no wrapper: `stop_agent`, `stop_crew` and a restart
+  return only when a pane process that takes half a second to die is
+  gone; a pane process that ignores the hangup fails the call after the
+  bound with the message of §13.5; a window whose pane already exited
+  stops at once.
+- `sandbox_it.rs`, real nono, the agent's generated profile: a sandboxed
+  process that signals a process outside the sandbox (the test process,
+  same user) is refused.
+- By hand: `mise run verify-claude`, because the wrapper now sits
+  between tmux and nono's terminal handling. Its result is stated in the
+  PR.
+
+### 13.8 Documents and issues
+
+- `docs/THREAT-MODEL.md`: a clause for the process tree, with §13.6's
+  limits.
+- `ARCHITECTURE.md`: the wrapper in the launch path, one line.
+- `materializer.rs`: the comments that say nono writes "shortly after
+  `tmux kill-window` returns" are corrected if the wait makes them
+  untrue; `retry_rmdir` stays (a purge of a plugin's directory, and
+  agents without a wrapper).
+- §10's "Killing survivors (NS-1)" is done by this section.
+- PR title `fix(runtime): stop ends the sandbox's whole process tree and
+  waits for it to be empty (#107)`; it closes #107.
+
+### 13.9 Done when
+
+1. Every `launch.sh` starts the agent under the wrapper, and
+   `stop_agent`, `stop_crew` and a restart return only when the pane's
+   process is gone, or fail after `STOP_WAIT`.
+2. The tests of §13.7 pass; `mise run check`, `mise run test-it` and
+   `mise run e2e` pass; `verify-claude` passes.
+3. The documents read as §13.8 says; #107 is closed.

@@ -13,6 +13,7 @@ balerix-api = { workspace = true }
 balerix-core = { workspace = true }
 hex = { workspace = true }
 portable-pty = { workspace = true }
+rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_norway = { workspace = true }

@@ -25,6 +25,7 @@ use balerix_core::{
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
+use crate::supervise::ProcIdentity;
 use crate::tools::Cmd;
 
 /// The window that keeps a session alive when every agent window is gone.
@@ -45,6 +46,21 @@ static SEND_SEQ: AtomicU64 = AtomicU64::new(0);
 /// multi-line text: tmux refuses a command whose argv exceeds ~16 KiB
 /// (`command too long`), and `send-keys -l` carries the text as argv.
 pub(crate) const SEND_KEYS_LIMIT: usize = 4096;
+
+/// How long a stop waits for the pane processes it ended (Spec N
+/// amendment NS-12): the supervisor's grace plus a margin.
+pub const STOP_WAIT: Duration = Duration::from_secs(5);
+const STOP_POLL: Duration = Duration::from_millis(10);
+const PANE_FORMAT: &str = "#{pane_dead}\t#{pane_pid}";
+
+/// The pids of the panes that are not dead, from `PANE_FORMAT` lines.
+pub(crate) fn parse_live_panes(text: &str) -> Vec<u32> {
+    text.lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(dead, _)| *dead == "0")
+        .filter_map(|(_, pid)| pid.parse().ok())
+        .collect()
+}
 
 /// `balerix-attach-<8 hex>`, unique per process: the clock, a counter and
 /// the pid folded into 32 bits.
@@ -139,6 +155,8 @@ impl Drop for TmuxAttach {
 pub struct TmuxRunner {
     pub tmux: PathBuf,
     pub socket: String,
+    /// `STOP_WAIT`; a field so a test can shorten it.
+    pub stop_wait: Duration,
     /// One lock per agent, held for the whole of a `send_text` or a
     /// `send_keys` (Spec J §4.2): a paced key sequence lasts seconds, and
     /// another send landing inside it would corrupt both. Entries are never
@@ -151,6 +169,7 @@ impl TmuxRunner {
         Self {
             tmux,
             socket: socket.into(),
+            stop_wait: STOP_WAIT,
             sends: Mutex::new(HashMap::new()),
         }
     }
@@ -246,6 +265,44 @@ impl TmuxRunner {
 
     fn window_target(agent: &AgentId) -> String {
         format!("={}:={}", agent.crew_ref(), agent.agent)
+    }
+
+    /// Blocks until every process in `procs` has exited (Spec N amendment
+    /// §13.5). The supervisor in front of an agent exits only when its
+    /// tree is empty, so its exit is what "stopped" means.
+    fn wait_gone(&self, id: &str, procs: &[ProcIdentity]) -> Result<(), RunnerError> {
+        let deadline = Instant::now() + self.stop_wait;
+        loop {
+            let Some(alive) = procs.iter().find(|p| !p.gone()) else {
+                return Ok(());
+            };
+            if Instant::now() >= deadline {
+                return Err(RunnerError::StillRunning {
+                    id: id.to_string(),
+                    pid: alive.pid,
+                });
+            }
+            std::thread::sleep(STOP_POLL);
+        }
+    }
+
+    /// Revives or replaces a window's pane with the idle placeholder.
+    fn respawn_idle(&self, id: &str, target: &str, cwd: &str) -> Result<(), RunnerError> {
+        self.run(
+            id,
+            &[
+                "respawn-window",
+                "-k",
+                "-t",
+                target,
+                "-c",
+                cwd,
+                IDLE_ARGV[0],
+                IDLE_ARGV[1],
+                IDLE_ARGV[2],
+            ],
+        )
+        .map(|_| ())
     }
 
     fn windows(
@@ -373,22 +430,17 @@ impl AgentRunner for TmuxRunner {
                 // `pipe-pane` refuses a dead pane ("target pane has
                 // exited"), so revive it into the idle placeholder first,
                 // for the same reason as the `None` arm above.
-                self.run(
-                    &id,
-                    &[
-                        "respawn-window",
-                        "-k",
-                        "-t",
-                        &target,
-                        "-c",
-                        &cwd,
-                        IDLE_ARGV[0],
-                        IDLE_ARGV[1],
-                        IDLE_ARGV[2],
-                    ],
-                )?;
+                self.respawn_idle(&id, &target, &cwd)?;
             }
-            Some(ProcessState::Running { .. }) => {}
+            Some(ProcessState::Running { pid }) => {
+                // A restart: end the old process first and wait for it,
+                // so the new agent never starts while the old tree is
+                // still dying (Spec N amendment §13.5). Through the idle
+                // placeholder, for the same reason as the arms above.
+                let old = ProcIdentity::of(pid);
+                self.respawn_idle(&id, &target, &cwd)?;
+                self.wait_gone(&id, old.as_slice())?;
+            }
         }
         // `set-option` is idempotent and, by this point, always aimed at a
         // live pane, so re-applying it here unconditionally (not only right
@@ -438,11 +490,16 @@ impl AgentRunner for TmuxRunner {
     }
 
     fn stop_agent(&self, agent: &AgentId) -> Result<(), RunnerError> {
-        self.run_optional(
-            &agent.to_string(),
-            &["kill-window", "-t", &Self::window_target(agent)],
-        )
-        .map(|_| ())
+        let id = agent.to_string();
+        let pane = match self
+            .windows(&agent.crew_ref())?
+            .and_then(|w| w.get(&agent.agent).copied())
+        {
+            Some(ProcessState::Running { pid }) => ProcIdentity::of(pid),
+            _ => None,
+        };
+        self.run_optional(&id, &["kill-window", "-t", &Self::window_target(agent)])?;
+        self.wait_gone(&id, pane.as_slice())
     }
 
     fn stop_crew(&self, crew: &CrewRef) -> Result<(), RunnerError> {
@@ -461,10 +518,39 @@ impl AgentRunner for TmuxRunner {
         else {
             return Ok(());
         };
-        for session in sessions_in_group(&text, &name) {
+        let sessions = sessions_in_group(&text, &name);
+        // Grouped sessions share the crew's windows, but the crew session
+        // may already be gone with an attach still holding them: the panes
+        // of every session of the group, each process once, are what the
+        // stop waits on.
+        let mut panes: Vec<ProcIdentity> = Vec::new();
+        for session in &sessions {
+            let found = self
+                .run_optional(
+                    &name,
+                    &[
+                        "list-panes",
+                        "-s",
+                        "-t",
+                        &format!("={session}"),
+                        "-F",
+                        PANE_FORMAT,
+                    ],
+                )?
+                .map(|text| parse_live_panes(&text))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(ProcIdentity::of);
+            for p in found {
+                if !panes.contains(&p) {
+                    panes.push(p);
+                }
+            }
+        }
+        for session in &sessions {
             self.run_optional(&name, &["kill-session", "-t", &format!("={session}")])?;
         }
-        Ok(())
+        self.wait_gone(&name, &panes)
     }
 
     fn observe(&self, fleet: &FleetName) -> Result<ObservedState, RunnerError> {
@@ -674,6 +760,15 @@ impl TmuxRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_panes_are_the_ones_not_dead() {
+        assert_eq!(
+            parse_live_panes("0\t41\n1\t42\n0\t43\n\n0\tx\n"),
+            vec![41, 43]
+        );
+        assert!(parse_live_panes("").is_empty());
+    }
 
     #[test]
     fn parses_running_dead_and_skips_anchor_and_foreign_windows() {

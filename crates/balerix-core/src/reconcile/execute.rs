@@ -39,8 +39,10 @@ impl ExecuteReport {
 }
 
 /// Runs every step in order. A failed step for an agent skips that agent's
-/// later steps; a failed `EnsureCrew` skips the crew's agents and writes the
-/// crew error into each of their messages. Ends with `finish_pass`.
+/// later steps and its crew's `RemoveCrew` (a stop that failed may have left
+/// the agent's processes alive in the workspace); a failed `EnsureCrew` skips
+/// the crew's agents and writes the crew error into each of their messages.
+/// Ends with `finish_pass`.
 pub fn execute(plan: &Plan, status: &mut FleetStatus, ctx: &ReconcileContext) -> ExecuteReport {
     let agents: BTreeMap<AgentId, ResolvedAgent> = ctx
         .desired
@@ -67,6 +69,12 @@ pub fn execute(plan: &Plan, status: &mut FleetStatus, ctx: &ReconcileContext) ->
                 report.skipped.push(step.clone());
                 continue;
             }
+        }
+        if let Step::RemoveCrew(crew, _) = step
+            && failed_agents.iter().any(|id| id.crew_ref() == *crew)
+        {
+            report.skipped.push(step.clone());
+            continue;
         }
         let now = ctx.clock.now();
         let outcome: Result<(), String> = match step {
@@ -386,6 +394,66 @@ mod tests {
                 .contains(&"remove_crew f/c repos=true sessions=true".to_string())
         );
         assert!(h.r.observed().crews.is_empty());
+    }
+
+    #[test]
+    fn a_failed_stop_holds_back_its_crews_removal_until_a_later_pass() {
+        let h = Harness::new();
+        let mut f = fleet(&["a"]);
+        let other = f.crews[&"c".parse().unwrap()].clone();
+        f.crews.insert("d".parse().unwrap(), other);
+        let mut st = FleetStatus::default();
+        reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        h.r.fail_next("stop_agent", "f/c/a", "still running");
+        let (p, rep) = reconcile_pass(&mut st, &h.ctx(None)).unwrap();
+        assert_eq!(
+            p.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "stop f/c/a",
+                "stop f/d/a",
+                "remove-crew f/c keep-repos=false keep-sessions=false",
+                "remove-crew f/d keep-repos=false keep-sessions=false"
+            ]
+        );
+        assert_eq!(rep.failures.len(), 1, "{rep:?}");
+        assert_eq!(
+            rep.skipped
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["remove-crew f/c keep-repos=false keep-sessions=false"],
+            "the failed agent's crew is held back"
+        );
+        assert!(!h.r.calls().contains(&"stop_crew f/c".to_string()));
+        assert!(
+            !h.m.calls()
+                .iter()
+                .any(|c| c.starts_with("remove_crew f/c ")),
+            "the workspace is not deleted while the agent may be alive"
+        );
+        assert!(
+            h.m.calls()
+                .iter()
+                .any(|c| c.starts_with("remove_crew f/d ")),
+            "another crew's removal proceeds"
+        );
+        assert_eq!(st.phase, FleetPhase::Terminating);
+        // the next pass stops the agent and removes its crew
+        let (p, rep) = reconcile_pass(&mut st, &h.ctx(None)).unwrap();
+        assert!(rep.all_ok(), "{rep:?}");
+        assert_eq!(
+            p.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "stop f/c/a",
+                "remove-crew f/c keep-repos=false keep-sessions=false"
+            ]
+        );
+        assert!(
+            h.m.calls()
+                .iter()
+                .any(|c| c.starts_with("remove_crew f/c "))
+        );
+        assert_eq!(st.phase, FleetPhase::Down);
     }
 
     #[test]

@@ -11,9 +11,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use rustix::io::Errno;
-use rustix::process::{
-    Pid, Signal, WaitOptions, getpid, kill_process, set_child_subreaper, waitpid,
-};
+use rustix::process::{Pid, Signal, WaitOptions, getpid, kill_process, set_child_subreaper, wait};
 
 /// How long the tree gets to exit after the hangup before it is killed
 /// (NS-9). Fixed.
@@ -123,7 +121,9 @@ pub(crate) fn exit_code(exited: Option<i32>, signalled: Option<i32>) -> i32 {
 /// a subreaper, that means its whole tree is empty.
 fn reap(main: u32, status: &mut Option<i32>) -> io::Result<bool> {
     loop {
-        match waitpid(None, WaitOptions::NOHANG) {
+        // `wait`, not `waitpid(None, ..)`: that only sees children in this
+        // process group, and a `setsid` orphan is in another.
+        match wait(WaitOptions::NOHANG) {
             Ok(Some((pid, st))) => {
                 if raw(pid) == main {
                     *status = Some(exit_code(st.exit_status(), st.terminating_signal()));

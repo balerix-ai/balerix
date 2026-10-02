@@ -473,14 +473,25 @@ Stated in `docs/THREAT-MODEL.md`:
 
 - A wrapper that is itself SIGKILLed (the OOM killer, an operator)
   leaves its orphans to pid 1, as before this amendment. The sandboxed
-  agent cannot do it: signalling the wrapper from inside the sandbox is
-  refused (§13.1), and a test pins that.
+  agent cannot do it while nono's default signal isolation holds:
+  signalling the wrapper from inside the sandbox is refused (§13.1), and
+  `sandbox_it` asserts that for the generated profile with an empty user
+  `sandbox` block on the test kernel. balerix does not pin it: a user
+  `sandbox` block that loosens it (`security.signal_mode: allow_all`,
+  checked against nono 0.79.0) or a kernel where nono cannot enforce it
+  (Landlock below ABI v6, i.e. before Linux 6.12) removes it. Pinning it
+  is a follow-up.
 - The kill loop races a process that forks faster than one `/proc` scan.
   It won every probe run; it is not a proof. A cgroup would be one, and
   is not available in an unprivileged container.
 - An agent launched before the upgrade has no wrapper until its next
   launch. `stop` waits for nono's pid and otherwise behaves as before:
   survivors are not found. No restart is forced.
+- Plugin windows (`render_plugin_launch`, unchanged) have no wrapper:
+  the pane's process is nono itself, so a plugin process that ignores the
+  hangup or detaches survives the stop as before this amendment; the stop
+  fails once with `StillRunning` and the retry returns `Ok`. Plugins
+  under the wrapper: a follow-up.
 - Linux only, like the sandbox.
 
 ### 13.7 Tests

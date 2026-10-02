@@ -12,9 +12,9 @@ agent's `SessionStart` hook runs.
 
 Mental model: **balerix is a config generator and process launcher.** It turns a
 fleet YAML file into one fully-resolved settings block per agent, then (later
-phases) materializes each agent as a tmux window running
-`balerix agent-supervise → nono run → mise exec → claude` in its own `$HOME`, and reconciles what exists
-against what was declared.
+phases) materializes each agent as a tmux window running `balerix
+agent-supervise → nono run → mise exec → claude` in its own `$HOME`, and
+reconciles what exists against what was declared.
 
 ## The pieces
 - `balerix-api` — serde wire types. A leaf; no logic. Anything that holds a secret

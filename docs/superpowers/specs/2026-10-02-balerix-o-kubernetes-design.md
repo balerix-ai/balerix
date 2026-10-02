@@ -340,12 +340,20 @@ comes from it.
    daemon does on one machine: the private clone with `--reference` to the
    crew cache, `home/` (settings with balerix's hooks, credentials,
    `hosts.yml`), `mise.toml` and the install of the agent's own tools into
-   `home/`, the nono profile and its validation, `launch.sh`.
+   `home/`, the nono profile and its validation, `launch.sh`. It then
+   runs a sandbox self-test in its own container, which has the same
+   pod seccomp settings and the same node kernel as the agent container:
+   `nono -s run --profile <the agent's profile> -- /bin/true`.
 2. A failure ends the sidecar with a one-line reason as the container's
-   termination message. A nono that cannot run is `SandboxUnavailable`.
-   Where Landlock is denied, nono exits 1 with `Landlock not available`
-   and runs nothing (§19.2); that exit is the signal, since
-   `/sys/kernel/security/lsm` cannot be read inside the pod.
+   termination message. A self-test that exits 1 with
+   `Landlock not available` is `SandboxUnavailable`. That exit and
+   message are what nono gave when the Landlock syscalls answered
+   `ENOSYS` (§19.2), and `/sys/kernel/security/lsm` did not exist in the
+   pods probed, so nono's own failure is the signal. The self-test is
+   needed because the first `nono run` of `launch.sh` happens in the agent
+   container, after these steps, where the sidecar does not see nono's
+   message: a node without Landlock would otherwise look like a pane
+   exiting 1 and be restarted with back-off.
 3. The sidecar writes the start marker. The `agent` container, which has
    been waiting for it, starts a tmux server on the shared socket with one
    window running `launch.sh` under `remain-on-exit`.
@@ -362,7 +370,7 @@ socket for `send_text`, `send_keys`, attach and respawn, and runs the core
 planner for its one agent, so a dead Claude restarts with the existing
 back-off and a `stop` holds until a `restart`.
 
-Two rules follow from the spike (§19.1):
+Three rules follow from the spike (§19.1):
 
 - Every tmux client call from the sidecar passes `-u`, or the sidecar's
   environment sets a UTF-8 locale. Without either, tmux replaces the tabs
@@ -372,13 +380,27 @@ Two rules follow from the spike (§19.1):
   it reports it in `status` and reads nothing under `/proc` by it. What
   reads `/proc` of Claude's process (`balerix agent-supervise`) runs in
   the agent container, from `launch.sh`.
+- On one machine, `TmuxRunner` waits for a process tree to end through
+  `/proc`: the restart arm of `ensure_agent`, `stop_agent` and
+  `stop_crew` take `ProcIdentity::of(pane_pid)`, which reads
+  `/proc/<pid>/stat`, and `wait_gone` polls it (Spec N amendment §13.5).
+  In the sidecar that read finds no process, so the wait returns at once
+  and #107's bug is back, or it finds an unrelated sidecar process with
+  the same pid and waits on that. Sub-project 2 therefore makes the
+  runner's process waits in pod mode use no `/proc`. They rely on tmux's
+  own view of the pane, where `pane_dead` under `remain-on-exit` is
+  visible from the sidecar (P1.8), and on `balerix agent-supervise`, the
+  pane's process, which runs in the agent container and exits only when
+  its tree is empty. A wait on `pane_dead` needs the pane to exist until
+  then, so a pod-mode stop does not remove the window before the pane is
+  dead.
 
 ### 6.4 Verified at the spike
 
 A tmux client in one container drives and attaches to a server in another
 through a socket on a shared volume, including the PTY an attach needs.
 This held on kind (Kubernetes 1.37.0 and 1.34.11) and on k3s 1.36.4
-(§19.1). The fallback in §6.4 is not taken. That fallback was one
+(§19.1). The fallback is not taken. That fallback was one
 container running both processes, with nono as the only wall between
 sidecar and agent; the two-container shape in §6.1 stands.
 
@@ -580,7 +602,7 @@ bundle) is in the sidecar container only.
 | Operator down | Nothing changes; agents, hooks and plugins keep working. |
 | Daemon down | Hooks pass; sidecars and plugins reconnect; the operator sets `DaemonUnavailable` and retries. After a restart the Daemon reloads its records from the state claim and the operator re-sends fleets and the plugin list. |
 | Sync Job fails | `CacheReady=False` or `ToolsReady=False` with the message; the crew's agents wait; retried with back-off. |
-| Node lacks Landlock | nono exits 1 and runs nothing (§19.2); the Agent is `Materialized=False`, reason `SandboxUnavailable`. |
+| Node lacks Landlock | The sidecar's sandbox self-test (§6.2) fails: nono exits 1 and runs nothing, as observed with the Landlock syscalls answering `ENOSYS` (§19.2); the Agent is `Materialized=False`, reason `SandboxUnavailable`. |
 | Pod evicted or node drained | Recreated on the same claim; Claude resumes. |
 | Harvest fails | The finalizer blocks with a condition; the purge annotation skips it. |
 | Shared class is not ReadWriteMany | The Daemon is `StorageReady=False`; nothing starts. |
@@ -751,7 +773,7 @@ Each gets its own plan.
 1. **Spike.** tmux across two containers on a shared socket, with attach;
    nono and Landlock on `kind` and on one managed cluster; a ReadWriteMany
    class on `kind` for CI. Output: answers, and §6.4's fallback taken or
-   not. Done; see §19.
+   not. Done; see §19 — §19.4 for the managed cluster.
 2. **Daemon mode and sidecar.** §6, §7, the pod layout in `StateLayout`,
    TLS. Done when the two-process integration tests pass.
 3. **Operator and CRDs.** §4, §5, §8. Done when `e2e-k8s` passes without
@@ -781,39 +803,47 @@ Each gets its own plan.
 ## 19. Recorded at the spike (2026-10)
 
 Probes: branch `spike/k8s` at `b61567a`, deleted after this section was
-written. Run on kind 0.33.0 (Kubernetes 1.37.0 and 1.34.11, three nodes,
-GitHub's `ubuntu-24.04` runner, kernel `6.17.0-1022-azure`) and on a k3s
-cluster (`v1.36.4+k3s1`, one x86_64 node, kernel `6.12.90+deb13.1-amd64`,
+written. The kind tables are from GitHub Actions run 37016593694 at
+`b2a4612`; the commits after it, up to `b61567a`, added only `run.sh`'s
+namespace creation, the claude pin and the k3s results file. Run on kind
+0.33.0 (Kubernetes 1.37.0 and 1.34.11, three nodes, GitHub's
+`ubuntu-24.04` runner, kernel `6.17.0-1022-azure`) and on a k3s cluster
+(`v1.36.4+k3s1`, one x86_64 node, kernel `6.12.90+deb13.1-amd64`,
 Debian 13), reached through a namespaced tenant role. The k3s cluster
 stands in for the managed cluster §17 asks for; no GKE, EKS or AKS cluster
 was available. Every probe pod ran with §6.1's settings (uid 10001,
 `runAsNonRoot`, read-only root filesystem, all capabilities dropped, no
 privilege escalation, `RuntimeDefault` seccomp, no service-account token)
-in a namespace enforcing `restricted`, from the pinned `debian:trixie-slim`,
-with tmux 3.7c and nono 0.79.0 copied in. kind 1.37.0 and 1.34.11 gave the
-same verdict on every row.
+and with `runAsGroup: 10001` and `fsGroup: 10001`, in a namespace
+enforcing `restricted`, from the pinned `debian:trixie-slim`, with tmux
+3.7c and nono 0.79.0 copied in. kind 1.37.0 and 1.34.11 gave the same
+verdict on every row.
 
 ### 19.1 tmux across containers (§6.4)
 
 P1.0–P1.5 and P1.7–P1.10 passed on kind 1.37.0, kind 1.34.11 and k3s
 1.36.4. The hardened pod with a native sidecar was admitted. A tmux server
 started from the agent container outlived the exec that started it. From
-the sidecar, through the socket in the shared `emptyDir`: `has-session`
-found the session; `send-keys -l` reached the pane;
-`load-buffer -b <name> -` from the client's stdin and `paste-buffer -p -d`
-reached it; `capture-pane` read it; a grouped attach session
-(`new-session -t crew -s balerix-attach-1`) in a PTY (`script`) typed into
-the pane and read it; `pane_dead=1` showed under `remain-on-exit` after the
-pane exited; `respawn-window -k` restarted the command in the agent
-container; `kill-session` ended the session.
+the sidecar, through the socket in the shared `emptyDir`:
+
+- `has-session` found the session;
+- `send-keys -l` reached the pane, and so did `load-buffer -b <name> -`
+  from the client's stdin followed by `paste-buffer -p -d`;
+- `capture-pane` read the pane;
+- a grouped attach session (`new-session -t crew -s balerix-attach-1`) in
+  a PTY (`script`) typed into the pane and read it;
+- `pane_dead=1` showed under `remain-on-exit` after the pane exited;
+- `respawn-window -k` restarted the command in the agent container, and
+  `kill-session` ended the session.
 
 The fallback in §6.4 is not taken.
 
 `#{pane_pid}` names a process in the agent container's PID namespace
 (P1.6: not visible). `list-windows -u` from the sidecar printed pid 55 or
 56 on kind and 51 on k3s, and `/proc/<pid>` did not exist in the sidecar.
-The sidecar therefore treats the pid as opaque, and what reads `/proc` of
-Claude's process runs in the agent container (§6.3).
+The sidecar therefore treats the pid as opaque, what reads `/proc` of
+Claude's process runs in the agent container, and `TmuxRunner`'s waits on
+a process tree use no `/proc` in pod mode (§6.3).
 
 The same `list-windows -F` without `-u`, in an environment with no UTF-8
 locale, printed `agent_0_56_` on kind 1.34.11 (`agent_0_55_` on 1.37.0,
@@ -840,8 +870,8 @@ Where Landlock is denied (P2.7, kind only, a `Localhost` seccomp profile
 answering `ENOSYS` to the three Landlock syscalls): nono exits `1` with
 `nono: Sandbox initialization failed: Landlock not available. Requires Linux kernel 5.13+ with Landlock enabled.`,
 and the command does not run (it wrote no file). The same on 1.37.0 and
-1.34.11. The sidecar maps that exit to `SandboxUnavailable` (§6.2); it
-needs no other check before `launch.sh`.
+1.34.11. That exit code and message are the signal the sidecar's sandbox
+self-test maps to `SandboxUnavailable` (§6.2).
 
 ### 19.3 ReadWriteMany on kind (O-5)
 
@@ -858,9 +888,13 @@ gave the same results.
 | kind's local-path provisioner with `config.json` `{"nodePathMap":[],"sharedFileSystemPath":"/var/local-path-shared"}`, that path one runner directory (mode 0777) mounted by `extraMounts` into every node; class `standard`; writer on `spike-worker`, reader on `spike-worker2` | PASS. The claim binds; uid 10001 creates the crew directory and writes an object; the reader sees it through the read-only sub-path; a write through that mount fails with `Read-only file system`; an object written after the reader started is visible to it. |
 
 The third class was added during the spike; the plan named only the first
-two. CI uses it (§15). uid 10001 needed no class parameter and no
-`fsGroup`. Its two nodes share one host directory, not a network
-filesystem, so it is a CI class and not a production one. `fsGroup` on an
+two classes. By the plan's own decision order (Task 4 Step 5) the outcome
+was "none": all three planned candidates (`standard` on two nodes,
+`nfs-csi` on two nodes, `standard` on one node) failed. The added class
+replaces that outcome, and §15 commits CI to it. uid 10001 needed no class
+parameter (the pods set `fsGroup: 10001`; the shared directory was 0777).
+Its two nodes share one host directory, not a network filesystem, so it is
+a CI class and not a production one. `fsGroup` on an
 NFS class was not exercised, since NFS never provisioned.
 
 ### 19.4 Still open
@@ -870,5 +904,8 @@ NFS class was not exercised, since NFS never provisioned.
 - An NFS-backed class on kind in CI: only the upstream example server was
   tried, and it could not export its in-pod directory. A real NFS export
   was not tried.
+- A kernel with Landlock built in but disabled at boot, where the
+  syscalls answer `EOPNOTSUPP` rather than `ENOSYS`, was not tested; P2.7
+  denied Landlock only through a seccomp profile.
 
 Every planned row has a verdict.

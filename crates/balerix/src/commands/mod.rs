@@ -4,3 +4,4 @@ pub mod fleet;
 pub mod plugin;
 pub mod relay;
 pub mod serve;
+pub mod supervise;

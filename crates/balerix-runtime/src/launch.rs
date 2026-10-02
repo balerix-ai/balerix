@@ -1,5 +1,6 @@
-//! `launch.sh` and the `LaunchPlan` (Phase 2 spec §4.2 step 5). No
-//! credential is ever an input here.
+//! `launch.sh` and the `LaunchPlan` (Phase 2 spec §4.2 step 5; the
+//! supervisor in front of nono, Spec N amendment §13.4). No credential
+//! is ever an input here.
 
 use balerix_api::ClaudeSettings;
 use balerix_core::{AgentId, LaunchPlan, MaterializeError};
@@ -44,6 +45,11 @@ pub fn render_launch(
         ("HOME".to_string(), paths.nono_home.display().to_string()),
     ]);
     let mut argv: Vec<String> = vec![
+        // Spec N amendment §13.4: a child subreaper in front of nono, so
+        // `stop` can end everything the agent detached.
+        tools.balerix.display().to_string(),
+        "agent-supervise".into(),
+        "--".into(),
         tools.nono.display().to_string(),
         "-s".into(),
         "--log-file".into(),
@@ -137,7 +143,14 @@ mod tests {
         assert!(script.contains(
             "exec env -i HOME='/h/.local/state/balerix/fleets/f/crews/c/agents/a/nono' PATH='/usr/local/bin:/usr/bin:/bin:/opt/mise/bin'"
         ));
-        assert!(script.contains("'/opt/nono' '-s' '--log-file'"));
+        assert!(
+            script.contains("'/opt/balerix' 'agent-supervise' '--' '/opt/nono' '-s' '--log-file'"),
+            "{script}"
+        );
+        assert_eq!(
+            plan.argv[..4],
+            ["/opt/balerix", "agent-supervise", "--", "/opt/nono"].map(String::from)
+        );
         assert!(script.contains(
             "'run' '--profile' '/h/.local/state/balerix/fleets/f/crews/c/agents/a/nono-profile.json' '--' '/opt/mise/bin/mise' 'exec' '--' 'claude' '--verbose' 'it'\\''s' '--continue'"
         ));

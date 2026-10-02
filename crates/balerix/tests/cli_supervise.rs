@@ -3,9 +3,14 @@
 //! §13.7). The wrapper is a child subreaper, so it is always its own
 //! process here, never the test's.
 
+use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use balerix_core::{AgentId, AgentRunner, LaunchPlan};
+use balerix_runtime::TmuxRunner;
 use balerix_runtime::testing::pid_alive;
 
 const BALERIX: &str = env!("CARGO_BIN_EXE_balerix");
@@ -216,4 +221,117 @@ fn the_childs_stdin_and_stdout_pass_through() {
         .assert()
         .success()
         .stdout("through\n");
+}
+
+// -- with tmux: #107 end to end (Spec N amendment §13.7) --
+
+fn tmux() -> Option<PathBuf> {
+    let found = std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join("tmux"))
+        .find(|p| p.is_file());
+    if found.is_none() {
+        if std::env::var_os("BALERIX_REQUIRE_TOOLS").is_some_and(|v| v == "1") {
+            panic!("tmux is required (BALERIX_REQUIRE_TOOLS=1) but not available");
+        }
+        eprintln!("skip: tmux not available");
+    }
+    found
+}
+
+struct KillServer {
+    tmux: PathBuf,
+    socket: String,
+}
+
+impl Drop for KillServer {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.tmux)
+            .args(["-L", &self.socket, "kill-server"])
+            .status();
+    }
+}
+
+struct Supervised {
+    r: TmuxRunner,
+    id: AgentId,
+    plan: LaunchPlan,
+    _server: KillServer,
+    _dir: tempfile::TempDir,
+}
+
+/// An agent window whose `launch.sh` is the wrapper in front of a script
+/// that detaches one sleeper and stays in another.
+fn supervised_agent(label: &str, m: &str) -> Option<Supervised> {
+    let tmux = tmux()?;
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+    let script = dir.path().join("launch.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nexec {BALERIX} agent-supervise -- /bin/sh -c 'setsid sleep {m} & exec sleep {m}'\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = format!("balerix-test-{label}-{}", std::process::id());
+    let guard = KillServer {
+        tmux: tmux.clone(),
+        socket: socket.clone(),
+    };
+    let r = TmuxRunner::new(tmux, socket);
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let plan = LaunchPlan {
+        cwd: dir.path().to_path_buf(),
+        env: BTreeMap::new(),
+        argv: vec![],
+        script,
+    };
+    r.ensure_crew(&id.crew_ref()).unwrap();
+    r.ensure_agent(&id, &plan).unwrap();
+    wait_for(|| sleepers(m).len() == 2);
+    Some(Supervised {
+        r,
+        id,
+        plan,
+        _server: guard,
+        _dir: dir,
+    })
+}
+
+/// #107's own case.
+#[test]
+fn stop_agent_leaves_no_process_of_an_agent_that_detached_a_sleeper() {
+    let m = marker(11);
+    let Some(a) = supervised_agent("sup-stop", &m) else {
+        return;
+    };
+    a.r.stop_agent(&a.id).unwrap();
+    assert!(with_cmdline(&m).is_empty(), "{:?}", with_cmdline(&m));
+}
+
+#[test]
+fn stop_crew_leaves_no_process_of_an_agent_that_detached_a_sleeper() {
+    let m = marker(12);
+    let Some(a) = supervised_agent("sup-crew", &m) else {
+        return;
+    };
+    a.r.stop_crew(&a.id.crew_ref()).unwrap();
+    assert!(with_cmdline(&m).is_empty(), "{:?}", with_cmdline(&m));
+}
+
+#[test]
+fn a_restart_leaves_no_process_of_the_old_agent() {
+    let m = marker(13);
+    let Some(a) = supervised_agent("sup-restart", &m) else {
+        return;
+    };
+    let old = sleepers(&m);
+    a.r.ensure_agent(&a.id, &a.plan).unwrap();
+    assert!(
+        old.iter().all(|pid| !pid_alive(*pid)),
+        "a sleeper of the old agent outlived the restart"
+    );
+    wait_for(|| sleepers(&m).len() == 2);
+    a.r.stop_crew(&a.id.crew_ref()).unwrap();
 }

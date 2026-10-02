@@ -501,6 +501,7 @@ impl AgentRunner for TmuxRunner {
         self.run_optional(&id, &["kill-window", "-t", &Self::window_target(agent)])?;
         self.wait_gone(&id, pane.as_slice())
     }
+
     fn stop_crew(&self, crew: &CrewRef) -> Result<(), RunnerError> {
         let name = crew.to_string();
         // `kill-session` on the crew session alone would leave its

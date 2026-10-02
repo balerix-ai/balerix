@@ -406,7 +406,7 @@ signal handlers (tokio, before the child exists) and hands the module a
 channel that carries one message per signal.
 `rustix` (already in the lockfile) becomes a direct dependency of
 `balerix-runtime` for `set_child_subreaper`, `kill_process` and
-`waitpid`. No `unsafe`.
+`wait` (any child, wait4(-1): rustix 1.1.4's `waitpid(None, …)` only sees children in the caller's process group, and a `setsid` orphan is in another). No `unsafe`.
 
 1. Mark the process a child subreaper. A failure is fatal: exit
    non-zero with the error on stderr, nothing spawned.
@@ -420,7 +420,7 @@ channel that carries one message per signal.
 5. On the main child's own exit: no grace.
 6. The kill loop, in both cases: list every descendant from `/proc`
    (parent pids, starting at the wrapper's own pid), SIGKILL each, reap
-   with `waitpid`, repeat until `waitpid` reports no children. It does
+   with `wait` (not `waitpid`, for the reason in the dependency sentence), repeat until `wait` reports no children. It does
    not give up; the caller's bound (§13.5) reports a stuck one.
 7. Exit status: the main child's (128+n if a signal killed it), so
    `pane_dead_status` keeps its meaning; 143 if the wrapper was stopped

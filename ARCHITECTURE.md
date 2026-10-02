@@ -13,7 +13,7 @@ agent's `SessionStart` hook runs.
 Mental model: **balerix is a config generator and process launcher.** It turns a
 fleet YAML file into one fully-resolved settings block per agent, then (later
 phases) materializes each agent as a tmux window running
-`nono run → mise exec → claude` in its own `$HOME`, and reconciles what exists
+`balerix agent-supervise → nono run → mise exec → claude` in its own `$HOME`, and reconciles what exists
 against what was declared.
 
 ## The pieces
@@ -108,7 +108,10 @@ cache fetch + private clone (`--reference` to the crew's object cache) →
 `home/` (settings.json with balerix's hooks, credentials,
 hosts.yml) → `mise.toml` + `mise install` → `nono-profile.json` + validate →
 `launch.sh`. `AgentRunner` (`TmuxRunner`) makes processes: session per crew,
-window per agent, `remain-on-exit`, `respawn-window`. `balerix dev
+window per agent, `remain-on-exit`, `respawn-window`.
+`agent-supervise` is a child subreaper in front of nono: `stop` and a
+restart wait for it, and it exits only when nothing the agent started is
+left (Spec N amendment §13). `balerix dev
 materialize` runs the file half alone.
 
 **Control plane (Phase 3):** `up` resolves the file exactly like `config resolve`,

@@ -277,11 +277,13 @@ const RM_RF_WINDOW: Duration = Duration::from_secs(5);
 const RM_RF_STEP: Duration = Duration::from_millis(100);
 
 /// `remove_dir_all` with a bounded retry on `DirectoryNotEmpty`: nono
-/// flushes its audit ledger and session file under `<root>/nono/` shortly
-/// after `tmux kill-window` returns, so a tree that was quiet when the
-/// walk started can refill under it. `NotFound` is success; every other
-/// error is returned at once, since only a concurrent writer is worth
-/// waiting for.
+/// flushes its audit ledger and session file under `<root>/nono/` as it
+/// exits. `stop` now waits for the pane's process (Spec N amendment
+/// §13.5), so this only matters after a stop that timed out, or for a
+/// writer that is not the agent's own tree; a tree that was quiet when
+/// the walk started can still refill under it. `NotFound` is success;
+/// every other error is returned at once, since only a concurrent writer
+/// is worth waiting for.
 pub(crate) fn retry_rmdir(
     path: &std::path::Path,
     window: Duration,
@@ -615,10 +617,10 @@ mod tests {
         std::io::Error::from(std::io::ErrorKind::DirectoryNotEmpty)
     }
 
-    /// nono keeps writing under `plugins/<name>/nono/` for a moment after
-    /// `tmux kill-window` returns, so a `remove_dir_all` that loses that
-    /// race must be retried rather than reported (`purge` and `down
-    /// --purge` both go through `rm_rf`).
+    /// A writer under `plugins/<name>/nono/` can outlast a stop that
+    /// timed out, so a `remove_dir_all` that loses that race must be
+    /// retried rather than reported (`purge` and `down --purge` both go
+    /// through `rm_rf`).
     #[test]
     fn rm_rf_retries_a_directory_that_refills_under_it() {
         let path = std::path::Path::new("/does/not/matter");

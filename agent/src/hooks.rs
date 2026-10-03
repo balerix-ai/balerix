@@ -1,9 +1,11 @@
 //! The sidecar's hook ingress (Spec O §7.1). Claude posts to
-//! `127.0.0.1:<port>` with the agent's token, exactly as it posts to the
-//! daemon on one machine: the same `settings.json` shape, the same
-//! `open_port` grant, the same `hook-relay` for `SessionStart`. Each event
-//! is forwarded to the Daemon's events route with the token, and the
-//! Daemon's answer returned. A Daemon that cannot be reached inside the
+//! `127.0.0.1:<port>` with its per-agent secret, exactly as it posts to
+//! the daemon on one machine: the same `settings.json` shape, the same
+//! `open_port` grant, the same `hook-relay` for `SessionStart`. That
+//! secret is the sidecar's own (`state::hook_secret`); each event is
+//! forwarded to the Daemon's events route with the operator's token,
+//! which never reaches the agent's files (§10.4), and the Daemon's answer
+//! returned. A Daemon that cannot be reached inside the
 //! budget gets the empty chain's answer, `200 {}`, and the failure is
 //! counted: a Daemon outage degrades the fleet, it never breaks the agent.
 //! Every accepted event's name also goes to the sidecar's loop, which
@@ -33,6 +35,9 @@ pub const BODY_LIMIT: usize = 1 << 20;
 
 pub struct Hooks {
     pub id: AgentId,
+    /// What Claude presents: the sidecar-local hook secret.
+    pub secret: String,
+    /// What the sidecar forwards with: the operator's token.
     pub token: String,
     /// `https://host:port`, no path.
     pub daemon_url: String,
@@ -47,6 +52,7 @@ impl std::fmt::Debug for Hooks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Hooks")
             .field("id", &self.id)
+            .field("secret", &"<redacted>")
             .field("token", &"<redacted>")
             .field("daemon_url", &self.daemon_url)
             .finish_non_exhaustive()
@@ -100,7 +106,7 @@ async fn events(
     let Some(token) = bearer(&headers) else {
         return unauthorized();
     };
-    if !constant_time_eq(token.as_bytes(), h.token.as_bytes()) {
+    if !constant_time_eq(token.as_bytes(), h.secret.as_bytes()) {
         return unauthorized();
     }
     let name = match serde_json::from_slice::<Value>(&body) {

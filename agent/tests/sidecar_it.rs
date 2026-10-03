@@ -230,6 +230,13 @@ impl Pod {
         .unwrap();
         profile["network"]["open_port"][0].as_u64().unwrap() as u16
     }
+    /// The sidecar-local hook secret (§7.1), where the sidecar keeps it.
+    fn hook_secret(&self) -> String {
+        std::fs::read_to_string(self.root.join("agent/.balerix/state/sidecar/hook-secret"))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
     fn still_running(&mut self) -> bool {
         self.sidecar
             .as_mut()
@@ -358,6 +365,20 @@ async fn the_sidecar_against_a_fake_daemon() {
     );
     assert!(pod.root.join("run/ready").is_file());
     assert!(pod.home().join("fake-claude.argv").is_file());
+    // §10.4: the operator's token stays in the sidecar container; Claude's
+    // settings, the profile and launch.sh carry the sidecar-local secret
+    assert_eq!(
+        files_holding(&pod.root.join("agent"), TOKEN.as_bytes()),
+        Vec::<PathBuf>::new(),
+        "the bundle token on the agent claim"
+    );
+    let secret = pod.hook_secret();
+    assert_eq!(secret.len(), 64);
+    assert!(
+        std::fs::read_to_string(pod.home().join(".claude/settings.json"))
+            .unwrap()
+            .contains(&secret)
+    );
 
     // send_text over the link reaches fake-claude's stdin
     assert_eq!(
@@ -497,7 +518,7 @@ async fn the_sidecar_against_a_fake_daemon() {
     let start = Instant::now();
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/agents/f/c/a/events"))
-        .bearer_auth(TOKEN)
+        .bearer_auth(pod.hook_secret())
         .header("content-type", "application/json")
         .body(r#"{"hook_event_name":"Stop"}"#)
         .send()
@@ -523,6 +544,27 @@ async fn the_sidecar_against_a_fake_daemon() {
     assert!(s.hook_failures >= 1, "{s:?}");
     assert!(pod.still_running());
     assert_no_server_left(pod, &tools);
+}
+
+/// Every file under `dir` whose bytes contain `needle`.
+fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        let Ok(kind) = e.file_type() else { continue };
+        if kind.is_dir() {
+            found.extend(files_holding(&p, needle));
+        } else if kind.is_file()
+            && let Ok(bytes) = std::fs::read(&p)
+            && bytes.windows(needle.len()).any(|w| w == needle)
+        {
+            found.push(p);
+        }
+    }
+    found
 }
 
 /// Dropping the pod leaves no tmux server under its root.

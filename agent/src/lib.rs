@@ -12,6 +12,7 @@ pub mod hooks;
 pub mod link;
 pub mod run;
 pub mod sidecar;
+pub mod state;
 pub mod tls;
 
 /// A unit test's scratch directory under the crate's `target/tmp`, never

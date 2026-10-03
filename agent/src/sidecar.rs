@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, watch};
 use crate::cli::SidecarArgs;
 use crate::hooks::{self, FORWARD_BUDGET, Hooks};
 use crate::link::{self, Control, LinkDeps};
-use crate::{bundle, run, tls};
+use crate::{bundle, run, state, tls};
 
 /// How long the `agent` container may take to bring the tmux server up
 /// after the start marker (image pull is before this; it is only the
@@ -140,11 +140,14 @@ pub async fn main(args: SidecarArgs) -> Result<()> {
     let runner = Arc::new(TmuxRunner::at_socket(tools.tmux.clone(), pod.tmux_socket()));
 
     // §7.1: the hook listener first; its port goes into the profile's
-    // `open_port` and its URL into `settings.json`, through `HookTarget`
+    // `open_port` and its URL into `settings.json`, through `HookTarget`.
+    // Claude's secret is the sidecar's own: the bundle token stays in this
+    // container (§10.4)
+    let state_dir = state::dir(&args.agent_dir);
     let listener = bind_hooks(args.hook_port).await?;
     let hook_target = HookTarget {
         url: format!("http://{}", listener.local_addr()?),
-        secret: loaded.bundle.token.clone(),
+        secret: state::hook_secret(&state_dir)?,
     };
 
     // §6.2 step 1: the files, as the daemon makes them
@@ -192,6 +195,7 @@ pub async fn main(args: SidecarArgs) -> Result<()> {
     let failures = Arc::new(AtomicU64::new(0));
     let hooks_state = Arc::new(Hooks {
         id: id.clone(),
+        secret: hook_target.secret.clone(),
         token: loaded.bundle.token.clone(),
         daemon_url: daemon_url.clone(),
         http: tls::http_client(&tls, Duration::from_secs(10))?,

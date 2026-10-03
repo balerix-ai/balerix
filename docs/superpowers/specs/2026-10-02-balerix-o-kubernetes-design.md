@@ -521,6 +521,12 @@ the Daemon's Secret.
   pool is `Ready` without installing (the shared volume's daemon pool is
   a Job's, §8.3). `GET /readyz` is 200 when Spec F's channel says `Ready`,
   503 with the reason otherwise.
+- **The hook hop has a secret of its own.** Claude authenticates to
+  the sidecar with a sidecar-local secret (32 random bytes, made on the
+  first start and kept under `<agent>/.balerix/state/sidecar/`, outside
+  the agent's sandbox grants); the operator's token authenticates the
+  sidecar to the Daemon, on the events route, the link and the attach
+  socket, and never reaches the agent's files.
 - **The agent container learns its session from the start marker.**
   `balerix-agent run` waits for `<run>/started`, whose content is
   `<fleet>/<crew>`, starts the tmux server with only the crew's anchor

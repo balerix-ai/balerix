@@ -18,7 +18,10 @@ use balerix_core::AgentId;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
+/// The operator's token: the sidecar forwards with it.
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+/// The sidecar-local secret Claude presents on the hook hop (§7.1).
+const SECRET: &str = "5ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2";
 
 /// A fake Daemon: records what arrives, answers a verdict, optionally
 /// after a sleep longer than the budget.
@@ -73,6 +76,7 @@ async fn sidecar(daemon_url: &str) -> (String, Arc<AtomicU64>, mpsc::UnboundedRe
     let failures = Arc::new(AtomicU64::new(0));
     let hooks = Arc::new(Hooks {
         id: "f/c/a".parse::<AgentId>().unwrap(),
+        secret: SECRET.into(),
         token: TOKEN.into(),
         daemon_url: daemon_url.into(),
         http: http_client(&tls, Duration::from_secs(10)).unwrap(),
@@ -83,6 +87,26 @@ async fn sidecar(daemon_url: &str) -> (String, Arc<AtomicU64>, mpsc::UnboundedRe
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(axum::serve(listener, router(hooks)).into_future());
     (url, failures, rx)
+}
+
+/// §10.3: the struct holds the local secret and the operator's token.
+#[test]
+fn debug_redacts_the_secret_and_the_token() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let tls = client_config(&ca_file(dir.path())).unwrap();
+    let (events, _rx) = mpsc::unbounded_channel();
+    let h = Hooks {
+        id: "f/c/a".parse::<AgentId>().unwrap(),
+        secret: SECRET.into(),
+        token: TOKEN.into(),
+        daemon_url: "https://d".into(),
+        http: http_client(&tls, Duration::from_secs(10)).unwrap(),
+        failures: Arc::new(AtomicU64::new(0)),
+        events,
+    };
+    let shown = format!("{h:?}");
+    assert!(!shown.contains(SECRET), "{shown}");
+    assert!(!shown.contains(TOKEN), "{shown}");
 }
 
 async fn post_event(base: &str, path: &str, token: Option<&str>, body: &str) -> (u16, String) {
@@ -99,12 +123,12 @@ async fn post_event(base: &str, path: &str, token: Option<&str>, body: &str) -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn forwards_with_the_token_and_returns_the_daemons_answer() {
+async fn takes_the_local_secret_forwards_with_the_token_and_returns_the_daemons_answer() {
     let (seen, daemon) = fake_daemon(false).await;
     let (base, failures, mut names) = sidecar(&daemon).await;
     let body =
         r#"{"hook_event_name":"PreToolUse","session_id":"s1","tool_input":{"command":"ls"}}"#;
-    let (status, text) = post_event(&base, "/v1/agents/f/c/a/events", Some(TOKEN), body).await;
+    let (status, text) = post_event(&base, "/v1/agents/f/c/a/events", Some(SECRET), body).await;
     assert_eq!(status, 200);
     assert_eq!(
         serde_json::from_str::<Value>(&text).unwrap(),
@@ -124,11 +148,19 @@ async fn refuses_another_agent_a_bad_token_and_a_bad_body() {
     let (base, _, _) = sidecar(&daemon).await;
     let ok = r#"{"hook_event_name":"Stop"}"#;
     assert_eq!(
-        post_event(&base, "/v1/agents/f/c/b/events", Some(TOKEN), ok).await,
+        post_event(&base, "/v1/agents/f/c/b/events", Some(SECRET), ok).await,
         (401, r#"{"error":"unknown agent or bad secret"}"#.into())
     );
     assert_eq!(
         post_event(&base, "/v1/agents/f/c/a/events", Some("nope"), ok)
+            .await
+            .0,
+        401
+    );
+    // §10.4: the operator's token is the sidecar's, not Claude's; the hook
+    // hop takes only the local secret
+    assert_eq!(
+        post_event(&base, "/v1/agents/f/c/a/events", Some(TOKEN), ok)
             .await
             .0,
         401
@@ -140,11 +172,11 @@ async fn refuses_another_agent_a_bad_token_and_a_bad_body() {
         401
     );
     assert_eq!(
-        post_event(&base, "/v1/agents/f/c/a/events", Some(TOKEN), "[1]").await,
+        post_event(&base, "/v1/agents/f/c/a/events", Some(SECRET), "[1]").await,
         (400, r#"{"error":"body must be a JSON object"}"#.into())
     );
     assert_eq!(
-        post_event(&base, "/v1/agents/f/c/a/events", Some(TOKEN), r#"{"x":1}"#).await,
+        post_event(&base, "/v1/agents/f/c/a/events", Some(SECRET), r#"{"x":1}"#).await,
         (
             400,
             r#"{"error":"hook_event_name must be a string"}"#.into()
@@ -166,7 +198,7 @@ async fn a_daemon_that_is_down_or_slow_fails_open_inside_the_budget() {
     let (status, text) = post_event(
         &base,
         "/v1/agents/f/c/a/events",
-        Some(TOKEN),
+        Some(SECRET),
         r#"{"hook_event_name":"Stop"}"#,
     )
     .await;
@@ -181,7 +213,7 @@ async fn a_daemon_that_is_down_or_slow_fails_open_inside_the_budget() {
     let (status, text) = post_event(
         &base,
         "/v1/agents/f/c/a/events",
-        Some(TOKEN),
+        Some(SECRET),
         r#"{"hook_event_name":"Stop"}"#,
     )
     .await;
@@ -223,7 +255,7 @@ async fn a_daemon_that_stalls_the_body_fails_open_inside_one_budget() {
     let (status, text) = post_event(
         &base,
         "/v1/agents/f/c/a/events",
-        Some(TOKEN),
+        Some(SECRET),
         r#"{"hook_event_name":"Stop"}"#,
     )
     .await;

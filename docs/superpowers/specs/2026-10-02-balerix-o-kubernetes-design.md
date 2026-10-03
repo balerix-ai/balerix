@@ -517,7 +517,10 @@ the Daemon's Secret.
   `<fleet>/<crew>`, starts the tmux server with only the crew's anchor
   window on `<run>/tmux.sock` and polls `has-session` until the server is
   gone; SIGTERM becomes `kill-server`. The sidecar creates the agent's
-  window through the runner. It needs no Secret and no arguments.
+  window through the runner. It needs no Secret and no arguments. The
+  sidecar never starts the server: every pod-mode tmux call carries `-N`,
+  and a pass that finds no crew session fails until `run` is back, so
+  Claude never runs in the sidecar's container.
 - **Mount paths are flags with §6.1's defaults** (`--agent-dir
   /balerix/agent`, `--shared-dir /balerix/shared`, `--run-dir
   /balerix/run`, `--bundle /balerix/secret/agent.json`, `--ca

@@ -208,9 +208,14 @@ credentials, hook input, or sandbox rules.
   `--purge`, `remove` and a branch change fail on such a host, `--purge`
   is the way past, and the user `sandbox` block does not reach this
   profile.
-- `TmuxRunner::at_socket` is the pod runner: `-S <path> -u` on every call,
-  and stops wait on `pane_dead` through a waiter the pane is respawned
-  into, never on `/proc` (the pid is the agent container's). The
+- `TmuxRunner::at_socket` is the pod runner: `-S <path> -u -N` on every
+  call, and stops wait on `pane_dead` through a waiter the pane is
+  respawned into, never on `/proc` (the pid is the agent container's).
+  `-N` because a tmux client starts a server when none listens: the
+  server, and so Claude, must only ever run in the agent container
+  (`balerix-agent run` creates it with the crew session), so a pod
+  `ensure_crew` that finds no session fails the pass instead of creating
+  one. The
   one-machine runner (`TmuxRunner::new`) is unchanged; `tmux_pod_it`
   covers the other.
 - A Kubernetes-mode daemon (`serve --mode kubernetes`) runs no planner

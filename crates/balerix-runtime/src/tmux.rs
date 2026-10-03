@@ -152,9 +152,9 @@ pub struct TmuxRunner {
     /// The `-L` socket name (one machine).
     pub socket: String,
     /// Spec O §6.3: a `-S` socket path on the pod's run directory. Set,
-    /// the runner is a pod runner: every client call carries `-u`, and
-    /// the waits on a pane's process go through tmux's `pane_dead`, never
-    /// `/proc` (the pid is the agent container's).
+    /// the runner is a pod runner: every client call carries `-u` and
+    /// `-N`, and the waits on a pane's process go through tmux's
+    /// `pane_dead`, never `/proc` (the pid is the agent container's).
     pub socket_path: Option<PathBuf>,
     /// `STOP_WAIT`; a field so a test can shorten it.
     pub stop_wait: Duration,
@@ -191,10 +191,19 @@ impl TmuxRunner {
         self.socket_path.is_some()
     }
 
-    /// `-S <path> -u` in a pod, `-L <name>` on one machine.
+    /// `-S <path> -u -N` in a pod, `-L <name>` on one machine. `-N`: a
+    /// tmux client starts a server when none is listening and its command
+    /// is one that may (`new-session`, the attach's among them); the pod's
+    /// server is the agent container's (Spec O §6.4, §10.4), so a pod
+    /// client never starts one, and finds it absent instead.
     pub fn socket_args(&self) -> Vec<String> {
         match &self.socket_path {
-            Some(p) => vec!["-S".to_string(), p.display().to_string(), "-u".to_string()],
+            Some(p) => vec![
+                "-S".to_string(),
+                p.display().to_string(),
+                "-u".to_string(),
+                "-N".to_string(),
+            ],
             None => vec!["-L".to_string(), self.socket.clone()],
         }
     }
@@ -457,6 +466,17 @@ impl AgentRunner for TmuxRunner {
             .is_some()
         {
             return Ok(());
+        }
+        if self.pod() {
+            // Spec O §6.2: `balerix-agent run` creates the crew session
+            // when it starts the server; until it is back the pass fails
+            // and the next one retries
+            return Err(RunnerError::Tool {
+                id: crew.to_string(),
+                subcommand: "has-session".into(),
+                args: vec![Self::session_target(crew)],
+                stderr: "the agent container's tmux server is not running".into(),
+            });
         }
         self.run(
             &crew.to_string(),
@@ -892,13 +912,16 @@ mod tests {
     use super::*;
 
     /// `cmd()` and `attach` build every client's leading argv from
-    /// `socket_args`: a pod runner always carries `-S <path> -u`, the
-    /// one-machine runner keeps `-L <name>` and no `-u`.
+    /// `socket_args`: a pod runner always carries `-S <path> -u -N`, the
+    /// one-machine runner keeps `-L <name>` and neither flag.
     #[test]
     fn socket_args_are_s_and_u_in_a_pod_and_l_on_one_machine() {
         let pod = TmuxRunner::at_socket("tmux".into(), "/balerix/run/tmux.sock".into());
         assert!(pod.pod());
-        assert_eq!(pod.socket_args(), ["-S", "/balerix/run/tmux.sock", "-u"]);
+        assert_eq!(
+            pod.socket_args(),
+            ["-S", "/balerix/run/tmux.sock", "-u", "-N"]
+        );
         let one = TmuxRunner::new("tmux".into(), "balerix-x");
         assert!(!one.pod());
         assert_eq!(one.socket_args(), ["-L", "balerix-x"]);

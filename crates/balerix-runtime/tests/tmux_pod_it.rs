@@ -68,6 +68,9 @@ fn pane(label: &str, body: &str) -> Option<Pane> {
         argv: vec![],
         script,
     };
+    // the agent container's `balerix-agent run` starts the server with
+    // the crew session and its anchor window; the sidecar never does
+    start_server(&tools.tmux, &socket);
     r.ensure_crew(&id.crew_ref()).unwrap();
     r.ensure_agent(&id, &plan).unwrap();
     Some(Pane {
@@ -79,6 +82,30 @@ fn pane(label: &str, body: &str) -> Option<Pane> {
         _server: guard,
         _root: root,
     })
+}
+
+/// What `balerix-agent run` does: `new-session` of the crew with the
+/// anchor window.
+fn start_server(tmux: &std::path::Path, socket: &std::path::Path) {
+    let st = std::process::Command::new(tmux)
+        .arg("-S")
+        .arg(socket)
+        .args([
+            "-u",
+            "new-session",
+            "-d",
+            "-s",
+            "f/c",
+            "-n",
+            balerix_runtime::ANCHOR_WINDOW,
+            "--",
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 3600; done",
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
 }
 
 fn running_pid(p: &Pane) -> u32 {
@@ -254,6 +281,35 @@ fn stop_crew_ends_every_window_and_the_session() {
     assert!(!pid_alive(pid));
     assert!(p.r.observe(&p.id.fleet).unwrap().crews.is_empty());
     p.r.stop_crew(&p.id.crew_ref()).unwrap(); // absent → ok
+}
+
+/// Spec O §6.4, §10.4: the tmux server, and so Claude, runs in the agent
+/// container only. With that server gone (the container restarting),
+/// `ensure_crew` fails the pass instead of starting a server in the
+/// sidecar's container, and no other call starts one either.
+#[test]
+fn the_pod_runner_never_starts_a_server() {
+    let Some(p) = pane("podnoserver", "exec sleep 300") else {
+        return;
+    };
+    tmux(&p, &["kill-server"]);
+    let t = Instant::now();
+    while std::os::unix::net::UnixStream::connect(&p.socket).is_ok() {
+        assert!(t.elapsed() < Duration::from_secs(5), "the server lingers");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let err = p.r.ensure_crew(&p.id.crew_ref()).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "f/c: tmux has-session: the agent container's tmux server is not running"
+    );
+    assert!(p.r.ensure_agent(&p.id, &p.plan).is_err());
+    assert!(p.r.attach(&p.id).is_err());
+    assert!(p.r.send_text(&p.id, "x\ny", true).is_err());
+    assert!(
+        std::os::unix::net::UnixStream::connect(&p.socket).is_err(),
+        "nothing listens on the socket"
+    );
 }
 
 #[test]

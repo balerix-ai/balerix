@@ -5,7 +5,9 @@
 //! sidecar then creates the agent's window through the socket exactly as
 //! the daemon does on one machine.
 //!
-//! It is the container's pid 1. The server daemonises away from it, so it
+//! It is the container's pid 1, so it handles SIGTERM and SIGINT from its
+//! first moment (pid 1 has no default action for them): during the marker
+//! wait one ends it at once. The server daemonises away from it, so it
 //! polls `has-session`; SIGTERM (the pod ending) becomes `kill-server`,
 //! and the supervisor in the pane ends the agent's tree on the hangup
 //! that follows (Spec N amendment §13).
@@ -25,34 +27,41 @@ const IDLE: &str = "while :; do sleep 3600; done";
 pub fn run(args: &RunArgs) -> Result<ExitCode> {
     let marker = args.run_dir.join("started");
     let socket = args.run_dir.join("tmux.sock");
-    let session = wait_marker(&marker, Duration::from_secs(args.start_timeout_secs))?;
-    let tmux = on_path("tmux").context("tmux is not on PATH")?;
-    let status = Command::new(&tmux)
-        .arg("-S")
-        .arg(&socket)
-        .args([
-            "-u",
-            "new-session",
-            "-d",
-            "-s",
-            &session,
-            "-n",
-            ANCHOR_WINDOW,
-            "--",
-            "/bin/sh",
-            "-c",
-            IDLE,
-        ])
-        .status()
-        .context("cannot start tmux")?;
-    ensure!(status.success(), "tmux new-session exited {status}");
-    tracing::info!(%session, socket = %socket.display(), "tmux server up");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     rt.block_on(async {
+        // first: as pid 1 the container has no default action for these,
+        // and the marker wait can last minutes
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let wait = wait_marker(&marker, Duration::from_secs(args.start_timeout_secs));
+        let session = tokio::select! {
+            s = wait => s?,
+            _ = term.recv() => return Ok(()),
+            _ = int.recv() => return Ok(()),
+        };
+        let tmux = on_path("tmux").context("tmux is not on PATH")?;
+        let status = Command::new(&tmux)
+            .arg("-S")
+            .arg(&socket)
+            .args([
+                "-u",
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-n",
+                ANCHOR_WINDOW,
+                "--",
+                "/bin/sh",
+                "-c",
+                IDLE,
+            ])
+            .status()
+            .context("cannot start tmux")?;
+        ensure!(status.success(), "tmux new-session exited {status}");
+        tracing::info!(%session, socket = %socket.display(), "tmux server up");
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
@@ -77,7 +86,7 @@ pub fn run(args: &RunArgs) -> Result<ExitCode> {
 }
 
 /// The marker's trimmed content: the crew's session name.
-fn wait_marker(marker: &Path, timeout: Duration) -> Result<String> {
+async fn wait_marker(marker: &Path, timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(s) = std::fs::read_to_string(marker)
@@ -92,7 +101,7 @@ fn wait_marker(marker: &Path, timeout: Duration) -> Result<String> {
                 timeout.as_secs()
             );
         }
-        std::thread::sleep(POLL);
+        tokio::time::sleep(POLL).await;
     }
 }
 

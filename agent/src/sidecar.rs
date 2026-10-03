@@ -114,6 +114,20 @@ pub async fn bind_hooks(port: u16) -> Result<TcpListener> {
 }
 
 pub async fn main(args: SidecarArgs) -> Result<()> {
+    // first: the sidecar is its container's pid 1, which has no default
+    // action for SIGTERM, and materialising or waiting for the agent
+    // container's server can take minutes
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        r = sidecar(args) => r,
+        _ = term.recv() => {
+            tracing::info!("SIGTERM; the agent container ends the tree");
+            Ok(())
+        }
+    }
+}
+
+async fn sidecar(args: SidecarArgs) -> Result<()> {
     let loaded = bundle::load(&args.bundle)?;
     let id = loaded.id.clone();
     let daemon_url = loaded.bundle.daemon_url.clone();
@@ -238,7 +252,6 @@ pub async fn main(args: SidecarArgs) -> Result<()> {
         stopped.insert(id.clone());
     }
     let mut recount: Option<tokio::time::Instant> = None;
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         let (new_status, pid, clean) = {
             let (fleet, creds, policy, clock, materializer, runner, hooks, stopped, id) = (
@@ -329,10 +342,6 @@ pub async fn main(args: SidecarArgs) -> Result<()> {
                 () = sleep_until(recount), if recount.is_some() => {
                     recount = None;
                     publish(&status_tx, &status, &id, pid, &failures);
-                }
-                _ = term.recv() => {
-                    tracing::info!("SIGTERM; the agent container ends the tree");
-                    return Ok(());
                 }
             }
         }

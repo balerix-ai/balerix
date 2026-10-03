@@ -140,6 +140,40 @@ fn a_sigterm_ends_the_server() {
     );
 }
 
+/// As the container's pid 1, `run` has no default SIGTERM action: a pod
+/// ended while it waits for the marker must still see it go, at once and
+/// by its own exit, not by the signal's default.
+#[test]
+fn a_sigterm_during_the_marker_wait_exits_at_once() {
+    let Some(_tools) = support::tools() else {
+        return;
+    };
+    let root = support::temp_root("run-term-wait");
+    let run_dir = root.join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let child = Command::new(BIN)
+        .args(["run", "--start-timeout-secs", "600", "--run-dir"])
+        .arg(&run_dir)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child = Kill(child);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(child.0.try_wait().unwrap().is_none(), "waiting");
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    support::wait_for("run to exit", Duration::from_secs(2), || {
+        child.0.try_wait().unwrap().is_some()
+    });
+    let status = child.0.wait().unwrap();
+    assert_eq!(status.code(), Some(0), "handled, not killed: {status:?}");
+}
+
 /// The helper every guard uses: it finds a live server under a root and
 /// ends it, and one already gone is not an error.
 #[test]

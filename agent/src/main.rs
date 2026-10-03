@@ -27,7 +27,12 @@ fn main() -> ExitCode {
                 Ok(rt) => rt,
                 Err(e) => return balerix_agent::cli::terminate(&termination_log, &e.into()),
             };
-            match rt.block_on(balerix_agent::sidecar::main(args)) {
+            let r = rt.block_on(balerix_agent::sidecar::main(args));
+            // a SIGTERM can land while a blocking step (a clone, an
+            // install, a pass) is still running: dropping the runtime
+            // would wait for it
+            rt.shutdown_timeout(std::time::Duration::from_secs(1));
+            match r {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => balerix_agent::cli::terminate(&termination_log, &e),
             }

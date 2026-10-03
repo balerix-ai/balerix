@@ -89,9 +89,8 @@ impl LinkHub {
         pending: Pending,
     ) -> u64 {
         let epoch = self.epochs.fetch_add(1, Ordering::SeqCst);
-        // an older connection's pending calls fail with `Down` when their
-        // senders drop here
-        lock(&self.conns).insert(
+        let mut conns = lock(&self.conns);
+        let old = conns.insert(
             agent.clone(),
             Conn {
                 tx,
@@ -101,6 +100,12 @@ impl LinkHub {
                 last: None,
             },
         );
+        // An older connection's calls in flight fail with `Down`: dropping
+        // their senders disconnects the receivers they wait on. Under the
+        // `conns` lock, so no call can still be adding to that map.
+        if let Some(old) = old {
+            lock(&old.pending).clear();
+        }
         epoch
     }
 
@@ -203,6 +208,9 @@ impl LinkHub {
             }
         }
         self.unregister(&agent, epoch);
+        // Calls still in flight fail with `Down` now, not at the timeout.
+        // After `unregister`: no call can find this connection any more.
+        lock(&pending).clear();
         // a replaced connection is not a link loss
         if !self.linked(&agent) {
             tracing::info!(agent = %agent, "sidecar link closed");

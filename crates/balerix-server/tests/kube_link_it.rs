@@ -259,3 +259,49 @@ async fn the_link_route_refuses_a_bad_token_a_wrong_protocol_and_a_tmux_daemon()
         404
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_in_flight_fails_link_down_when_its_link_closes_or_is_replaced() {
+    let h = Harness::kube(Duration::from_secs(3600));
+    let w = world(&h).await;
+    let name = "f".parse().unwrap();
+    w.daemon
+        .apply(&name, spec(), CredentialBundle::default(), false)
+        .await
+        .unwrap();
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let token = w.daemon.hook_secret(&id).await.unwrap();
+    let hub = w.daemon.kube().unwrap().clone();
+    let link_down = RunnerError::Link {
+        id: "f/c/a".into(),
+        message: "link down".into(),
+    };
+
+    // the socket closes with a request unanswered
+    let mut ws = connect(w.port, &token, "1").await.unwrap();
+    wait_for(async || hub.linked(&id)).await;
+    let (hub2, id2) = (hub.clone(), id.clone());
+    let started = Instant::now();
+    let call = tokio::task::spawn_blocking(move || hub2.send_text(&id2, "hello", true));
+    ws.next().await.unwrap().unwrap().into_text().unwrap();
+    ws.close(None).await.unwrap();
+    assert_eq!(call.await.unwrap().unwrap_err(), link_down);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "not the timeout path"
+    );
+
+    // a reconnect replaces the connection with a request unanswered
+    let mut old = connect(w.port, &token, "1").await.unwrap();
+    wait_for(async || hub.linked(&id)).await;
+    let (hub2, id2) = (hub.clone(), id.clone());
+    let started = Instant::now();
+    let call = tokio::task::spawn_blocking(move || hub2.send_text(&id2, "hello", true));
+    old.next().await.unwrap().unwrap().into_text().unwrap();
+    let _new = connect(w.port, &token, "1").await.unwrap();
+    assert_eq!(call.await.unwrap().unwrap_err(), link_down);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "not the timeout path"
+    );
+}

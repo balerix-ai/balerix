@@ -1,0 +1,34 @@
+---
+source: src/desired/fleet.rs
+expression: plan.crews
+---
+- apiVersion: balerix.ai/v1alpha1
+  kind: Crew
+  metadata:
+    labels:
+      app.kubernetes.io/managed-by: balerix-operator
+      balerix.ai/component: crew
+      balerix.ai/crew: backend
+      balerix.ai/daemon: default
+      balerix.ai/fleet: payments
+    name: payments-backend
+    namespace: team-a
+    ownerReferences:
+      - apiVersion: balerix.ai/v1alpha1
+        controller: true
+        kind: Fleet
+        name: payments
+        uid: fleet-uid
+  spec:
+    daemon: default
+    fleet: payments
+    crew: backend
+    repo: acme/payments-api
+    ref: main
+    git:
+      auth: gh
+      push: true
+    fleetTools:
+      node: 22.11.0
+    tools:
+      python: 3.12.8

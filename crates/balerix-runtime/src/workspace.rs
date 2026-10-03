@@ -340,6 +340,9 @@ pub struct Workspace<'a> {
     pub tools: &'a ToolPaths,
     /// `GH_CONFIG_DIR` for the daemon's git calls when `git.auth: gh`.
     pub gh_config_dir: Option<PathBuf>,
+    /// Spec O §8.1: the cache is a read-only mount kept current by a Job;
+    /// a new clone skips the fetch into it and the harvested-branch seed.
+    pub cache_is_read_only: bool,
 }
 
 impl Workspace<'_> {
@@ -767,11 +770,13 @@ impl Workspace<'_> {
     ) -> Result<(), MaterializeError> {
         let cache = crew.repo.display().to_string();
         let ws = agent.workspace.display().to_string();
-        self.git(
-            id,
-            crew,
-            &["-C", &cache, "fetch", "--quiet", "--no-auto-gc", "origin"],
-        )?;
+        if !self.cache_is_read_only {
+            self.git(
+                id,
+                crew,
+                &["-C", &cache, "fetch", "--quiet", "--no-auto-gc", "origin"],
+            )?;
+        }
         self.git(
             id,
             crew,
@@ -787,11 +792,14 @@ impl Workspace<'_> {
         )?;
         let refname = format!("refs/heads/{branch}");
         let remote = format!("refs/remotes/origin/{branch}");
-        let cached = self.git_probe(
-            id,
-            crew,
-            &["-C", &cache, "rev-parse", "--verify", "--quiet", &refname],
-        )?;
+        // A pod's cache slice holds objects only: no harvested branch is
+        // visible through it, and `rev-parse` there is "not a repository".
+        let cached = !self.cache_is_read_only
+            && self.git_probe(
+                id,
+                crew,
+                &["-C", &cache, "rev-parse", "--verify", "--quiet", &refname],
+            )?;
         // The cache's copy is a harvest (`ensure_repo` keeps no other
         // branch there), worth seeding from only while it holds commits
         // `origin/<branch>` lacks: one the agent pushed is behind origin's

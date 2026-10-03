@@ -72,6 +72,7 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     let rt = Runtime::new(layout.clone(), tools.clone());
 

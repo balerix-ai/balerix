@@ -74,6 +74,7 @@ fn a_private_clone_borrows_from_the_cache_and_pushes_to_origin() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
 
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
@@ -169,6 +170,7 @@ fn errors_name_the_id_tool_and_first_stderr_line() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     let err = ws
         .ensure_repo(
@@ -239,6 +241,7 @@ fn a_clone_on_an_existing_remote_branch_is_created_from_it_and_reused() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
@@ -305,6 +308,7 @@ fn a_changed_branch_moves_a_clean_clone_and_keeps_the_old_branch() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let head = || {
@@ -419,6 +423,7 @@ fn a_changed_branch_on_a_dirty_clone_fails_and_keeps_the_tree() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -475,6 +480,7 @@ fn a_missing_remote_branch_fails_the_clone_and_leaves_nothing() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let e = ws
@@ -598,6 +604,7 @@ fn an_agent_switching_branches_itself_is_left_alone_on_an_unchanged_setting() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let head = || {
@@ -659,6 +666,7 @@ fn a_clone_without_a_marker_is_judged_by_head_once_then_recorded() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let head = || {
@@ -714,6 +722,7 @@ fn a_changed_branch_the_clone_already_sits_on_is_recorded_without_a_move() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let head = || {
@@ -766,6 +775,7 @@ fn two_agents_on_one_branch_both_materialize() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     for name in ["a", "b"] {
@@ -806,6 +816,7 @@ fn a_worktree_from_0_1_is_refused_with_the_purge_message() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     // what 0.1.x's ensure_worktree made
@@ -854,6 +865,7 @@ fn a_crashed_clone_directory_without_git_is_replaced() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     std::fs::create_dir_all(&paths.workspace).unwrap();
@@ -890,6 +902,7 @@ fn the_clone_step_runs_no_program_from_the_clone_config() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -953,6 +966,7 @@ fn an_unpushed_commit_survives_removal_and_seeds_the_next_clone() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -1038,6 +1052,7 @@ fn removal_harvests_head_without_a_marker_and_skips_what_is_not_there() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let make = |name: &str| {
@@ -1123,6 +1138,7 @@ fn a_branch_the_cache_has_checked_out_is_harvested_too() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
@@ -1181,6 +1197,7 @@ fn a_broken_clone_fails_the_removal_and_stays() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -1220,6 +1237,7 @@ fn a_worktree_from_0_1_is_refused_and_keep_repos_migrates_it() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     // what 0.1.x left behind: a clone without the gc pin, a worktree, an
     // unpushed commit on the worktree's branch, and no marker
@@ -1310,6 +1328,7 @@ fn a_clone_pointed_at_another_repository_is_refused_and_nothing_is_harvested() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
@@ -1516,6 +1535,7 @@ fn a_clone_rewritten_after_the_checks_serves_nothing_foreign() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
@@ -1697,6 +1717,7 @@ fn an_agent_on_the_default_branch_materializes() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     // origin moves on after the cache was cloned
@@ -1804,6 +1825,7 @@ fn a_force_pushed_default_branch_does_not_seed_from_the_cache() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
@@ -1861,6 +1883,7 @@ fn a_promisor_remote_in_the_clone_fetches_nothing_and_runs_nothing() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
@@ -2064,6 +2087,7 @@ fn a_cache_whose_pin_failed_is_removed_and_made_again() {
     let e = Workspace {
         tools: &broken,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .ensure_repo("f/c", &crew, &repo, "main")
     .unwrap_err()
@@ -2077,6 +2101,7 @@ fn a_cache_whose_pin_failed_is_removed_and_made_again() {
     Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .ensure_repo("f/c", &crew, &repo, "main")
     .unwrap();
@@ -2103,6 +2128,7 @@ fn an_unreadable_head_without_a_marker_fails_the_removal() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -2113,6 +2139,7 @@ fn an_unreadable_head_without_a_marker_fails_the_removal() {
     let e = Workspace {
         tools: &broken,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .harvest_and_remove("f/c/a", &crew, &paths)
     .unwrap_err()
@@ -2145,6 +2172,7 @@ fn an_unreadable_head_fails_a_branch_change() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -2154,6 +2182,7 @@ fn an_unreadable_head_fails_a_branch_change() {
     let e = Workspace {
         tools: &broken,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .ensure_clone(
         "f/c/a",
@@ -2191,6 +2220,7 @@ fn a_failed_harvest_probe_fails_the_clone() {
     Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .ensure_repo("f/c", &crew, &repo, "main")
     .unwrap();
@@ -2199,6 +2229,7 @@ fn a_failed_harvest_probe_fails_the_clone() {
     let e = Workspace {
         tools: &broken,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
     .unwrap_err()
@@ -2228,6 +2259,7 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -2296,6 +2328,7 @@ fn a_state_root_with_a_space_and_a_quote_is_harvested() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -2328,12 +2361,14 @@ fn a_harvest_without_a_working_nono_fails_and_keeps_the_clone() {
     Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .ensure_repo("f/c", &crew, &repo, "main")
     .unwrap();
     Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
     .unwrap();
@@ -2345,6 +2380,7 @@ fn a_harvest_without_a_working_nono_fails_and_keeps_the_clone() {
     let e = Workspace {
         tools: &no_nono,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .harvest_and_remove("f/c/a", &crew, &paths)
     .unwrap_err()
@@ -2387,6 +2423,7 @@ fn a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone() {
     let ws = Workspace {
         tools: &tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -2412,6 +2449,7 @@ fn a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone() {
     let e = Workspace {
         tools: &broken,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .harvest_and_remove("f/c/a", &crew, &paths)
     .expect_err("a nono that cannot run must fail the removal")
@@ -2505,6 +2543,7 @@ fn clone_with_unpushed_work(
     let ws = Workspace {
         tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -2534,6 +2573,7 @@ fn a_nono_failure_after_the_canary_fails_the_removal_and_keeps_the_clone() {
     let e = Workspace {
         tools: &broken,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .harvest_and_remove("f/c/a", &crew, &paths)
     .expect_err("a nono failure must not read as git's no")
@@ -2573,6 +2613,7 @@ fn a_nono_failure_after_the_canary_fails_a_branch_change() {
     let e = Workspace {
         tools: &broken,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .ensure_clone(
         "f/c/a",
@@ -2617,6 +2658,7 @@ fn a_git_warning_on_a_successful_probe_does_not_fail_the_harvest() {
     Workspace {
         tools: &noisy,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .harvest_and_remove("f/c/a", &crew, &paths)
     .unwrap();
@@ -2651,6 +2693,7 @@ fn a_git_warning_beside_a_no_fails_the_removal_and_keeps_the_clone() {
     let e = Workspace {
         tools: &noisy,
         gh_config_dir: None,
+        cache_is_read_only: false,
     }
     .harvest_and_remove("f/c/a", &crew, &paths)
     .unwrap_err()

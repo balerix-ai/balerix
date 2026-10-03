@@ -23,6 +23,12 @@ pub enum Command {
     Sidecar(SidecarArgs),
     /// The agent container: start the tmux server once the sidecar is ready.
     Run(RunArgs),
+    /// The sync Job: the crew cache and the crew pool (Spec O §8.3).
+    CrewSync(CrewSyncArgs),
+    /// A pool Job: the daemon pool or a fleet's pool (§20.3).
+    PoolSync(PoolSyncArgs),
+    /// The harvest Job: the agent's branch into the crew cache (§8.4).
+    Harvest(HarvestArgs),
 }
 
 #[derive(Debug, Args)]
@@ -68,15 +74,109 @@ pub struct RunArgs {
     pub start_timeout_secs: u64,
 }
 
-/// Ends the sidecar with its reason as the termination message: the first
+/// Where a Job finds the slice, its scratch directory and its outcome.
+#[derive(Debug, Args)]
+pub struct JobDirs {
+    /// The crew's slice, mounted read-write where the pod has it read-only.
+    #[arg(long, default_value = "/balerix/shared")]
+    pub shared_dir: PathBuf,
+    /// An emptyDir: the gh config, the git profile, nono's home and logs.
+    #[arg(long, default_value = "/balerix/scratch")]
+    pub scratch_dir: PathBuf,
+    /// One line: the outcome the operator reads.
+    #[arg(long, default_value = "/dev/termination-log")]
+    pub termination_log: PathBuf,
+}
+
+/// `--tool node=22.11.0`: one entry of a tool table.
+fn tool(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((name, version)) if !name.is_empty() && !version.is_empty() => {
+            Ok((name.to_string(), version.to_string()))
+        }
+        _ => Err(format!("{s:?}: expected <name>=<version>")),
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct CrewSyncArgs {
+    /// `<fleet>/<crew>`.
+    #[arg(long)]
+    pub crew: String,
+    #[arg(long)]
+    pub repo: String,
+    #[arg(long = "ref")]
+    pub git_ref: String,
+    /// The GitHub token as a mounted file (`git.auth: gh`), never an argument.
+    #[arg(long)]
+    pub gh_token_file: Option<PathBuf>,
+    /// The crew's own tool table.
+    #[arg(long = "tool", value_parser = tool)]
+    pub tools: Vec<(String, String)>,
+    #[command(flatten)]
+    pub dirs: JobDirs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Level {
+    Daemon,
+    Fleet,
+}
+
+#[derive(Debug, Args)]
+pub struct PoolSyncArgs {
+    #[arg(long, value_enum)]
+    pub level: Level,
+    /// The fleet's name; required with `--level fleet`.
+    #[arg(long)]
+    pub fleet: Option<String>,
+    /// The table to install. With `--level daemon` and none given, the
+    /// system table this binary embeds (`claude`, `gh`).
+    #[arg(long = "tool", value_parser = tool)]
+    pub tools: Vec<(String, String)>,
+    /// Install an empty daemon table rather than the embedded one.
+    #[arg(long, conflicts_with = "tools")]
+    pub no_tools: bool,
+    #[command(flatten)]
+    pub dirs: JobDirs,
+}
+
+#[derive(Debug, Args)]
+pub struct HarvestArgs {
+    /// `<fleet>/<crew>/<agent>`.
+    #[arg(long)]
+    pub agent: String,
+    /// The agent claim, mounted read-only.
+    #[arg(long, default_value = "/balerix/agent")]
+    pub agent_dir: PathBuf,
+    #[command(flatten)]
+    pub dirs: JobDirs,
+}
+
+/// Ends a command with its reason as the termination message: the first
 /// line of `e`, written to `log` (best effort: the path may not exist off
 /// a pod) and to stderr. Always exit 1.
-pub fn terminate(log: &Path, e: &anyhow::Error) -> ExitCode {
+pub fn terminate(log: &Path, who: &str, e: &anyhow::Error) -> ExitCode {
     let reason = format!("{e:#}");
-    let first = reason.lines().next().unwrap_or("").to_string();
-    if let Err(write) = std::fs::write(log, format!("{first}\n")) {
+    write_line(log, reason.lines().next().unwrap_or(""));
+    eprintln!("balerix-agent {who}: {reason}");
+    ExitCode::FAILURE
+}
+
+/// A Job's end: its one-line outcome on success, `terminate` otherwise.
+pub fn finish(log: &Path, who: &str, outcome: anyhow::Result<String>) -> ExitCode {
+    match outcome {
+        Ok(line) => {
+            write_line(log, &line);
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => terminate(log, who, &e),
+    }
+}
+
+fn write_line(log: &Path, line: &str) {
+    if let Err(write) = std::fs::write(log, format!("{line}\n")) {
         tracing::debug!(path = %log.display(), "no termination log: {write}");
     }
-    eprintln!("balerix-agent sidecar: {reason}");
-    ExitCode::FAILURE
 }

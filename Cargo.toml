@@ -56,8 +56,8 @@ tokio-tungstenite = "0.30.0"
 portable-pty = "0.9.0"
 # Spec O §7.3, §10.3: the Daemon serves TLS in Kubernetes mode. axum-server
 # binds rustls to axum; `tls-rustls-no-provider` so the crypto provider is
-# chosen here — ring, pure Rust, which builds for static musl without a C
-# toolchain — rather than aws-lc-rs. No reqwest feature changes: the core
+# chosen here — ring, which builds for static musl with no cmake and a
+# smaller C build than aws-lc-rs — rather than aws-lc-rs. No reqwest feature changes: the core
 # `reqwest` keeps `json` alone (scripts/check-core-deps.sh).
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }

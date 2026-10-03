@@ -26,7 +26,7 @@ actionlint = "1.7.12"
 shellcheck = "0.11.0"
 
 [tasks.fmt]
-description = "Format the core workspace and every standalone plugin project"
+description = "Format the core workspace, every standalone plugin project and the agent project"
 run = [
   "cargo fmt --all",
   "scripts/plugin.sh fmt common",
@@ -94,7 +94,7 @@ run = [
 ]
 
 [tasks.audit]
-description = "Nightly tier: dependency CVEs and policy, for the core workspace and each standalone plugin project"
+description = "Nightly tier: dependency CVEs and policy, for the core workspace, each standalone plugin project and the agent project"
 run = [
   "cargo audit",
   "cargo deny check advisories bans sources licenses",

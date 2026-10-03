@@ -727,8 +727,7 @@ operator/                     standalone project, own Cargo.lock
   src/daemon_client.rs        the Daemon admin API
   src/main.rs                 run | crds
 agent/                        standalone project, own Cargo.lock
-  src/sidecar.rs  link.rs  hooks.rs  crew_sync.rs  harvest.rs  run.rs
-  src/{cli,bundle,tls,hooks,link,attach,sidecar,run}.rs
+  src/{cli,bundle,tls,hooks,link,attach,sidecar,state,run}.rs; crew_sync.rs, harvest.rs (the Jobs, §8.3, §8.4)
 crates/balerix-server/src/kube/   link.rs (LinkHub), plugins route, managed-fleets list
   kube/{link,pty,idle,tls}.rs
 crates/balerix-api            link frames, the plugins request, the manifest in hello

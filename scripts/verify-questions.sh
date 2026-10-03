@@ -108,7 +108,8 @@ submit() { # submit <text>: type it, press Enter until UserPromptSubmit shows it
   while :; do
     t send-keys -t s Enter
     wait_for 5 more_lines "$SUBMIT" "$before" && break
-    # taken but its hook still running: another Enter would answer the dialog
+    # defensive: an open dialog means the prompt was taken, and another
+    # Enter would answer the dialog
     dialog_open && break
     tries=$((tries + 1))
     say "Enter again ($tries): ${text:0:80}" >> "$ROOT/resubmits.log"

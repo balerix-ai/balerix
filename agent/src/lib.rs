@@ -6,4 +6,6 @@
 //! says the agent is ready to launch.
 
 pub mod cli;
+pub mod hooks;
 pub mod run;
+pub mod tls;

@@ -13,7 +13,7 @@ use axum::response::Response;
 use axum::routing::get;
 use std::future::IntoFuture;
 
-use balerix_agent::link::{Control, LinkDeps, run};
+use balerix_agent::link::{Control, LINK_IDLE, LinkDeps, run, run_with_idle};
 use balerix_agent::tls::client_config;
 use balerix_api::{
     AgentPhase, AgentStatus, FailureKind, LinkOp, LinkRequest, LinkResult, LinkStatus,
@@ -151,6 +151,12 @@ struct Side {
 }
 
 fn start_sidecar_link(daemon_url: &str) -> Side {
+    let (deps, side) = sidecar(daemon_url);
+    tokio::spawn(run(deps));
+    side
+}
+
+fn sidecar(daemon_url: &str) -> (Arc<LinkDeps>, Side) {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -178,12 +184,14 @@ fn start_sidecar_link(daemon_url: &str) -> Side {
         control: control_tx,
         status: status_rx,
     });
-    tokio::spawn(run(deps));
-    Side {
-        runner,
-        control,
-        status,
-    }
+    (
+        deps,
+        Side {
+            runner,
+            control,
+            status,
+        },
+    )
 }
 
 async fn reply(conn: &mut Conn) -> (u64, LinkResult) {
@@ -352,13 +360,63 @@ async fn the_link_connects_answers_requests_and_reconnects() {
         }
     }
 
-    // the Daemon drops the link: the sidecar is back within the back-off
+    // the Daemon drops the link: the sidecar is back within the back-off,
+    // and its first frame is the status the Daemon reconciles on
     drop(conn);
-    let again = tokio::time::timeout(Duration::from_secs(5), links.recv())
+    let mut again = tokio::time::timeout(Duration::from_secs(5), links.recv())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(again.headers["authorization"], format!("Bearer {TOKEN}"));
+    match again.from_sidecar.recv().await.unwrap() {
+        SidecarFrame::Status(s) => assert_eq!(s.status.phase, AgentPhase::Ready),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A Daemon whose node died: the socket stays open and nothing arrives,
+/// not even its pings. The sidecar gives up after the idle limit and
+/// reconnects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_gone_silent_is_left_after_the_idle_limit() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (sockets, mut sockets_rx) = mpsc::unbounded_channel::<WebSocket>();
+    let silent = Router::new().route(
+        "/v1/agents/{f}/{c}/{a}/link",
+        get(move |ws: WebSocketUpgrade| async move {
+            // held, never read nor written
+            ws.on_upgrade(move |socket| async move {
+                let _ = sockets.send(socket);
+            })
+        }),
+    );
+    tokio::spawn(axum::serve(listener, silent).into_future());
+    let (deps, _side) = sidecar(&url);
+    tokio::spawn(run_with_idle(deps, Duration::from_secs(1)));
+
+    let _first = tokio::time::timeout(Duration::from_secs(5), sockets_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // idle limit (1 s) plus the first back-off (1 s), with room
+    let _second = tokio::time::timeout(Duration::from_secs(6), sockets_rx.recv())
+        .await
+        .expect("the sidecar stayed on a silent link")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn link_deps_never_print_the_token() {
+    let (deps, _side) = sidecar("http://127.0.0.1:1");
+    let shown = format!("{deps:?}");
+    assert!(shown.contains("<redacted>"), "{shown}");
+    assert!(!shown.contains(TOKEN), "{shown}");
+}
+
+#[test]
+fn the_idle_limit_is_three_missed_daemon_pings() {
+    assert_eq!(LINK_IDLE, Duration::from_secs(3 * 30));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

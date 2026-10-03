@@ -12,7 +12,7 @@ use balerix_api::{
     FailureKind, LINK_PROTOCOL, LINK_PROTOCOL_HEADER, LinkFailure, LinkOp, LinkReply, LinkRequest,
     LinkResult, LinkStatus, SidecarFrame,
 };
-use balerix_core::{AgentId, AgentRunner, WorkspaceError, WorkspaceReader};
+use balerix_core::{AgentId, AgentRunner, RunnerError, WorkspaceError, WorkspaceReader};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -25,6 +25,16 @@ use tokio_tungstenite::{
 
 pub const RECONNECT_MIN: Duration = Duration::from_secs(1);
 pub const RECONNECT_MAX: Duration = Duration::from_secs(30);
+
+/// The Daemon pings every link this often (`PING_INTERVAL` in the
+/// server's `kube/link.rs`).
+pub const DAEMON_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Three missed pings: a link that has carried nothing for this long is
+/// dead (a Daemon node gone, a partition: no FIN ever arrives), and the
+/// sidecar reconnects.
+pub const LINK_IDLE: Duration = Duration::from_secs(3 * DAEMON_PING_INTERVAL.as_secs());
+/// TCP, TLS and the upgrade, together.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -48,6 +58,16 @@ pub struct LinkDeps {
     pub status: watch::Receiver<LinkStatus>,
 }
 
+impl std::fmt::Debug for LinkDeps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkDeps")
+            .field("id", &self.id)
+            .field("token", &"<redacted>")
+            .field("daemon_url", &self.daemon_url)
+            .finish_non_exhaustive()
+    }
+}
+
 /// `https://` → `wss://`, `http://` → `ws://`, plus `path`.
 pub fn ws_url(daemon_url: &str, path: &str) -> String {
     let base = daemon_url.trim_end_matches('/');
@@ -61,28 +81,37 @@ pub fn ws_url(daemon_url: &str, path: &str) -> String {
     format!("{base}{path}")
 }
 
-/// A socket to the Daemon at `path`, with the token and the protocol.
+/// A socket to the Daemon at `path`, with the token and the protocol,
+/// within `CONNECT_TIMEOUT`.
 pub async fn connect(deps: &LinkDeps, path: &str) -> Result<Ws> {
     let mut req = ws_url(&deps.daemon_url, path).into_client_request()?;
     req.headers_mut()
         .insert(AUTHORIZATION, format!("Bearer {}", deps.token).parse()?);
     req.headers_mut()
         .insert(LINK_PROTOCOL_HEADER, LINK_PROTOCOL.to_string().parse()?);
-    let (ws, _) =
-        connect_async_tls_with_config(req, None, false, Some(Connector::Rustls(deps.tls.clone())))
-            .await?;
+    let connecting =
+        connect_async_tls_with_config(req, None, false, Some(Connector::Rustls(deps.tls.clone())));
+    let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer within {} s", CONNECT_TIMEOUT.as_secs()))??;
     Ok(ws)
 }
 
 /// For the life of the sidecar: connect, serve the session, reconnect.
 pub async fn run(deps: Arc<LinkDeps>) {
+    run_with_idle(deps, LINK_IDLE).await
+}
+
+/// `run` with another idle limit; the tests' silent Daemon uses it.
+#[doc(hidden)]
+pub async fn run_with_idle(deps: Arc<LinkDeps>, idle: Duration) {
     let mut backoff = RECONNECT_MIN;
     loop {
         match connect(&deps, &format!("/v1/agents/{}/link", deps.id)).await {
             Ok(ws) => {
                 tracing::info!("link up");
                 backoff = RECONNECT_MIN;
-                session(deps.clone(), ws).await;
+                session(deps.clone(), ws, idle).await;
                 tracing::warn!("link closed");
             }
             Err(e) => tracing::warn!("link: cannot connect: {e}"),
@@ -98,7 +127,7 @@ async fn send(ws: &mut Ws, frame: &SidecarFrame) -> Result<()> {
     Ok(())
 }
 
-async fn session(deps: Arc<LinkDeps>, mut ws: Ws) {
+async fn session(deps: Arc<LinkDeps>, mut ws: Ws, idle: Duration) {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SidecarFrame>();
     let mut status = deps.status.clone();
     // the current status first, before any request is read: the Daemon
@@ -108,8 +137,15 @@ async fn session(deps: Arc<LinkDeps>, mut ws: Ws) {
     if send(&mut ws, &SidecarFrame::Status(current)).await.is_err() {
         return;
     }
+    // reset by every frame the Daemon sends, its pings among them; what
+    // the sidecar sends proves nothing about the other end
+    let mut deadline = tokio::time::Instant::now() + idle;
     loop {
         tokio::select! {
+            () = tokio::time::sleep_until(deadline) => {
+                tracing::warn!("link: nothing from the Daemon in {} s", idle.as_secs());
+                return;
+            }
             changed = status.changed() => {
                 if changed.is_err() {
                     return;
@@ -124,33 +160,54 @@ async fn session(deps: Arc<LinkDeps>, mut ws: Ws) {
                     return;
                 }
             }
-            msg = ws.next() => match msg {
-                Some(Ok(Message::Text(text))) => match serde_json::from_str::<LinkRequest>(text.as_str()) {
-                    Ok(req) => {
-                        // each request on its own task: a paced send_keys
-                        // must not hold up a status frame or another request
-                        let deps = deps.clone();
-                        let out = out_tx.clone();
-                        tokio::spawn(async move {
-                            let result = dispatch(&deps, req.op).await;
-                            let _ = out.send(SidecarFrame::Reply(LinkReply { id: req.id, result }));
-                        });
-                    }
-                    Err(e) => tracing::warn!("link: not a request: {e}"),
-                },
-                Some(Ok(Message::Ping(p))) => {
-                    if ws.send(Message::Pong(p)).await.is_err() {
-                        return;
-                    }
+            msg = ws.next() => {
+                if matches!(msg, Some(Ok(_))) {
+                    deadline = tokio::time::Instant::now() + idle;
                 }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
-                Some(Ok(_)) => {}
-            },
+                match msg {
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<LinkRequest>(text.as_str()) {
+                        Ok(req) => {
+                            // each request on its own task: a paced send_keys
+                            // must not hold up a status frame or another request
+                            let deps = deps.clone();
+                            let out = out_tx.clone();
+                            tokio::spawn(async move {
+                                let result = dispatch(&deps, req.op).await;
+                                let _ = out.send(SidecarFrame::Reply(LinkReply { id: req.id, result }));
+                            });
+                        }
+                        Err(e) => tracing::warn!("link: not a request: {e}"),
+                    },
+                    Some(Ok(Message::Ping(p))) => {
+                        if ws.send(Message::Pong(p)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                    Some(Ok(_)) => {}
+                }
+            }
         }
     }
 }
 
-fn runner_failed(message: String) -> LinkResult {
+/// A runner error's text without the id its display leads with: the
+/// Daemon's `RunnerError::Link { id, message }` puts the id back.
+pub(crate) fn runner_message(e: &RunnerError) -> String {
+    let text = e.to_string();
+    let id = match e {
+        RunnerError::Tool { id, .. }
+        | RunnerError::Parse { id, .. }
+        | RunnerError::StillRunning { id, .. }
+        | RunnerError::Link { id, .. } => id,
+    };
+    match text.strip_prefix(&format!("{id}: ")) {
+        Some(rest) => rest.to_string(),
+        None => text,
+    }
+}
+
+pub(crate) fn runner_failed(message: String) -> LinkResult {
     LinkResult::Failed {
         failure: LinkFailure {
             reason: FailureKind::Runner,
@@ -160,9 +217,9 @@ fn runner_failed(message: String) -> LinkResult {
 }
 
 /// `WorkspaceError` by variant, with its text. For the variants the Daemon
-/// rebuilds from `message` alone (`Missing`, `InvalidPath`, `Filter`), the
-/// message is the field the variant holds, so the rebuilt error displays
-/// as the sidecar's did; for the others, the whole display text.
+/// rebuilds from `message` (`Missing`, `InvalidPath`, `Filter`, `Tool`),
+/// the message is the field it rebuilds, so nothing reads twice; for the
+/// others, the whole display text.
 pub fn workspace_failure(e: WorkspaceError) -> LinkFailure {
     use WorkspaceError as W;
     let reason = match &e {
@@ -178,6 +235,7 @@ pub fn workspace_failure(e: WorkspaceError) -> LinkFailure {
     };
     let message = match e {
         W::Missing(field) | W::InvalidPath(field) | W::Filter { key: field } => field,
+        W::Tool { stderr, .. } => stderr,
         other => other.to_string(),
     };
     LinkFailure { reason, message }
@@ -216,7 +274,7 @@ pub async fn dispatch(deps: &Arc<LinkDeps>, op: LinkOp) -> LinkResult {
             let r = deps.runner.clone();
             match blocking(move || r.send_text(&id, &text, submit)).await {
                 Ok(Ok(())) => LinkResult::Ok,
-                Ok(Err(e)) => runner_failed(e.to_string()),
+                Ok(Err(e)) => runner_failed(runner_message(&e)),
                 Err(m) => runner_failed(m),
             }
         }
@@ -225,7 +283,7 @@ pub async fn dispatch(deps: &Arc<LinkDeps>, op: LinkOp) -> LinkResult {
             let delay = Duration::from_millis(delay_ms);
             match blocking(move || r.send_keys(&id, &steps, delay)).await {
                 Ok(Ok(())) => LinkResult::Ok,
-                Ok(Err(e)) => runner_failed(e.to_string()),
+                Ok(Err(e)) => runner_failed(runner_message(&e)),
                 Err(m) => runner_failed(m),
             }
         }
@@ -314,9 +372,67 @@ mod tests {
             };
             assert_eq!(rebuilt.to_string(), e.to_string());
         }
+        // `Tool` carries its stderr alone: the Daemon rebuilds the id and a
+        // subcommand of its own around it
+        let failure = workspace_failure(WorkspaceError::Tool {
+            id: "f/c/a".into(),
+            subcommand: "diff".into(),
+            args: vec![],
+            stderr: "fatal: bad revision\nmore".into(),
+        });
+        assert_eq!(
+            serde_json::to_value(&failure).unwrap(),
+            json!({ "reason": "tool", "message": "fatal: bad revision\nmore" })
+        );
+        let rebuilt = WorkspaceError::Tool {
+            id: "f/c/a".into(),
+            subcommand: "link".into(),
+            args: vec![],
+            stderr: failure.message,
+        };
+        assert_eq!(rebuilt.to_string(), "f/c/a: git link: fatal: bad revision");
         // the others carry their display text
         let failure = workspace_failure(WorkspaceError::TooLarge { limit: 1 << 20 });
         assert_eq!(failure.reason, FailureKind::TooLarge { limit: 1 << 20 });
         assert_eq!(failure.message, "file larger than 1 MiB");
+    }
+
+    /// A runner failure goes without the id its display leads with: the
+    /// Daemon's `RunnerError::Link { id, message }` puts the id back once.
+    #[test]
+    fn runner_failures_round_trip_through_the_daemons_rebuild() {
+        let id: AgentId = "f/c/a".parse().unwrap();
+        let cases = [
+            (
+                RunnerError::Tool {
+                    id: id.to_string(),
+                    subcommand: "send-keys".into(),
+                    args: vec![],
+                    stderr: "no such window".into(),
+                },
+                "tmux send-keys: no such window",
+            ),
+            (
+                RunnerError::StillRunning {
+                    id: id.to_string(),
+                    pid: 42,
+                },
+                "agent processes still running after stop (pid 42)",
+            ),
+        ];
+        for (e, message) in cases {
+            let LinkResult::Failed { failure } = runner_failed(runner_message(&e)) else {
+                panic!("not a failure");
+            };
+            assert_eq!(
+                serde_json::to_value(&failure).unwrap(),
+                json!({ "reason": "runner", "message": message })
+            );
+            let rebuilt = RunnerError::Link {
+                id: id.to_string(),
+                message: failure.message,
+            };
+            assert_eq!(rebuilt.to_string(), e.to_string());
+        }
     }
 }

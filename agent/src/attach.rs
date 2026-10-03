@@ -8,24 +8,15 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use balerix_api::{FailureKind, LinkFailure, LinkResult, ResizeFrame, TextFrame};
+use balerix_api::{LinkResult, ResizeFrame, TextFrame};
 use balerix_core::PtyStream;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::link::{LinkDeps, Ws, connect};
+use crate::link::{LinkDeps, Ws, connect, runner_failed, runner_message};
 
 const READ_CHUNK: usize = 8192;
-
-fn failed(message: String) -> LinkResult {
-    LinkResult::Failed {
-        failure: LinkFailure {
-            reason: FailureKind::Runner,
-            message,
-        },
-    }
-}
 
 /// Attaches through the runner, opens the session's socket (on this
 /// agent's path, with its token and the link protocol: the Daemon pairs a
@@ -35,15 +26,15 @@ pub async fn open(deps: &Arc<LinkDeps>, session: &str) -> LinkResult {
     let (runner, id) = (deps.runner.clone(), deps.id.clone());
     let stream = match tokio::task::spawn_blocking(move || runner.attach(&id)).await {
         Ok(Ok(s)) => s,
-        Ok(Err(e)) => return failed(e.to_string()),
-        Err(e) => return failed(format!("task failed: {e}")),
+        Ok(Err(e)) => return runner_failed(runner_message(&e)),
+        Err(e) => return runner_failed(format!("task failed: {e}")),
     };
     let path = format!("/v1/agents/{}/link/attach/{session}", deps.id);
     let ws = match connect(deps, &path).await {
         Ok(ws) => ws,
         Err(e) => {
             let _ = tokio::task::spawn_blocking(move || drop(stream)).await;
-            return failed(format!("attach socket: {e}"));
+            return runner_failed(format!("attach socket: {e}"));
         }
     };
     tokio::spawn(bridge(ws, stream));

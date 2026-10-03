@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use balerix_api::{CredentialBundle, FleetSpec, Timestamp};
+use balerix_api::{AgentPhase, CredentialBundle, FleetSpec, Timestamp};
 use balerix_core::reconcile::{
     ReconcileContext, agent_ready, finish_pass, reconcile_pass, set_desired,
 };
@@ -36,6 +36,9 @@ pub enum Msg {
     Apply {
         spec: FleetSpec,
         credentials: CredentialBundle,
+        /// Spec O §7.3: the operator's per-agent tokens, each becoming that
+        /// agent's hook secret. Empty for every other caller.
+        agent_tokens: balerix_api::AgentTokens,
         reply: oneshot::Sender<FleetRecord>,
     },
     Down {
@@ -216,9 +219,10 @@ impl Actor {
                 Some(Msg::Apply {
                     spec,
                     credentials,
+                    agent_tokens,
                     reply,
                 }) => {
-                    self.apply(spec, credentials).await;
+                    self.apply(spec, credentials, agent_tokens).await;
                     let _ = reply.send(self.record.clone());
                     self.pass().await;
                 }
@@ -226,8 +230,21 @@ impl Actor {
                     self.record.desired = Desired::Down { keep, purge };
                     self.persist().await;
                     self.publish();
-                    let _ = reply.send(self.record.clone());
-                    self.pass().await;
+                    if self.ports.kube.is_some() {
+                        for id in self.wanted_agents() {
+                            self.link_op(&id, balerix_api::LinkOp::Stop).await;
+                        }
+                        // the pods are the operator's to remove; the
+                        // Daemon's view of them ends with the down
+                        self.record.status.agents.clear();
+                        // replied after the pass: nothing is left to wait
+                        // for, so the reply is already `Down`
+                        self.mirror_pass().await;
+                        let _ = reply.send(self.record.clone());
+                    } else {
+                        let _ = reply.send(self.record.clone());
+                        self.pass().await;
+                    }
                 }
                 Some(Msg::SetStopped {
                     agent,
@@ -242,6 +259,14 @@ impl Actor {
                     }
                     self.persist().await;
                     self.publish();
+                    if self.ports.kube.is_some() {
+                        let op = if stopped {
+                            balerix_api::LinkOp::Stop
+                        } else {
+                            balerix_api::LinkOp::Restart
+                        };
+                        self.link_op(&agent, op).await;
+                    }
                     self.pass().await;
                     let _ = reply.send(self.record.clone());
                 }
@@ -309,7 +334,12 @@ impl Actor {
         }
     }
 
-    async fn apply(&mut self, spec: FleetSpec, credentials: CredentialBundle) {
+    async fn apply(
+        &mut self,
+        spec: FleetSpec,
+        credentials: CredentialBundle,
+        agent_tokens: balerix_api::AgentTokens,
+    ) {
         self.record.generation += 1;
         self.record.spec = spec;
         self.record.desired = Desired::Up;
@@ -323,15 +353,21 @@ impl Actor {
         let mut next = BTreeMap::new();
         for id in &wanted {
             let key = id.to_string();
-            let secret = self
-                .secrets
-                .hook_secrets
+            let secret = agent_tokens
                 .get(&key)
                 .cloned()
+                .or_else(|| self.secrets.hook_secrets.get(&key).cloned())
                 .unwrap_or_else(|| random_hex(32));
             next.insert(key, secret);
         }
         self.secrets.hook_secrets = next;
+        // Kubernetes mode: every wanted agent is visible before its sidecar
+        // links
+        if self.ports.kube.is_some() {
+            for id in &wanted {
+                self.record.status.entry(&id.to_string());
+            }
+        }
         {
             let mut idx = self.shared.hook_secrets.write().await;
             idx.retain(|id, _| id.fleet != self.name);
@@ -358,12 +394,48 @@ impl Actor {
         self.publish();
     }
 
+    /// One frame to one agent's sidecar, off the runtime (the hub's call
+    /// blocks). A failure is logged: the set is the record's, and the
+    /// next status frame reconciles it (`link_status`).
+    async fn link_op(&self, agent: &AgentId, op: balerix_api::LinkOp) {
+        let Some(hub) = self.ports.kube.clone() else {
+            return;
+        };
+        let id = agent.clone();
+        let what = format!("{op:?}");
+        match tokio::task::spawn_blocking(move || hub.call(&id, op)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(agent = %agent, "link {what} failed: {e}"),
+            Err(e) => tracing::error!(agent = %agent, "link task panicked: {e}"),
+        }
+    }
+
     /// Spec O §7.2: the sidecar's status is the Daemon's observed state.
+    /// A frame that disagrees with the stopped set (a `Ready` agent the
+    /// set holds, a `Stopped` one it does not) gets the frame it missed,
+    /// which is how a sidecar that was away during `stop` or `restart`
+    /// learns of it. A downed fleet records nothing (its view of the pods
+    /// ended with the down) and stops any agent that reports otherwise:
+    /// the down may have landed while that link was away.
     async fn link_status(&mut self, agent: AgentId, status: balerix_api::LinkStatus) {
-        self.record
-            .status
-            .agents
-            .insert(agent.to_string(), status.status);
+        let reported_stopped = status.status.phase == AgentPhase::Stopped;
+        if matches!(self.record.desired, Desired::Down { .. }) {
+            if !reported_stopped {
+                self.link_op(&agent, balerix_api::LinkOp::Stop).await;
+            }
+            return;
+        }
+        let key = agent.to_string();
+        let wanted_stopped = self.record.stopped.contains(&key);
+        self.record.status.agents.insert(key, status.status);
+        if wanted_stopped != reported_stopped {
+            let op = if wanted_stopped {
+                balerix_api::LinkOp::Stop
+            } else {
+                balerix_api::LinkOp::Restart
+            };
+            self.link_op(&agent, op).await;
+        }
         self.mirror_pass().await;
     }
 
@@ -517,7 +589,7 @@ impl Actor {
 mod tests {
     use super::*;
     use crate::testing::Harness;
-    use balerix_api::{AgentPhase, AgentSettings, AgentStatus, CrewSpec, FleetPhase, GitSettings};
+    use balerix_api::{AgentSettings, AgentStatus, CrewSpec, FleetPhase, GitSettings};
     use balerix_core::ProcessState;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -566,6 +638,7 @@ mod tests {
         h.tx.send(Msg::Apply {
             spec,
             credentials: CredentialBundle::default(),
+            agent_tokens: BTreeMap::new(),
             reply: tx,
         })
         .await

@@ -257,6 +257,7 @@ impl PluginHost {
             .send(Msg::Apply {
                 spec,
                 credentials: CredentialBundle::default(),
+                agent_tokens: Default::default(),
                 reply,
             })
             .await

@@ -268,6 +268,7 @@ fn a_managed_fleet_shows_its_owner_and_needs_force_to_go_down() {
             Default::default(),
             ApplyMode::Create,
             &Caller::Plugin("gh".parse().unwrap()),
+            Default::default(),
         ))
         .unwrap();
 
@@ -354,6 +355,7 @@ fn plugin_remove_purge_purges_every_fleet_the_plugin_owns() {
                     Default::default(),
                     ApplyMode::Create,
                     caller,
+                    Default::default(),
                 )
                 .await
                 .unwrap();
@@ -431,6 +433,7 @@ fn plugin_remove_purge_purges_a_fleet_applied_during_the_sync_and_no_other_plugi
                                 Default::default(),
                                 ApplyMode::Create,
                                 &late_gh,
+                                Default::default(),
                             )
                             .await
                             .unwrap();
@@ -470,6 +473,7 @@ fn plugin_remove_purge_purges_a_fleet_applied_during_the_sync_and_no_other_plugi
                     Default::default(),
                     ApplyMode::Create,
                     caller,
+                    Default::default(),
                 )
                 .await
                 .unwrap();

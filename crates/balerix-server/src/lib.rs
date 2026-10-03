@@ -31,7 +31,7 @@ pub use daemon::{
     ApplyMode, Caller, Daemon, DaemonError, DaemonHandler, HEALTH_INTERVAL, HelloObserver,
 };
 pub use hooks::{ParsedEvent, parse_event};
-pub use kube::{KUBERNETES_OWNER, LINK_CALL_TIMEOUT, LinkError, LinkHub};
+pub use kube::{KUBERNETES_OWNER, LINK_CALL_TIMEOUT, LinkError, LinkHub, NoFiles, NoPool};
 pub use lifecycle::{
     LifecycleError, ServerPaths, load_or_create_token, read_endpoint, read_pid, remove_if_exists,
     write_endpoint, write_pid,

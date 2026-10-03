@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.2 - 2026-10-03
+
+### Features
+
+- **core:** Restricted settings surface for plugin-applied fleet files, the operator's fleetDefaults layer, and the fleets-gated PUT answer (Spec M §12) (#86)
+- **common:** Delivery confirmation, adopted by matrix as 📨 then 👍 (Spec M §8.7, #85) (#91)
+- **github:** The GitHub plugin, an agent per issue or pull request (Spec M) (#93)
+- **server:** Kubernetes mode and the balerix-agent sidecar over a TLS link (Spec O §6, §7) (#125)
+- **operator:** The operator project, its five kinds and pure desired state; the sync and harvest Jobs (Spec O §20) (#126)
+
+### Bug fixes
+
+- **common:** Press Enter again while a prompt is unconfirmed, adopted by github and matrix (#99) (#101)
+- **flow:** Press Enter again while a submitted send is unconfirmed (#100) (#102)
+
 ## 0.1.1 - 2026-09-27
 
 ### Features

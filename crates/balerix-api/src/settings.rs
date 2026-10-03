@@ -83,12 +83,47 @@ impl Default for ClaudeSettings {
     }
 }
 
-/// Which runner materializes the agent. Only tmux exists today (spec §6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+/// Which runner materializes the agent: a tmux window on one machine
+/// (spec §6), or a pod (Spec O §4.2). The pod's Kubernetes shapes are
+/// opaque here; `balerix-operator` gives them their types, so
+/// `k8s-openapi` stays out of this crate (Spec O §20.3).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum RunnerSettings {
     #[default]
     Tmux,
+    #[serde(rename_all = "camelCase")]
+    Pod {
+        /// A `ResourceRequirements` for the agent container.
+        #[serde(default = "empty_object")]
+        resources: Value,
+        /// `{ size }`: overrides the Daemon's agent claim size.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        storage: Option<Value>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        node_selector: BTreeMap<String, String>,
+        /// A list of `Toleration`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tolerations: Vec<Value>,
+    },
+}
+
+/// `RunnerSettings` without its payload: what a resolver or a daemon is
+/// willing to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunnerKind {
+    #[default]
+    Tmux,
+    Pod,
+}
+
+impl RunnerSettings {
+    pub fn kind(&self) -> RunnerKind {
+        match self {
+            Self::Tmux => RunnerKind::Tmux,
+            Self::Pod { .. } => RunnerKind::Pod,
+        }
+    }
 }
 
 fn empty_object() -> Value {
@@ -103,6 +138,55 @@ fn default_binary() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_pod_runner_keeps_its_kubernetes_shapes_as_json() {
+        let s: AgentSettings = serde_json::from_value(json!({
+            "runner": {
+                "type": "pod",
+                "resources": { "requests": { "cpu": "1", "memory": "2Gi" } },
+                "storage": { "size": "40Gi" },
+                "nodeSelector": { "pool": "agents" },
+                "tolerations": [{ "key": "agents", "operator": "Exists" }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(s.runner.kind(), RunnerKind::Pod);
+        let RunnerSettings::Pod {
+            resources,
+            storage,
+            node_selector,
+            tolerations,
+        } = &s.runner
+        else {
+            panic!("{:?}", s.runner)
+        };
+        assert_eq!(resources["requests"]["memory"], "2Gi");
+        assert_eq!(storage.as_ref().unwrap()["size"], "40Gi");
+        assert_eq!(node_selector["pool"], "agents");
+        assert_eq!(tolerations.len(), 1);
+        // round trip, camelCase on the wire
+        let back = serde_json::to_value(&s.runner).unwrap();
+        assert_eq!(back["nodeSelector"]["pool"], "agents");
+        assert_eq!(
+            serde_json::from_value::<RunnerSettings>(back).unwrap(),
+            s.runner
+        );
+    }
+
+    #[test]
+    fn a_bare_pod_runner_has_empty_shapes_and_an_unknown_key_is_refused() {
+        let r: RunnerSettings = serde_json::from_value(json!({ "type": "pod" })).unwrap();
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            json!({ "type": "pod", "resources": {} })
+        );
+        let e = serde_json::from_value::<RunnerSettings>(json!({ "type": "pod", "image": "x" }))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unknown field `image`"), "{e}");
+        assert_eq!(RunnerSettings::default().kind(), RunnerKind::Tmux);
+    }
 
     #[test]
     fn default_settings_are_tmux_with_claude_binary_and_empty_blocks() {

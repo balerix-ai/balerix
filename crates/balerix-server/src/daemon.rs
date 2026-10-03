@@ -683,6 +683,9 @@ impl Daemon {
             )));
         }
         Fleet::try_from(spec.clone()).map_err(|e| DaemonError::Invalid(e.to_string()))?;
+        if self.ports.kube.is_none() {
+            refuse_pod_runner(&spec)?;
+        }
         // Activation runs before the actor sees the spec (§16.2): a
         // rejection is a 400 and nothing lands. Held for the whole method
         // so two applies of the same fleet cannot interleave.
@@ -1230,6 +1233,22 @@ impl Daemon {
     }
 }
 
+/// A tmux-mode daemon runs no pod (Spec O §20.3). The CLI's resolver
+/// refuses this first; the daemon does not rely on that (#24).
+fn refuse_pod_runner(spec: &FleetSpec) -> Result<(), DaemonError> {
+    for (crew_name, crew) in &spec.crews {
+        for (agent_name, settings) in &crew.agents {
+            if settings.runner.kind() == balerix_api::RunnerKind::Pod {
+                return Err(DaemonError::Invalid(format!(
+                    "crews.{crew_name}.agents.{agent_name}.runner.type: `pod` runs only on \
+                     Kubernetes; this daemon runs agents in tmux"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1242,6 +1261,31 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    #[test]
+    fn a_pod_runner_is_refused_with_its_config_path() {
+        let spec: FleetSpec = serde_json::from_value(serde_json::json!({
+            "name": "f",
+            "crews": { "c": { "repo": "o/r", "ref": "main", "agents": {
+                "a": {},
+                "b": { "runner": { "type": "pod" } }
+            } } }
+        }))
+        .unwrap();
+        let DaemonError::Invalid(message) = refuse_pod_runner(&spec).unwrap_err() else {
+            panic!("not Invalid")
+        };
+        assert_eq!(
+            message,
+            "crews.c.agents.b.runner.type: `pod` runs only on Kubernetes; this daemon runs agents in tmux"
+        );
+        let tmux_only: FleetSpec = serde_json::from_value(serde_json::json!({
+            "name": "f",
+            "crews": { "c": { "repo": "o/r", "ref": "main", "agents": { "a": {} } } }
+        }))
+        .unwrap();
+        assert!(refuse_pod_runner(&tmux_only).is_ok());
+    }
 
     fn spec(agents: &[(&str, &[(&str, serde_json::Value)])]) -> FleetSpec {
         FleetSpec {

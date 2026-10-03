@@ -42,7 +42,7 @@ pub use protocol::{
 };
 pub use record::{Desired, FleetRecord, Keep};
 pub use request::{DownQuery, ErrorBody, FleetRequest, SessionRequest, SessionResponse};
-pub use settings::{AgentSettings, ClaudeSettings, RunnerSettings};
+pub use settings::{AgentSettings, ClaudeSettings, RunnerKind, RunnerSettings};
 pub use status::{
     ActivationState, AgentPhase, AgentStatus, FleetPhase, FleetStatus, FleetSummary,
     PluginActivation, SpecHash, Timestamp,

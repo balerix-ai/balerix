@@ -2108,6 +2108,45 @@ fn a_cache_whose_pin_failed_is_removed_and_made_again() {
     assert_eq!(git(&crew.repo, &["config", "gc.auto"]).trim(), "0");
 }
 
+/// Spec O §20.3: in a Job the cache directory is a mount point, which can
+/// be emptied and never removed. A cache whose making failed half-way is
+/// emptied, git's own error is the one reported, and the next run makes it.
+#[test]
+fn a_half_made_cache_in_a_directory_that_cannot_be_removed_is_emptied() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-cache-mountpoint");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let crew = layout.crew(&"f/c".parse().unwrap());
+    std::fs::create_dir_all(&crew.repo).unwrap();
+    // the parent refuses the rmdir, as a mount point's does
+    std::fs::set_permissions(&crew.root, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let broken = failing_git(&root, &tools, "config");
+    let e = Workspace {
+        tools: &broken,
+        gh_config_dir: None,
+        cache_is_read_only: false,
+    }
+    .ensure_repo("f/c", &crew, &repo, "main")
+    .unwrap_err()
+    .to_string();
+    let made = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+        cache_is_read_only: false,
+    }
+    .ensure_repo("f/c", &crew, &repo, "main");
+    std::fs::set_permissions(&crew.root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(e.contains("config refused"), "{e}");
+    assert!(!e.contains("removing what it left behind failed"), "{e}");
+    made.unwrap();
+    assert_eq!(git(&crew.repo, &["config", "gc.auto"]).trim(), "0");
+}
+
 /// #74: a clone whose HEAD git cannot read, with no marker to fall back
 /// on, is not "detached": the removal fails and keeps the clone.
 #[test]

@@ -14,7 +14,7 @@ use crate::home::{HomeInputs, write_home};
 use crate::launch::{hooks_port, render_launch, wants_continue, write_launch};
 use crate::layout::StateLayout;
 use crate::sandbox::{balerix_grants, render_profile, validate_profile, write_profile};
-use crate::toolchain::{Toolchain, system_tools};
+use crate::toolchain::{Toolchain, drop_stale_marker, system_tools};
 use crate::tools::ToolPaths;
 use crate::workspace::Workspace;
 
@@ -218,18 +218,7 @@ impl SystemToolchain for Runtime {
             .join("logs")
             .join("mise.system.log");
         let system = system_tools(&self.layout, "system")?;
-        // Drop a stale marker so `install_level` cannot short-circuit past a
-        // pool that is no longer there.
-        if !pool.exists()
-            && let Err(e) = std::fs::remove_file(&marker)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(MaterializeError::Io {
-                id: "system".to_string(),
-                path: marker,
-                message: e.to_string(),
-            });
-        }
+        drop_stale_marker("system", &pool, &marker)?;
         tc.install_level(
             "system",
             "system",

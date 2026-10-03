@@ -158,6 +158,9 @@ fn remove_tree(id: &str, path: &Path) -> Result<(), MaterializeError> {
 fn discard_half_made(id: &str, path: &Path, failed: MaterializeError) -> MaterializeError {
     match remove_tree(id, path) {
         Ok(()) => failed,
+        // A mount point (the cache in a sync Job, Spec O §20.3) can be
+        // emptied and never removed; empty is what the next pass needs.
+        Err(_) if std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_none()) => failed,
         Err(cleanup) => {
             let strip = |e: &MaterializeError| {
                 let s = e.to_string();
@@ -457,6 +460,48 @@ impl Workspace<'_> {
         self.git(id, crew, &["-C", &cache, "config", "gc.auto", "0"])
             .and_then(|_| self.detach_cache_head(id, crew))
             .map_err(|e| discard_half_made(id, &crew.repo, e))
+    }
+
+    /// The sync Job's cache step (Spec O §8.3): the cache made when absent,
+    /// then fetched, since in a pod nothing else ever fetches it
+    /// (`create_clone` skips its own fetch there). Creates the crew's
+    /// `no-hooks` directory, which the pod's git calls name and cannot
+    /// make on a read-only mount. Returns the commit `origin/<git_ref>` is
+    /// at, the Crew's `cacheRef`.
+    pub fn sync_cache(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        repo: &RepoRef,
+        git_ref: &str,
+    ) -> Result<String, MaterializeError> {
+        self.ensure_repo(id, crew, repo, git_ref)?;
+        let no_hooks = crew.no_hooks();
+        std::fs::create_dir_all(&no_hooks).map_err(|e| MaterializeError::Io {
+            id: id.to_string(),
+            path: no_hooks,
+            message: e.to_string(),
+        })?;
+        let cache = crew.repo.display().to_string();
+        self.git(
+            id,
+            crew,
+            &["-C", &cache, "fetch", "--quiet", "--no-auto-gc", "origin"],
+        )?;
+        let remote = format!("refs/remotes/origin/{git_ref}^{{commit}}");
+        // `--quiet` answers a missing ref with exit 1 and no text
+        if !self.git_probe(
+            id,
+            crew,
+            &["-C", &cache, "rev-parse", "--verify", "--quiet", &remote],
+        )? {
+            return Err(MaterializeError::Invalid {
+                id: id.to_string(),
+                message: format!("the remote has no branch {git_ref}"),
+            });
+        }
+        self.git(id, crew, &["-C", &cache, "rev-parse", "--verify", &remote])
+            .map(|sha| sha.trim().to_string())
     }
 
     /// A `--no-checkout` clone still has the remote's default branch under
@@ -907,7 +952,7 @@ impl Workspace<'_> {
         agent: &AgentPaths,
         branch: &str,
         before_fetch: impl FnOnce(),
-    ) -> Result<(), MaterializeError> {
+    ) -> Result<bool, MaterializeError> {
         let refname = format!("refs/heads/{branch}");
         let present = self.agent_git(
             id,
@@ -917,7 +962,7 @@ impl Workspace<'_> {
             &[0, 1],
         )?;
         if present.trim().is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         // Run by a shell on the fetch's serving side: every word quoted.
         // `env -i` for the same reason `agent_git` clears its environment.
@@ -947,7 +992,7 @@ impl Workspace<'_> {
                 &format!("+{refname}:{refname}"),
             ],
         )
-        .map(|_| ())
+        .map(|_| true)
     }
 
     fn record_branch(id: &str, agent: &AgentPaths, branch: &str) -> Result<(), MaterializeError> {
@@ -995,16 +1040,47 @@ impl Workspace<'_> {
         after_checks: impl FnOnce(),
         before_fetch: impl FnOnce(),
     ) -> Result<(), MaterializeError> {
-        if crew.repo.join(".git").is_dir() && agent.workspace.join(".git").is_dir() {
-            check_clone(id, crew, agent)?;
-            self.prepare_sandbox(id, crew, agent)?;
-            self.check_clone_config(id, crew, agent)?;
-            after_checks();
-            if let Some(branch) = self.assigned_branch(id, crew, agent)? {
-                self.harvest(id, crew, agent, &branch, before_fetch)?;
-            }
-        }
+        self.harvest_checked(id, crew, agent, after_checks, before_fetch)?;
         remove_tree(id, &agent.workspace)
+    }
+
+    /// The harvest Job's step (Spec O §8.4): `harvest_and_remove` without
+    /// the removal, since the Job's claim is mounted read-only and the
+    /// operator deletes it afterwards. Returns the branch now in the
+    /// cache; `None` when there was nothing to harvest (no clone, no
+    /// cache, a detached HEAD, a branch the agent deleted).
+    pub fn harvest_only(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        agent: &AgentPaths,
+    ) -> Result<Option<String>, MaterializeError> {
+        self.harvest_checked(id, crew, agent, || {}, || {})
+    }
+
+    /// The checks, the sandbox canary, the config check and the fetch, in
+    /// the order `harvest_and_remove_after` documents.
+    fn harvest_checked(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        agent: &AgentPaths,
+        after_checks: impl FnOnce(),
+        before_fetch: impl FnOnce(),
+    ) -> Result<Option<String>, MaterializeError> {
+        if !(crew.repo.join(".git").is_dir() && agent.workspace.join(".git").is_dir()) {
+            return Ok(None);
+        }
+        check_clone(id, crew, agent)?;
+        self.prepare_sandbox(id, crew, agent)?;
+        self.check_clone_config(id, crew, agent)?;
+        after_checks();
+        let Some(branch) = self.assigned_branch(id, crew, agent)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .harvest(id, crew, agent, &branch, before_fetch)?
+            .then_some(branch))
     }
 
     /// The marker's branch, else HEAD's; `None` for a detached HEAD. A

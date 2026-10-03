@@ -53,6 +53,13 @@ reconciles what exists against what was declared.
   `send_keys`, `stop`, `restart`, `attach` and the workspace reads arrive.
   `run` is the agent container's entrypoint: the tmux server, once the
   sidecar's start marker says the agent is materialised.
+- `balerix-operator` (`operator/`, standalone like `agent/`) — the Kubernetes
+  operator (Spec O §5, §12). Its `desired` functions are pure, from observed
+  objects to typed `k8s-openapi` objects and status conditions; the
+  controllers (sub-project 3b) are the only part that touches a cluster. The
+  Daemon holds no Kubernetes credentials, so the operator pushes resolved
+  fleets to it through `daemon_client`. The sync, pool and harvest Jobs are
+  `balerix-agent` commands over `balerix_runtime::jobs`.
 - `balerix-plugin-sdk` — the plugin side of the host protocol; depends on
   `api` only. `Host` (async, one method per route, including
   `Host::attach`/`watch_fleets`), the `Plugin` trait (`Plugin::routes`) and

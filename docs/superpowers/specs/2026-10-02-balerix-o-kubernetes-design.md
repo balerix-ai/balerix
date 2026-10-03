@@ -549,7 +549,8 @@ the Daemon's Secret.
   /balerix/run`, `--bundle /balerix/secret/agent.json`, `--ca
   /balerix/tls/ca.crt`, `--termination-log /dev/termination-log`,
   `--hook-port 7643`). Under the shared mount: `repo/.git/objects`,
-  `crew/mise`, `fleet/mise`, `daemon/mise`. Sub-project 3 mounts the
+  and the three pool directories mounted whole: `crew`, `fleet` and
+  `daemon`, each holding `mise/` (§20.5). Sub-project 3 mounts the
   shared claim's sub-paths there and the Secret at the bundle path.
 - **The link's wire shapes** are `balerix-api`'s `link` module: a
   Daemon → sidecar text frame is a `LinkRequest` (`id`, `op` tagged
@@ -724,13 +725,15 @@ bundle) is in the sidecar container only.
 operator/                     standalone project, own Cargo.lock
   src/api/                    the five kinds (kube CustomResource, schemars)
   src/desired/                pure: observed objects → desired objects
+                              {common,names,fleet,daemon,jobs,agent}.rs
   src/controllers/            one module per kind
   src/daemon_client.rs        the Daemon admin API
   src/pki.rs                  the per-Daemon authority and serving certificates
   crds/                       generated definitions, until the chart holds them (§20.2)
   src/main.rs                 run | crds
 agent/                        standalone project, own Cargo.lock
-  src/{cli,bundle,tls,hooks,link,attach,sidecar,state,run}.rs; crew_sync.rs, pool_sync.rs, harvest.rs (the Jobs, §8.3, §8.4)
+  src/{cli,bundle,tls,hooks,link,attach,sidecar,state,run,jobs}.rs (jobs.rs: the Jobs, §8.3, §8.4)
+crates/balerix-runtime/src/jobs.rs   the Jobs' work: sync, pool install, harvest
 crates/balerix-server/src/kube/   link.rs (LinkHub), plugins route, managed-fleets list
   kube/{link,pty,idle,tls}.rs
 crates/balerix-api            link frames, the plugins request, the manifest in hello
@@ -898,7 +901,7 @@ Each gets its own plan.
    TLS. Done when the two-process integration tests pass. Done 2026-10
    (PR #125).
 3. **Operator and CRDs.** §4, §5, §8. Done when `e2e-k8s` passes without
-   plugins. Built as two plans, 3a without a cluster and 3b on one (§20).
+   plugins. Built as two plans, 3a without a cluster and 3b on one (§20). 3a done 2026-10.
 4. **Plugins.** §9. Done when `e2e-k8s` passes with flow and web, and the
    managed journey passes with `dev fake-plugin`.
 5. **Release and charts.** §13, §14. Done when a fork rehearsal publishes
@@ -1144,3 +1147,110 @@ In 3a the binary has `crds` only; `run` arrives with the controllers.
   fails the harvest, and a harvest leaves the claim byte for byte as it
   found it.
 - CI gains an `operator` job beside `agent`.
+
+### 20.5 Decided by the plan
+
+What 3a's plan decided beyond §20.1–§20.4, as built.
+
+- **The runner check is the resolver's.** `ResolveOptions` gains
+  `runner: RunnerKind` (default `Tmux`), and an agent whose `runner.type`
+  differs fails with the config path. The CLI resolves with `Tmux`, the
+  operator with `Pod`. This amends §20.2's "a Fleet resolves through
+  `balerix-config` as it is … after resolving": `balerix-config` gains
+  that one option, and the operator checks nothing after resolving but
+  the object name's length. A tmux-mode daemon also refuses a posted
+  `pod` runner, since it trusts what it is posted (#24); a
+  Kubernetes-mode daemon checks nothing, and its tests post specs with
+  the default runner.
+- **The pod mounts whole pool directories.** `/balerix/shared/crew`,
+  `/balerix/shared/fleet` and `/balerix/shared/daemon` are each one
+  read-only sub-path mount (holding `mise/`, and for the crew
+  `no-hooks/`), beside `/balerix/shared/repo/.git/objects`. §7.4's
+  `crew/mise` and the like are inside them.
+- **A crew with no agent is `layout::SharedSlice`**, which the pod
+  layout's branches also use: one type gives the paths of the slice a Job
+  or a pod mounts. This amends §20.3's "the pod layout is widened to a
+  crew with no agent".
+- **The volume's directories** are §8.1's: `pools/daemon`,
+  `fleets/<fleet>/pool`, `fleets/<fleet>/crews/<crew>/pool` and
+  `fleets/<fleet>/crews/<crew>/repo`.
+- **Each Job has an init container `slice`** that mounts the whole shared
+  claim at `/balerix/volume` and runs `mkdir -p` for the Job's
+  directories as uid 10001: the kubelet creates a missing sub-path owned
+  by root, which the Job's user could not write.
+- **Tool tables are arguments** (`--tool node=22.11.0`, repeated); the
+  GitHub token is a mounted file (`--gh-token-file`). The agent's three
+  Job commands are in one file, `agent/src/jobs.rs`, over
+  `balerix_runtime::jobs`.
+- **`pool-sync --level daemon` installs the embedded system table**
+  (`claude`, `gh`) unless `--tool` is given. The sidecar renders the same
+  embedded table, and both come from one image version (O-13).
+- **A crew sync fetches with `--prune`.** A branch deleted on the remote
+  stops being synced, and the Crew's `CacheReady` goes false with `the
+  remote has no branch <ref>`. Harvested branches live under the cache's
+  `refs/heads` and are untouched.
+- **A Job is re-run when its input changes:** every Job carries
+  `balerix.ai/input-hash`; `backoffLimit: 0`, and the operator retries
+  with back-off (3b).
+- **Object names:** per Daemon `balerix-<daemon>` (StatefulSet, Service,
+  NetworkPolicy), `balerix-<daemon>-state` and `balerix-<daemon>-shared`
+  (claims), `balerix-<daemon>-ca` (Secret and ConfigMap),
+  `balerix-<daemon>-tls` and `balerix-<daemon>-admin` (Secrets),
+  `balerix-<daemon>-pool` (Job). Per fleet `<fleet>-pool` (Job). Per Crew
+  `<fleet>-<crew>-sync` (Job). Per Agent `<fleet>-<crew>-<agent>` (claim,
+  Pod, NetworkPolicy), `…-bundle` and `…-token` (Secrets), `…-harvest`
+  (Job). A Job's name becomes a label value, so it is bounded to 63
+  characters: a name that would be longer is the truncated base, `-`,
+  eight hex characters of the base's hash, then the suffix
+  (`operator/src/desired/names.rs`). Names that fit are as listed.
+- **Certificates:** the authority is valid ten years, a serving
+  certificate ninety days, renewed thirty days before expiry. The expiry
+  is kept as the Secret annotation `balerix.ai/not-after` (unix seconds),
+  so nothing parses X.509. The authority is reloaded from its key alone:
+  its parameters are a function of the Daemon's namespace and name.
+  `pki::issue_serving` refuses an empty name list (`PkiError::NoNames`).
+- **The Daemon pod mounts no shared volume.** In Kubernetes mode it
+  installs no pool and reads workspaces over the link (§7.4).
+- **A Daemon's two claims carry no owner reference:** deleting a Daemon
+  leaves its state and its shared volume, as a StatefulSet leaves its
+  claims. Everything else the operator makes is owned and
+  garbage-collected.
+- **The Daemon's NetworkPolicy admits its own agents, Jobs and the
+  operator.** §10.2's "whatever the user's Ingress names" has no field in
+  §4.1 and is left for the chart (sub-project 5).
+- **The sidecar's requests are fixed** at `cpu: 50m`, `memory: 64Mi`
+  (§6.1 says "small fixed requests").
+- **A renewed serving certificate rolls the daemon pod:** its expiry is
+  an annotation on the pod template, since `serve` reads the certificate
+  at start.
+- **In a pod the crew's logs are `<claim>/.balerix/state/crew-logs`**,
+  outside the agent's sandbox grants like the sidecar's own state.
+- **Types are built against `k8s-openapi`'s `v1_32`**, the oldest it
+  offers; §6.1's minimum of 1.29 is about the cluster, and nothing here
+  uses a field newer than native sidecars.
+- **`status.session` on an Agent stays unset in 3a:** the Daemon's
+  `AgentStatus` carries no session id.
+- **Crew and agent names are not pattern-checked by the schema:** a
+  structural schema cannot constrain map keys; `balerix-config` checks
+  them at resolution.
+- **A type holding a token, key or credentials never derives `Debug`:**
+  it has none, or a hand-written one printing `<redacted>`. The
+  operator's `Material`, `DaemonSecrets`, `AgentInputs` and
+  `AgentObjects` have none.
+- **`desired::common::hash` takes a `serde_json::Value`**, and the claim
+  builder (`common::claim`) is shared by the Daemon's and the Agent's
+  claims.
+
+Known in 3a and left for 3b:
+
+- The `slice` init container's directories being writable by uid 10001,
+  and sub-path mounts of directories a Job made, are unverified without a
+  cluster.
+- The agent and daemon containers have a read-only root and no writable
+  `/tmp`.
+- The Daemon client accepts a plain `http://` base (its tests use one);
+  3b must build `https://` endpoints only.
+- Names derived from a Daemon's (`balerix-<daemon>…`) have no length
+  bound.
+- A stale sidecar crash message can show `MaterializeFailed` after a
+  successful restart, until something is reported.

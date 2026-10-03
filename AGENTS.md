@@ -18,6 +18,12 @@ credentials, hook input, or sandbox rules.
   Spec O §12); builds `balerix` first, since its two-process tests run
   `balerix serve --mode kubernetes` and `launch.sh`. Its own CI job; not part
   of `check`.
+- `operator` — lint and test the standalone `operator/` project
+  (`balerix-operator`, Spec O §12); builds `balerix` first, since its
+  client test runs `balerix serve --mode kubernetes`. Fails when
+  `operator/crds/` differs from the Rust types. Its own CI job; not part
+  of `check`.
+- `crds` — regenerates `operator/crds/` from `operator/src/api/`.
 - `mutants` — nightly tier: mutation-tests `balerix-core` (the reconciler).
   `.cargo/mutants.toml` excludes `fakes.rs`: the fakes are exercised by
   `balerix-server`'s tests, which that run never executes.
@@ -103,8 +109,36 @@ credentials, hook input, or sandbox rules.
 - `agent/` is standalone like a plugin (own `Cargo.lock`, `deny.toml`,
   lints), depending on `balerix-api`, `balerix-core` and `balerix-runtime` by
   path; its TLS and WebSocket stack never reaches the core resolution.
+- `operator/` is standalone like `agent/`, depending on `balerix-api`,
+  `balerix-core` and `balerix-config` by path; `kube` and `k8s-openapi`
+  never reach the core workspace or `agent/`, which is why a `pod`
+  runner's Kubernetes shapes are opaque JSON in `balerix-api`.
+  `operator/src/desired/` is pure: no clock, no random value, no I/O.
+  Tokens and certificates are made by `pki` and passed in.
 
 ## Gotchas
+- A `desired` function writes its manifest as JSON and returns the
+  `k8s-openapi` type (`common::typed`). Those types ignore unknown
+  fields, so a misspelt key is dropped without an error: the insta
+  snapshot is the check. Read a `.snap.new` for what is missing, not
+  only for what is there.
+- `ResolveOptions::runner` says which runner a resolution is for; the
+  CLI's is `Tmux`, the operator's `Pod`, and an agent of the other kind
+  fails with its config path. A Kubernetes-mode daemon does not check
+  the runner; a tmux-mode daemon refuses `pod`.
+- The Jobs (`balerix-agent crew-sync`, `pool-sync`, `harvest`) see the
+  shared slice at the pod's paths (`SharedSlice`, `/balerix/shared`):
+  `check_clone` compares a clone's `alternates` with the cache's path,
+  so a harvest that saw the cache anywhere else would refuse every
+  clone. `harvest` writes nothing under the claim; its git profile,
+  nono's home and its logs are in the scratch directory, which is why
+  `AgentPaths::git_profile` is a field.
+- In a pod `CrewPaths::logs` is on the agent claim
+  (`.balerix/state/crew-logs`): the crew root is a read-only mount.
+  Never write `crew.root.join("logs")`.
+- The cache directory can be a mount point (a sync Job): it can be
+  emptied, never removed. `discard_half_made` accepts an emptied
+  directory for that reason.
 - Run cargo through mise (`mise x -- cargo …`) or via a `mise run` task.
 - `mise run check` covers the core workspace only. Cargo unifies features
   across every member one invocation selects, so while the plugins were

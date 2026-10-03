@@ -548,6 +548,132 @@ async fn a_sidecar_that_links_after_a_down_is_told_to_stop() {
     assert!(record.status.agents.is_empty());
 }
 
+/// The operator re-sends its `PUT` on every reconcile: in Kubernetes mode
+/// an apply keeps a plugin's stop for an agent still wanted (an "apply
+/// always wins" would undo every stop within one reconcile), says nothing
+/// to the sidecar, and drops only the agents the spec no longer has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_operator_apply_keeps_a_plugins_stop() {
+    const TOKEN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let h = Harness::kube(Duration::from_secs(3600));
+    let w = world(&h).await;
+    let name = "f".parse().unwrap();
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let mut two = spec();
+    two.crews
+        .get_mut("c")
+        .unwrap()
+        .agents
+        .insert("b".to_string(), AgentSettings::default());
+    let both = BTreeMap::from([
+        ("f/c/a".to_string(), TOKEN.to_string()),
+        ("f/c/b".to_string(), TOKEN_B.to_string()),
+    ]);
+    w.daemon
+        .apply_kube(&name, two.clone(), both.clone())
+        .await
+        .unwrap();
+    let mut ws = link(w.port, TOKEN).await;
+    ws.send(status_frame(AgentPhase::Ready)).await.unwrap();
+    wait_for(async || {
+        w.daemon.get(&name).await.unwrap().status.agents["f/c/a"].phase == AgentPhase::Ready
+    })
+    .await;
+    let (d, i) = (w.daemon.clone(), id.clone());
+    let action = tokio::spawn(async move { d.execute_action(&i, &PluginAction::Stop, None).await });
+    let req = next_request(&mut ws).await;
+    assert_eq!(req.op, LinkOp::Stop);
+    reply_ok(&mut ws, req.id).await;
+    action.await.unwrap().unwrap();
+    // b is stopped too, while unlinked
+    w.daemon
+        .execute_action(&"f/c/b".parse().unwrap(), &PluginAction::Stop, None)
+        .await
+        .unwrap();
+    ws.send(status_frame(AgentPhase::Stopped)).await.unwrap();
+
+    // the routine re-apply: the stop holds and nothing is sent
+    let record = w.daemon.apply_kube(&name, two, both).await.unwrap();
+    assert!(record.stopped.contains("f/c/a"), "{:?}", record.stopped);
+    assert!(record.stopped.contains("f/c/b"), "{:?}", record.stopped);
+    assert_no_request(&mut ws, Duration::from_millis(500)).await;
+
+    // a reconnect that reports Stopped agrees with the set: no restart
+    ws.close(None).await.unwrap();
+    wait_for(async || !w.daemon.kube().unwrap().linked(&id)).await;
+    let mut ws = link(w.port, TOKEN).await;
+    ws.send(status_frame(AgentPhase::Stopped)).await.unwrap();
+    assert_no_request(&mut ws, Duration::from_millis(500)).await;
+
+    // an apply that drops b drops its stop; a's holds
+    let record = w
+        .daemon
+        .apply_kube(
+            &name,
+            spec(),
+            BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        record.stopped,
+        std::collections::BTreeSet::from(["f/c/a".to_string()])
+    );
+}
+
+/// An apply that brings a downed fleet back up tells every linked sidecar
+/// to restart: the down stopped them, and nothing else would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_apply_after_a_down_restarts_the_linked_agents() {
+    let h = Harness::kube(Duration::from_secs(3600));
+    let w = world(&h).await;
+    let name: balerix_core::FleetName = "f".parse().unwrap();
+    let tokens = BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]);
+    w.daemon
+        .apply_kube(&name, spec(), tokens.clone())
+        .await
+        .unwrap();
+    let mut ws = link(w.port, TOKEN).await;
+    ws.send(status_frame(AgentPhase::Ready)).await.unwrap();
+    wait_for(async || {
+        w.daemon.get(&name).await.unwrap().status.agents["f/c/a"].phase == AgentPhase::Ready
+    })
+    .await;
+    let (d, n) = (w.daemon.clone(), name.clone());
+    let down = tokio::spawn(async move {
+        d.down_as(
+            &n,
+            Keep::default(),
+            false,
+            &balerix_server::Caller::Admin { force: true },
+        )
+        .await
+    });
+    let req = next_request(&mut ws).await;
+    assert_eq!(req.op, LinkOp::Stop);
+    reply_ok(&mut ws, req.id).await;
+    assert!(down.await.unwrap().unwrap().is_down());
+    ws.send(status_frame(AgentPhase::Stopped)).await.unwrap();
+
+    let (d, n) = (w.daemon.clone(), name.clone());
+    let up = tokio::spawn(async move { d.apply_kube(&n, spec(), tokens).await });
+    let req = next_request(&mut ws).await;
+    assert_eq!(req.op, LinkOp::Restart);
+    reply_ok(&mut ws, req.id).await;
+    let record = up.await.unwrap().unwrap();
+    assert_eq!(record.desired, balerix_api::Desired::Up);
+    // an Up re-apply sends nothing more
+    w.daemon
+        .apply_kube(
+            &name,
+            spec(),
+            BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+        )
+        .await
+        .unwrap();
+    assert_no_request(&mut ws, Duration::from_millis(500)).await;
+}
+
 /// No text frame (a request) reaches the fake within `wait`; pings are
 /// the hub's and do not count.
 async fn assert_no_request(ws: &mut Ws, wait: Duration) {

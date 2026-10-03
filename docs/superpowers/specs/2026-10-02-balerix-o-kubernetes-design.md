@@ -475,7 +475,12 @@ the Daemon's Secret.
   is not `Stopped` gets `stop` and its status is not mirrored. `Down`
   sends `stop` to every linked agent, clears the agents and is `Down`
   (the pods are the operator's to delete). An apply drops the agents the
-  spec no longer has from the status, and frames for them are ignored. A
+  spec no longer has from the status and the stopped set, and frames for
+  them are ignored. It keeps the stop of an agent still wanted: the
+  operator re-sends its apply on every reconcile, so "an apply always
+  wins" (plugins spec §16.4) would undo every plugin `stop` here. An
+  apply that takes the fleet from Down to Up sends `restart` to each
+  linked agent the set does not hold. A
   plugin sync leaves `kubernetes`-owned fleets alone. Two planners over
   one agent would double every restart.
 - **A pod-mode stop is a respawn into a waiter.** From the sidecar

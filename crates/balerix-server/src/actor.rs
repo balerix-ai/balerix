@@ -347,16 +347,23 @@ impl Actor {
         credentials: CredentialBundle,
         agent_tokens: balerix_api::AgentTokens,
     ) {
+        let was_down = matches!(self.record.desired, Desired::Down { .. });
         self.record.generation += 1;
         self.record.spec = spec;
         self.record.desired = Desired::Up;
         set_desired(&mut self.record.status, self.record.generation);
         self.secrets.credentials = credentials;
         let wanted = self.wanted_agents();
-        // an Apply always wins over a plugin's stop (plugins spec §16.4)
-        self.record
-            .stopped
-            .retain(|k| !wanted.iter().any(|id| id.to_string() == *k));
+        let is_wanted = |k: &String| wanted.iter().any(|id| id.to_string() == *k);
+        if self.ports.kube.is_some() {
+            // Spec O §7.4: the operator re-sends its apply on every
+            // reconcile, so here an apply keeps a plugin's stop and only
+            // forgets the agents the spec dropped
+            self.record.stopped.retain(is_wanted);
+        } else {
+            // an Apply always wins over a plugin's stop (plugins spec §16.4)
+            self.record.stopped.retain(|k| !is_wanted(k));
+        }
         let mut next = BTreeMap::new();
         for id in &wanted {
             let key = id.to_string();
@@ -390,6 +397,17 @@ impl Actor {
         }
         self.persist().await;
         self.publish();
+        // the down stopped every linked sidecar, and a sidecar holds a
+        // stop until a restart: an apply that brings the fleet back up
+        // sends one to each linked agent the set does not hold (an
+        // unlinked one gets it on its first status frame)
+        if was_down && let Some(hub) = self.ports.kube.clone() {
+            for id in &wanted {
+                if hub.linked(id) && !self.record.stopped.contains(&id.to_string()) {
+                    self.link_op(id, balerix_api::LinkOp::Restart).await;
+                }
+            }
+        }
     }
 
     async fn event(&mut self, agent: AgentId, name: String, at: Timestamp) {

@@ -292,7 +292,8 @@ credentials, hook input, or sandbox rules.
   survives a plain remove.
 - A plugin's `stop` action leaves the agent `Stopped` until a `restart`
   action or the next `up`/`update`; the reconciler will not restart it and
-  `status` shows `stopped`.
+  `status` shows `stopped`. In Kubernetes mode the operator's apply keeps
+  the stop (it re-sends on every reconcile); only a `restart` ends it.
 - The `PluginClient` is built with `.no_proxy()`; do not remove it — a
   `HTTP_PROXY` in the daemon's environment would otherwise capture loopback
   calls.

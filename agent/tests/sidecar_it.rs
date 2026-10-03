@@ -719,10 +719,9 @@ async fn the_sidecar_against_a_real_daemon_over_tls() {
     );
     assert!(pod.still_running());
 
-    // up again, and the Daemon restarts on the same port: the sidecar's
-    // first status says Stopped where the record wants it running, and the
-    // answer is a restart. Ready on this Daemon is therefore the proof the
-    // sidecar reconnected: nothing else would have started the agent.
+    // up again over the live link: the apply that takes the fleet from
+    // Down to Up sends the sidecar a restart (nothing else would start
+    // the agent; the sidecar holds the stop)
     let resp = put(&url).await;
     assert_eq!(
         resp.status().as_u16(),
@@ -730,9 +729,6 @@ async fn the_sidecar_against_a_real_daemon_over_tls() {
         "{}",
         resp.text().await.unwrap()
     );
-    shut_down(&mut daemon);
-    daemon = serve(&tools, &scratch, &daemon_home, &bind);
-    assert_eq!(endpoint_url(&endpoint, None), url);
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let a = agent(&url).await;

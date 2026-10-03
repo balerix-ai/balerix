@@ -216,7 +216,7 @@ pub fn write_git_profile(
     }
     let exec_path = git_exec_path(tools, id)?;
     let profile = render_git_profile(&agent_id, paths, crew, &tools.git, &exec_path);
-    let path = paths.git_profile();
+    let path = paths.git_profile.clone();
     if write_profile_at(&agent_id, &path, &profile)? {
         validate_profile_at(
             tools,

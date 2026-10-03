@@ -390,8 +390,7 @@ impl Workspace<'_> {
         args: &[&str],
         accepted: &[i32],
     ) -> Result<CmdOutput, MaterializeError> {
-        let mut cmd =
-            scrub_git_env(Cmd::new(&self.tools.git).log(&crew.root.join("logs").join("git.log")));
+        let mut cmd = scrub_git_env(Cmd::new(&self.tools.git).log(&crew.logs.join("git.log")));
         if let Some(dir) = &self.gh_config_dir {
             cmd = cmd.env("GH_CONFIG_DIR", dir.display().to_string()).args([
                 "-c",
@@ -586,7 +585,7 @@ impl Workspace<'_> {
             agent.logs.join("nono-git.log").display().to_string(),
             "run".into(),
             "--profile".into(),
-            agent.git_profile().display().to_string(),
+            agent.git_profile.display().to_string(),
             "--".into(),
             self.tools.git.display().to_string(),
         ]
@@ -622,7 +621,7 @@ impl Workspace<'_> {
             .env_clear()
             .env("HOME", agent.nono_home.display().to_string())
             .env("PATH", outer_path(self.tools))
-            .log(&crew.root.join("logs").join("git.log"))
+            .log(&crew.logs.join("git.log"))
             .args(self.sandbox_args(agent))
             .args(["-c", "core.fsmonitor=false"])
             .args([

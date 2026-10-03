@@ -215,7 +215,7 @@ fn the_git_profile_reads_the_clone_and_the_cache_and_writes_nothing() {
 
     balerix_runtime::write_git_profile(&tools, "f/c/a", &paths, &crew).unwrap();
     assert_eq!(
-        std::fs::metadata(paths.git_profile())
+        std::fs::metadata(&paths.git_profile)
             .unwrap()
             .permissions()
             .mode()
@@ -239,7 +239,7 @@ fn the_git_profile_reads_the_clone_and_the_cache_and_writes_nothing() {
             "-s",
             "run",
             "--profile",
-            &paths.git_profile().display().to_string(),
+            &paths.git_profile.display().to_string(),
             "--",
             "/bin/sh",
             "-c",
@@ -321,7 +321,7 @@ fn the_git_profile_grants_gits_exec_path() {
 
     balerix_runtime::write_git_profile(&shimmed, "f/c/a", &paths, &crew).unwrap();
     let granted = std::fs::canonicalize(&real).unwrap();
-    let profile = std::fs::read_to_string(paths.git_profile()).unwrap();
+    let profile = std::fs::read_to_string(&paths.git_profile).unwrap();
     assert!(
         profile.contains(&format!("\"{}\"", granted.display())),
         "the resolved exec-path is granted: {profile}"
@@ -336,7 +336,7 @@ fn the_git_profile_grants_gits_exec_path() {
             "-s",
             "run",
             "--profile",
-            &paths.git_profile().display().to_string(),
+            &paths.git_profile.display().to_string(),
             "--",
             "/bin/cat",
             &granted.join("helper").display().to_string(),
@@ -378,7 +378,7 @@ fn a_git_that_cannot_name_its_exec_path_writes_no_profile() {
         .unwrap_err()
         .to_string();
     assert_eq!(e, "f/c/a: git --exec-path: shim: no exec path");
-    assert!(!paths.git_profile().exists());
+    assert!(!paths.git_profile.exists());
 
     let missing = root.join("missing");
     let lost = git_shim(
@@ -394,7 +394,7 @@ fn a_git_that_cannot_name_its_exec_path_writes_no_profile() {
         e.starts_with(&format!("f/c/a: git --exec-path: {}: ", missing.display())),
         "{e}"
     );
-    assert!(!paths.git_profile().exists());
+    assert!(!paths.git_profile.exists());
 
     let file = root.join("a-file");
     std::fs::write(&file, "").unwrap();
@@ -408,7 +408,7 @@ fn a_git_that_cannot_name_its_exec_path_writes_no_profile() {
         .unwrap_err()
         .to_string();
     assert!(e.ends_with(": not a directory"), "{e}");
-    assert!(!paths.git_profile().exists());
+    assert!(!paths.git_profile.exists());
 }
 
 /// §12.1: the query runs from an empty environment, as the sandboxed git
@@ -444,5 +444,5 @@ fn the_exec_path_query_starts_from_an_empty_environment() {
         ),
     );
     balerix_runtime::write_git_profile(&strict, "f/c/a", &paths, &crew).unwrap();
-    assert!(paths.git_profile().exists());
+    assert!(paths.git_profile.exists());
 }

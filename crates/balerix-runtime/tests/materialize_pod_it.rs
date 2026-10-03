@@ -156,6 +156,14 @@ fn a_pod_materialize_clones_from_the_objects_only_cache_and_writes_nothing_into_
     assert_eq!(alternates.trim(), objects.display().to_string());
     assert_eq!(mtimes(&objects), before, "the cache was written");
     assert!(a.installed_marker().is_file());
+    assert!(
+        layout.crew(&id.crew_ref()).logs.join("git.log").is_file(),
+        "the clone's git calls are logged on the claim"
+    );
+    assert!(
+        !root.join("shared/crew/logs").exists(),
+        "nothing is written under the crew root, a read-only mount in a pod"
+    );
     chmod_tree(&objects, 0o755, 0o644); // let TempRoot remove it
 }
 

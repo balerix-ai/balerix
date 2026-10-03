@@ -172,7 +172,7 @@ impl Runtime {
         let fleet = self.layout.fleet(&crew.fleet);
         let crew_paths = self.layout.crew(crew);
         let daemon_pool = self.layout.mise_data_dir();
-        let log = crew_paths.root.join("logs").join("mise.pools.log");
+        let log = crew_paths.logs.join("mise.pools.log");
 
         let crew_id = crew.to_string();
         tc.install_level(

@@ -87,7 +87,7 @@ impl Runtime {
         accepted: &[i32],
     ) -> Result<String, WorkspaceError> {
         let cmd = crate::workspace::harden_agent_git(
-            Cmd::new(&self.tools.git).log_argv_only(&crew.root.join("logs").join("git.log")),
+            Cmd::new(&self.tools.git).log_argv_only(&crew.logs.join("git.log")),
             crew,
             &paths.root,
         )

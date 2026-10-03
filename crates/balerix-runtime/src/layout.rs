@@ -54,7 +54,46 @@ impl PodLayout {
     }
     /// The crew cache as the pod sees it: only `.git/objects` is mounted.
     pub fn shared_repo(&self) -> PathBuf {
-        self.mounts.shared.join("repo")
+        SharedSlice::new(&self.mounts.shared).crew().repo
+    }
+}
+
+/// The shared slice of one crew, as the agent pod and the Jobs both mount
+/// it (Spec O §8.1, §20.3): `repo` (the crew cache), `crew`, `fleet` and
+/// `daemon` (the three pool directories, each holding `mise/`). Nothing
+/// here knows the directory names on the volume itself; those are the
+/// operator's sub-path mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedSlice {
+    pub root: PathBuf,
+}
+
+impl SharedSlice {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+    /// The crew's paths with its logs beside its pool: right for a Job,
+    /// which mounts the slice read-write.
+    pub fn crew(&self) -> CrewPaths {
+        let root = self.root.join("crew");
+        CrewPaths {
+            repo: self.root.join("repo"),
+            logs: root.join("logs"),
+            root,
+        }
+    }
+    pub fn fleet(&self) -> FleetPaths {
+        let root = self.root.join("fleet");
+        FleetPaths {
+            mise_toml: root.join("mise.toml"),
+            root,
+        }
+    }
+    pub fn daemon_root(&self) -> PathBuf {
+        self.root.join("daemon")
+    }
+    pub fn daemon_pool(&self) -> PathBuf {
+        self.daemon_root().join("mise")
     }
 }
 
@@ -71,6 +110,10 @@ pub struct FleetPaths {
 pub struct CrewPaths {
     pub root: PathBuf,
     pub repo: PathBuf,
+    /// Where git calls and pool installs for this crew are logged:
+    /// `<root>/logs` on one machine and in a Job; on the agent claim in a
+    /// pod, where the crew root is a read-only mount (Spec O §20.3).
+    pub logs: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +126,12 @@ pub struct AgentPaths {
     pub mise_toml: PathBuf,
     pub profile: PathBuf,
     pub launch: PathBuf,
+    /// The nono profile the daemon's own git runs under in this agent's
+    /// clone (Spec N amendment 2026-10-01 §4). Daemon-owned: the agent
+    /// root is outside every sandbox grant. A field so that the harvest
+    /// Job, whose claim is read-only, can put it in its scratch directory
+    /// (Spec O §20.3).
+    pub git_profile: PathBuf,
     pub logs: PathBuf,
 }
 
@@ -189,7 +238,7 @@ impl StateLayout {
 
     pub fn mise_data_dir(&self) -> PathBuf {
         match &self.pod {
-            Some(p) => p.mounts.shared.join("daemon").join("mise"),
+            Some(p) => SharedSlice::new(&p.mounts.shared).daemon_pool(),
             None => self.data_root.join("mise"),
         }
     }
@@ -221,13 +270,14 @@ impl StateLayout {
             && p.id.crew_ref() == *c
         {
             return CrewPaths {
-                repo: p.shared_repo(),
-                root: p.mounts.shared.join("crew"),
+                logs: self.state_root.join("crew-logs"),
+                ..SharedSlice::new(&p.mounts.shared).crew()
             };
         }
         let root = self.fleet_dir(&c.fleet).join("crews").join(c.crew.as_str());
         CrewPaths {
             repo: root.join("repo"),
+            logs: root.join("logs"),
             root,
         }
     }
@@ -235,11 +285,7 @@ impl StateLayout {
         if let Some(p) = &self.pod
             && p.id.fleet == *f
         {
-            let root = p.mounts.shared.join("fleet");
-            return FleetPaths {
-                mise_toml: root.join("mise.toml"),
-                root,
-            };
+            return SharedSlice::new(&p.mounts.shared).fleet();
         }
         let root = self.fleet_dir(f);
         FleetPaths {
@@ -264,6 +310,7 @@ impl StateLayout {
             mise_toml: root.join("mise.toml"),
             profile: root.join("nono-profile.json"),
             launch: root.join("launch.sh"),
+            git_profile: root.join("nono-git-profile.json"),
             logs: root.join("logs"),
             root,
         }
@@ -357,14 +404,6 @@ impl AgentPaths {
     /// every sandbox grant.
     pub fn branch_marker(&self) -> PathBuf {
         self.root.join(".branch")
-    }
-
-    /// The nono profile the daemon's own git runs under in this agent's
-    /// clone (Spec N amendment 2026-10-01 §4). Daemon-owned: the agent
-    /// root is outside every sandbox grant, so the agent can neither read
-    /// nor change it.
-    pub fn git_profile(&self) -> PathBuf {
-        self.root.join("nono-git-profile.json")
     }
 
     pub fn claude_dir(&self) -> PathBuf {

@@ -23,7 +23,8 @@ pub use env::agent_env;
 pub use home::{HOOK_EVENTS, HomeInputs, write_home};
 pub use launch::{hooks_port, render_launch, wants_continue};
 pub use layout::{
-    AgentPaths, CrewPaths, FleetPaths, PluginPaths, PodLayout, PodMounts, StateLayout, shared_list,
+    AgentPaths, CrewPaths, FleetPaths, PluginPaths, PodLayout, PodMounts, SharedSlice, StateLayout,
+    shared_list,
 };
 pub use materializer::{RenderOptions, RenderOutcome, Runtime};
 pub use plugin::{

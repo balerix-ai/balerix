@@ -2265,7 +2265,7 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
         .unwrap();
     assert!(
-        !paths.git_profile().exists(),
+        !paths.git_profile.exists(),
         "a fresh clone needs no git profile: the agent has not touched it"
     );
     std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();
@@ -2274,7 +2274,7 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
     let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
 
     // whatever sits at the profile's path is replaced before use
-    std::fs::write(paths.git_profile(), "{\"filesystem\":{\"allow\":[\"/\"]}}").unwrap();
+    std::fs::write(&paths.git_profile, "{\"filesystem\":{\"allow\":[\"/\"]}}").unwrap();
     ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap();
 
     assert_eq!(
@@ -2283,12 +2283,12 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
         "the harvest still works through the sandbox"
     );
     let profile: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(paths.git_profile()).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(&paths.git_profile).unwrap()).unwrap();
     assert!(profile["filesystem"].get("allow").is_none(), "{profile}");
     assert_eq!(profile["network"]["block"], true);
 
     let log = std::fs::read_to_string(crew.root.join("logs/git.log")).unwrap();
-    let profile_arg = format!("run --profile {}", paths.git_profile().display());
+    let profile_arg = format!("run --profile {}", paths.git_profile.display());
     let in_clone: Vec<&str> = log
         .lines()
         .filter(|l| l.starts_with("$ ") && l.contains(&paths.workspace.display().to_string()))

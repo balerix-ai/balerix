@@ -106,6 +106,19 @@ impl Materializer for PodMaterializer {
     }
 }
 
+/// Spec O §10.3: `https://<authority>`, or `http://` under the hidden
+/// `--allow-plain-http` (tests). Anything else is refused rather than
+/// handed on: `link::ws_url` maps exactly these two schemes.
+pub fn check_daemon_url(url: &str, allow_plain_http: bool) -> Result<()> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://").filter(|_| allow_plain_http));
+    match rest {
+        Some(authority) if !authority.is_empty() => Ok(()),
+        _ => bail!("daemon_url must be https:// (Spec O §10.3)"),
+    }
+}
+
 /// The hook listener (§7.1): loopback only, Claude is in the same pod.
 pub async fn bind_hooks(port: u16) -> Result<TcpListener> {
     TcpListener::bind(("127.0.0.1", port))
@@ -131,9 +144,7 @@ async fn sidecar(args: SidecarArgs) -> Result<()> {
     let loaded = bundle::load(&args.bundle)?;
     let id = loaded.id.clone();
     let daemon_url = loaded.bundle.daemon_url.clone();
-    if daemon_url.starts_with("http://") && !args.allow_plain_http {
-        bail!("daemon_url must be https:// (Spec O §10.3)");
-    }
+    check_daemon_url(&daemon_url, args.allow_plain_http)?;
     let tls = tls::client_config(&args.ca)?;
     let layout = StateLayout::pod(
         PodMounts {
@@ -477,6 +488,25 @@ mod tests {
         agent_ready(&mut s, &"f/c/a".parse().unwrap(), Timestamp(101));
         assert_eq!(s.agents["f/c/a"].phase, AgentPhase::Ready);
         assert_eq!(next_deadline(&s, true, Timestamp(101)), RESYNC);
+    }
+
+    /// §10.3: the scheme is required, not merely `http://` refused.
+    #[test]
+    fn the_daemon_url_must_be_https() {
+        assert!(check_daemon_url("https://d:7643", false).is_ok());
+        for bad in [
+            "http://d:7643",
+            "HTTP://d:7643",
+            "ws://d:7643",
+            "wss://d:7643",
+            "d:7643",
+            "https://",
+        ] {
+            let e = check_daemon_url(bad, false).unwrap_err();
+            assert_eq!(e.to_string(), "daemon_url must be https:// (Spec O §10.3)");
+        }
+        assert!(check_daemon_url("http://127.0.0.1:1", true).is_ok());
+        assert!(check_daemon_url("ws://127.0.0.1:1", true).is_err());
     }
 
     #[test]

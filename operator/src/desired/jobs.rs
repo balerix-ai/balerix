@@ -378,7 +378,7 @@ pub fn crew_status(
     CrewStatus {
         observed_generation: crew.metadata.generation,
         conditions: conditions(
-            // cannot fire: no old status means no old conditions
+            // a Crew with no status yet has no conditions
             old.map(|s| s.conditions.as_slice()).unwrap_or_default(),
             &[cache, tools],
             crew.metadata.generation,

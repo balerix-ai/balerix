@@ -105,3 +105,59 @@ pub fn wait_for(what: &str, timeout: Duration, mut f: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// Ends the tmux server on `socket`, if one is there. A test's server is
+/// a daemon, outlives the `balerix-agent run` that started it once that is
+/// SIGKILLed, and keeps the panes' processes alive; every guard that holds
+/// one calls this. stderr is nulled: a server already gone prints nothing.
+pub fn kill_tmux_server(tmux: &Path, socket: &Path) {
+    let _ = std::process::Command::new(tmux)
+        .arg("-S")
+        .arg(socket)
+        .args(["-u", "kill-server"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Every socket under `root` a tmux server still answers on.
+pub fn live_tmux_servers(tmux: &Path, root: &Path) -> Vec<PathBuf> {
+    use std::os::unix::fs::FileTypeExt;
+    let mut live = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_dir() {
+                dirs.push(e.path());
+            } else if kind.is_socket()
+                && std::process::Command::new(tmux)
+                    .arg("-S")
+                    .arg(e.path())
+                    .args(["-u", "list-sessions"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+            {
+                live.push(e.path());
+            }
+        }
+    }
+    live
+}
+
+/// Kills the tmux server on `socket` when dropped, the test failed or not.
+pub struct TmuxServer {
+    pub tmux: PathBuf,
+    pub socket: PathBuf,
+}
+
+impl Drop for TmuxServer {
+    fn drop(&mut self) {
+        kill_tmux_server(&self.tmux, &self.socket);
+    }
+}

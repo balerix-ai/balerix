@@ -39,6 +39,10 @@ fn run_waits_for_the_marker_starts_the_server_and_ends_with_it() {
     let run_dir = root.join("run");
     std::fs::create_dir_all(&run_dir).unwrap();
     let socket = run_dir.join("tmux.sock");
+    let _server = support::TmuxServer {
+        tmux: tools.tmux.clone(),
+        socket: socket.clone(),
+    };
     let child = Command::new(BIN)
         .args(["run", "--start-timeout-secs", "20", "--run-dir"])
         .arg(&run_dir)
@@ -106,6 +110,10 @@ fn a_sigterm_ends_the_server() {
     std::fs::create_dir_all(&run_dir).unwrap();
     std::fs::write(run_dir.join("started"), "f/c\n").unwrap();
     let socket = run_dir.join("tmux.sock");
+    let _server = support::TmuxServer {
+        tmux: tools.tmux.clone(),
+        socket: socket.clone(),
+    };
     let child = Command::new(BIN)
         .args(["run", "--run-dir"])
         .arg(&run_dir)
@@ -130,4 +138,40 @@ fn a_sigterm_ends_the_server() {
         tmux(&tools, &socket, &["has-session", "-t", "=f/c"]).is_none(),
         "the server is gone"
     );
+}
+
+/// The helper every guard uses: it finds a live server under a root and
+/// ends it, and one already gone is not an error.
+#[test]
+fn kill_tmux_server_leaves_no_server_under_the_root() {
+    let Some(tools) = support::tools() else {
+        return;
+    };
+    let root = support::temp_root("run-kill-server");
+    let socket = root.join("deep/tmux.sock");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    assert!(
+        tmux(
+            &tools,
+            &socket,
+            &[
+                "new-session",
+                "-d",
+                "-s",
+                "x",
+                "--",
+                "/bin/sh",
+                "-c",
+                "sleep 600"
+            ]
+        )
+        .is_some()
+    );
+    assert_eq!(
+        support::live_tmux_servers(&tools.tmux, &root),
+        vec![socket.clone()]
+    );
+    support::kill_tmux_server(&tools.tmux, &socket);
+    assert!(support::live_tmux_servers(&tools.tmux, &root).is_empty());
+    support::kill_tmux_server(&tools.tmux, &socket);
 }

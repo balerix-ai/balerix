@@ -61,6 +61,8 @@ struct Pod {
     ca: PathBuf,
     run: Option<Kill>,
     sidecar: Option<Kill>,
+    /// For the server `run` started: `Drop` ends it.
+    tmux: PathBuf,
 }
 
 impl Pod {
@@ -132,6 +134,7 @@ impl Pod {
             root,
             run: None,
             sidecar: None,
+            tmux: tools.tmux.clone(),
         }
     }
 
@@ -241,6 +244,9 @@ impl Pod {
 impl Drop for Pod {
     fn drop(&mut self) {
         self.sidecar.take();
+        // `run` kills the server only on SIGTERM, and `Kill` is SIGKILL:
+        // the daemonised server would outlive it, panes and all
+        support::kill_tmux_server(&self.tmux, &self.socket());
         self.run.take();
         let objects = self.root.join("shared/repo/.git/objects");
         if objects.exists() {
@@ -516,6 +522,17 @@ async fn the_sidecar_against_a_fake_daemon() {
     let s = next_status(&mut conn, |_| true, "a status after reconnect").await;
     assert!(s.hook_failures >= 1, "{s:?}");
     assert!(pod.still_running());
+    assert_no_server_left(pod, &tools);
+}
+
+/// Dropping the pod leaves no tmux server under its root.
+fn assert_no_server_left(pod: Pod, tools: &support::Tools) {
+    let root = pod.root.clone();
+    drop(pod);
+    assert_eq!(
+        support::live_tmux_servers(&tools.tmux, &root),
+        Vec::<PathBuf>::new()
+    );
 }
 
 /// `balerix serve --mode kubernetes` on `bind`, its state under `home`.
@@ -734,4 +751,5 @@ async fn the_sidecar_against_a_real_daemon_over_tls() {
     });
     assert!(pod.still_running());
     drop(daemon);
+    assert_no_server_left(pod, &tools);
 }

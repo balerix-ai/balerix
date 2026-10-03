@@ -17,7 +17,7 @@ fn version_prints_the_core_version() {
 /// a message, and the message is the termination log's one line.
 #[test]
 fn a_sidecar_without_a_bundle_exits_one_with_the_reason() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let log = dir.path().join("termination-log");
     let out = Command::new(BIN)
         .args([

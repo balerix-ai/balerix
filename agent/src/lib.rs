@@ -13,3 +13,14 @@ pub mod link;
 pub mod run;
 pub mod sidecar;
 pub mod tls;
+
+/// A unit test's scratch directory under the crate's `target/tmp`, never
+/// `/tmp` (nono grants it by default). `CARGO_TARGET_TMPDIR` is set for
+/// integration tests only; `scripts/agent.sh` builds into `agent/target`,
+/// so this is the same directory.
+#[cfg(test)]
+pub(crate) fn test_dir() -> tempfile::TempDir {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+    std::fs::create_dir_all(&base).unwrap();
+    tempfile::tempdir_in(base).unwrap()
+}

@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn a_bundle_becomes_one_fleet_with_one_agent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir();
         let path = dir.path().join("agent.json");
         std::fs::write(
             &path,

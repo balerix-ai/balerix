@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn the_ready_marker_follows_the_phase() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir();
         let id: AgentId = "f/c/a".parse().unwrap();
         let pod = PodLayout {
             mounts: PodMounts {
@@ -479,7 +479,7 @@ mod tests {
     /// `Runtime`'s would run git to harvest into the read-only cache.
     #[test]
     fn removal_in_a_pod_touches_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_dir();
         let id: AgentId = "f/c/a".parse().unwrap();
         let layout = StateLayout::pod(
             PodMounts {

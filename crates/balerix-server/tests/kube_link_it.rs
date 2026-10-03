@@ -20,6 +20,13 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+/// The operator's apply: a Kubernetes-mode daemon takes no other.
+fn tokens() -> BTreeMap<String, String> {
+    BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())])
+}
+
 fn spec() -> FleetSpec {
     FleetSpec {
         name: "f".into(),
@@ -107,10 +114,7 @@ async fn a_sidecar_links_sends_status_and_answers_calls() {
     let h = Harness::kube(Duration::from_secs(3600));
     let w = world(&h).await;
     let name = "f".parse().unwrap();
-    w.daemon
-        .apply(&name, spec(), CredentialBundle::default(), false)
-        .await
-        .unwrap();
+    w.daemon.apply_kube(&name, spec(), tokens()).await.unwrap();
     let id: AgentId = "f/c/a".parse().unwrap();
     let token = w.daemon.hook_secret(&id).await.unwrap();
     let hub = w.daemon.kube().unwrap().clone();
@@ -230,10 +234,7 @@ async fn the_link_route_refuses_a_bad_token_a_wrong_protocol_and_a_tmux_daemon()
     let h = Harness::kube(Duration::from_secs(3600));
     let w = world(&h).await;
     let name = "f".parse().unwrap();
-    w.daemon
-        .apply(&name, spec(), CredentialBundle::default(), false)
-        .await
-        .unwrap();
+    w.daemon.apply_kube(&name, spec(), tokens()).await.unwrap();
     let id: AgentId = "f/c/a".parse().unwrap();
     let token = w.daemon.hook_secret(&id).await.unwrap();
     let status = |e: tokio_tungstenite::tungstenite::Error| match e {
@@ -265,10 +266,7 @@ async fn a_call_in_flight_fails_link_down_when_its_link_closes_or_is_replaced() 
     let h = Harness::kube(Duration::from_secs(3600));
     let w = world(&h).await;
     let name = "f".parse().unwrap();
-    w.daemon
-        .apply(&name, spec(), CredentialBundle::default(), false)
-        .await
-        .unwrap();
+    w.daemon.apply_kube(&name, spec(), tokens()).await.unwrap();
     let id: AgentId = "f/c/a".parse().unwrap();
     let token = w.daemon.hook_secret(&id).await.unwrap();
     let hub = w.daemon.kube().unwrap().clone();

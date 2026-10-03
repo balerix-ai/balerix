@@ -562,6 +562,10 @@ impl Daemon {
                 "fleet {name} is not managed by a plugin"
             ))),
             (Caller::Kubernetes, Some(p)) if p != crate::kube::KUBERNETES_OWNER => Err(managed(p)),
+            // the operator never adopts a record it did not create
+            (Caller::Kubernetes, None) => Err(DaemonError::Managed(format!(
+                "fleet {name} is not managed by kubernetes"
+            ))),
             _ => Ok(()),
         }
     }
@@ -684,6 +688,22 @@ impl Daemon {
         // so two applies of the same fleet cannot interleave.
         let lock = self.fleet_lock(name);
         let _guard = lock.lock().await;
+        // Spec O §7.4: in Kubernetes mode a fleet runs only as pods the
+        // operator made, so the CLI's apply of a fleet the operator does
+        // not own (absent, or unowned) would wait for a `Ready` that never
+        // comes. A kubernetes- or plugin-owned one gets the owner's 409
+        // from `check_owner` below.
+        if self.ports.kube.is_some() && matches!(caller, Caller::Admin { .. }) {
+            let unowned = match self.fleets.read().await.get(name) {
+                Some(h) => h.status.borrow().owner.is_none(),
+                None => true,
+            };
+            if unowned {
+                return Err(DaemonError::Managed(
+                    "this daemon is in kubernetes mode; create a Fleet object".into(),
+                ));
+            }
+        }
         // A plugin the registry no longer lists gets nothing (#62): its
         // `PUT` may have passed `manage_fleet`'s cheap owner check before
         // the operator removed it, and `sync_plugins` replaces the plugin

@@ -504,8 +504,12 @@ the Daemon's Secret.
   and the link. The CLI's `PUT` without tokens, `POST` and `DELETE`
   without `force` answer 409 (`fleet <name> is managed by kubernetes;
   change it through its Fleet object`); the operator's down is
-  `DELETE …?force=true`. A tmux-mode daemon answers a body with
-  `agent_tokens` 400.
+  `DELETE …?force=true`. For a fleet that is absent or has no owner,
+  the CLI's `POST` and `PUT` answer 409 `this daemon is in kubernetes
+  mode; create a Fleet object` (no pod would ever run it), and the
+  operator's `PUT` does not adopt a record with no owner or another
+  owner: 409, as a plugin's would be. A tmux-mode daemon answers a body
+  with `agent_tokens` 400.
 - **Kubernetes mode is flags on `serve`:** `--mode kubernetes --tls-cert
   --tls-key --admin-token-file`, with any `--bind` address and no `-d`.
   The Daemon reads no `plugins.yaml` and launches no plugin; its system

@@ -271,6 +271,76 @@ async fn the_operators_put_records_a_kubernetes_fleet_the_cli_cannot_touch() {
     wait_for(async || w.daemon.get(&"f".parse().unwrap()).await.unwrap().is_down()).await;
 }
 
+/// A Kubernetes-mode daemon has no pod for a fleet the CLI made: the
+/// CLI's apply of an absent or unowned fleet is refused, and the operator
+/// does not adopt a record it does not own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kubernetes_daemon_takes_no_fleet_but_the_operators() {
+    let h = Harness::kube(Duration::from_secs(3600));
+    let named = |n: &str| FleetSpec {
+        name: n.into(),
+        ..spec()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = h.daemon_with_existing(
+        Arc::new(PassThrough),
+        dir.path(),
+        vec![
+            (
+                balerix_api::FleetRecord::with_owner(named("u"), None),
+                balerix_core::FleetSecrets::default(),
+            ),
+            (
+                balerix_api::FleetRecord::with_owner(named("p"), Some("github".into())),
+                balerix_core::FleetSecrets::default(),
+            ),
+        ],
+        balerix_server::testing::ready_toolchain(),
+    );
+    let refused = "this daemon is in kubernetes mode; create a Fleet object";
+    let tokens = |n: &str| BTreeMap::from([(format!("{n}/c/a"), TOKEN.to_string())]);
+    for n in ["f", "u"] {
+        let name = n.parse().unwrap();
+        for replace in [false, true] {
+            let e = daemon
+                .apply(&name, named(n), Default::default(), replace)
+                .await
+                .unwrap_err();
+            assert_eq!(e.to_string(), refused, "{n} replace={replace}");
+            assert!(matches!(e, balerix_server::DaemonError::Managed(_)), "409");
+        }
+    }
+    assert!(daemon.get(&"f".parse().unwrap()).await.is_none());
+    let e = daemon
+        .apply_kube(&"u".parse().unwrap(), named("u"), tokens("u"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.to_string(), "fleet u is not managed by kubernetes");
+    let e = daemon
+        .apply_kube(&"p".parse().unwrap(), named("p"), tokens("p"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.to_string(), "fleet p is managed by plugin github");
+    let u = daemon.get(&"u".parse().unwrap()).await.unwrap();
+    assert_eq!(u.owner, None, "not adopted");
+
+    // over HTTP: both CLI shapes are 409
+    let w = world(&h).await;
+    let (status, body) = w
+        .call("POST", "/v1/fleets", Some("admin-tok"), Some(request(None)))
+        .await;
+    assert_eq!((status, body["error"].as_str().unwrap()), (409, refused));
+    let (status, body) = w
+        .call(
+            "PUT",
+            "/v1/fleets/f",
+            Some("admin-tok"),
+            Some(request(None)),
+        )
+        .await;
+    assert_eq!((status, body["error"].as_str().unwrap()), (409, refused));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn readyz_follows_the_pool_channel() {
     let h = Harness::kube(Duration::from_secs(3600));

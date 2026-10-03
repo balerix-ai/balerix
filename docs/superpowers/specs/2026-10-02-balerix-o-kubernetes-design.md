@@ -845,9 +845,10 @@ its index by hand.
   to Crews and Agents, Agent to Pod, Secret and NetworkPolicy, Plugin to
   Deployment, Daemon to StatefulSet. Property test: resolving a Fleet's
   `spec` equals resolving the same content as a fleet file.
-- **Operator, controllers:** against a pinned `kind` (a mise tool), with a
-  stub Daemon: rejection lands nothing; a changed `specHash` replaces the
-  pod and keeps the claim; finalizers; `watchNamespaces`.
+- **Operator, controllers:** against the pinned envtest binaries (a mise
+  tool; §21.3), with a stub Daemon: rejection lands nothing; a changed
+  `specHash` replaces the pod and keeps the claim; finalizers;
+  `watchNamespaces`. Needs no cluster.
 - **Sidecar and link:** integration tests with the real tools under
   `BALERIX_REQUIRE_TOOLS`, no cluster: a Daemon in Kubernetes mode and a
   sidecar as two processes, hooks forwarded, `send_text` over the link,
@@ -866,8 +867,7 @@ its index by hand.
   locally built images and `dev fake-claude`: apply a Daemon and a Fleet,
   wait `Ready`, a flow rule fires, evict the pod and resume, drop an agent
   and find its branch in the cache.
-- **Shared volume on kind:** every kind run (controllers, end to end,
-  charts) gives the shared claim kind's local-path provisioner with
+- **Shared volume on kind:** every kind run (end to end, charts) gives the shared claim kind's local-path provisioner with
   `sharedFileSystemPath` set to one host directory mounted into every node
   (§19.3). kind's default class refuses ReadWriteMany. This class is for CI
   only; production needs a real ReadWriteMany class (§4.1).
@@ -901,7 +901,8 @@ Each gets its own plan.
    TLS. Done when the two-process integration tests pass. Done 2026-10
    (PR #125).
 3. **Operator and CRDs.** §4, §5, §8. Done when `e2e-k8s` passes without
-   plugins. Built as two plans, 3a without a cluster and 3b on one (§20). 3a done 2026-10.
+   plugins. Built as two plans, 3a without a cluster and 3b on one (§20,
+   §21). 3a done 2026-10.
 4. **Plugins.** §9. Done when `e2e-k8s` passes with flow and web, and the
    managed journey passes with `dev fake-plugin`.
 5. **Release and charts.** §13, §14. Done when a fork rehearsal publishes
@@ -1266,3 +1267,237 @@ Known in 3a and left for 3b:
   bound.
 - A stale sidecar crash message can show `MaterializeFailed` after a
   successful restart, until something is reported.
+
+## 21. Decided in sub-project 3b (2026-10)
+
+The second half of §20.1's cut: the four controllers behind
+`balerix-operator run`, the two Dockerfiles, a `kind` cluster with the
+ReadWriteMany class of §19.3, and `e2e-k8s`. The probe that shaped it: the
+envtest binaries (`kube-apiserver`, `etcd`) from
+`kubernetes-sigs/controller-tools` start on a host with no container
+runtime, as an ordinary user, answer `/readyz` in about three seconds, and
+take the five definitions, server-side apply under a field manager and
+status patches. The controller tests therefore run on the developer's
+machine and in the `operator` CI job; only `e2e-k8s` needs a cluster.
+
+### 21.1 The cut, refined
+
+- **In 3b:** `run` and the Daemon, Fleet, Crew and Agent controllers; the
+  envtest harness and the controller tests; `docker/operator/Dockerfile`
+  and `docker/agent/Dockerfile`; `scripts/kind-up.sh`; `mise run
+  e2e-k8s` and its CI job; a fourth Job command, `balerix-agent
+  crew-remove`. Done when `e2e-k8s` passes without plugins (§17).
+- **Not in 3b:** the Plugin controller and §15's flow-rule step
+  (sub-project 4); the images' release wiring (`build.sh`, `images.yml`,
+  cosign), the operator's Deployment, RBAC and `verify-k8s`
+  (sub-project 5). The operator process has no HTTP endpoint, no metrics
+  and no leader election: one replica, and its Deployment is the chart's.
+- **The operator runs outside the cluster in `e2e-k8s`**, a child process
+  of the test against `kind`'s kubeconfig. Only the daemon and agent
+  images are loaded into `kind`; the operator image is built and linted,
+  and runs in a cluster first with the chart.
+- **The Daemon is polled, not watched.** The Fleet controller reads
+  `GET /v1/fleets/{name}` on every reconcile and requeues every 15 s; the
+  admin API gains no watch route (the plugin-host API's
+  `fleets/watch` is under a plugin token). An event-driven feed can
+  replace the poll later without touching the kinds.
+
+### 21.2 `run` and the controllers
+
+`balerix-operator run` takes `--watch-namespaces a,b` (every namespace
+when absent, §5.6), `--namespace` (the operator's own, for the Daemon's
+NetworkPolicy; default from `POD_NAMESPACE`), `--daemon-image` and
+`--agent-image` (default `Images::for_version` of the operator's own
+version), and the kubeconfig `kube` infers. `kube` gains `client`,
+`runtime`, `rustls-tls` and `ring`: its default TLS stack, on the ring
+provider the Daemon client already uses.
+
+Four `kube_runtime::Controller`s on one `Client` in one runtime. A
+reconcile is observe, `desired`, apply: the owned objects come from the
+controllers' reflector stores and the Secrets from the API; the `desired`
+functions of §20 are called as they are; the result is applied with
+server-side apply under the field manager `balerix-operator`, and status
+is a merge patch on the subresource with the object's generation as
+`observedGeneration`. Each controller `owns` what its function returns
+(Daemon: StatefulSet, Service, the three Secrets, the ConfigMap, the pool
+Job, the NetworkPolicies; Fleet: Crews, Agents, the fleet pool Job;
+Crew: its sync Job; Agent: claim, bundle Secret, NetworkPolicy, Pod,
+harvest Job). Two cross-kind watches: a Daemon change maps to the Fleets
+naming it; a Fleet change maps to its Agents, which is how an Agent sees
+a fresh record. An error requeues with kube-runtime's exponential
+back-off; a healthy reconcile requeues on a period, 15 s for a Fleet (the
+status poll) and 60 s for the others (renewal and drift). A
+`DaemonClient` is built from the Daemon's authority ConfigMap and admin
+Secret, cached per Daemon and rebuilt when either changes.
+
+**Daemon.** Mint what is missing first: the authority (Secret and
+ConfigMap), the serving certificate when absent or `needs_renewal`
+against the real clock, the admin token. Then `daemon_objects` with the
+certificate's `not-after`, applied in one wave, and the pool Job under
+the Job rule. Status is `daemon_status` over the shared claim, the
+StatefulSet and the pool Job, and `Ready` additionally needs one
+`GET /readyz` answered 200 once the StatefulSet has a ready replica.
+`status.endpoint` is `names::endpoint`.
+
+**Fleet.** §5.2 in order. `plan_fleet`; a `PlanError` is `Resolved=False`
+and the reconcile ends. A `…-token` Secret is minted for every planned
+Agent that has none, all are read, and the `PUT` carries one token per
+agent. A 400 is `Accepted=False` with the Daemon's message and no child
+is touched; a Daemon that does not answer is `DaemonUnavailable`, the
+children are left alone and the reconcile is retried. On success the
+fleet pool Job, the Crews and the Agents are applied, and the Crews and
+Agents labelled with this fleet that the plan no longer has are deleted.
+The record from `get` goes into the per-fleet cache the Agent controller
+reads, and `fleet_conditions` is written with the ready count. Deletion
+under `balerix.ai/fleet`: delete the Agents and wait until none remain
+(their finalizers harvest), `DELETE …?force=true` on the Daemon, and for
+`retain: None` one cleanup Job per crew, `balerix-agent crew-remove
+--crew <fleet>/<crew>`, which removes `repo/` and `pool/` under the
+crew's slice; then the finalizer is dropped.
+
+**Crew.** `crew_sync_job`, with the fleet pool Job read by name.
+`job_outcome` decides: `Absent` or `Stale` creates (a stale Job is
+deleted first), `Running` requeues, `Succeeded` and `Failed` become
+`crew_status`. §5.3's lock: a Job is created only when no Job labelled
+with the crew is active, sync or harvest; otherwise requeue in 5 s.
+
+**Agent.** Waits for the Crew's `CacheReady` and `ToolsReady`. Then
+`agent_objects` with the token from its Secret and the credentials from
+the Secrets the Daemon names, applied. A Pod whose `specHash` annotation
+differs is deleted; once it is gone the next reconcile makes the new one
+on the same claim. Status is `agent_status` over the Pod and the cached
+record's entry for the agent. Deletion under `balerix.ai/harvest`: delete
+the Pod and wait, then the harvest Job unless `balerix.ai/purge` is on
+the Agent or its Fleet, or the Fleet is being deleted with `retain:
+None`. A failed harvest keeps the finalizer and the message in a
+condition (§8.5); a success deletes the claim and drops the finalizer.
+The other children go with the owner reference.
+
+**The Job rule.** Every Job has `backoffLimit: 0` (§20.5). A `Failed`
+outcome is written into status and retried by the operator: the owner
+carries `balerix.ai/attempts: n`, the delay is 30 s doubling to a cap of
+10 min, and once it has passed the failed Job is deleted and recreated
+with the count plus one. A changed input hash resets the count. One
+function serves the pool, sync, harvest and cleanup Jobs; it reads its
+clock from the controller context so a test can move it.
+
+**Errors.** A reconcile's error names its object and has three arms: a
+Kubernetes API error (requeued with back-off); a `ClientError`, which
+`Accepted` classifies into `Rejected` and `DaemonUnavailable`; and a
+`DesiredError` or `PlanError`, written into status as `Resolved=False` or
+the kind's `Ready=False` and not retried beyond the period, since the
+same input cannot resolve differently. Logs carry the namespace and name
+as `tracing` fields and never a token or a key; the secret-holding types
+stay without `Debug` (§20.5).
+
+### 21.3 The envtest harness and the controller tests
+
+A task-level mise tool on the `operator` task,
+`github:kubernetes-sigs/controller-tools` at `envtest-v1.34.1` (the
+spike's 1.34 line; `mise ls-remote` lists the tag), the way tuwunel is on
+`verify-matrix-local`. `operator/tests/support/envtest.rs` starts `etcd`
+and `kube-apiserver` on free ports under a temp root with a static token
+file, waits for `/readyz`, applies the five definitions from
+`operator/crds/`, and hands back a `kube::Client`. One instance per test
+binary, shared through a `OnceLock`; each test owns a namespace. The
+operator runs in-process: the controllers' entry point takes the
+`Client` and the config, so a test spawns it as a task with its namespace
+in `watch_namespaces` and aborts it at the end. The Daemon is 3a's stub,
+extended to count `PUT`s and serve a scripted record. The tests skip
+without the tool and fail under `BALERIX_REQUIRE_TOOLS=1`.
+
+The harness's limit, which the tests state: envtest has no
+controller-manager and no kubelet. A test stands in for the kubelet by
+patching a Job's `status.succeeded` or `failed` and its pod's termination
+message, or a Pod's phase and the sidecar's readiness. Owner-reference
+garbage collection never runs there and is proved by `e2e-k8s` alone.
+Finalizers and deletion timestamps are the API server's and are real.
+
+Cases:
+
+- A Daemon gets its Secrets, ConfigMap, StatefulSet, Service, pool Job
+  and policies; a `not-after` within the renewal window yields a new
+  certificate and a rolled pod template.
+- A Fleet becomes Crews, Agents and token Secrets, and the `PUT` carries
+  one token per agent; a 400 from the stub lands no child; a refused
+  connection leaves existing children.
+- A crew dropped from the Fleet: its Crew and Agent are deleted, the
+  Agent's finalizer runs the harvest Job, a patched success deletes the
+  claim and the Agent is gone.
+- A changed `specHash` replaces the Pod and keeps the claim.
+- A failed sync Job is `CacheReady=False` with the message and is
+  recreated as attempt two once the moved clock passes the delay.
+- The crew lock: a running sync Job holds off the harvest.
+- `watchNamespaces`: a Fleet in another namespace is never reconciled.
+- Fleet deletion with `retain: None`: Agents gone, the stub's `DELETE`
+  hit, the cleanup Job made, the finalizer dropped.
+
+### 21.4 Images, `kind`, `e2e-k8s` and CI
+
+- **`docker/operator/Dockerfile`** is the plugin image's shape: distroless
+  static nonroot, one static binary. **`docker/agent/Dockerfile`** is
+  `FROM` the runtime image, a build argument `BASE` (default
+  `ghcr.io/balerix-ai/balerix:<version>`), adding `balerix-agent` under
+  `/usr/local/bin` with the entrypoint on it. Both pass hadolint.
+- **`scripts/kind-up.sh`** (`down` too), with `kind` and `kubectl` as
+  task-level tools: a two-node cluster whose config `extraMounts` one
+  host directory into every node, the local-path provisioner's ConfigMap
+  patched to `sharedFileSystemPath` (§19.3), the five definitions
+  applied, and the two locally built images loaded with `kind load`. The
+  local build is `cargo build --release` of `balerix` and
+  `balerix-agent` for the host's own architecture, then `docker build` of
+  the runtime image through `image-context.sh`'s core context and of the
+  agent image on top of it. No musl, no manifest, no scan.
+- **`mise run e2e-k8s`** is `operator/tests/e2e_k8s.rs` under nextest,
+  gated as `e2e` is: it skips unless `KUBECONFIG` names the cluster and
+  `BALERIX_K8S_IMAGES` the loaded tags, and fails under
+  `BALERIX_REQUIRE_TOOLS=1`. It starts `balerix-operator run` as a child
+  with `--watch-namespaces` on a fresh namespace and the image overrides,
+  and drives the cluster with the typed kinds. The journey:
+  1. a git server pod from the agent image (`git daemon`, a Service),
+     seeded with the Phase 3 repository over `kubectl exec`; the crew
+     uses `git: { push: false, auth: none }` as the one-machine `e2e`
+     does;
+  2. a Daemon whose `defaults.claude` runs `balerix dev fake-claude` from
+     the image, as the daemon's own tests wire it; wait `Ready`;
+  3. a Fleet of one crew and two agents; wait `Ready`, which means both
+     sidecars forwarded `SessionStart`;
+  4. one agent's pod deleted; the operator recreates it on the same
+     claim, the Agent is `Ready` again and the claim's `home/` is intact
+     (read over `kubectl exec`);
+  5. that agent dropped from the Fleet; its harvest Job succeeds and the
+     branch is listed in the crew cache, read from a probe pod mounting
+     the shared claim;
+  6. the Fleet deleted with `retain: None`; the crew's directories are
+     gone and the Daemon lists no fleet.
+  `kind`'s network plugin does not enforce NetworkPolicy, so the policies
+  are inert here; the test says so. §15's flow-rule step arrives with
+  plugins; `verify-k8s` waits for a cluster.
+- **CI:** `ci.yml` gains `e2e-k8s` on `ubuntu-24.04`, path-filtered to
+  `operator/**`, `agent/**`, `crates/**`, `docker/**`, `scripts/kind*`,
+  `mise.toml` and the workflow, and on the nightly; a required check
+  like `operator`. The `operator` job installs the envtest tool.
+- **The `cargo-insta` 1.49.0 pin in `mise.toml` lands with this
+  sub-project**, and the `insta` dev-dependency in the root workspace,
+  `operator/`, `plugins/common`, `plugins/matrix` and `plugins/github`
+  moves to 1.49.0 with it, so tool and library match; the snapshot
+  suites on the branch are the proof.
+
+### 21.5 §20.5's open items
+
+- The `slice` init container's ownership and the sub-path mounts of
+  directories a Job made are what `e2e-k8s` step 3 exercises; a failure
+  there is a finding for the plan, not a design change.
+- The agent, sidecar and Job containers get an `emptyDir` at `/tmp`:
+  git, mise and nono expect a writable temporary directory under a
+  read-only root. The daemon container, whose home is its claim, needs
+  none unless `e2e-k8s` shows otherwise.
+- Names derived from a Daemon's are bounded as §20.5 bounds a Job's
+  (`names.rs`), so a long Daemon name cannot make an invalid label.
+- The sidecar's termination message is read only while the sidecar is
+  not running: a recreated or restarted sidecar's last state no longer
+  shows `MaterializeFailed` once it runs again.
+
+### 21.6 Decided by the plan
+
+Filled in as 3b's plan and build decide beyond §21.1–§21.5.

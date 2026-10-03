@@ -197,6 +197,27 @@ pub struct ServeArgs {
     /// Set by `-d` on the child it spawns.
     #[arg(long, hide = true)]
     pub detached_child: bool,
+    /// `tmux` (the default): one machine. `kubernetes` (Spec O §7.3): TLS
+    /// from --tls-cert and --tls-key, the admin token from
+    /// --admin-token-file, any --bind address, no plugins.yaml, and the
+    /// sidecar link in place of tmux.
+    #[arg(long, value_enum, default_value_t = ServeMode::Tmux)]
+    pub mode: ServeMode,
+    /// The serving certificate chain, PEM (--mode kubernetes).
+    #[arg(long, requires = "tls_key")]
+    pub tls_cert: Option<PathBuf>,
+    /// The serving key, PEM (--mode kubernetes).
+    #[arg(long, requires = "tls_cert")]
+    pub tls_key: Option<PathBuf>,
+    /// A file holding the admin token (--mode kubernetes).
+    #[arg(long)]
+    pub admin_token_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ServeMode {
+    Tmux,
+    Kubernetes,
 }
 
 #[derive(Debug, Subcommand)]

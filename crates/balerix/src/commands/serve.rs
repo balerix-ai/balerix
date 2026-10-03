@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use balerix_core::{FleetStore, ReconcilePolicy};
 use balerix_runtime::{Runtime, StateLayout, TmuxRunner};
+use balerix_server::kube::{LinkHub, NoFiles, NoPool, serve_tls};
 use balerix_server::{
     Daemon, FileFleetStore, Metrics, PluginClient, PluginEventHandler, PluginHostConfig, PluginKv,
     PluginRegistry, Ports, ServerPaths, Vault, load_or_create_token, read_endpoint,
@@ -19,7 +20,7 @@ use balerix_server::{
 };
 use serde::Deserialize;
 
-use crate::cli::ServeArgs;
+use crate::cli::{ServeArgs, ServeMode};
 use crate::wiring::{HostResolver, SystemClock, layout_from_env, server_paths, tool_paths};
 
 const RESYNC: Duration = Duration::from_secs(30);
@@ -86,18 +87,44 @@ pub fn serve_command(args: &ServeArgs) -> Result<String> {
     let paths = server_paths(&layout);
     let config = ServerConfig::load(&layout.config_root.join("config.toml"))?;
     let bind = args.bind.clone().unwrap_or(config.bind);
-    require_loopback(&bind)?;
-    if args.detach {
-        return detach(&paths, &bind, &args.tmux_socket);
+    match args.mode {
+        ServeMode::Tmux => {
+            if args.tls_cert.is_some() || args.tls_key.is_some() || args.admin_token_file.is_some()
+            {
+                bail!("--tls-cert, --tls-key and --admin-token-file are for --mode kubernetes");
+            }
+            require_loopback(&bind)?;
+            if args.detach {
+                return detach(&paths, &bind, &args.tmux_socket);
+            }
+            run(
+                &layout,
+                &paths,
+                &bind,
+                &config.log,
+                &args.tmux_socket,
+                args.detached_child,
+            )
+        }
+        ServeMode::Kubernetes => {
+            let (Some(cert), Some(key), Some(token_file)) =
+                (&args.tls_cert, &args.tls_key, &args.admin_token_file)
+            else {
+                bail!(
+                    "serve --mode kubernetes needs --tls-cert, --tls-key and --admin-token-file (Spec O §7.3)"
+                );
+            };
+            if args.detach {
+                bail!(
+                    "--detach is not available with --mode kubernetes; a pod runs the daemon in the foreground"
+                );
+            }
+            let addr: SocketAddr = bind
+                .parse()
+                .with_context(|| format!("bind address {bind:?} is not a valid host:port"))?;
+            run_kubernetes(&layout, &paths, addr, &config.log, cert, key, token_file)
+        }
     }
-    run(
-        &layout,
-        &paths,
-        &bind,
-        &config.log,
-        &args.tmux_socket,
-        args.detached_child,
-    )
 }
 
 fn already_running(paths: &ServerPaths) -> Result<Option<String>> {
@@ -133,6 +160,91 @@ fn init_tracing(paths: &ServerPaths, level: &str, to_file: bool) -> Result<()> {
         builder.with_writer(std::io::stderr).init();
     }
     Ok(())
+}
+
+/// Spec O §7.3: TLS on the pod address, the operator's admin token, the
+/// link hub as the runner and the workspace reader, no files to
+/// materialise, a pool that is a Job's, and no `plugins.yaml` (§9 brings
+/// `PUT /v1/plugins`): the startup plugin sync is not run. One process per
+/// pod, so there is no `already_running` check and no detach.
+fn run_kubernetes(
+    layout: &StateLayout,
+    paths: &ServerPaths,
+    addr: SocketAddr,
+    log: &str,
+    cert: &Path,
+    key: &Path,
+    token_file: &Path,
+) -> Result<String> {
+    init_tracing(paths, log, false)?;
+    let token = std::fs::read_to_string(token_file)
+        .with_context(|| format!("cannot read {}", token_file.display()))?
+        .trim()
+        .to_string();
+    if token.len() < 32 {
+        bail!(
+            "{}: the admin token is at least 32 characters",
+            token_file.display()
+        );
+    }
+    let vault = Vault::load_or_create(&paths.vault_key())?;
+    let store = FileFleetStore::new(layout.fleets_dir(), vault.clone());
+    let existing = store.load_all()?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let hub = LinkHub::new();
+        let ports = Ports {
+            materializer: Arc::new(NoFiles),
+            runner: hub.clone(),
+            clock: Arc::new(SystemClock),
+            store: Arc::new(store),
+            workspace: hub.clone(),
+            resolver: Arc::new(HostResolver),
+            credentials: Arc::new(HostResolver),
+            policy: ReconcilePolicy::default(),
+            hook_url: format!("https://{addr}"),
+            resync: RESYNC,
+            kube: Some(hub),
+        };
+        let fleets = existing.len();
+        let metrics = Metrics::new()?;
+        let registry = PluginRegistry::new();
+        let client = PluginClient::new().map_err(|e| anyhow!("plugins: {e}"))?;
+        let kv = Arc::new(PluginKv::new(layout.plugins_state_dir(), vault.clone()));
+        let handler = PluginEventHandler::new(registry.clone(), client.clone(), metrics.clone());
+        let daemon = Daemon::start(
+            ports,
+            handler,
+            metrics,
+            token,
+            existing,
+            PluginHostConfig {
+                plugins_file: layout.config_root.join("plugins.yaml"),
+                install_root: layout.plugins_data_dir(),
+            },
+            registry,
+            client,
+            kv,
+            Arc::new(NoPool),
+        );
+        let server = serve_tls(addr, cert, key, router(daemon)).await?;
+        let Some(local) = server.local_addr().await else {
+            server.shutdown().await?;
+            bail!("cannot bind {addr}");
+        };
+        let url = format!("https://{local}");
+        write_pid(&paths.pid(), std::process::id())?;
+        write_endpoint(&paths.endpoint(), &url)?;
+        tracing::info!(%url, fleets, "balerix daemon listening (kubernetes mode)");
+        eprintln!("listening on {url}");
+        shutdown_signal().await;
+        tracing::info!("shutting down");
+        server.shutdown().await?;
+        remove_if_exists(&paths.endpoint())?;
+        remove_if_exists(&paths.pid())?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(String::new())
 }
 
 fn run(

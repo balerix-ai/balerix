@@ -54,6 +54,14 @@ tokio-tungstenite = "0.30.0"
 # client. The workspace forbids `unsafe`, so the setsid/TIOCSCTTY dance a
 # hand-rolled pre_exec would need lives in this crate instead.
 portable-pty = "0.9.0"
+# Spec O §7.3, §10.3: the Daemon serves TLS in Kubernetes mode. axum-server
+# binds rustls to axum; `tls-rustls-no-provider` so the crypto provider is
+# chosen here — ring, pure Rust, which builds for static musl without a C
+# toolchain — rather than aws-lc-rs. No reqwest feature changes: the core
+# `reqwest` keeps `json` alone (scripts/check-core-deps.sh).
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
 prometheus = "0.14.0"
 chacha20poly1305 = "0.11.0"
 rand = "0.10.2"
@@ -68,6 +76,8 @@ insta = { version = "1.48.0", features = ["yaml", "json"] }
 proptest = "1.11.0"
 proptest-state-machine = "0.8.0"
 tempfile = "3.27.0"
+# a throwaway authority and a leaf for 127.0.0.1 in the TLS tests
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 pretty_assertions = "1.4.1"
 assert_cmd = "2.2.2"
 predicates = "3.1.4"

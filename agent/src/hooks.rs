@@ -117,23 +117,21 @@ async fn events(
         h.daemon_url.trim_end_matches('/'),
         h.id
     );
-    let sent = tokio::time::timeout(
-        FORWARD_BUDGET,
-        h.http
+    // one budget over the whole exchange: the answer, headers and body
+    let forward = async {
+        let resp = h
+            .http
             .post(&url)
             .bearer_auth(&h.token)
             .header(CONTENT_TYPE, "application/json")
             .body(body)
-            .send(),
-    )
-    .await;
-    match sent {
-        Ok(Ok(resp)) => {
-            let status = resp.status().as_u16();
-            let bytes = match tokio::time::timeout(FORWARD_BUDGET, resp.bytes()).await {
-                Ok(Ok(b)) => b,
-                _ => return fail_open(&h, &name, "the Daemon's reply did not arrive"),
-            };
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        Ok::<_, reqwest::Error>((status, resp.bytes().await?))
+    };
+    match tokio::time::timeout(FORWARD_BUDGET, forward).await {
+        Ok(Ok((status, bytes))) => {
             if (200..300).contains(&status) && bytes.is_empty() {
                 return Json(json!({})).into_response();
             }

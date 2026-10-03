@@ -193,3 +193,45 @@ async fn a_daemon_that_is_down_or_slow_fails_open_inside_the_budget() {
     );
     assert_eq!(failures.load(Ordering::Relaxed), 1);
 }
+
+/// One budget covers the whole forward: a Daemon that sends its headers
+/// inside the budget and then stalls the body is answered `200 {}` inside one budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_that_stalls_the_body_fails_open_inside_one_budget() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let daemon = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                // headers late in the budget, so a second budget would show
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{",
+                )
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+    let (base, failures, _) = sidecar(&daemon).await;
+    let start = Instant::now();
+    let (status, text) = post_event(
+        &base,
+        "/v1/agents/f/c/a/events",
+        Some(TOKEN),
+        r#"{"hook_event_name":"Stop"}"#,
+    )
+    .await;
+    assert_eq!((status, text.as_str()), (200, "{}"));
+    assert!(
+        start.elapsed() < FORWARD_BUDGET + Duration::from_millis(500),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(failures.load(Ordering::Relaxed), 1);
+}

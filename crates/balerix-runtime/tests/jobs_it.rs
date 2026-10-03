@@ -171,6 +171,40 @@ fn crew_sync_makes_the_cache_fetches_the_ref_and_reports_its_commit() {
     assert_ne!(second, first, "an existing cache is fetched");
 }
 
+/// The gh token goes under `scratch/gh` for the credential helper, and
+/// nowhere on the volume.
+#[test]
+fn a_gh_token_is_written_under_scratch_and_never_onto_the_volume() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git+mise", false));
+        return;
+    };
+    let root = support::temp_root("jobs-crew-sync-gh");
+    let (repo, _work) = upstream(&root);
+    let slice = slice(&root);
+    let scratch = root.join("scratch");
+    let token = "gho_0123456789abcdef0123456789abcdef";
+    sync_crew(
+        &tools,
+        &slice,
+        &scratch,
+        &crew(),
+        &repo,
+        "main",
+        Some(token),
+        &none(),
+    )
+    .unwrap();
+    let hosts = std::fs::read_to_string(scratch.join("gh/hosts.yml")).unwrap();
+    assert!(hosts.contains(token), "{hosts}");
+    let git_log = std::fs::read_to_string(slice.crew().logs.join("git.log")).unwrap();
+    assert!(git_log.contains("auth git-credential"), "{git_log}");
+    for (path, (_, _, bytes)) in listing(&slice.root) {
+        let held = bytes.is_some_and(|b| b.windows(token.len()).any(|w| w == token.as_bytes()));
+        assert!(!held, "{path} holds the token");
+    }
+}
+
 /// Review focus 2.
 #[test]
 fn a_ref_the_remote_lacks_is_a_cache_error_that_names_it() {

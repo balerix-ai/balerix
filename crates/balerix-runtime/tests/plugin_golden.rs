@@ -11,11 +11,11 @@ use serde_json::json;
 fn plugin_files_match_the_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().display().to_string();
-    let layout = StateLayout {
-        state_root: dir.path().join("state"),
-        data_root: dir.path().join("data"),
-        config_root: dir.path().join("config"),
-    };
+    let layout = StateLayout::xdg(
+        dir.path().join("state"),
+        dir.path().join("data"),
+        dir.path().join("config"),
+    );
     // Fixed tool paths so launch.sh and the profile are deterministic;
     // nothing is executed. They must not exist: `plugin_grants`
     // canonicalizes `mise`, and a real `/usr/local/bin/mise` is a symlink

@@ -22,15 +22,18 @@ pub mod workspace;
 pub use env::agent_env;
 pub use home::{HOOK_EVENTS, HomeInputs, write_home};
 pub use launch::{hooks_port, render_launch, wants_continue};
-pub use layout::{AgentPaths, CrewPaths, FleetPaths, PluginPaths, StateLayout, shared_list};
+pub use layout::{
+    AgentPaths, CrewPaths, FleetPaths, PluginPaths, PodLayout, PodMounts, StateLayout, shared_list,
+};
 pub use materializer::{RenderOptions, RenderOutcome, Runtime};
 pub use plugin::{
     install_plugin_tools, plugin_env, plugin_grants, render_plugin_launch, write_plugin_home,
 };
 pub use quote::sh_quote;
 pub use sandbox::{
-    Grants, balerix_grants, check_conflicts, merge_profile, render_git_profile, render_profile,
-    validate_profile, validate_profile_at, write_git_profile, write_profile, write_profile_at,
+    Grants, SelfTestError, balerix_grants, check_conflicts, merge_profile, render_git_profile,
+    render_profile, sandbox_self_test, validate_profile, validate_profile_at, write_git_profile,
+    write_profile, write_profile_at,
 };
 pub use tmux::{ANCHOR_WINDOW, ATTACH_SESSION_PREFIX, STOP_WAIT, TmuxAttach, TmuxRunner};
 pub use toolchain::{

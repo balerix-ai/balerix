@@ -110,7 +110,7 @@ pub struct TmuxAttach {
     /// relying on what `portable-pty` does on a second `take_writer`.
     writer_taken: AtomicBool,
     tmux: PathBuf,
-    socket: String,
+    socket_args: Vec<String>,
     session: String,
 }
 
@@ -141,20 +141,21 @@ impl Drop for TmuxAttach {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = Cmd::new(&self.tmux)
-            .args([
-                "-L".to_string(),
-                self.socket.clone(),
-                "kill-session".to_string(),
-                "-t".to_string(),
-                format!("={}", self.session),
-            ])
+            .args(&self.socket_args)
+            .args(["kill-session", "-t", &format!("={}", self.session)])
             .run();
     }
 }
 
 pub struct TmuxRunner {
     pub tmux: PathBuf,
+    /// The `-L` socket name (one machine).
     pub socket: String,
+    /// Spec O §6.3: a `-S` socket path on the pod's run directory. Set,
+    /// the runner is a pod runner: every client call carries `-u` and
+    /// `-N`, and the waits on a pane's process go through tmux's
+    /// `pane_dead`, never `/proc` (the pid is the agent container's).
+    pub socket_path: Option<PathBuf>,
     /// `STOP_WAIT`; a field so a test can shorten it.
     pub stop_wait: Duration,
     /// One lock per agent, held for the whole of a `send_text` or a
@@ -169,8 +170,41 @@ impl TmuxRunner {
         Self {
             tmux,
             socket: socket.into(),
+            socket_path: None,
             stop_wait: STOP_WAIT,
             sends: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The sidecar's runner (Spec O §6.3).
+    pub fn at_socket(tmux: PathBuf, socket: PathBuf) -> Self {
+        Self {
+            tmux,
+            socket: String::new(),
+            socket_path: Some(socket),
+            stop_wait: STOP_WAIT,
+            sends: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn pod(&self) -> bool {
+        self.socket_path.is_some()
+    }
+
+    /// `-S <path> -u -N` in a pod, `-L <name>` on one machine. `-N`: a
+    /// tmux client starts a server when none is listening and its command
+    /// is one that may (`new-session`, the attach's among them); the pod's
+    /// server is the agent container's (Spec O §6.4, §10.4), so a pod
+    /// client never starts one, and finds it absent instead.
+    pub fn socket_args(&self) -> Vec<String> {
+        match &self.socket_path {
+            Some(p) => vec![
+                "-S".to_string(),
+                p.display().to_string(),
+                "-u".to_string(),
+                "-N".to_string(),
+            ],
+            None => vec!["-L".to_string(), self.socket.clone()],
         }
     }
 
@@ -199,7 +233,7 @@ impl TmuxRunner {
     }
 
     fn cmd(&self) -> Cmd {
-        Cmd::new(&self.tmux).args(["-L".to_string(), self.socket.clone()])
+        Cmd::new(&self.tmux).args(self.socket_args())
     }
 
     fn run(&self, id: &str, args: &[&str]) -> Result<String, RunnerError> {
@@ -233,23 +267,10 @@ impl TmuxRunner {
             })
     }
 
-    /// tmux exits non-zero with "no server running" / "can't find" /
-    /// "error connecting" when nothing exists, and with "no current
-    /// target" when the server is up but holds no session at all (the
-    /// moment between another crew's `new-session` starting the server and
-    /// its session existing — two crews on one socket race there at daemon
-    /// start); all of those are "absent", not errors.
     fn run_optional(&self, id: &str, args: &[&str]) -> Result<Option<String>, RunnerError> {
         match self.cmd().args(args.iter().copied()).run() {
             Ok(o) => Ok(Some(o.stdout)),
-            Err(f)
-                if f.stderr.contains("no server running")
-                    || f.stderr.contains("can't find")
-                    || f.stderr.contains("error connecting")
-                    || f.stderr.contains("no current target") =>
-            {
-                Ok(None)
-            }
+            Err(f) if absent(&f.stderr) => Ok(None),
             Err(f) => Err(RunnerError::Tool {
                 id: id.to_string(),
                 subcommand: f.subcommand,
@@ -280,6 +301,92 @@ impl TmuxRunner {
                 return Err(RunnerError::StillRunning {
                     id: id.to_string(),
                     pid: alive.pid,
+                });
+            }
+            std::thread::sleep(STOP_POLL);
+        }
+    }
+
+    /// The pod-mode wait (Spec O §6.3): the pane's process runs in the
+    /// agent container, so its pid cannot be watched from here. Polls
+    /// `pane_dead` of the window until tmux reports the pane dead or the
+    /// window is gone, within `stop_wait`; past it, `StillRunning` with
+    /// the pid tmux reported.
+    fn wait_pane_dead(&self, id: &str, agent: &AgentId, pid: u32) -> Result<(), RunnerError> {
+        let deadline = Instant::now() + self.stop_wait;
+        loop {
+            match self
+                .windows(&agent.crew_ref())?
+                .and_then(|w| w.get(&agent.agent).copied())
+            {
+                None | Some(ProcessState::Exited { .. }) => return Ok(()),
+                Some(ProcessState::Running { .. }) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(RunnerError::StillRunning {
+                    id: id.to_string(),
+                    pid,
+                });
+            }
+            std::thread::sleep(STOP_POLL);
+        }
+    }
+
+    /// Pod mode's way of ending a pane's process while keeping its window:
+    /// `respawn-window -k` hangs the process up exactly as `kill-window`
+    /// would and starts, in the agent container, a command that lives
+    /// while that process does. The supervisor exits only when its tree
+    /// is empty; the waiter exits when the supervisor is gone; the pane is
+    /// then dead to `windows()`. `kill -0` of a reused pid would hold the
+    /// waiter until the bound: `StillRunning`, as for a tree that will not
+    /// die.
+    fn respawn_into_waiter(
+        &self,
+        id: &str,
+        target: &str,
+        cwd: &str,
+        pid: u32,
+    ) -> Result<(), RunnerError> {
+        let waiter = format!("while kill -0 {pid} 2>/dev/null; do sleep 0.02; done");
+        self.run(
+            id,
+            &[
+                "respawn-window",
+                "-k",
+                "-t",
+                target,
+                "-c",
+                cwd,
+                "/bin/sh",
+                "-c",
+                &waiter,
+            ],
+        )
+        .map(|_| ())
+    }
+
+    /// The end of a pod-mode `stop_crew`: `kill-session` returns before
+    /// tmux has dropped the session (and, for the last one, before the
+    /// server has exited), so "returned" would not mean "gone" as it does
+    /// on one machine after `wait_gone`. Polls `list-sessions` until none
+    /// of `sessions` is listed, within `stop_wait`.
+    fn wait_sessions_gone(&self, id: &str, sessions: &[String]) -> Result<(), RunnerError> {
+        let deadline = Instant::now() + self.stop_wait;
+        loop {
+            let Some(text) = self.run_optional(id, &["list-sessions", "-F", "#{session_name}"])?
+            else {
+                return Ok(());
+            };
+            let left = text.lines().find(|l| sessions.iter().any(|s| s == l));
+            let Some(left) = left else {
+                return Ok(());
+            };
+            if Instant::now() >= deadline {
+                return Err(RunnerError::Tool {
+                    id: id.to_string(),
+                    subcommand: "kill-session".into(),
+                    args: vec![format!("={left}")],
+                    stderr: format!("session {left} still listed after {:?}", self.stop_wait),
                 });
             }
             std::thread::sleep(STOP_POLL);
@@ -324,6 +431,26 @@ impl TmuxRunner {
         };
         parse_windows(&crew.fleet, &crew.crew, &text).map(Some)
     }
+}
+
+/// tmux exits non-zero with "no server running" / "can't find" /
+/// "error connecting" when nothing exists; with "no current target" when
+/// the server is up but holds no session at all (the moment between
+/// another crew's `new-session` starting the server and its session
+/// existing — two crews on one socket race there at daemon start); and
+/// with "server exited unexpectedly" when the server was ending as the
+/// client connected (its last session just killed, or the agent container
+/// shutting down). All of those are "absent", not errors.
+pub(crate) fn absent(stderr: &str) -> bool {
+    [
+        "no server running",
+        "can't find",
+        "error connecting",
+        "no current target",
+        "server exited unexpectedly",
+    ]
+    .iter()
+    .any(|m| stderr.contains(m))
 }
 
 pub(crate) fn parse_windows(
@@ -374,6 +501,17 @@ impl AgentRunner for TmuxRunner {
             .is_some()
         {
             return Ok(());
+        }
+        if self.pod() {
+            // Spec O §6.2: `balerix-agent run` creates the crew session
+            // when it starts the server; until it is back the pass fails
+            // and the next one retries
+            return Err(RunnerError::Tool {
+                id: crew.to_string(),
+                subcommand: "has-session".into(),
+                args: vec![Self::session_target(crew)],
+                stderr: "the agent container's tmux server is not running".into(),
+            });
         }
         self.run(
             &crew.to_string(),
@@ -435,11 +573,21 @@ impl AgentRunner for TmuxRunner {
             Some(ProcessState::Running { pid }) => {
                 // A restart: end the old process first and wait for it,
                 // so the new agent never starts while the old tree is
-                // still dying (Spec N amendment §13.5). Through the idle
-                // placeholder, for the same reason as the arms above.
-                let old = ProcIdentity::of(pid);
-                self.respawn_idle(&id, &target, &cwd)?;
-                self.wait_gone(&id, old.as_slice())?;
+                // still dying (Spec N amendment §13.5). On one machine
+                // through the idle placeholder and `/proc`; in a pod
+                // (Spec O §6.3) through a waiter and `pane_dead`.
+                if self.pod() {
+                    self.respawn_into_waiter(&id, &target, &cwd, pid)?;
+                    self.wait_pane_dead(&id, agent, pid)?;
+                    // the pane is dead now and `pipe-pane` refuses a dead
+                    // pane: revive it into the idle placeholder, as the
+                    // `Exited` arm does
+                    self.respawn_idle(&id, &target, &cwd)?;
+                } else {
+                    let old = ProcIdentity::of(pid);
+                    self.respawn_idle(&id, &target, &cwd)?;
+                    self.wait_gone(&id, old.as_slice())?;
+                }
             }
         }
         // `set-option` is idempotent and, by this point, always aimed at a
@@ -491,10 +639,21 @@ impl AgentRunner for TmuxRunner {
 
     fn stop_agent(&self, agent: &AgentId) -> Result<(), RunnerError> {
         let id = agent.to_string();
-        let pane = match self
+        let state = self
             .windows(&agent.crew_ref())?
-            .and_then(|w| w.get(&agent.agent).copied())
-        {
+            .and_then(|w| w.get(&agent.agent).copied());
+        if self.pod() {
+            // Spec O §6.3: the window stays until the pane is dead, so
+            // `pane_dead` can be waited on; then it goes, so the agent is
+            // absent, as it is on one machine after `kill-window`.
+            if let Some(ProcessState::Running { pid }) = state {
+                self.respawn_into_waiter(&id, &Self::window_target(agent), "/", pid)?;
+                self.wait_pane_dead(&id, agent, pid)?;
+            }
+            self.run_optional(&id, &["kill-window", "-t", &Self::window_target(agent)])?;
+            return Ok(());
+        }
+        let pane = match state {
             Some(ProcessState::Running { pid }) => ProcIdentity::of(pid),
             _ => None,
         };
@@ -519,6 +678,34 @@ impl AgentRunner for TmuxRunner {
             return Ok(());
         };
         let sessions = sessions_in_group(&text, &name);
+        if self.pod() {
+            let mut first_err = None;
+            if let Some(windows) = self.windows(crew)? {
+                for (agent, state) in windows {
+                    if let ProcessState::Running { pid } = state {
+                        let id = AgentId {
+                            fleet: crew.fleet.clone(),
+                            crew: crew.crew.clone(),
+                            agent,
+                        };
+                        let target = Self::window_target(&id);
+                        let r = self
+                            .respawn_into_waiter(&id.to_string(), &target, "/", pid)
+                            .and_then(|()| self.wait_pane_dead(&id.to_string(), &id, pid));
+                        if let Err(e) = r
+                            && first_err.is_none()
+                        {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            for session in &sessions {
+                self.run_optional(&name, &["kill-session", "-t", &format!("={session}")])?;
+            }
+            self.wait_sessions_gone(&name, &sessions)?;
+            return first_err.map_or(Ok(()), Err);
+        }
         // Grouped sessions share the crew's windows, but the crew session
         // may already be gone with an attach still holding them: the panes
         // of every session of the group, each process once, are what the
@@ -678,9 +865,8 @@ impl AgentRunner for TmuxRunner {
         // `destroy-unattached` is set: tmux destroys a detached session the
         // moment that option lands on it.
         let mut cmd = CommandBuilder::new(&self.tmux);
+        cmd.args(self.socket_args());
         cmd.args([
-            "-L".to_string(),
-            self.socket.clone(),
             "new-session".to_string(),
             "-t".to_string(),
             Self::session_target(&crew),
@@ -711,7 +897,7 @@ impl AgentRunner for TmuxRunner {
             child,
             writer_taken: AtomicBool::new(false),
             tmux: self.tmux.clone(),
-            socket: self.socket.clone(),
+            socket_args: self.socket_args(),
             session: session.clone(),
         };
         // Everything after the `windows()` check was fire-and-forget: a
@@ -760,6 +946,36 @@ impl TmuxRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cmd()` and `attach` build every client's leading argv from
+    /// `socket_args`: a pod runner always carries `-S <path> -u -N`, the
+    /// one-machine runner keeps `-L <name>` and neither flag.
+    #[test]
+    fn socket_args_are_s_and_u_in_a_pod_and_l_on_one_machine() {
+        let pod = TmuxRunner::at_socket("tmux".into(), "/balerix/run/tmux.sock".into());
+        assert!(pod.pod());
+        assert_eq!(
+            pod.socket_args(),
+            ["-S", "/balerix/run/tmux.sock", "-u", "-N"]
+        );
+        let one = TmuxRunner::new("tmux".into(), "balerix-x");
+        assert!(!one.pod());
+        assert_eq!(one.socket_args(), ["-L", "balerix-x"]);
+    }
+
+    #[test]
+    fn a_server_gone_or_going_is_absent_and_anything_else_an_error() {
+        for m in [
+            "no server running on /x",
+            "can't find session: =f/c",
+            "error connecting to /x (No such file or directory)",
+            "no current target",
+            "server exited unexpectedly",
+        ] {
+            assert!(absent(m), "{m}");
+        }
+        assert!(!absent("duplicate session: f/c"));
+    }
 
     #[test]
     fn live_panes_are_the_ones_not_dead() {

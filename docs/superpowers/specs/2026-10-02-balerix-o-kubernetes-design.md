@@ -2,7 +2,8 @@
 
 **Date:** 2026-10-02
 **Status:** Design approved in brainstorm 2026-10-02; written spec approved
-2026-10-02; the spike's findings recorded in §19
+2026-10-02; the spike's findings recorded in §19; sub-project 2 decisions
+in §7.4
 **Scope:** running balerix on Kubernetes. A `balerix-operator` reconciles
 five custom resources (Daemon, Fleet, Crew, Agent, Plugin) into pods,
 claims, Secrets and Jobs. Each Daemon object is a `balerix serve` instance
@@ -355,8 +356,9 @@ comes from it.
    message: a node without Landlock would otherwise look like a pane
    exiting 1 and be restarted with back-off.
 3. The sidecar writes the start marker. The `agent` container, which has
-   been waiting for it, starts a tmux server on the shared socket with one
-   window running `launch.sh` under `remain-on-exit`.
+   been waiting for it, starts a tmux server on the shared socket with the
+   crew's anchor window only; the sidecar then creates the agent's window,
+   running `launch.sh` under `remain-on-exit`, through the runner (§7.4).
 4. Claude's `SessionStart` reaches the sidecar through `hook-relay`; the
    sidecar forwards it to the Daemon and its readiness probe turns true.
 
@@ -432,7 +434,7 @@ one response per id:
 |---|---|
 | `status` | phase, pid, restarts, on every change |
 
-On the Daemon, a `LinkRunner` adapter implements `AgentRunner` and
+On the Daemon, a `LinkHub` adapter implements `AgentRunner` and
 `WorkspaceReader` over the link. A call for an agent whose link is down
 fails with a `RunnerError` naming it. `ensure_agent`, `stop_crew` and the
 `Materializer` have nothing to do in this mode: the Daemon's fleet actor
@@ -457,6 +459,112 @@ Everything else (the chain, KV, proxy, sessions, `plugin open`, attach,
 watch, metrics) is unchanged. The CLI works against a Daemon through a
 port-forward or an Ingress the user provides, with the admin token from
 the Daemon's Secret.
+
+### 7.4 Decided in sub-project 2 (2026-10)
+
+- **The Daemon mirrors; it does not plan.** For a fleet with
+  `owner: kubernetes` the actor runs no `reconcile_pass`. The sidecar's
+  `status` frames are its observed state, written into `status.agents`
+  as sent; `SetStopped` becomes a `stop` or `restart` frame. The stopped
+  set is reconciled only on the first `status` frame of a link (a connect
+  or a reconnect): a `Ready` agent the set holds, or a `Stopped` one it
+  does not, gets the frame it missed, which is how a sidecar that was away
+  during a `stop` learns of it. Later frames are mirrored only: a
+  `Restart` is a stop then a restart, and a late `Stopped` frame must not
+  trigger a second restart. For a downed fleet a first frame whose phase
+  is not `Stopped` gets `stop` and its status is not mirrored. `Down`
+  sends `stop` to every linked agent, clears the agents and is `Down`
+  (the pods are the operator's to delete). An apply drops the agents the
+  spec no longer has from the status and the stopped set, and frames for
+  them are ignored. It keeps the stop of an agent still wanted: the
+  operator re-sends its apply on every reconcile, so "an apply always
+  wins" (plugins spec §16.4) would undo every plugin `stop` here. An
+  apply that takes the fleet from Down to Up sends `restart` to each
+  linked agent the set does not hold. A
+  plugin sync leaves `kubernetes`-owned fleets alone. Two planners over
+  one agent would double every restart.
+- **A pod-mode stop is a respawn into a waiter.** From the sidecar
+  nothing can signal the pane's process and `/proc` is another
+  container's. `respawn-window -k` hangs the supervisor up as
+  `kill-window` does today, into a command that runs in the agent
+  container: `while kill -0 <pane_pid> 2>/dev/null; do sleep 0.02; done`.
+  The supervisor exits when its tree is empty; the waiter exits when the
+  supervisor is gone; tmux marks the pane dead; the sidecar polls
+  `pane_dead` under the existing 5 s bound (`StillRunning` past it, the
+  window kept), then kills the window so the agent is absent, which is
+  what leaving the stopped set expects. The restart arm of
+  `ensure_agent` does the same without the final `kill-window`.
+- **In a pod the sidecar never removes or harvests.** Removal on a pod
+  layout is a logged no-op (the harvest is a Job's, §8.4). The sidecar
+  publishes its status on every hook event, and once more after the
+  forward budget, so the hook-failure count reaches the Daemon.
+- **Readiness is a file.** Agent pods accept no inbound connections
+  (O-10), so the probe is `exec: test -f /balerix/run/ready`; the sidecar
+  writes the marker on `SessionStart` and removes it when the phase
+  leaves `Ready`.
+- **The operator's apply is `PUT /v1/fleets/{name}` with `agent_tokens`**
+  (`fleet/crew/agent` → token, at least 32 characters, one per agent of
+  the spec). The fleet is recorded with `owner: kubernetes` and the tokens
+  as the agents' hook secrets: one token per agent for the hook route
+  and the link. The CLI's `PUT` without tokens, `POST` and `DELETE`
+  without `force` answer 409 (`fleet <name> is managed by kubernetes;
+  change it through its Fleet object`); the operator's down is
+  `DELETE …?force=true`. For a fleet that is absent or has no owner,
+  the CLI's `POST` and `PUT` answer 409 `this daemon is in kubernetes
+  mode; create a Fleet object` (no pod would ever run it), and the
+  operator's `PUT` does not adopt a record with no owner or another
+  owner: 409, as a plugin's would be. A tmux-mode daemon answers a body
+  with `agent_tokens` 400.
+- **Kubernetes mode is flags on `serve`:** `--mode kubernetes --tls-cert
+  --tls-key --admin-token-file`, with any `--bind` address and no `-d`.
+  The Daemon reads no `plugins.yaml` and launches no plugin; its system
+  pool is `Ready` without installing (the shared volume's daemon pool is
+  a Job's, §8.3). `GET /readyz` is 200 when Spec F's channel says `Ready`,
+  503 with the reason otherwise.
+- **The sidecar's state survives it.** The stopped flag and the
+  planner's status (`FleetStatus`, as the one-machine daemon persists it)
+  are written atomically to `<agent>/.balerix/state/sidecar/state.json`
+  and loaded before the first pass: a `stop` holds across a sidecar
+  restart with the Daemon away, and the status's applied hash keeps the
+  first pass from relaunching a healthy Claude. The link opens after that
+  first pass, so its first `status` frame, which the Daemon reconciles
+  its stopped set against, is the pass's answer.
+- **The hook hop has a secret of its own.** Claude authenticates to
+  the sidecar with a sidecar-local secret (32 random bytes, made on the
+  first start and kept under `<agent>/.balerix/state/sidecar/`, outside
+  the agent's sandbox grants); the operator's token authenticates the
+  sidecar to the Daemon, on the events route, the link and the attach
+  socket, and never reaches the agent's files.
+- **The agent container learns its session from the start marker.**
+  `balerix-agent run` waits for `<run>/started`, whose content is
+  `<fleet>/<crew>`, starts the tmux server with only the crew's anchor
+  window on `<run>/tmux.sock` and polls `has-session` until the server is
+  gone; SIGTERM becomes `kill-server`. The sidecar creates the agent's
+  window through the runner. It needs no Secret and no arguments. The
+  sidecar never starts the server: every pod-mode tmux call carries `-N`,
+  and a pass that finds no crew session fails until `run` is back, so
+  Claude never runs in the sidecar's container.
+- **Mount paths are flags with §6.1's defaults** (`--agent-dir
+  /balerix/agent`, `--shared-dir /balerix/shared`, `--run-dir
+  /balerix/run`, `--bundle /balerix/secret/agent.json`, `--ca
+  /balerix/tls/ca.crt`, `--termination-log /dev/termination-log`,
+  `--hook-port 7643`). Under the shared mount: `repo/.git/objects`,
+  `crew/mise`, `fleet/mise`, `daemon/mise`. Sub-project 3 mounts the
+  shared claim's sub-paths there and the Secret at the bundle path.
+- **The link's wire shapes** are `balerix-api`'s `link` module: a
+  Daemon → sidecar text frame is a `LinkRequest` (`id`, `op` tagged
+  `kind`), a sidecar → Daemon frame is a `SidecarFrame` (`reply` with the
+  id and a `result` tagged `kind`, or `status` with the agent's
+  `AgentStatus`, the pane's pid and the hook-failure count). File bytes
+  travel as a JSON array; the 1 MiB file cap keeps that small. Both
+  sockets, the link and the attach socket, carry `balerix-link-protocol:
+  1`, checked before the upgrade. An attach session is bound to the agent
+  the `attach` request was sent to: another agent's socket is answered as
+  an unknown session (close 1008). A call in flight when its link ends or
+  is replaced fails `link down` at once. The sidecar drops a link that has
+  been silent for three Daemon pings (90 s) and reconnects, and bounds its
+  connect at 10 s. Workspace and runner error text crosses the link
+  without the id prefix, which the Daemon adds back.
 
 ## 8. Storage
 
@@ -619,8 +727,9 @@ operator/                     standalone project, own Cargo.lock
   src/daemon_client.rs        the Daemon admin API
   src/main.rs                 run | crds
 agent/                        standalone project, own Cargo.lock
-  src/sidecar.rs  link.rs  hooks.rs  crew_sync.rs  harvest.rs  run.rs
-crates/balerix-server/src/kube/   link.rs (LinkRunner), plugins route, managed-fleets list
+  src/{cli,bundle,tls,hooks,link,attach,sidecar,state,run}.rs; crew_sync.rs, harvest.rs (the Jobs, §8.3, §8.4)
+crates/balerix-server/src/kube/   link.rs (LinkHub), plugins route, managed-fleets list
+  kube/{link,pty,idle,tls}.rs
 crates/balerix-api            link frames, the plugins request, the manifest in hello
 crates/balerix-plugin-sdk     TLS serving and trust
 charts/balerix-operator/      crds/, templates/, values.yaml, values.schema.json
@@ -737,6 +846,14 @@ its index by hand.
   `BALERIX_REQUIRE_TOOLS`, no cluster: a Daemon in Kubernetes mode and a
   sidecar as two processes, hooks forwarded, `send_text` over the link,
   attach, workspace reads, link loss and reconnect, the fail-open hook.
+  As built (`agent/tests/sidecar_it.rs`): against a fake Daemon, the
+  hooks forwarded, `send_text`, workspace reads, attach, `stop` and
+  `restart`, a dead Claude restarted, the fail-open hook and its count,
+  and the link's return; against a real `balerix serve --mode kubernetes`
+  over TLS, the link and `SessionStart` to `Ready`, the first-status
+  reconciliation of a down made while the link was away and of an up after
+  it (stop, then restart), and a forced down travelling the live link as a
+  stop.
 - **Jobs:** `crew-sync` and `harvest` against temp roots, reusing Spec N's
   cases (a nono that cannot run keeps the clone).
 - **End to end:** `mise run e2e-k8s`, the Phase 3 journey on `kind` with
@@ -775,7 +892,8 @@ Each gets its own plan.
    class on `kind` for CI. Output: answers, and §6.4's fallback taken or
    not. Done; see §19 — §19.4 for the managed cluster.
 2. **Daemon mode and sidecar.** §6, §7, the pod layout in `StateLayout`,
-   TLS. Done when the two-process integration tests pass.
+   TLS. Done when the two-process integration tests pass. Done 2026-10
+   (PR #125).
 3. **Operator and CRDs.** §4, §5, §8. Done when `e2e-k8s` passes without
    plugins.
 4. **Plugins.** §9. Done when `e2e-k8s` passes with flow and web, and the

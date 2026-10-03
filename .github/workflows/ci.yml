@@ -69,6 +69,27 @@ jobs:
           workspaces: "plugins/${{ matrix.plugin }} -> target"
           key: ${{ matrix.plugin }}
       - run: mise run plugin ${{ matrix.plugin }}
+  # The agent project (Spec O §12) is standalone like a plugin, with one
+  # difference: its two-process tests run the core `balerix` binary, so
+  # the job carries the core target cache too and the real tools.
+  agent:
+    runs-on: ubuntu-latest
+    env:
+      BALERIX_REQUIRE_TOOLS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with: { version: 2026.9.2, install: false, cache: true }
+      - run: mise install rust cargo:cargo-nextest tmux nono gh
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+            agent -> target
+          key: agent
+      - run: mise run agent
   mutants:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest

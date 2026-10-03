@@ -256,6 +256,7 @@ impl Runtime {
         Workspace {
             tools: &self.tools,
             gh_config_dir: (git.auth == GitAuth::Gh).then(|| self.layout.fleet_gh_dir(fleet)),
+            cache_is_read_only: self.layout.pod_layout().is_some(),
         }
     }
 
@@ -325,6 +326,23 @@ impl Materializer for Runtime {
             })?;
             Workspace::write_fleet_gh_config(&self.layout.fleet_gh_dir(&crew.fleet), token, &id)?;
         }
+        // Spec O §8.3: in a pod the cache and the pools are a Job's work,
+        // mounted read-only; the sidecar only checks the cache is there. The
+        // gh config above stays: the fleet's gh dir is on the writable claim
+        // and a clone with `git.auth: gh` needs it (§10.4).
+        if self.layout.pod_layout().is_some() {
+            let objects = self.layout.crew(crew).cache_objects();
+            if !objects.is_dir() {
+                return Err(MaterializeError::Invalid {
+                    id,
+                    message: format!(
+                        "crew cache not synced: {} is missing (the crew sync Job has not run)",
+                        objects.display()
+                    ),
+                });
+            }
+            return Ok(());
+        }
         self.install_pools(crew, tools)?;
         self.workspace(&crew.fleet, git)
             .ensure_repo(&id, &self.layout.crew(crew), repo, git_ref)
@@ -363,6 +381,7 @@ impl Materializer for Runtime {
         Workspace {
             tools: &self.tools,
             gh_config_dir: None,
+            cache_is_read_only: false,
         }
         .harvest_and_remove(&id, &crew, &paths)?;
         Self::rm_rf(&id, &paths.root)
@@ -388,6 +407,7 @@ impl Materializer for Runtime {
                     Workspace {
                         tools: &self.tools,
                         gh_config_dir: None,
+                        cache_is_read_only: false,
                     }
                     .harvest_and_remove(
                         &agent_id.to_string(),
@@ -431,11 +451,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn runtime(root: &std::path::Path) -> Runtime {
-        let layout = StateLayout {
-            state_root: root.join("state"),
-            data_root: root.join("data"),
-            config_root: root.join("config"),
-        };
+        let layout = StateLayout::xdg(root.join("state"), root.join("data"), root.join("config"));
         std::fs::create_dir_all(&layout.config_root).unwrap();
         std::fs::write(layout.system_mise_toml(), "[tools]\n").unwrap();
         let tools = ToolPaths {

@@ -409,6 +409,45 @@ pub fn validate_profile(
     )
 }
 
+/// Spec O §6.2 step 2: `nono -s run --profile <profile> -- /bin/true` in
+/// the sidecar's own container, which shares the pod's seccomp settings
+/// and the node's kernel with the agent container. nono's own exit 1 with
+/// `Landlock not available` is the `SandboxUnavailable` signal (§19.2);
+/// `/sys/kernel/security/lsm` is not mounted in a pod, so there is nothing
+/// else to read.
+pub fn sandbox_self_test(tools: &ToolPaths, paths: &AgentPaths) -> Result<(), SelfTestError> {
+    let out = std::process::Command::new(&tools.nono)
+        .args(["-s", "run", "--profile"])
+        .arg(&paths.profile)
+        .args(["--", "/bin/true"])
+        .env_clear()
+        .env("HOME", &paths.nono_home)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .output()
+        .map_err(|e| SelfTestError::Io(e.to_string()))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr.lines().next().unwrap_or("").trim().to_string();
+    if out.status.code() == Some(1) && line.contains("Landlock not available") {
+        return Err(SelfTestError::Unavailable(line));
+    }
+    Err(SelfTestError::Failed(line))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SelfTestError {
+    /// nono exited 1 with `Landlock not available` (Spec O §19.2).
+    #[error("SandboxUnavailable: {0}")]
+    Unavailable(String),
+    /// Any other non-zero exit; the first stderr line.
+    #[error("sandbox self-test failed: {0}")]
+    Failed(String),
+    #[error("sandbox self-test could not run nono: {0}")]
+    Io(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,6 +14,10 @@ credentials, hook input, or sandbox rules.
   (`mise run plugin matrix`). `plugins` does all five (common is the shared
   library, Spec K). Neither is part of `check`; CI runs them as their own
   concurrent jobs.
+- `agent` — lint and test the standalone `agent/` project (`balerix-agent`,
+  Spec O §12); builds `balerix` first, since its two-process tests run
+  `balerix serve --mode kubernetes` and `launch.sh`. Its own CI job; not part
+  of `check`.
 - `mutants` — nightly tier: mutation-tests `balerix-core` (the reconciler).
   `.cargo/mutants.toml` excludes `fakes.rs`: the fakes are exercised by
   `balerix-server`'s tests, which that run never executes.
@@ -96,6 +100,9 @@ credentials, hook input, or sandbox rules.
   `crates/balerix/tests/cli_supervise.rs`. Never call
   `balerix_runtime::supervise::supervise` inside a test process: it makes
   the process a subreaper and kills every descendant.
+- `agent/` is standalone like a plugin (own `Cargo.lock`, `deny.toml`,
+  lints), depending on `balerix-api`, `balerix-core` and `balerix-runtime` by
+  path; its TLS and WebSocket stack never reaches the core resolution.
 
 ## Gotchas
 - Run cargo through mise (`mise x -- cargo …`) or via a `mise run` task.
@@ -201,6 +208,19 @@ credentials, hook input, or sandbox rules.
   `--purge`, `remove` and a branch change fail on such a host, `--purge`
   is the way past, and the user `sandbox` block does not reach this
   profile.
+- `TmuxRunner::at_socket` is the pod runner: `-S <path> -u -N` on every
+  call, and stops wait on `pane_dead` through a waiter the pane is
+  respawned into, never on `/proc` (the pid is the agent container's).
+  `-N` because a tmux client starts a server when none listens: the
+  server, and so Claude, must only ever run in the agent container
+  (`balerix-agent run` creates it with the crew session), so a pod
+  `ensure_crew` that finds no session fails the pass instead of creating
+  one. The
+  one-machine runner (`TmuxRunner::new`) is unchanged; `tmux_pod_it`
+  covers the other.
+- A Kubernetes-mode daemon (`serve --mode kubernetes`) runs no planner
+  for its fleets and reads no `plugins.yaml`; `Harness::kube()` is the
+  test harness for it, `kube_*_it.rs` the tests.
 - The e2e overrides the system tool table with an empty `[tools]` in its scratch
   `$XDG_CONFIG_HOME/balerix/mise.toml` so nothing downloads; the real embedded
   table pins `claude`, and a fresh `up` on a real host installs it.
@@ -272,7 +292,8 @@ credentials, hook input, or sandbox rules.
   survives a plain remove.
 - A plugin's `stop` action leaves the agent `Stopped` until a `restart`
   action or the next `up`/`update`; the reconciler will not restart it and
-  `status` shows `stopped`.
+  `status` shows `stopped`. In Kubernetes mode the operator's apply keeps
+  the stop (it re-sends on every reconcile); only a `restart` ends it.
 - The `PluginClient` is built with `.no_proxy()`; do not remove it — a
   `HTTP_PROXY` in the daemon's environment would otherwise capture loopback
   calls.

@@ -29,6 +29,7 @@ use crate::proxy;
 use crate::sessions::{
     COOKIE, CodeRejected, MOUNT_PREFIX, cookie_value, login_target, same_origin, set_cookie,
 };
+use crate::system_pool::SystemPoolState;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -155,6 +156,14 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
             "/v1/agents/{fleet}/{crew}/{agent}/events",
             post(hooks::events),
         )
+        .route(
+            "/v1/agents/{fleet}/{crew}/{agent}/link",
+            get(crate::kube::link::link),
+        )
+        .route(
+            "/v1/agents/{fleet}/{crew}/{agent}/link/attach/{session}",
+            get(crate::kube::link::link_attach),
+        )
         .layer(DefaultBodyLimit::max(1 << 20));
     let plugins = Router::new()
         .route("/v1/plugin-host/hello", post(plugin_hello))
@@ -170,6 +179,7 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route("/v1/plugins/{name}/{*rest}", any(proxy_rest));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/v1/login/{code}", get(login))
         .merge(admin)
@@ -278,6 +288,12 @@ async fn create_fleet(
     b: Result<Json<FleetRequest>, JsonRejection>,
 ) -> Result<Json<FleetRecord>, ApiError> {
     let req = body(b)?;
+    if req.agent_tokens.is_some() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "agent_tokens: use PUT /v1/fleets/{name}",
+        ));
+    }
     let name = fleet_name(&req.spec.name)?;
     Ok(Json(
         state
@@ -294,12 +310,32 @@ async fn update_fleet(
 ) -> Result<Json<FleetRecord>, ApiError> {
     let req = body(b)?;
     let name = fleet_name(&path_name(name)?)?;
-    Ok(Json(
-        state
-            .daemon
-            .apply(&name, req.spec, req.credentials, true)
-            .await?,
-    ))
+    let record = match req.agent_tokens {
+        // Spec O §7.3: the operator's apply
+        Some(tokens) => state.daemon.apply_kube(&name, req.spec, tokens).await?,
+        None => {
+            state
+                .daemon
+                .apply(&name, req.spec, req.credentials, true)
+                .await?
+        }
+    };
+    Ok(Json(record))
+}
+
+/// `GET /readyz` (Spec O §7.3): Spec F's pool channel and nothing else.
+async fn readyz(State(state): State<AppState>) -> Response {
+    match state.daemon.system_pool_state() {
+        SystemPoolState::Ready => "ready".into_response(),
+        SystemPoolState::Pending => {
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "daemon pool: pending").into_response()
+        }
+        SystemPoolState::Unready { reason } => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("daemon pool: {reason}"),
+        )
+        .into_response(),
+    }
 }
 
 async fn get_fleet(

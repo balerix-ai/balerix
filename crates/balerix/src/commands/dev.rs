@@ -59,11 +59,11 @@ pub fn materialize_command(args: &MaterializeArgs) -> Result<String> {
             path
         }
     };
-    let layout = StateLayout {
-        state_root: out_root.join("state"),
-        data_root: out_root.join("data"),
-        config_root: real.config_root,
-    };
+    let layout = StateLayout::xdg(
+        out_root.join("state"),
+        out_root.join("data"),
+        real.config_root,
+    );
     let rt = Runtime::new(layout.clone(), tools);
 
     let paths = layout.agent(&agent.id);

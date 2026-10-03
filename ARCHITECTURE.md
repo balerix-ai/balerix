@@ -35,7 +35,9 @@ reconciles what exists against what was declared.
   `/metrics`, `plugins/`: `plugins.yaml` sync, package install, `PluginHost`,
   `PluginRegistry` (activations, interceptor order), `PluginEventHandler` (the
   chain), `PluginKv`, `sessions.rs` (login codes and cookies), `proxy.rs` (the
-  mount), `attach.rs` and `watch.rs` (the two streams). Depends on `core` +
+  mount), `attach.rs` and `watch.rs` (the two streams); `kube/` (Spec O §7:
+  the sidecar link hub implementing `AgentRunner` and `WorkspaceReader` over
+  the link, the idle ports, TLS serving). Depends on `core` +
   `api` only; the binary hands it the runtime.
 - `balerix` — the binary, and the only crate allowed to see both ports and
   adapters; it does the wiring.
@@ -43,6 +45,14 @@ reconciles what exists against what was declared.
   module per materialization step; every path from StateLayout, every binary
   from ToolPaths; never reads the process environment. `inspect.rs` reads an
   agent's clone for the plugin host's workspace routes.
+- `balerix-agent` (`agent/`, a standalone project like the plugins) — the
+  agent pod (Spec O §6, §7). `sidecar` is a one-agent daemon: the core
+  planner over `Runtime` and `TmuxRunner` on a pod layout
+  (`StateLayout::pod`) and a socket path; it forwards Claude's hooks to the
+  Daemon and holds one outbound WebSocket link over which `send_text`,
+  `send_keys`, `stop`, `restart`, `attach` and the workspace reads arrive.
+  `run` is the agent container's entrypoint: the tmux server, once the
+  sidecar's start marker says the agent is materialised.
 - `balerix-plugin-sdk` — the plugin side of the host protocol; depends on
   `api` only. `Host` (async, one method per route, including
   `Host::attach`/`watch_fleets`), the `Plugin` trait (`Plugin::routes`) and
@@ -231,6 +241,13 @@ makes an existing remote branch its clone's branch and start point
 - **Ports live in `balerix-core`, adapters depend on it, never on each other.**
   The future Kubernetes split cuts between `balerix-server` and
   `balerix-runtime`; `core` is shared.
+- **A Kubernetes-mode Daemon mirrors; the sidecar plans.** The planner
+  runs in the pod, next to tmux; the Daemon's actor takes the sidecar's
+  `status` frames as observed state and sends the stopped set as frames.
+  Two planners over one agent would double every restart (Spec O §7.4).
+- **Pod-mode process waits use no `/proc`.** The pane's pid is the agent
+  container's. A stop respawns the pane into a waiter that outlives the
+  supervisor and polls tmux's own `pane_dead` (Spec O §6.3, §7.4).
 - **The agent environment lives in the nono profile, not in `env -i`.** nono
   refuses a read-write grant on any directory holding its own state root, and
   it derives that root from its own `$HOME`. So nono runs with `HOME=agents/<a>/nono`

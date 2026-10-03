@@ -138,6 +138,10 @@ pub enum RunnerError {
     /// amendment §13.5).
     #[error("{id}: agent processes still running after stop (pid {pid})")]
     StillRunning { id: String, pid: u32 },
+    /// Spec O §7.2: the agent's sidecar link is down, timed out, or the
+    /// sidecar answered with a failure.
+    #[error("{id}: {message}")]
+    Link { id: String, message: String },
 }
 
 /// Why a workspace read failed (Spec C §3.1). `Display` is what the

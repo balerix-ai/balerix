@@ -34,11 +34,19 @@ pub fn temp_root(test: &str) -> balerix_runtime::testing::TempRoot {
 }
 
 pub fn layout(root: &Path) -> StateLayout {
-    StateLayout {
-        state_root: root.join("state"),
-        data_root: root.join("data"),
-        config_root: root.join("config"),
-    }
+    StateLayout::xdg(root.join("state"), root.join("data"), root.join("config"))
+}
+
+/// A pod layout on temp mounts: `<root>/agent`, `<root>/shared`, `<root>/run`.
+pub fn pod_layout(root: &Path, id: &balerix_core::AgentId) -> StateLayout {
+    StateLayout::pod(
+        balerix_runtime::layout::PodMounts {
+            agent: root.join("agent"),
+            shared: root.join("shared"),
+            run: root.join("run"),
+        },
+        id,
+    )
 }
 
 /// True when Landlock is usable: `nono run` of `true` succeeds. `--allow-cwd`

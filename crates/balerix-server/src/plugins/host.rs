@@ -94,6 +94,7 @@ impl PluginHost {
             policy: agent_ports.policy.clone(),
             hook_url: agent_ports.hook_url.clone(),
             resync: agent_ports.resync,
+            kube: agent_ports.kube.clone(),
         });
         let name = RESERVED_FLEET.parse().unwrap_or_else(|_| unreachable!());
         let record = FleetRecord::new(plugin_fleet(&[]).into());
@@ -256,6 +257,7 @@ impl PluginHost {
             .send(Msg::Apply {
                 spec,
                 credentials: CredentialBundle::default(),
+                agent_tokens: Default::default(),
                 reply,
             })
             .await

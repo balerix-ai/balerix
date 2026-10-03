@@ -8,9 +8,11 @@
 pub const API_VERSION: &str = "balerix/v1";
 
 pub mod branch;
+pub mod bundle;
 pub mod credentials;
 pub mod fleet;
 pub mod hook;
+pub mod link;
 pub mod plugin;
 pub mod protocol;
 pub mod record;
@@ -20,9 +22,14 @@ pub mod status;
 pub mod workspace;
 
 pub use branch::check_branch_name;
+pub use bundle::AgentBundle;
 pub use credentials::CredentialBundle;
 pub use fleet::{CrewSpec, FleetSpec, GitAuth, GitIdentity, GitSettings};
 pub use hook::{HOOK_EVENTS, HookEvent};
+pub use link::{
+    AgentTokens, FailureKind, LINK_PROTOCOL, LINK_PROTOCOL_HEADER, LinkFailure, LinkOp, LinkReply,
+    LinkRequest, LinkResult, LinkStatus, SidecarFrame,
+};
 pub use plugin::{
     Capability, HelloRequest, HelloResponse, HookSubscriptions, PLUGIN_KIND, PLUGIN_PROTOCOL,
     PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport,

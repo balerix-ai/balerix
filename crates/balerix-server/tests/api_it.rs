@@ -193,7 +193,8 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
     // create, conflict, get, list
     let req = json!(FleetRequest {
         spec: spec(&["a", "b"]),
-        credentials: Default::default()
+        credentials: Default::default(),
+        agent_tokens: None,
     });
     let (st, v) = admin(api.clone(), "POST", "/v1/fleets".into(), Some(req.clone())).await;
     assert_eq!(st, 200, "{v}");
@@ -233,7 +234,8 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
         .insert("V".into(), "1".into());
     let req2 = json!(FleetRequest {
         spec: changed,
-        credentials: Default::default()
+        credentials: Default::default(),
+        agent_tokens: None,
     });
     let (st, v) = admin(api.clone(), "PUT", "/v1/fleets/f".into(), Some(req2)).await;
     assert_eq!((st, v["generation"].as_u64()), (200, Some(2)));

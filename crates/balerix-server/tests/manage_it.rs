@@ -155,7 +155,8 @@ async fn a_plugin_with_manage_applies_and_downs_a_fleet_it_owns() {
     // the admin routes refuse a managed fleet; `force` takes it down
     let req = json!(FleetRequest {
         spec: spec("f"),
-        credentials: Default::default()
+        credentials: Default::default(),
+        agent_tokens: None,
     });
     let (s, v) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(
@@ -202,7 +203,8 @@ async fn a_plugin_with_manage_applies_and_downs_a_fleet_it_owns() {
     // a fleet the CLI created is not the plugin's to apply or down
     let g = json!(FleetRequest {
         spec: spec("g"),
-        credentials: Default::default()
+        credentials: Default::default(),
+        agent_tokens: None,
     });
     let (s, _) = w.api.admin("POST", "/v1/fleets", Some(&g));
     assert_eq!(s, 200);

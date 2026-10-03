@@ -392,6 +392,7 @@ fn a_purge_deletes_a_broken_clone_without_harvesting() {
     let ws = balerix_runtime::Workspace {
         tools: &rt.tools,
         gh_config_dir: None,
+        cache_is_read_only: false,
     };
     ws.ensure_clone(
         &agent.id.to_string(),

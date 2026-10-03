@@ -17,6 +17,7 @@ use balerix_core::{
 
 use crate::actor::Ports;
 use crate::daemon::{Daemon, DaemonHandler};
+use crate::kube::LinkHub;
 use crate::metrics::Metrics;
 use crate::plugins::{PluginClient, PluginKv, PluginRegistry};
 use crate::vault::Vault;
@@ -71,6 +72,9 @@ pub struct Harness {
     /// Owns the `kv` store's directory: dropped with the harness.
     pub kv_dir: tempfile::TempDir,
     pub kv: Arc<PluginKv>,
+    /// `Harness::kube`'s link hub, also `ports.runner`, `ports.workspace`
+    /// and `ports.kube`.
+    pub hub: Option<Arc<LinkHub>>,
 }
 
 impl Harness {
@@ -97,6 +101,7 @@ impl Harness {
             policy,
             hook_url: "http://127.0.0.1:1".to_string(),
             resync,
+            kube: None,
         });
         let kv_dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let kv = Arc::new(PluginKv::new(
@@ -116,7 +121,25 @@ impl Harness {
             client: PluginClient::new().unwrap_or_else(|e| panic!("http client: {e}")),
             kv_dir,
             kv,
+            hub: None,
         }
+    }
+
+    /// Kubernetes mode (Spec O §7): the runner and the workspace reader are
+    /// the link hub and `Ports.kube` is set, so actors mirror and plan
+    /// nothing. The fake materializer stays: nothing calls it.
+    pub fn kube(resync: Duration) -> Self {
+        let mut h = Self::new(resync);
+        let hub = LinkHub::new();
+        let ports = Ports {
+            runner: hub.clone(),
+            workspace: hub.clone(),
+            kube: Some(hub.clone()),
+            ..(*h.ports).clone()
+        };
+        h.ports = Arc::new(ports);
+        h.hub = Some(hub);
+        h
     }
 
     /// A daemon over these fakes with an empty fleet set.
@@ -190,17 +213,15 @@ impl Harness {
         existing: Vec<(FleetRecord, FleetSecrets)>,
         toolchain: Arc<dyn SystemToolchain>,
     ) -> Arc<Daemon> {
+        // The runner, the workspace reader and `kube` come from `self.ports`:
+        // `Harness::kube` swaps those three for the link hub.
         let ports = Ports {
             materializer: self.materializer.clone(),
-            runner: self.runner.clone(),
             clock: self.clock.clone(),
             store: self.store.clone(),
-            workspace: self.workspace.clone(),
             resolver: self.resolver.clone(),
             credentials: self.credentials.clone(),
-            policy: self.ports.policy.clone(),
-            hook_url: self.ports.hook_url.clone(),
-            resync: self.ports.resync,
+            ..(*self.ports).clone()
         };
         Daemon::start(
             ports,

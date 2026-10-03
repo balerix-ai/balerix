@@ -39,6 +39,9 @@ assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [lints]
 workspace = true

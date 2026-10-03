@@ -224,7 +224,11 @@ fn apply(args: &ApplyArgs, replace: bool) -> Result<String> {
     let (spec, credentials) = load_request(args)?;
     let client = Client::connect(args.api_url.as_deref())?;
     let name = spec.name.clone();
-    let req = FleetRequest { spec, credentials };
+    let req = FleetRequest {
+        spec,
+        credentials,
+        agent_tokens: None,
+    };
     let record = if replace {
         client.update(&req)?
     } else {

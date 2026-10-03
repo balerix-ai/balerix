@@ -12,7 +12,7 @@ use balerix_api::{
 };
 use balerix_core::{
     AgentId, AgentName, AgentRunner, EventHandler, Fleet, FleetName, FleetRecord, FleetSecrets,
-    Keep, Outcome, SystemToolchain, WorkspaceReader, is_reserved_fleet, plugin_id,
+    Keep, Outcome, ResolvedAgent, SystemToolchain, WorkspaceReader, is_reserved_fleet, plugin_id,
     reserved_fleet_reason,
 };
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
@@ -27,7 +27,7 @@ use crate::plugins::{
     PluginRegistry,
 };
 use crate::sessions::Sessions;
-use crate::system_pool::SystemPoolConfig;
+use crate::system_pool::{SystemPoolConfig, SystemPoolState};
 
 /// The chain handler's hello hook; `PassThrough` has nothing to clear.
 pub trait HelloObserver: Send + Sync {
@@ -96,11 +96,14 @@ pub enum DaemonError {
 /// the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Caller {
-    /// The admin API. `force` lets `down` take a plugin-managed fleet
-    /// (`balerix down --force`); nothing lets the admin apply one.
+    /// The admin API. `force` lets `down` take a managed fleet
+    /// (`balerix down --force`, and the operator's own `DELETE`); nothing
+    /// lets the admin apply one.
     Admin { force: bool },
     /// A plugin with `manage`, by name.
     Plugin(AgentName),
+    /// The operator (Spec O §7.3): a `PUT` carrying `agent_tokens`.
+    Kubernetes,
 }
 
 impl Caller {
@@ -108,6 +111,7 @@ impl Caller {
         match self {
             Caller::Admin { .. } => None,
             Caller::Plugin(p) => Some(p.to_string()),
+            Caller::Kubernetes => Some(crate::kube::KUBERNETES_OWNER.to_string()),
         }
     }
 }
@@ -326,6 +330,37 @@ impl Daemon {
         self.ports.workspace.clone()
     }
 
+    /// Spec O §7: the link hub, when this daemon is in Kubernetes mode.
+    pub fn kube(&self) -> Option<&Arc<crate::kube::LinkHub>> {
+        self.ports.kube.as_ref()
+    }
+
+    /// A sidecar's `status` frame, to its fleet's actor. An unknown fleet
+    /// (the operator deleted it while the pod lived) is dropped.
+    /// `first` is true for the first frame of a link (a connect or a
+    /// reconnect): the one the actor reconciles the stopped set against.
+    pub async fn link_status(&self, agent: &AgentId, status: balerix_api::LinkStatus, first: bool) {
+        if let Some(h) = self.fleets.read().await.get(&agent.fleet) {
+            let _ =
+                h.tx.send(Msg::LinkStatus {
+                    agent: agent.clone(),
+                    status,
+                    first,
+                })
+                .await;
+        }
+    }
+
+    pub async fn link_down(&self, agent: &AgentId) {
+        if let Some(h) = self.fleets.read().await.get(&agent.fleet) {
+            let _ =
+                h.tx.send(Msg::LinkDown {
+                    agent: agent.clone(),
+                })
+                .await;
+        }
+    }
+
     /// `origin/<ref>` of the agent's crew, from the fleet's record; `None`
     /// when the fleet or the crew is unknown.
     pub async fn base_ref(&self, agent: &AgentId) -> Option<String> {
@@ -360,7 +395,11 @@ impl Daemon {
             let Some(plugin) = record.owner.as_deref() else {
                 continue;
             };
-            if declared.contains(plugin) || matches!(record.desired, Desired::Down { .. }) {
+            // the operator's fleets have no plugin behind them (Spec O §7.3)
+            if plugin == crate::kube::KUBERNETES_OWNER
+                || declared.contains(plugin)
+                || matches!(record.desired, Desired::Down { .. })
+            {
                 continue;
             }
             let Ok(name) = FleetName::try_from(record.spec.name.clone()) else {
@@ -509,15 +548,23 @@ impl Daemon {
         caller: &Caller,
         downing: bool,
     ) -> Result<(), DaemonError> {
+        let managed = |p: &str| {
+            DaemonError::Managed(if p == crate::kube::KUBERNETES_OWNER {
+                format!("fleet {name} is managed by kubernetes; change it through its Fleet object")
+            } else {
+                format!("fleet {name} is managed by plugin {p}")
+            })
+        };
         match (caller, owner) {
-            (Caller::Admin { force }, Some(p)) if !(downing && *force) => Err(
-                DaemonError::Managed(format!("fleet {name} is managed by plugin {p}")),
-            ),
-            (Caller::Plugin(me), Some(p)) if p != me.as_str() => Err(DaemonError::Managed(
-                format!("fleet {name} is managed by plugin {p}"),
-            )),
+            (Caller::Admin { force }, Some(p)) if !(downing && *force) => Err(managed(p)),
+            (Caller::Plugin(me), Some(p)) if p != me.as_str() => Err(managed(p)),
             (Caller::Plugin(_), None) => Err(DaemonError::Managed(format!(
                 "fleet {name} is not managed by a plugin"
+            ))),
+            (Caller::Kubernetes, Some(p)) if p != crate::kube::KUBERNETES_OWNER => Err(managed(p)),
+            // the operator never adopts a record it did not create
+            (Caller::Kubernetes, None) => Err(DaemonError::Managed(format!(
+                "fleet {name} is not managed by kubernetes"
             ))),
             _ => Ok(()),
         }
@@ -542,8 +589,69 @@ impl Daemon {
             credentials,
             mode,
             &Caller::Admin { force: false },
+            BTreeMap::new(),
         )
         .await
+    }
+
+    /// Spec O §7.3: the operator's apply. A resolved spec plus one token
+    /// per agent, which becomes the agent's hook secret (its sidecar
+    /// presents it on the hook route and on the link). An upsert: the
+    /// operator re-sends on every reconcile. The tokens are checked
+    /// against the spec before the owner rule or any plugin is consulted.
+    pub async fn apply_kube(
+        &self,
+        name: &FleetName,
+        spec: FleetSpec,
+        agent_tokens: balerix_api::AgentTokens,
+    ) -> Result<FleetRecord, DaemonError> {
+        if self.ports.kube.is_none() {
+            return Err(DaemonError::Invalid(
+                "agent_tokens is accepted only by a daemon in kubernetes mode".into(),
+            ));
+        }
+        let fleet =
+            Fleet::try_from(spec.clone()).map_err(|e| DaemonError::Invalid(e.to_string()))?;
+        let wanted: Vec<String> = ResolvedAgent::from_fleet(&fleet)
+            .into_iter()
+            .map(|a| a.id.to_string())
+            .collect();
+        for key in &wanted {
+            match agent_tokens.get(key) {
+                None => {
+                    return Err(DaemonError::Invalid(format!(
+                        "agent_tokens: no token for {key}"
+                    )));
+                }
+                Some(t) if t.len() < 32 => {
+                    return Err(DaemonError::Invalid(format!(
+                        "agent_tokens.{key}: a token is at least 32 characters"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        for key in agent_tokens.keys() {
+            if !wanted.contains(key) {
+                return Err(DaemonError::Invalid(format!(
+                    "agent_tokens: {key} is not an agent of the fleet"
+                )));
+            }
+        }
+        self.apply_as(
+            name,
+            spec,
+            CredentialBundle::default(),
+            ApplyMode::Upsert,
+            &Caller::Kubernetes,
+            agent_tokens,
+        )
+        .await
+    }
+
+    /// Spec F's channel, for `/readyz`.
+    pub fn system_pool_state(&self) -> SystemPoolState {
+        self.shared.system_pool.borrow().clone()
     }
 
     /// `Create`: 409 unless the fleet is absent or settled `Down`.
@@ -565,6 +673,7 @@ impl Daemon {
         credentials: CredentialBundle,
         mode: ApplyMode,
         caller: &Caller,
+        agent_tokens: balerix_api::AgentTokens,
     ) -> Result<FleetRecord, DaemonError> {
         Self::reject_reserved(name)?;
         if spec.name != name.as_str() {
@@ -579,6 +688,22 @@ impl Daemon {
         // so two applies of the same fleet cannot interleave.
         let lock = self.fleet_lock(name);
         let _guard = lock.lock().await;
+        // Spec O §7.4: in Kubernetes mode a fleet runs only as pods the
+        // operator made, so the CLI's apply of a fleet the operator does
+        // not own (absent, or unowned) would wait for a `Ready` that never
+        // comes. A kubernetes- or plugin-owned one gets the owner's 409
+        // from `check_owner` below.
+        if self.ports.kube.is_some() && matches!(caller, Caller::Admin { .. }) {
+            let unowned = match self.fleets.read().await.get(name) {
+                Some(h) => h.status.borrow().owner.is_none(),
+                None => true,
+            };
+            if unowned {
+                return Err(DaemonError::Managed(
+                    "this daemon is in kubernetes mode; create a Fleet object".into(),
+                ));
+            }
+        }
         // A plugin the registry no longer lists gets nothing (#62): its
         // `PUT` may have passed `manage_fleet`'s cheap owner check before
         // the operator removed it, and `sync_plugins` replaces the plugin
@@ -755,6 +880,7 @@ impl Daemon {
             .send(Msg::Apply {
                 spec,
                 credentials,
+                agent_tokens,
                 reply,
             })
             .await
@@ -898,8 +1024,15 @@ impl Daemon {
             .await
             .map_err(|e| DaemonError::Internal(e.to_string()))?
             .map_err(DaemonError::Internal)?;
-        self.apply_as(name, spec, credentials, ApplyMode::Upsert, &caller)
-            .await
+        self.apply_as(
+            name,
+            spec,
+            credentials,
+            ApplyMode::Upsert,
+            &caller,
+            BTreeMap::new(),
+        )
+        .await
     }
 
     pub async fn get(&self, name: &FleetName) -> Option<FleetRecord> {

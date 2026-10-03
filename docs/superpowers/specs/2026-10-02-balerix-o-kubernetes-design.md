@@ -1157,8 +1157,12 @@ What 3a's plan decided beyond §20.1–§20.4, as built.
   differs fails with the config path. The CLI resolves with `Tmux`, the
   operator with `Pod`. This amends §20.2's "a Fleet resolves through
   `balerix-config` as it is … after resolving": `balerix-config` gains
-  that one option, and the operator checks nothing after resolving but
-  the object name's length. A tmux-mode daemon also refuses a posted
+  that one option, and the operator checks after resolving only what
+  Kubernetes alone can refuse, each failure with its config path: the
+  object name's length, and the pod runner's shapes (`desired::fleet::
+  check_runner`). `resources` must be a `ResourceRequirements`,
+  `tolerations` a list of `Toleration`, and `storage.size`, when
+  `storage` is set, a non-empty string; it is not parsed as a quantity. A tmux-mode daemon also refuses a posted
   `pod` runner, since it trusts what it is posted (#24); a
   Kubernetes-mode daemon checks nothing, and its tests post specs with
   the default runner.

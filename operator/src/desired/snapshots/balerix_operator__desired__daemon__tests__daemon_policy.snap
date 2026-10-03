@@ -1,0 +1,40 @@
+---
+source: src/desired/daemon.rs
+expression: o.policy
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: balerix-operator
+    balerix.ai/component: daemon
+    balerix.ai/daemon: default
+  name: balerix-default
+  namespace: team-a
+  ownerReferences:
+    - apiVersion: balerix.ai/v1alpha1
+      controller: true
+      kind: Daemon
+      name: default
+      uid: daemon-uid
+spec:
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              balerix.ai/daemon: default
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: balerix-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: balerix-operator
+      ports:
+        - port: 7643
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      balerix.ai/component: daemon
+      balerix.ai/daemon: default
+  policyTypes:
+    - Ingress

@@ -4,6 +4,7 @@
 //! reading of the cluster and the writing back.
 
 pub mod common;
+pub mod daemon;
 pub mod fleet;
 pub mod jobs;
 pub mod names;

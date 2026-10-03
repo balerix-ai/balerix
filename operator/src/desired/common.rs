@@ -2,11 +2,14 @@
 //! labels, the conditions, and `typed`, which turns a manifest written as
 //! JSON into the `k8s-openapi` type the function returns.
 
+use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::Resource;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+use crate::api::ClaimSpec;
 
 /// The server-side-apply field manager (Spec O §5).
 pub const MANAGER: &str = "balerix-operator";
@@ -98,6 +101,31 @@ pub fn owner_of<K: Resource<DynamicType = ()>>(object: &K) -> Result<Value, Desi
         .controller_owner_ref(&())
         .ok_or(DesiredError::Missing("the owner", "metadata.name and uid"))?;
     Ok(serde_json::to_value(reference)?)
+}
+
+/// A claim of `spec`'s size and class in `mode` (`ReadWriteOnce` or
+/// `ReadWriteMany`). It carries no owner reference: deleting its owner
+/// leaves the data, as a StatefulSet leaves its claims.
+pub fn claim(
+    namespace: &str,
+    name: &str,
+    labels: Value,
+    spec: &ClaimSpec,
+    mode: &str,
+) -> Result<PersistentVolumeClaim, DesiredError> {
+    let mut claim_spec = json!({
+        "accessModes": [mode],
+        "resources": { "requests": { "storage": spec.size } },
+    });
+    if let Some(class) = &spec.storage_class_name {
+        claim_spec["storageClassName"] = json!(class);
+    }
+    typed(json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": { "name": name, "namespace": namespace, "labels": labels },
+        "spec": claim_spec,
+    }))
 }
 
 /// sha256 over the value's JSON. `serde_json` keeps object keys sorted
@@ -238,6 +266,30 @@ mod tests {
         );
         assert_ne!(hash(&json!({ "a": 1 })), hash(&json!({ "a": 2 })));
         assert_eq!(hash(&json!({})).len(), 64);
+    }
+
+    #[test]
+    fn a_claim_has_its_mode_size_and_optional_class_and_no_owner() {
+        let with = ClaimSpec {
+            storage_class_name: Some("efs".into()),
+            size: "1Gi".into(),
+        };
+        let c = claim("ns", "c", json!({ "a": "b" }), &with, "ReadWriteMany").unwrap();
+        let spec = c.spec.unwrap();
+        assert_eq!(spec.access_modes, Some(vec!["ReadWriteMany".to_string()]));
+        assert_eq!(spec.storage_class_name.as_deref(), Some("efs"));
+        assert_eq!(
+            spec.resources.unwrap().requests.unwrap()["storage"].0,
+            "1Gi"
+        );
+        assert_eq!(c.metadata.namespace.as_deref(), Some("ns"));
+        assert!(c.metadata.owner_references.is_none());
+        let without = ClaimSpec {
+            storage_class_name: None,
+            size: "1Gi".into(),
+        };
+        let c = claim("ns", "c", json!({}), &without, "ReadWriteOnce").unwrap();
+        assert_eq!(c.spec.unwrap().storage_class_name, None);
     }
 
     #[test]

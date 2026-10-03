@@ -233,6 +233,7 @@ async fn plugins_sync_hello_list_and_purge() {
     let req = serde_json::to_value(FleetRequest {
         spec,
         credentials: Default::default(),
+        agent_tokens: None,
     })
     .unwrap();
     let (s, body) = api.call("POST", "/v1/fleets", admin, Some(&req));

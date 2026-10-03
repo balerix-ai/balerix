@@ -151,7 +151,8 @@ async fn activation_pending_then_active_rejection_fails_up_and_down_deactivates(
     // pending: the plugin has not said hello
     let req = json!(FleetRequest {
         spec: spec(&[("a", json!({ "v": 1 }))]),
-        credentials: Default::default()
+        credentials: Default::default(),
+        agent_tokens: None,
     });
     let (s, v) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(s, 200, "{v}");
@@ -179,7 +180,8 @@ async fn activation_pending_then_active_rejection_fails_up_and_down_deactivates(
     // a rejected activation fails the update with the config path
     let bad = json!(FleetRequest {
         spec: spec(&[("a", json!({ "v": 1 })), ("b", json!({ "reject": true }))]),
-        credentials: Default::default()
+        credentials: Default::default(),
+        agent_tokens: None,
     });
     let (s, v) = w.api.admin("PUT", "/v1/fleets/f", Some(&bad));
     assert_eq!(s, 400);
@@ -212,7 +214,8 @@ async fn activation_pending_then_active_rejection_fails_up_and_down_deactivates(
         "/v1/fleets/f",
         Some(&json!(FleetRequest {
             spec: s2,
-            credentials: Default::default()
+            credentials: Default::default(),
+            agent_tokens: None,
         })),
     );
     assert_eq!(
@@ -246,7 +249,8 @@ async fn the_chain_blocks_observers_see_and_actions_reach_the_runner() {
     let (plugin, _host) = start_flow(&w).await;
     let req = json!(FleetRequest {
         spec: spec(&[("a", json!({}))]),
-        credentials: Default::default()
+        credentials: Default::default(),
+        agent_tokens: None,
     });
     let (s, _) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(s, 200);
@@ -359,7 +363,8 @@ async fn host_routes_are_gated_by_needs_and_kv_and_actions_work() {
         "/v1/fleets",
         Some(&json!(FleetRequest {
             spec: spec(&[("a", json!({}))]),
-            credentials: Default::default()
+            credentials: Default::default(),
+            agent_tokens: None,
         })),
     );
     assert_eq!(s, 200);

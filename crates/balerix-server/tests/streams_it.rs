@@ -188,7 +188,8 @@ async fn fleets_watch_sends_the_full_list_on_every_change() {
     // an apply: the record appears, then its agent
     let req = json!(FleetRequest {
         spec: spec(&[("a", &[("flow", json!({ "v": 1 }))])]),
-        credentials: Default::default()
+        credentials: Default::default(),
+        agent_tokens: None,
     });
     let (st, _) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(st, 200);
@@ -230,7 +231,8 @@ async fn a_rejected_activation_is_a_watch_frame() {
             ("a", &[("flow", json!({ "v": 1 }))]),
             ("b", &[("flow", json!({ "v": 1 }))]),
         ]),
-        credentials: Default::default()
+        credentials: Default::default(),
+        agent_tokens: None,
     });
     let (st, v) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(st, 200, "{v}");
@@ -253,7 +255,8 @@ async fn a_rejected_activation_is_a_watch_frame() {
             ("a", &[("flow", json!({ "v": 2 }))]),
             ("b", &[("flow", json!({ "reject": true }))]),
         ]),
-        credentials: Default::default()
+        credentials: Default::default(),
+        agent_tokens: None,
     });
     let (st, v) = w.api.admin("PUT", "/v1/fleets/f", Some(&bad));
     assert_eq!(st, 400, "{v}");
@@ -278,7 +281,8 @@ async fn removing_a_plugin_is_a_watch_frame() {
     let _flow = start_silent(&w, "flow").await;
     let req = json!(FleetRequest {
         spec: spec(&[("a", &[("flow", json!({ "v": 1 }))])]),
-        credentials: Default::default()
+        credentials: Default::default(),
+        agent_tokens: None,
     });
     let (st, v) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(st, 200, "{v}");
@@ -323,7 +327,8 @@ async fn world_with_web_active() -> (World, String, Host) {
     let web_plugin = start_silent(&w, "web").await;
     let req = json!(FleetRequest {
         spec: spec(&[("a", &[("web", json!({}))]), ("b", &[])]),
-        credentials: Default::default()
+        credentials: Default::default(),
+        agent_tokens: None,
     });
     let (st, _) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(st, 200);

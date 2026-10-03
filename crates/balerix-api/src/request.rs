@@ -11,6 +11,12 @@ pub struct FleetRequest {
     pub spec: FleetSpec,
     #[serde(default)]
     pub credentials: CredentialBundle,
+    /// Spec O §7.3: the operator's `PUT` carries one token per agent
+    /// (`fleet/crew/agent` → token); the fleet is then recorded with
+    /// `owner: kubernetes`. Refused with 400 by a daemon not in
+    /// Kubernetes mode. Absent from every CLI request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_tokens: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Query flags of `DELETE /v1/fleets/{name}` (spec D6). Every flag is sent
@@ -72,10 +78,32 @@ mod tests {
                 ..Default::default()
             },
             credentials: CredentialBundle::default(),
+            agent_tokens: None,
         };
         let back: FleetRequest = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.spec, r.spec);
         assert_eq!(back.credentials.gh_token, None);
+    }
+
+    #[test]
+    fn agent_tokens_is_optional_and_absent_on_the_wire_by_default() {
+        let r = FleetRequest {
+            spec: FleetSpec {
+                name: "f".into(),
+                crews: BTreeMap::new(),
+                ..Default::default()
+            },
+            credentials: CredentialBundle::default(),
+            agent_tokens: None,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("agent_tokens").is_none());
+        let with: FleetRequest = serde_json::from_value(serde_json::json!({
+            "spec": { "name": "f" },
+            "agent_tokens": { "f/c/a": "t1" }
+        }))
+        .unwrap();
+        assert_eq!(with.agent_tokens.unwrap()["f/c/a"], "t1");
     }
 
     #[test]

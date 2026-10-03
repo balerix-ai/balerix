@@ -1,0 +1,104 @@
+---
+source: src/desired/jobs.rs
+expression: "fleet_pool_job(&c, \"payments\", &crew(\"gh\").fleet_tools).unwrap()"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    balerix.ai/input-hash: e791505a9d32449adfb87b8d0751763afc88e8ae97ddaf72652c29a710b71b81
+  labels:
+    app.kubernetes.io/managed-by: balerix-operator
+    balerix.ai/component: pool
+    balerix.ai/daemon: default
+    balerix.ai/fleet: payments
+  name: payments-pool
+  namespace: team-a
+  ownerReferences:
+    - apiVersion: balerix.ai/v1alpha1
+      controller: true
+      kind: Crew
+      name: payments-backend
+      uid: crew-uid
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: balerix-operator
+        balerix.ai/component: pool
+        balerix.ai/daemon: default
+        balerix.ai/fleet: payments
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - args:
+            - pool-sync
+            - "--level"
+            - fleet
+            - "--fleet"
+            - payments
+            - "--tool"
+            - node=22.11.0
+          command:
+            - balerix-agent
+          env:
+            - name: HOME
+              value: /balerix/scratch
+          image: "ghcr.io/balerix-ai/balerix-agent:0.2.0"
+          name: job
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - mountPath: /balerix/shared/fleet
+              name: shared
+              readOnly: false
+              subPath: fleets/payments/pool
+            - mountPath: /balerix/shared/daemon
+              name: shared
+              readOnly: true
+              subPath: pools/daemon
+            - mountPath: /balerix/scratch
+              name: scratch
+      enableServiceLinks: false
+      initContainers:
+        - command:
+            - mkdir
+            - "-p"
+            - /balerix/volume/fleets/payments/pool
+            - /balerix/volume/pools/daemon
+          image: "ghcr.io/balerix-ai/balerix-agent:0.2.0"
+          name: slice
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - mountPath: /balerix/volume
+              name: shared
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: balerix-default-shared
+        - emptyDir: {}
+          name: scratch

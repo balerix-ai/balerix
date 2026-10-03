@@ -5,4 +5,5 @@
 
 pub mod common;
 pub mod fleet;
+pub mod jobs;
 pub mod names;

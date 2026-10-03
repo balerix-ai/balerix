@@ -29,6 +29,10 @@ pub struct ResolveOptions {
     /// Spec M §12.1: refuse `restricted::REFUSED_KEYS` at each of the
     /// file's layers. Set for a plugin-applied file, never for `up`.
     pub restricted: bool,
+    /// The runner this resolution is for: `Tmux` on one machine (the
+    /// default), `Pod` for the operator (Spec O §4.2). An agent whose
+    /// `runner.type` is the other one fails with its config path.
+    pub runner: balerix_api::RunnerKind,
 }
 
 /// Resolves every agent and validates the result.
@@ -91,6 +95,20 @@ pub fn resolve(file: &FleetFile, opts: &ResolveOptions) -> Result<FleetSpec, Con
                     message: e.to_string(),
                 })?;
             validate_agent(&agent_path, &settings)?;
+            if settings.runner.kind() != opts.runner {
+                return Err(ConfigError::Invalid {
+                    path: format!("{agent_path}.runner.type"),
+                    message: match opts.runner {
+                        balerix_api::RunnerKind::Tmux => {
+                            "`pod` runs only on Kubernetes; this daemon runs agents in tmux"
+                        }
+                        balerix_api::RunnerKind::Pod => {
+                            "`tmux` is not available on Kubernetes; a Fleet's agents run as pods"
+                        }
+                    }
+                    .to_string(),
+                });
+            }
             agents.insert(agent_name.clone(), settings);
         }
         crews.insert(
@@ -146,6 +164,26 @@ mod tests {
     }
 
     const BASE: &str = "apiVersion: balerix/v1\nkind: Fleet\nname: f\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a: {}\n";
+
+    #[test]
+    fn a_runner_this_resolver_does_not_serve_fails_with_the_config_path() {
+        let pod = "apiVersion: balerix/v1\nkind: Fleet\nname: f\ndefaults:\n  runner: { type: pod }\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a: {}\n";
+        let err = resolve(&file(pod), &opts()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "crews.c.agents.a.runner.type: `pod` runs only on Kubernetes; this daemon runs agents in tmux"
+        );
+        let as_pod = ResolveOptions {
+            runner: balerix_api::RunnerKind::Pod,
+            ..opts()
+        };
+        assert!(resolve(&file(pod), &as_pod).is_ok());
+        let err = resolve(&file(BASE), &as_pod).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "crews.c.agents.a.runner.type: `tmux` is not available on Kubernetes; a Fleet's agents run as pods"
+        );
+    }
 
     #[test]
     fn name_override_beats_file_name_and_missing_name_errors() {

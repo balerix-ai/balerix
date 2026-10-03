@@ -1,0 +1,107 @@
+---
+source: src/desired/daemon.rs
+expression: o.statefulset
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: balerix-operator
+    balerix.ai/component: daemon
+    balerix.ai/daemon: default
+  name: balerix-default
+  namespace: team-a
+  ownerReferences:
+    - apiVersion: balerix.ai/v1alpha1
+      controller: true
+      kind: Daemon
+      name: default
+      uid: daemon-uid
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      balerix.ai/component: daemon
+      balerix.ai/daemon: default
+  serviceName: balerix-default
+  template:
+    metadata:
+      annotations:
+        balerix.ai/not-after: "1807776000"
+      labels:
+        app.kubernetes.io/managed-by: balerix-operator
+        balerix.ai/component: daemon
+        balerix.ai/daemon: default
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - args:
+            - serve
+            - "--mode"
+            - kubernetes
+            - "--bind"
+            - "0.0.0.0:7643"
+            - "--tls-cert"
+            - /balerix/tls/tls.crt
+            - "--tls-key"
+            - /balerix/tls/tls.key
+            - "--admin-token-file"
+            - /balerix/admin/token
+          command:
+            - balerix
+          env:
+            - name: HOME
+              value: /balerix/state
+          image: "ghcr.io/balerix-ai/balerix:0.2.0"
+          name: daemon
+          ports:
+            - containerPort: 7643
+              name: https
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - mountPath: /balerix/state
+              name: state
+            - mountPath: /balerix/tls
+              name: tls
+              readOnly: true
+            - mountPath: /balerix/admin
+              name: admin
+              readOnly: true
+      enableServiceLinks: false
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: balerix-default-state
+        - name: tls
+          secret:
+            defaultMode: 288
+            secretName: balerix-default-tls
+        - name: admin
+          secret:
+            defaultMode: 288
+            secretName: balerix-default-admin

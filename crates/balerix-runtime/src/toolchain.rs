@@ -332,6 +332,23 @@ impl Toolchain<'_> {
     }
 }
 
+/// Drops a marker whose pool directory is gone, so `install_level` cannot
+/// short-circuit past it and report an empty directory as installed (Spec
+/// F, F-5). Does nothing while the pool exists.
+pub fn drop_stale_marker(id: &str, pool: &Path, marker: &Path) -> Result<(), MaterializeError> {
+    if !pool.exists()
+        && let Err(e) = std::fs::remove_file(marker)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(MaterializeError::Io {
+            id: id.to_string(),
+            path: marker.to_path_buf(),
+            message: e.to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

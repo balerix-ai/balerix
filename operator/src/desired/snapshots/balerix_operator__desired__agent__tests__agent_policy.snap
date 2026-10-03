@@ -1,0 +1,31 @@
+---
+source: src/desired/agent.rs
+expression: o.policy
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: balerix-operator
+    balerix.ai/agent: alice
+    balerix.ai/component: agent
+    balerix.ai/crew: backend
+    balerix.ai/daemon: default
+    balerix.ai/fleet: payments
+  name: payments-backend-alice
+  namespace: team-a
+  ownerReferences:
+    - apiVersion: balerix.ai/v1alpha1
+      controller: true
+      kind: Agent
+      name: payments-backend-alice
+      uid: agent-uid
+spec:
+  ingress: []
+  podSelector:
+    matchLabels:
+      balerix.ai/agent: alice
+      balerix.ai/crew: backend
+      balerix.ai/fleet: payments
+  policyTypes:
+    - Ingress

@@ -94,3 +94,36 @@ fn an_xdg_layout_has_no_pod() {
     );
     assert_eq!(layout.mise_data_dir(), PathBuf::from("/d/mise"));
 }
+
+#[test]
+fn crew_logs_follow_the_layout_and_the_git_profile_is_a_field() {
+    let id: AgentId = "payments/backend/alice".parse().unwrap();
+    let pod = StateLayout::pod(mounts(), &id);
+    assert_eq!(
+        pod.crew(&id.crew_ref()).logs,
+        PathBuf::from("/balerix/agent/.balerix/state/crew-logs"),
+        "the crew root is a read-only mount in a pod"
+    );
+    assert_eq!(
+        pod.agent(&id).git_profile,
+        PathBuf::from("/balerix/agent/nono-git-profile.json")
+    );
+    let xdg = StateLayout::xdg("/s".into(), "/d".into(), "/c".into());
+    let crew = xdg.crew(&id.crew_ref());
+    assert_eq!(crew.logs, crew.root.join("logs"));
+}
+
+#[test]
+fn a_shared_slice_is_the_pods_view_without_an_agent() {
+    use balerix_runtime::layout::SharedSlice;
+    let id: AgentId = "payments/backend/alice".parse().unwrap();
+    let pod = StateLayout::pod(mounts(), &id);
+    let slice = SharedSlice::new("/balerix/shared");
+    let crew = slice.crew();
+    assert_eq!(crew.repo, pod.crew(&id.crew_ref()).repo);
+    assert_eq!(crew.root, pod.crew(&id.crew_ref()).root);
+    assert_eq!(crew.logs, PathBuf::from("/balerix/shared/crew/logs"));
+    assert_eq!(slice.fleet().mise_pool(), pod.fleet(&id.fleet).mise_pool());
+    assert_eq!(slice.daemon_pool(), pod.mise_data_dir());
+    assert_eq!(slice.daemon_root(), PathBuf::from("/balerix/shared/daemon"));
+}

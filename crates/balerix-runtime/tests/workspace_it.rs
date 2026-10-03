@@ -2108,6 +2108,45 @@ fn a_cache_whose_pin_failed_is_removed_and_made_again() {
     assert_eq!(git(&crew.repo, &["config", "gc.auto"]).trim(), "0");
 }
 
+/// Spec O §20.3: in a Job the cache directory is a mount point, which can
+/// be emptied and never removed. A cache whose making failed half-way is
+/// emptied, git's own error is the one reported, and the next run makes it.
+#[test]
+fn a_half_made_cache_in_a_directory_that_cannot_be_removed_is_emptied() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-cache-mountpoint");
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let crew = layout.crew(&"f/c".parse().unwrap());
+    std::fs::create_dir_all(&crew.repo).unwrap();
+    // the parent refuses the rmdir, as a mount point's does
+    std::fs::set_permissions(&crew.root, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let broken = failing_git(&root, &tools, "config");
+    let e = Workspace {
+        tools: &broken,
+        gh_config_dir: None,
+        cache_is_read_only: false,
+    }
+    .ensure_repo("f/c", &crew, &repo, "main")
+    .unwrap_err()
+    .to_string();
+    let made = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+        cache_is_read_only: false,
+    }
+    .ensure_repo("f/c", &crew, &repo, "main");
+    std::fs::set_permissions(&crew.root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(e.contains("config refused"), "{e}");
+    assert!(!e.contains("removing what it left behind failed"), "{e}");
+    made.unwrap();
+    assert_eq!(git(&crew.repo, &["config", "gc.auto"]).trim(), "0");
+}
+
 /// #74: a clone whose HEAD git cannot read, with no marker to fall back
 /// on, is not "detached": the removal fails and keeps the clone.
 #[test]
@@ -2265,7 +2304,7 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
         .unwrap();
     assert!(
-        !paths.git_profile().exists(),
+        !paths.git_profile.exists(),
         "a fresh clone needs no git profile: the agent has not touched it"
     );
     std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();
@@ -2274,7 +2313,7 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
     let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
 
     // whatever sits at the profile's path is replaced before use
-    std::fs::write(paths.git_profile(), "{\"filesystem\":{\"allow\":[\"/\"]}}").unwrap();
+    std::fs::write(&paths.git_profile, "{\"filesystem\":{\"allow\":[\"/\"]}}").unwrap();
     ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap();
 
     assert_eq!(
@@ -2283,12 +2322,12 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
         "the harvest still works through the sandbox"
     );
     let profile: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(paths.git_profile()).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(&paths.git_profile).unwrap()).unwrap();
     assert!(profile["filesystem"].get("allow").is_none(), "{profile}");
     assert_eq!(profile["network"]["block"], true);
 
     let log = std::fs::read_to_string(crew.root.join("logs/git.log")).unwrap();
-    let profile_arg = format!("run --profile {}", paths.git_profile().display());
+    let profile_arg = format!("run --profile {}", paths.git_profile.display());
     let in_clone: Vec<&str> = log
         .lines()
         .filter(|l| l.starts_with("$ ") && l.contains(&paths.workspace.display().to_string()))

@@ -1,0 +1,94 @@
+---
+source: src/desired/jobs.rs
+expression: daemon_pool_job(&c).unwrap()
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    balerix.ai/input-hash: 8660da38be09abe989d2a68b2da1ba7b2e0f838683b0fb82da800bb89a70529e
+  labels:
+    app.kubernetes.io/managed-by: balerix-operator
+    balerix.ai/component: pool
+    balerix.ai/daemon: default
+  name: balerix-default-pool
+  namespace: team-a
+  ownerReferences:
+    - apiVersion: balerix.ai/v1alpha1
+      controller: true
+      kind: Crew
+      name: payments-backend
+      uid: crew-uid
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: balerix-operator
+        balerix.ai/component: pool
+        balerix.ai/daemon: default
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - args:
+            - pool-sync
+            - "--level"
+            - daemon
+          command:
+            - balerix-agent
+          env:
+            - name: HOME
+              value: /balerix/scratch
+          image: "ghcr.io/balerix-ai/balerix-agent:0.2.0"
+          name: job
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - mountPath: /balerix/shared/daemon
+              name: shared
+              readOnly: false
+              subPath: pools/daemon
+            - mountPath: /balerix/scratch
+              name: scratch
+      enableServiceLinks: false
+      initContainers:
+        - command:
+            - mkdir
+            - "-p"
+            - /balerix/volume/pools/daemon
+          image: "ghcr.io/balerix-ai/balerix-agent:0.2.0"
+          name: slice
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          terminationMessagePolicy: FallbackToLogsOnError
+          volumeMounts:
+            - mountPath: /balerix/volume
+              name: shared
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: balerix-default-shared
+        - emptyDir: {}
+          name: scratch

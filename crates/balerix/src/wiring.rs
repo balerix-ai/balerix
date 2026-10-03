@@ -63,6 +63,7 @@ pub fn resolve_file(
             host_claude_settings: defaults.claude_settings.clone(),
             operator_layer: Some(layer.clone()),
             restricted: true,
+            runner: Default::default(),
         },
     )
     .map_err(|e| e.to_string())?;

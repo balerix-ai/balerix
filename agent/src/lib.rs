@@ -9,6 +9,7 @@ pub mod attach;
 pub mod bundle;
 pub mod cli;
 pub mod hooks;
+pub mod jobs;
 pub mod link;
 pub mod run;
 pub mod sidecar;

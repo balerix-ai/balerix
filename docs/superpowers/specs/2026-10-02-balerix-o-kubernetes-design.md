@@ -3,7 +3,7 @@
 **Date:** 2026-10-02
 **Status:** Design approved in brainstorm 2026-10-02; written spec approved
 2026-10-02; the spike's findings recorded in §19; sub-project 2 decisions
-in §7.4
+in §7.4; sub-project 3a decisions in §20
 **Scope:** running balerix on Kubernetes. A `balerix-operator` reconciles
 five custom resources (Daemon, Fleet, Crew, Agent, Plugin) into pods,
 claims, Secrets and Jobs. Each Daemon object is a `balerix serve` instance
@@ -593,8 +593,9 @@ the harvest.
 
 `balerix-agent crew-sync`, with the shared volume read-write and the
 GitHub token mounted: fetches the crew cache (`ensure_repo`, `gc.auto=0`,
-`--no-auto-gc`) and installs the fleet and crew pools. The Daemon-level Job
-installs `pools/daemon` the same way. A failure sets `CacheReady=False` or
+`--no-auto-gc`) and installs the crew pool. The fleet pool and the
+Daemon's `pools/daemon` are each installed by a Job of their own,
+`balerix-agent pool-sync` (§20.3). A failure sets `CacheReady=False` or
 `ToolsReady=False` with the tool's message and is retried with back-off;
 the crew's agents wait.
 
@@ -725,9 +726,11 @@ operator/                     standalone project, own Cargo.lock
   src/desired/                pure: observed objects → desired objects
   src/controllers/            one module per kind
   src/daemon_client.rs        the Daemon admin API
+  src/pki.rs                  the per-Daemon authority and serving certificates
+  crds/                       generated definitions, until the chart holds them (§20.2)
   src/main.rs                 run | crds
 agent/                        standalone project, own Cargo.lock
-  src/{cli,bundle,tls,hooks,link,attach,sidecar,state,run}.rs; crew_sync.rs, harvest.rs (the Jobs, §8.3, §8.4)
+  src/{cli,bundle,tls,hooks,link,attach,sidecar,state,run}.rs; crew_sync.rs, pool_sync.rs, harvest.rs (the Jobs, §8.3, §8.4)
 crates/balerix-server/src/kube/   link.rs (LinkHub), plugins route, managed-fleets list
   kube/{link,pty,idle,tls}.rs
 crates/balerix-api            link frames, the plugins request, the manifest in hello
@@ -895,7 +898,7 @@ Each gets its own plan.
    TLS. Done when the two-process integration tests pass. Done 2026-10
    (PR #125).
 3. **Operator and CRDs.** §4, §5, §8. Done when `e2e-k8s` passes without
-   plugins.
+   plugins. Built as two plans, 3a without a cluster and 3b on one (§20).
 4. **Plugins.** §9. Done when `e2e-k8s` passes with flow and web, and the
    managed journey passes with `dev fake-plugin`.
 5. **Release and charts.** §13, §14. Done when a fork rehearsal publishes
@@ -1027,3 +1030,117 @@ NFS class was not exercised, since NFS never provisioned.
   denied Landlock only through a seccomp profile.
 
 Every planned row has a verdict.
+
+## 20. Decided in sub-project 3a (2026-10)
+
+Sub-project 3 is built as two plans, split at the cluster. This host has
+no container runtime, so no `kind`, and the k3s tenant cluster allows no
+cluster-scoped object, so no CustomResourceDefinition: whatever needs a
+cluster is verified in CI only. 3a is the part that needs none.
+
+### 20.1 The cut
+
+- **3a, no cluster:** the `operator/` project, the five kinds and the
+  `crds` command, every `desired` function, the `pki` module, the Daemon
+  client, and the Jobs' commands in `agent/` (`crew-sync`, `pool-sync`,
+  `harvest`). Done when `mise run operator` and `mise run agent` pass,
+  `balerix-operator crds` prints five documents, and `mise run check`
+  passes with the tmux mode unchanged.
+- **3b, on a cluster:** the controllers and `balerix-operator run`,
+  `docker/operator` and `docker/agent`, the `kind` setup with the
+  ReadWriteMany class (§19.3), and `e2e-k8s`. Done when `e2e-k8s` passes
+  without plugins, which is §17's condition for sub-project 3.
+
+In 3a the binary has `crds` only; `run` arrives with the controllers.
+
+### 20.2 The operator project
+
+- **Five kinds from the start.** The Plugin kind (§4.5) is defined and its
+  definition generated in 3a; its controller (§5.5) and `PUT /v1/plugins`
+  stay in sub-project 4. Until then the Daemon's `desired` function sets
+  `PluginsReady=True` for an empty `spec.plugins` and `PluginsReady=False`,
+  reason `PluginsUnsupported`, for any other: a Daemon never reports
+  `Ready` over a plugin list nothing acts on. Sub-project 4 replaces that
+  branch.
+- **Generated definitions live in `operator/crds/`** until sub-project 5
+  moves them into the chart (§14.1). `mise run crds` regenerates them; CI
+  fails when the committed files differ.
+- **`desired` returns typed objects.** Each function takes the observed
+  objects and returns `k8s-openapi` objects and the status conditions:
+  Daemon to claims, StatefulSet, Service, pool Job and NetworkPolicies;
+  Fleet to Crews, Agents and the `PUT` body; Crew to its sync Job; Agent
+  to claim, bundle Secret, NetworkPolicy, Pod and harvest Job; Pod state
+  to the Agent's conditions.
+- **Nothing random is made in `desired`.** Tokens and certificates are
+  observed inputs: the controller reads them from their Secrets, or mints
+  them and writes the Secret first. `src/pki.rs` makes the per-Daemon
+  authority and the serving certificates (§10.3) with `rcgen` and decides
+  renewal from a clock it is given.
+- **A Fleet resolves through `balerix-config` as it is.** The Fleet's
+  `spec` becomes a `FleetFile` through `file::from_value`, with
+  `metadata.name` as the name. The Daemon's `defaults` go in as
+  `ResolveOptions::operator_layer`, with `runner: { type: pod }` beneath
+  them, which is how an omitted `runner.type` is `pod`. After resolving,
+  an agent whose runner is `tmux`, and a `<fleet>-<crew>-<agent>` over 63
+  characters, fail with the config path.
+- **`src/daemon_client.rs`** speaks §7.4's routes: `PUT /v1/fleets/{name}`
+  with `agent_tokens`, `DELETE …?force=true`, the fleet's status and
+  `GET /readyz`. It trusts only the authority it is given.
+- New dependencies, all in `operator/`'s own manifest: `kube`,
+  `k8s-openapi`, `schemars`, `rcgen`. The plan pins the exact versions it
+  has probed.
+
+### 20.3 Outside `operator/`
+
+- **`RunnerSettings` gains `Pod`** with `resources`, `storage`,
+  `nodeSelector` and `tolerations`. In `balerix-api` the Kubernetes shapes
+  are opaque JSON, so `k8s-openapi` stays out of the core workspace; the
+  operator gives them their types when it builds the Pod. A tmux-mode
+  daemon refuses a `pod` runner with the config path.
+- **The Jobs see the shared volume as the agent pod does.** They mount
+  the same sub-paths at the same places (`repo`, `crew`, `fleet`,
+  `daemon` under `/balerix/shared`), read-write where the pod has them
+  read-only. A clone made in a pod names
+  `/balerix/shared/repo/.git/objects` in its `alternates`, and
+  `check_clone` accepts only the line naming the crew cache, so the
+  harvest must see the cache at that path; a pool is likewise read at the
+  path it was installed at. The pod layout is widened to a crew with no
+  agent. §8.1's directory names are the operator's sub-path mapping;
+  nothing in `balerix-runtime` knows them, and a Job reaches only its own
+  crew's slice.
+- **`balerix-agent crew-sync`** makes the crew cache or fetches `ref`
+  into it, creates the crew's `no-hooks` directory, and installs the crew
+  pool with the fleet and daemon pools as read-only parents. On success
+  its termination message is the commit fetched (`cacheRef`); a failure's
+  message starts with `cache:` or `tools:`, which is how the operator
+  picks `CacheReady` or `ToolsReady`.
+- **`balerix-agent pool-sync --level daemon|fleet`** installs one upper
+  pool. This amends §8.3, where each crew's Job installed the fleet pool:
+  two crews of one fleet would write that pool at once, and §5.3's lock is
+  per crew. The fleet pool has a Job of its own, run before the crews'.
+- **`balerix-agent harvest`** is §8.4 through a harvest-only entry point
+  split from `harvest_and_remove`, which keeps its behaviour on one
+  machine. The entry point removes nothing (the operator deletes the
+  claim) and writes its git profile to a scratch directory, since the
+  claim is mounted read-only.
+- **The sidecar writes nothing under the crew root**, which is a
+  read-only mount in a pod: its git log moves to the agent claim, and
+  `no-hooks` is `crew-sync`'s to create. Left open by sub-project 2's
+  review; `e2e-k8s` cannot pass without it.
+
+### 20.4 Testing in 3a
+
+- insta snapshots of every `desired` function, and the property test of
+  §15: a Fleet's `spec` resolves to what the same content resolves to as
+  a fleet file.
+- `pki`: issuance, the chain a client verifies, and renewal against a
+  given clock.
+- The Daemon client against a stub, and against a real
+  `balerix serve --mode kubernetes` over TLS for the 400 and the 409s of
+  §7.4. `mise run operator` therefore builds `balerix` first, as
+  `mise run agent` does.
+- The Jobs against temp roots with the real git, mise and nono under
+  `BALERIX_REQUIRE_TOOLS`, reusing Spec N's cases: a nono that cannot run
+  fails the harvest, and a harvest leaves the claim byte for byte as it
+  found it.
+- CI gains an `operator` job beside `agent`.

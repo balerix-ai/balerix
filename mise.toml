@@ -34,6 +34,7 @@ run = [
   "scripts/plugin.sh fmt web",
   "scripts/plugin.sh fmt matrix",
   "scripts/plugin.sh fmt github",
+  "scripts/agent.sh fmt",
 ]
 
 [tasks.lint]
@@ -77,6 +78,10 @@ run = [
   "scripts/plugin.sh check github",
 ]
 
+[tasks.agent]
+description = "Lint and test the standalone agent project (balerix-agent, Spec O §12): builds balerix first for its two-process tests. Its own tier; not part of `check`"
+run = "scripts/agent.sh check"
+
 [tasks.check]
 description = "Everything the PR tier runs"
 depends = ["lint", "test"]
@@ -103,6 +108,8 @@ run = [
   "cargo deny --manifest-path plugins/matrix/Cargo.toml check advisories bans sources licenses",
   "cargo audit --file plugins/github/Cargo.lock",
   "cargo deny --manifest-path plugins/github/Cargo.toml check advisories bans sources licenses",
+  "cargo audit --file agent/Cargo.lock",
+  "cargo deny --manifest-path agent/Cargo.toml check advisories bans sources licenses",
 ]
 
 [tasks.mutants]

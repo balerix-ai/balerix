@@ -4,3 +4,4 @@
 mutants.out/
 plugins/*/target
 .claude/worktrees/
+agent/target

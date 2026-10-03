@@ -1,0 +1,72 @@
+# A standalone project, not a workspace member (Spec H, Spec O-12): its
+# TLS stack, WebSocket client and their trees stay out of the core
+# workspace's feature resolution. Reaches the core crates by path.
+[workspace]
+resolver = "3"
+
+[package]
+name = "balerix-agent"
+description = "The balerix agent pod: the sidecar that materialises and drives one agent, and the agent container's entrypoint (Spec O §6, §7)"
+# The core version (O-13): scripts/release/prepare.sh writes it with the
+# other core manifests once sub-project 5 lands.
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/balerix-ai/balerix"
+publish = false
+
+[lib]
+name = "balerix_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "balerix-agent"
+path = "src/main.rs"
+
+[dependencies]
+balerix-api = { path = "../crates/balerix-api" }
+balerix-core = { path = "../crates/balerix-core" }
+balerix-runtime = { path = "../crates/balerix-runtime" }
+# Error context on the entrypoints' failures, printed as the exit reason.
+anyhow = "1.0.104"
+# The command line: `sidecar` and `run` with the pod's mount defaults.
+clap = { version = "4.6.6", features = ["derive"] }
+# The agent bundle (Spec O §5.4) and the link's frames (§7.2).
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# `run`'s signal wait; the sidecar's listener, link and forwarder.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "fs"] }
+# The hook listener on 127.0.0.1 (§7.1): plain HTTP, as the daemon's own
+# ingress is on one machine. `ws` for the tests' fake Daemon.
+axum = { version = "0.8.9", features = ["ws"] }
+# The hook forwarder to the Daemon (§7.1) over TLS from the mounted
+# authority (§10.3): rustls with no provider of its own, ring below.
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+# The link (§7.2). `rustls-tls-webpki-roots` is the feature that enables
+# `Connector::Rustls`; the bundled roots go unused, since the Daemon's
+# authority is the only one trusted.
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+# Structured logs on stderr, the container's log stream.
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+# a throwaway authority for the two-process TLS test
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+# a scratch directory for the CLI tests' termination log
+tempfile = "3.27.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+strip = true

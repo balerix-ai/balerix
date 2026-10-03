@@ -1,0 +1,88 @@
+# A standalone project, not a workspace member (Spec H, Spec O-12): kube,
+# k8s-openapi and their trees stay out of the core workspace's feature
+# resolution. Reaches the core crates by path.
+[workspace]
+resolver = "3"
+
+[package]
+name = "balerix-operator"
+description = "The balerix operator: five custom resources reconciled into pods, claims, Secrets and Jobs (Spec O §4, §5)"
+# The core version (O-13): scripts/release/prepare.sh writes it with the
+# other core manifests once sub-project 5 lands.
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/balerix-ai/balerix"
+publish = false
+
+[lib]
+name = "balerix_operator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "balerix-operator"
+path = "src/main.rs"
+
+[dependencies]
+# The core crates, by path: the wire types, the reconciler's vocabulary and
+# the settings the Fleet's layers resolve with.
+balerix-api = { path = "../crates/balerix-api" }
+balerix-core = { path = "../crates/balerix-core" }
+balerix-config = { path = "../crates/balerix-config" }
+# Error context on the entrypoint's failures.
+anyhow = "1.0.104"
+# The command line: `crds` now, `run` with the controllers (sub-project 3b).
+clap = { version = "4.6.6", features = ["derive"] }
+# The CustomResource derive and the CRD type only: no client, no runtime
+# until the controllers exist, which keeps hyper and tower out for now.
+kube = { version = "4.2.0", default-features = false, features = ["derive"] }
+# Typed Pods, Jobs, claims and policies. `v1_32` is the oldest API this
+# release offers; `schemars` so `Condition` can sit in a status schema.
+k8s-openapi = { version = "0.28.0", features = ["v1_32", "schemars"] }
+# The kinds' OpenAPI schemas; the version kube 4.2 derives against.
+schemars = "1.2.2"
+# The kinds' spec and status types, and the opaque JSON layers in them.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# The generated CRD files, in the YAML crate the core already uses.
+serde_norway = "0.9.42"
+# Typed errors for the library modules.
+thiserror = "2.0.20"
+# specHash and the Jobs' input hash.
+sha2 = "0.11.0"
+hex = "0.4.3"
+# Tokens (agent, admin): 32 random bytes, as the daemon's vault mints them.
+rand = "0.10.2"
+# The per-Daemon authority and serving certificates (Spec O §10.3).
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+# rcgen's validity dates.
+time = "0.3.55"
+# The Daemon admin API over TLS from the Daemon's own authority (§10.3):
+# rustls with no provider of its own, ring below. The same stack as agent/.
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+# The client's async calls, and their tests.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net"] }
+
+[dev-dependencies]
+# every `desired` function is pinned by a YAML snapshot (Spec O §15)
+insta = { version = "1.48.0", features = ["yaml"] }
+# a Fleet's spec resolves as the same content does as a file (§15)
+proptest = "1.11.0"
+# the stub Daemon the client tests talk to
+axum = "0.8.9"
+# scratch directories for the tests that write files
+tempfile = "3.27.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+strip = true

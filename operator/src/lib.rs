@@ -5,3 +5,5 @@
 //! sub-project 3b.
 
 pub mod api;
+pub mod desired;
+pub mod pki;

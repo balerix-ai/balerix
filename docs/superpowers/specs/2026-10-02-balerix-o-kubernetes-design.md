@@ -892,7 +892,8 @@ Each gets its own plan.
    class on `kind` for CI. Output: answers, and §6.4's fallback taken or
    not. Done; see §19 — §19.4 for the managed cluster.
 2. **Daemon mode and sidecar.** §6, §7, the pod layout in `StateLayout`,
-   TLS. Done when the two-process integration tests pass.
+   TLS. Done when the two-process integration tests pass. Done 2026-10
+   (PR #125).
 3. **Operator and CRDs.** §4, §5, §8. Done when `e2e-k8s` passes without
    plugins.
 4. **Plugins.** §9. Done when `e2e-k8s` passes with flow and web, and the

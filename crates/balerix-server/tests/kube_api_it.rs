@@ -280,11 +280,15 @@ async fn readyz_follows_the_pool_channel() {
     assert_eq!((status, body), (200, Value::String("ready".into())));
 }
 
-async fn link(
-    port: u16,
-    token: &str,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let mut req = format!("ws://127.0.0.1:{port}/v1/agents/f/c/a/link")
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn link(port: u16, token: &str) -> Ws {
+    link_as(port, "f/c/a", token).await
+}
+
+async fn link_as(port: u16, agent: &str, token: &str) -> Ws {
+    let mut req = format!("ws://127.0.0.1:{port}/v1/agents/{agent}/link")
         .into_client_request()
         .unwrap();
     req.headers_mut()
@@ -472,4 +476,149 @@ async fn a_sidecar_that_links_after_a_down_is_told_to_stop() {
     let record = w.daemon.get(&name).await.unwrap();
     assert!(record.is_down());
     assert!(record.status.agents.is_empty());
+}
+
+/// No text frame (a request) reaches the fake within `wait`; pings are
+/// the hub's and do not count.
+async fn assert_no_request(ws: &mut Ws, wait: Duration) {
+    let quiet = tokio::time::timeout(wait, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                other => return other,
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "a frame arrived: {quiet:?}");
+}
+
+/// The stopped set is reconciled on a link's first status frame only: on
+/// a live link, the `Stopped` report of a restart's own stop can land
+/// after the resume, and correcting it would send a second `restart`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_status_on_a_live_link_is_mirrored_not_corrected() {
+    let h = Harness::kube(Duration::from_secs(3600));
+    let w = world(&h).await;
+    let name = "f".parse().unwrap();
+    let id: AgentId = "f/c/a".parse().unwrap();
+    w.daemon
+        .apply_kube(
+            &name,
+            spec(),
+            BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+        )
+        .await
+        .unwrap();
+    let mut ws = link(w.port, TOKEN).await;
+    ws.send(status_frame(AgentPhase::Ready)).await.unwrap();
+    wait_for(async || {
+        w.daemon.get(&name).await.unwrap().status.agents["f/c/a"].phase == AgentPhase::Ready
+    })
+    .await;
+
+    let (d, i) = (w.daemon.clone(), id.clone());
+    let action =
+        tokio::spawn(async move { d.execute_action(&i, &PluginAction::Restart, None).await });
+    let req = next_request(&mut ws).await;
+    assert_eq!(req.op, LinkOp::Stop);
+    reply_ok(&mut ws, req.id).await;
+    let req = next_request(&mut ws).await;
+    assert_eq!(req.op, LinkOp::Restart);
+    reply_ok(&mut ws, req.id).await;
+    action.await.unwrap().unwrap();
+
+    // the stop's own report, late: mirrored, and nothing is sent
+    ws.send(status_frame(AgentPhase::Stopped)).await.unwrap();
+    wait_for(async || {
+        w.daemon.get(&name).await.unwrap().status.agents["f/c/a"].phase == AgentPhase::Stopped
+    })
+    .await;
+    assert_no_request(&mut ws, Duration::from_millis(500)).await;
+}
+
+/// `sync_plugins` downs a fleet whose plugin is not declared; the
+/// operator is not a plugin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plugin_sync_leaves_a_kubernetes_fleet_up() {
+    let h = Harness::kube(Duration::from_secs(3600));
+    let w = world(&h).await;
+    let name = "f".parse().unwrap();
+    w.daemon
+        .apply_kube(
+            &name,
+            spec(),
+            BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+        )
+        .await
+        .unwrap();
+    let report = w.daemon.sync_plugins().await.unwrap();
+    assert!(report.downed.is_empty(), "{report:?}");
+    let record = w.daemon.get(&name).await.unwrap();
+    assert_eq!(record.desired, balerix_api::Desired::Up);
+}
+
+/// An agent the operator's `PUT` drops leaves the status, and a status
+/// frame its still-open link sends afterwards is ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_agent_leaves_the_status_and_its_frames_are_ignored() {
+    const TOKEN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let h = Harness::kube(Duration::from_secs(3600));
+    let w = world(&h).await;
+    let name = "f".parse().unwrap();
+    let mut two = spec();
+    two.crews
+        .get_mut("c")
+        .unwrap()
+        .agents
+        .insert("b".to_string(), AgentSettings::default());
+    w.daemon
+        .apply_kube(
+            &name,
+            two,
+            BTreeMap::from([
+                ("f/c/a".to_string(), TOKEN.to_string()),
+                ("f/c/b".to_string(), TOKEN_B.to_string()),
+            ]),
+        )
+        .await
+        .unwrap();
+    let mut ws_b = link_as(w.port, "f/c/b", TOKEN_B).await;
+    ws_b.send(status_frame(AgentPhase::Ready)).await.unwrap();
+    wait_for(async || {
+        w.daemon.get(&name).await.unwrap().status.agents["f/c/b"].phase == AgentPhase::Ready
+    })
+    .await;
+
+    let record = w
+        .daemon
+        .apply_kube(
+            &name,
+            spec(),
+            BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !record.status.agents.contains_key("f/c/b"),
+        "{:?}",
+        record.status.agents
+    );
+
+    ws_b.send(status_frame(AgentPhase::Ready)).await.unwrap();
+    // a frame on the remaining agent's link is a barrier: the actor
+    // handles its inbox in order
+    let mut ws_a = link(w.port, TOKEN).await;
+    ws_a.send(status_frame(AgentPhase::Ready)).await.unwrap();
+    wait_for(async || {
+        w.daemon.get(&name).await.unwrap().status.agents["f/c/a"].phase == AgentPhase::Ready
+    })
+    .await;
+    let record = w.daemon.get(&name).await.unwrap();
+    assert!(
+        !record.status.agents.contains_key("f/c/b"),
+        "{:?}",
+        record.status.agents
+    );
+    assert_eq!(record.status.phase, FleetPhase::Ready);
 }

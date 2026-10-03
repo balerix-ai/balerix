@@ -337,12 +337,15 @@ impl Daemon {
 
     /// A sidecar's `status` frame, to its fleet's actor. An unknown fleet
     /// (the operator deleted it while the pod lived) is dropped.
-    pub async fn link_status(&self, agent: &AgentId, status: balerix_api::LinkStatus) {
+    /// `first` is true for the first frame of a link (a connect or a
+    /// reconnect): the one the actor reconciles the stopped set against.
+    pub async fn link_status(&self, agent: &AgentId, status: balerix_api::LinkStatus, first: bool) {
         if let Some(h) = self.fleets.read().await.get(&agent.fleet) {
             let _ =
                 h.tx.send(Msg::LinkStatus {
                     agent: agent.clone(),
                     status,
+                    first,
                 })
                 .await;
         }
@@ -392,7 +395,11 @@ impl Daemon {
             let Some(plugin) = record.owner.as_deref() else {
                 continue;
             };
-            if declared.contains(plugin) || matches!(record.desired, Desired::Down { .. }) {
+            // the operator's fleets have no plugin behind them (Spec O §7.3)
+            if plugin == crate::kube::KUBERNETES_OWNER
+                || declared.contains(plugin)
+                || matches!(record.desired, Desired::Down { .. })
+            {
                 continue;
             }
             let Ok(name) = FleetName::try_from(record.spec.name.clone()) else {

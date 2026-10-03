@@ -60,9 +60,12 @@ pub enum Msg {
         at: Timestamp,
     },
     /// Spec O §7.2: a sidecar's `status` frame; the Daemon mirrors it.
+    /// `first` marks a link's first frame (a connect or a reconnect), the
+    /// only one reconciled against the stopped set.
     LinkStatus {
         agent: AgentId,
         status: balerix_api::LinkStatus,
+        first: bool,
     },
     /// The sidecar's link closed and no newer one replaced it.
     LinkDown { agent: AgentId },
@@ -271,7 +274,11 @@ impl Actor {
                     let _ = reply.send(self.record.clone());
                 }
                 Some(Msg::Event { agent, name, at }) => self.event(agent, name, at).await,
-                Some(Msg::LinkStatus { agent, status }) => self.link_status(agent, status).await,
+                Some(Msg::LinkStatus {
+                    agent,
+                    status,
+                    first,
+                }) => self.link_status(agent, status, first).await,
                 Some(Msg::LinkDown { agent }) => {
                     if let Some(a) = self.record.status.agents.get_mut(&agent.to_string()) {
                         a.message = "link down".to_string();
@@ -362,8 +369,12 @@ impl Actor {
         }
         self.secrets.hook_secrets = next;
         // Kubernetes mode: every wanted agent is visible before its sidecar
-        // links
+        // links, and one the spec dropped leaves (no planner prunes it)
         if self.ports.kube.is_some() {
+            self.record
+                .status
+                .agents
+                .retain(|k, _| wanted.iter().any(|id| id.to_string() == *k));
             for id in &wanted {
                 self.record.status.entry(&id.to_string());
             }
@@ -410,25 +421,33 @@ impl Actor {
         }
     }
 
-    /// Spec O §7.2: the sidecar's status is the Daemon's observed state.
-    /// A frame that disagrees with the stopped set (a `Ready` agent the
-    /// set holds, a `Stopped` one it does not) gets the frame it missed,
-    /// which is how a sidecar that was away during `stop` or `restart`
-    /// learns of it. A downed fleet records nothing (its view of the pods
-    /// ended with the down) and stops any agent that reports otherwise:
-    /// the down may have landed while that link was away.
-    async fn link_status(&mut self, agent: AgentId, status: balerix_api::LinkStatus) {
+    /// Spec O §7.2: the sidecar's status is the Daemon's observed state;
+    /// a frame for an agent the spec does not want is ignored. A link's
+    /// first frame (`first`: a connect or a reconnect) that disagrees with
+    /// the stopped set (a `Ready` agent the set holds, a `Stopped` one it
+    /// does not) gets the frame it missed, which is how a sidecar that was
+    /// away during `stop` or `restart` learns of it. Later frames are only
+    /// mirrored: on a live link every frame was delivered, and a report
+    /// racing the actor's own `stop`/`restart` must not be "corrected". A
+    /// downed fleet records nothing (its view of the pods ended with the
+    /// down) and stops an agent whose first frame reports otherwise: the
+    /// down may have landed while that link was away.
+    async fn link_status(&mut self, agent: AgentId, status: balerix_api::LinkStatus, first: bool) {
         let reported_stopped = status.status.phase == AgentPhase::Stopped;
         if matches!(self.record.desired, Desired::Down { .. }) {
-            if !reported_stopped {
+            if first && !reported_stopped {
                 self.link_op(&agent, balerix_api::LinkOp::Stop).await;
             }
+            return;
+        }
+        if !self.wanted_agents().contains(&agent) {
+            tracing::debug!(agent = %agent, fleet = %self.name, "ignoring the status of an agent the spec does not want");
             return;
         }
         let key = agent.to_string();
         let wanted_stopped = self.record.stopped.contains(&key);
         self.record.status.agents.insert(key, status.status);
-        if wanted_stopped != reported_stopped {
+        if first && wanted_stopped != reported_stopped {
             let op = if wanted_stopped {
                 balerix_api::LinkOp::Stop
             } else {

@@ -170,6 +170,8 @@ impl LinkHub {
         tracing::info!(agent = %agent, "sidecar linked");
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.tick().await; // the first tick is immediate
+        // the actor reconciles the stopped set on this link's first status
+        let mut first = true;
         loop {
             tokio::select! {
                 req = rx.recv() => match req {
@@ -190,7 +192,8 @@ impl LinkHub {
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<SidecarFrame>(text.as_str()) {
                         Ok(SidecarFrame::Status(status)) => {
                             self.note_status(&agent, epoch, &status);
-                            daemon.link_status(&agent, status).await;
+                            daemon.link_status(&agent, status, first).await;
+                            first = false;
                         }
                         Ok(SidecarFrame::Reply(reply)) => {
                             if let Some(tx) = lock(&pending).remove(&reply.id) {

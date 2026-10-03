@@ -25,6 +25,7 @@ impl Drop for KillServer {
             .arg("-S")
             .arg(&self.socket)
             .arg("kill-server")
+            .stderr(std::process::Stdio::null())
             .status();
     }
 }

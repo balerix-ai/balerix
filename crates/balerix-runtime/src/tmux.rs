@@ -267,23 +267,10 @@ impl TmuxRunner {
             })
     }
 
-    /// tmux exits non-zero with "no server running" / "can't find" /
-    /// "error connecting" when nothing exists, and with "no current
-    /// target" when the server is up but holds no session at all (the
-    /// moment between another crew's `new-session` starting the server and
-    /// its session existing — two crews on one socket race there at daemon
-    /// start); all of those are "absent", not errors.
     fn run_optional(&self, id: &str, args: &[&str]) -> Result<Option<String>, RunnerError> {
         match self.cmd().args(args.iter().copied()).run() {
             Ok(o) => Ok(Some(o.stdout)),
-            Err(f)
-                if f.stderr.contains("no server running")
-                    || f.stderr.contains("can't find")
-                    || f.stderr.contains("error connecting")
-                    || f.stderr.contains("no current target") =>
-            {
-                Ok(None)
-            }
+            Err(f) if absent(&f.stderr) => Ok(None),
             Err(f) => Err(RunnerError::Tool {
                 id: id.to_string(),
                 subcommand: f.subcommand,
@@ -378,6 +365,34 @@ impl TmuxRunner {
         .map(|_| ())
     }
 
+    /// The end of a pod-mode `stop_crew`: `kill-session` returns before
+    /// tmux has dropped the session (and, for the last one, before the
+    /// server has exited), so "returned" would not mean "gone" as it does
+    /// on one machine after `wait_gone`. Polls `list-sessions` until none
+    /// of `sessions` is listed, within `stop_wait`.
+    fn wait_sessions_gone(&self, id: &str, sessions: &[String]) -> Result<(), RunnerError> {
+        let deadline = Instant::now() + self.stop_wait;
+        loop {
+            let Some(text) = self.run_optional(id, &["list-sessions", "-F", "#{session_name}"])?
+            else {
+                return Ok(());
+            };
+            let left = text.lines().find(|l| sessions.iter().any(|s| s == l));
+            let Some(left) = left else {
+                return Ok(());
+            };
+            if Instant::now() >= deadline {
+                return Err(RunnerError::Tool {
+                    id: id.to_string(),
+                    subcommand: "kill-session".into(),
+                    args: vec![format!("={left}")],
+                    stderr: format!("session {left} still listed after {:?}", self.stop_wait),
+                });
+            }
+            std::thread::sleep(STOP_POLL);
+        }
+    }
+
     /// Revives or replaces a window's pane with the idle placeholder.
     fn respawn_idle(&self, id: &str, target: &str, cwd: &str) -> Result<(), RunnerError> {
         self.run(
@@ -416,6 +431,26 @@ impl TmuxRunner {
         };
         parse_windows(&crew.fleet, &crew.crew, &text).map(Some)
     }
+}
+
+/// tmux exits non-zero with "no server running" / "can't find" /
+/// "error connecting" when nothing exists; with "no current target" when
+/// the server is up but holds no session at all (the moment between
+/// another crew's `new-session` starting the server and its session
+/// existing — two crews on one socket race there at daemon start); and
+/// with "server exited unexpectedly" when the server was ending as the
+/// client connected (its last session just killed, or the agent container
+/// shutting down). All of those are "absent", not errors.
+pub(crate) fn absent(stderr: &str) -> bool {
+    [
+        "no server running",
+        "can't find",
+        "error connecting",
+        "no current target",
+        "server exited unexpectedly",
+    ]
+    .iter()
+    .any(|m| stderr.contains(m))
 }
 
 pub(crate) fn parse_windows(
@@ -668,6 +703,7 @@ impl AgentRunner for TmuxRunner {
             for session in &sessions {
                 self.run_optional(&name, &["kill-session", "-t", &format!("={session}")])?;
             }
+            self.wait_sessions_gone(&name, &sessions)?;
             return first_err.map_or(Ok(()), Err);
         }
         // Grouped sessions share the crew's windows, but the crew session
@@ -925,6 +961,20 @@ mod tests {
         let one = TmuxRunner::new("tmux".into(), "balerix-x");
         assert!(!one.pod());
         assert_eq!(one.socket_args(), ["-L", "balerix-x"]);
+    }
+
+    #[test]
+    fn a_server_gone_or_going_is_absent_and_anything_else_an_error() {
+        for m in [
+            "no server running on /x",
+            "can't find session: =f/c",
+            "error connecting to /x (No such file or directory)",
+            "no current target",
+            "server exited unexpectedly",
+        ] {
+            assert!(absent(m), "{m}");
+        }
+        assert!(!absent("duplicate session: f/c"));
     }
 
     #[test]

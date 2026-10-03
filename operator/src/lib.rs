@@ -5,5 +5,6 @@
 //! sub-project 3b.
 
 pub mod api;
+pub mod daemon_client;
 pub mod desired;
 pub mod pki;

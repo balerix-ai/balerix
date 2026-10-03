@@ -1,11 +1,13 @@
 //! Request bodies for the fleet endpoints (spec §7).
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
-use crate::{CredentialBundle, FleetSpec};
+use crate::{AgentTokens, CredentialBundle, FleetSpec};
 
 /// Body of `POST /v1/fleets` (up) and `PUT /v1/fleets/{name}` (update).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FleetRequest {
     pub spec: FleetSpec,
@@ -16,7 +18,21 @@ pub struct FleetRequest {
     /// `owner: kubernetes`. Refused with 400 by a daemon not in
     /// Kubernetes mode. Absent from every CLI request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_tokens: Option<std::collections::BTreeMap<String, String>>,
+    pub agent_tokens: Option<AgentTokens>,
+}
+
+/// Hand-written: `agent_tokens` holds plaintext tokens.
+impl fmt::Debug for FleetRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FleetRequest")
+            .field("spec", &self.spec)
+            .field("credentials", &self.credentials)
+            .field(
+                "agent_tokens",
+                &self.agent_tokens.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Query flags of `DELETE /v1/fleets/{name}` (spec D6). Every flag is sent
@@ -104,6 +120,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(with.agent_tokens.unwrap()["f/c/a"], "t1");
+    }
+
+    #[test]
+    fn debug_never_prints_the_agent_tokens() {
+        let r: FleetRequest = serde_json::from_value(serde_json::json!({
+            "spec": { "name": "f" },
+            "agent_tokens": { "f/c/a": "tok-SECRET" }
+        }))
+        .unwrap();
+        let dbg = format!("{r:?}");
+        assert!(!dbg.contains("SECRET"), "{dbg}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
     }
 
     #[test]

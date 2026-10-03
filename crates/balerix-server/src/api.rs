@@ -160,6 +160,10 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
             "/v1/agents/{fleet}/{crew}/{agent}/link",
             get(crate::kube::link::link),
         )
+        .route(
+            "/v1/agents/{fleet}/{crew}/{agent}/link/attach/{session}",
+            get(crate::kube::link::link_attach),
+        )
         .layer(DefaultBodyLimit::max(1 << 20));
     let plugins = Router::new()
         .route("/v1/plugin-host/hello", post(plugin_hello))

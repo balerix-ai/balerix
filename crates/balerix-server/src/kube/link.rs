@@ -35,6 +35,9 @@ use crate::daemon::Daemon;
 
 /// How long a blocking call waits for the sidecar's reply.
 pub const LINK_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long `attach` waits for the sidecar's second socket once it has
+/// answered `Attach`.
+pub const ATTACH_WAIT: Duration = Duration::from_secs(5);
 /// Reaps a sidecar that vanished without a close frame (as `watch.rs`).
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -55,6 +58,8 @@ struct Conn {
 pub struct LinkHub {
     conns: Mutex<HashMap<AgentId, Conn>>,
     epochs: AtomicU64,
+    /// `attach` calls waiting for their second socket, by session name.
+    attach_waiting: Mutex<HashMap<String, SyncSender<super::pty::WsPty>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -217,6 +222,34 @@ impl LinkHub {
             daemon.link_down(&agent).await;
         }
     }
+
+    /// The second socket: paired with the waiting `attach`, then pumped
+    /// until the viewer is done. A session nobody waits for is closed 1008.
+    pub async fn attach_arrived(self: Arc<Self>, session: String, mut socket: WebSocket) {
+        let Some(waiter) = lock(&self.attach_waiting).remove(&session) else {
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: 1008,
+                    reason: "unknown attach session".into(),
+                })))
+                .await;
+            return;
+        };
+        let (to_pty_tx, to_pty_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (from_pty_tx, from_pty_rx) = mpsc::unbounded_channel::<super::pty::Outbound>();
+        let pty = super::pty::WsPty::new(to_pty_rx, from_pty_tx);
+        if waiter.try_send(pty).is_err() {
+            // the blocking attach gave up (ATTACH_WAIT)
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: crate::attach::CLOSE_ERROR,
+                    reason: "the attach timed out".into(),
+                })))
+                .await;
+            return;
+        }
+        super::pty::pump(socket, to_pty_tx, from_pty_rx).await;
+    }
 }
 
 fn runner_err(agent: &AgentId, e: LinkError) -> RunnerError {
@@ -330,9 +363,43 @@ impl AgentRunner for LinkHub {
         .map(|_| ())
         .map_err(|e| runner_err(agent, e))
     }
+    /// Spec O §7.2: a session name goes out as `Attach`; the sidecar opens
+    /// `GET …/link/attach/{session}` and answers; `attach_arrived` hands the
+    /// socket here as a `WsPty`. The sidecar may open the socket before
+    /// it answers, so the waiter is registered before the request leaves.
     fn attach(&self, agent: &AgentId) -> Result<Box<dyn PtyStream>, RunnerError> {
-        // Task 8 replaces this body with the second socket.
-        Err(runner_err(agent, LinkError::Unexpected("attach")))
+        let session = crate::vault::random_hex(16);
+        let (tx, rx) = sync_channel(1);
+        lock(&self.attach_waiting).insert(session.clone(), tx);
+        let forget = || {
+            lock(&self.attach_waiting).remove(&session);
+        };
+        match self.call(
+            agent,
+            LinkOp::Attach {
+                session: session.clone(),
+            },
+        ) {
+            Ok(LinkResult::Ok) => {}
+            Ok(_) => {
+                forget();
+                return Err(runner_err(agent, LinkError::Unexpected("attach")));
+            }
+            Err(e) => {
+                forget();
+                return Err(runner_err(agent, e));
+            }
+        }
+        match rx.recv_timeout(ATTACH_WAIT) {
+            Ok(pty) => Ok(Box::new(pty)),
+            Err(_) => {
+                forget();
+                Err(RunnerError::Link {
+                    id: agent.to_string(),
+                    message: "the sidecar did not open the attach socket".into(),
+                })
+            }
+        }
     }
 }
 
@@ -389,6 +456,44 @@ impl WorkspaceReader for LinkHub {
     }
 }
 
+/// The two link routes' shared checks, in the order the link route has
+/// always made them: kubernetes mode (404), the path, then the agent's
+/// token (401 for a bad token or an unknown agent alike). The refusal is
+/// boxed: a `Response` is too large for an `Err` (clippy).
+async fn authenticate(
+    state: &AppState,
+    path: Result<(String, String, String), PathRejection>,
+    headers: &HeaderMap,
+) -> Result<(Arc<LinkHub>, AgentId), Box<Response>> {
+    let refuse = |e: ApiError| Box::new(e.into_response());
+    let Some(hub) = state.daemon.kube().cloned() else {
+        return Err(refuse(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not a daemon in kubernetes mode",
+        )));
+    };
+    let (fleet, crew, agent) = match path {
+        Ok(p) => p,
+        Err(e) => return Err(refuse(ApiError::new(e.status(), e.body_text()))),
+    };
+    let unauthorized = || {
+        refuse(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unknown agent or bad secret",
+        ))
+    };
+    let Ok(id) = format!("{fleet}/{crew}/{agent}").parse::<AgentId>() else {
+        return Err(unauthorized());
+    };
+    let Some(token) = bearer(headers) else {
+        return Err(unauthorized());
+    };
+    if !state.daemon.verify_secret(&id, token).await {
+        return Err(unauthorized());
+    }
+    Ok((hub, id))
+}
+
 /// `GET /v1/agents/{fleet}/{crew}/{agent}/link`: the sidecar's one socket.
 /// Authenticated like the hook route (401 for a bad token or an unknown
 /// agent alike), then the protocol header, then the upgrade.
@@ -398,25 +503,10 @@ pub(crate) async fn link(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let Some(hub) = state.daemon.kube().cloned() else {
-        return ApiError::new(StatusCode::NOT_FOUND, "not a daemon in kubernetes mode")
-            .into_response();
+    let (hub, id) = match authenticate(&state, path.map(|Path(p)| p), &headers).await {
+        Ok(ok) => ok,
+        Err(refusal) => return *refusal,
     };
-    let Path((fleet, crew, agent)) = match path {
-        Ok(p) => p,
-        Err(e) => return ApiError::new(e.status(), e.body_text()).into_response(),
-    };
-    let unauthorized =
-        || ApiError::new(StatusCode::UNAUTHORIZED, "unknown agent or bad secret").into_response();
-    let Ok(id) = format!("{fleet}/{crew}/{agent}").parse::<AgentId>() else {
-        return unauthorized();
-    };
-    let Some(token) = bearer(&headers) else {
-        return unauthorized();
-    };
-    if !state.daemon.verify_secret(&id, token).await {
-        return unauthorized();
-    }
     let got = headers
         .get(LINK_PROTOCOL_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -433,4 +523,24 @@ pub(crate) async fn link(
     }
     let daemon = state.daemon.clone();
     ws.on_upgrade(move |socket| hub.serve(daemon, id, socket))
+}
+
+/// `GET /v1/agents/{fleet}/{crew}/{agent}/link/attach/{session}`: the
+/// sidecar's second socket for one `attach` (Spec O §7.2), authenticated
+/// like the link route.
+pub(crate) async fn link_attach(
+    State(state): State<AppState>,
+    path: Result<Path<(String, String, String, String)>, PathRejection>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let (path, session) = match path {
+        Ok(Path((fleet, crew, agent, session))) => (Ok((fleet, crew, agent)), session),
+        Err(e) => (Err(e), String::new()),
+    };
+    let (hub, _) = match authenticate(&state, path, &headers).await {
+        Ok(ok) => ok,
+        Err(refusal) => return *refusal,
+    };
+    ws.on_upgrade(move |socket| hub.attach_arrived(session, socket))
 }

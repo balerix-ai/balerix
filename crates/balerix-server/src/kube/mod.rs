@@ -3,9 +3,10 @@
 
 pub mod idle;
 pub mod link;
+pub mod pty;
 
 pub use idle::{NoFiles, NoPool};
-pub use link::{LINK_CALL_TIMEOUT, LinkError, LinkHub};
+pub use link::{ATTACH_WAIT, LINK_CALL_TIMEOUT, LinkError, LinkHub};
 
 /// `FleetRecord.owner` of a fleet the operator applied (§7.3).
 pub const KUBERNETES_OWNER: &str = "kubernetes";

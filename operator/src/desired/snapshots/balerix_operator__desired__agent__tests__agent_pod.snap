@@ -1,0 +1,151 @@
+---
+source: src/desired/agent.rs
+expression: o.pod
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    balerix.ai/spec-hash: abc123
+  labels:
+    app.kubernetes.io/managed-by: balerix-operator
+    balerix.ai/agent: alice
+    balerix.ai/component: agent
+    balerix.ai/crew: backend
+    balerix.ai/daemon: default
+    balerix.ai/fleet: payments
+  name: payments-backend-alice
+  namespace: team-a
+  ownerReferences:
+    - apiVersion: balerix.ai/v1alpha1
+      controller: true
+      kind: Agent
+      name: payments-backend-alice
+      uid: agent-uid
+spec:
+  automountServiceAccountToken: false
+  containers:
+    - command:
+        - balerix-agent
+        - run
+      image: "ghcr.io/balerix-ai/balerix-agent:0.2.0"
+      name: agent
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - mountPath: /balerix/agent
+          name: agent
+        - mountPath: /balerix/shared/repo/.git/objects
+          name: shared
+          readOnly: true
+          subPath: fleets/payments/crews/backend/repo/.git/objects
+        - mountPath: /balerix/shared/crew
+          name: shared
+          readOnly: true
+          subPath: fleets/payments/crews/backend/pool
+        - mountPath: /balerix/shared/fleet
+          name: shared
+          readOnly: true
+          subPath: fleets/payments/pool
+        - mountPath: /balerix/shared/daemon
+          name: shared
+          readOnly: true
+          subPath: pools/daemon
+        - mountPath: /balerix/run
+          name: run
+  enableServiceLinks: false
+  initContainers:
+    - command:
+        - balerix-agent
+        - sidecar
+      image: "ghcr.io/balerix-ai/balerix-agent:0.2.0"
+      name: sidecar
+      readinessProbe:
+        exec:
+          command:
+            - test
+            - "-f"
+            - /balerix/run/ready
+        periodSeconds: 5
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+      restartPolicy: Always
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - mountPath: /balerix/agent
+          name: agent
+        - mountPath: /balerix/shared/repo/.git/objects
+          name: shared
+          readOnly: true
+          subPath: fleets/payments/crews/backend/repo/.git/objects
+        - mountPath: /balerix/shared/crew
+          name: shared
+          readOnly: true
+          subPath: fleets/payments/crews/backend/pool
+        - mountPath: /balerix/shared/fleet
+          name: shared
+          readOnly: true
+          subPath: fleets/payments/pool
+        - mountPath: /balerix/shared/daemon
+          name: shared
+          readOnly: true
+          subPath: pools/daemon
+        - mountPath: /balerix/run
+          name: run
+        - mountPath: /balerix/secret
+          name: bundle
+          readOnly: true
+        - mountPath: /balerix/tls
+          name: authority
+          readOnly: true
+  nodeSelector:
+    pool: agents
+  restartPolicy: Always
+  securityContext:
+    fsGroup: 10001
+    runAsGroup: 10001
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  tolerations:
+    - key: agents
+      operator: Exists
+  volumes:
+    - name: agent
+      persistentVolumeClaim:
+        claimName: payments-backend-alice
+    - name: shared
+      persistentVolumeClaim:
+        claimName: balerix-default-shared
+        readOnly: true
+    - emptyDir: {}
+      name: run
+    - name: bundle
+      secret:
+        defaultMode: 288
+        secretName: payments-backend-alice-bundle
+    - configMap:
+        name: balerix-default-ca
+      name: authority

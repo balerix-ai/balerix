@@ -521,6 +521,14 @@ the Daemon's Secret.
   pool is `Ready` without installing (the shared volume's daemon pool is
   a Job's, §8.3). `GET /readyz` is 200 when Spec F's channel says `Ready`,
   503 with the reason otherwise.
+- **The sidecar's state survives it.** The stopped flag and the
+  planner's status (`FleetStatus`, as the one-machine daemon persists it)
+  are written atomically to `<agent>/.balerix/state/sidecar/state.json`
+  and loaded before the first pass: a `stop` holds across a sidecar
+  restart with the Daemon away, and the status's applied hash keeps the
+  first pass from relaunching a healthy Claude. The link opens after that
+  first pass, so its first `status` frame, which the Daemon reconciles
+  its stopped set against, is the pass's answer.
 - **The hook hop has a secret of its own.** Claude authenticates to
   the sidecar with a sidecar-local secret (32 random bytes, made on the
   first start and kept under `<agent>/.balerix/state/sidecar/`, outside

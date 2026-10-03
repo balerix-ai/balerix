@@ -9,6 +9,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use balerix_api::FleetStatus;
+use serde::{Deserialize, Serialize};
 
 /// The directory, from the agent claim's mount.
 pub fn dir(agent_dir: &Path) -> PathBuf {
@@ -37,6 +39,41 @@ pub fn hook_secret(dir: &Path) -> Result<String> {
     let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     write_atomic(&path, format!("{secret}\n").as_bytes())?;
     Ok(secret)
+}
+
+/// What the planner needs to carry over a sidecar restart (Spec O §6.3):
+/// a `stop` holds until a `restart`, even when the sidecar restarts with
+/// the Daemon away; and the status, whose `applied_hash` keeps the first
+/// pass from relaunching a healthy Claude. `FleetStatus` is what the
+/// one-machine daemon persists in its fleet record, the same way.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Saved {
+    #[serde(default)]
+    pub stopped: bool,
+    #[serde(default)]
+    pub status: FleetStatus,
+}
+
+const SAVED: &str = "state.json";
+
+/// The last `save`, or nothing saved yet. A file that does not parse
+/// fails the start: guessing would lose a `stop`.
+pub fn load(dir: &Path) -> Result<Saved> {
+    let path = dir.join(SAVED);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).with_context(|| {
+            format!(
+                "{}: not the sidecar's saved state; delete it to start over",
+                path.display()
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Saved::default()),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+pub fn save(dir: &Path, saved: &Saved) -> Result<()> {
+    write_atomic(&dir.join(SAVED), &serde_json::to_vec(saved)?)
 }
 
 fn is_secret(s: &str) -> bool {
@@ -73,6 +110,27 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_saved_state_round_trips_and_a_damaged_file_fails() {
+        let root = crate::test_dir();
+        let d = dir(root.path());
+        assert_eq!(load(&d).unwrap(), Saved::default(), "nothing saved yet");
+        let mut saved = Saved {
+            stopped: true,
+            ..Saved::default()
+        };
+        saved.status.entry("f/c/a").restarts = 2;
+        save(&d, &saved).unwrap();
+        assert_eq!(load(&d).unwrap(), saved);
+        assert!(!d.join(".state.json.tmp").exists());
+        std::fs::write(d.join(SAVED), "{").unwrap();
+        let e = load(&d).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("not the sidecar's saved state"),
+            "{e:#}"
+        );
+    }
 
     #[test]
     fn the_hook_secret_is_made_once_kept_private_and_reloaded() {

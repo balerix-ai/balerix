@@ -209,7 +209,10 @@ pub async fn main(args: SidecarArgs) -> Result<()> {
         pid: None,
         hook_failures: 0,
     });
-    tokio::spawn(link::run(Arc::new(LinkDeps {
+    // started after the first pass: a link's first status frame is what
+    // the Daemon reconciles its stopped set against (§7.4), so it must be
+    // the pass's answer, not the placeholder above
+    let mut link = Some(Arc::new(LinkDeps {
         id: id.clone(),
         token: loaded.bundle.token.clone(),
         daemon_url,
@@ -218,16 +221,22 @@ pub async fn main(args: SidecarArgs) -> Result<()> {
         workspace: runtime.clone() as Arc<dyn WorkspaceReader>,
         control: control_tx,
         status: status_rx,
-    })));
+    }));
 
     let fleet = Arc::new(loaded.fleet);
     let creds = Arc::new(loaded.bundle.credentials.clone());
     let policy = Arc::new(ReconcilePolicy::default());
     let clock = Arc::new(WallClock);
     let materializer = Arc::new(PodMaterializer(runtime.clone()));
-    let mut status = FleetStatus::default();
+    // §6.3: what the last sidecar left, so a stop holds across a restart
+    // and a healthy Claude is not relaunched
+    let saved = state::load(&state_dir)?;
+    let mut status = saved.status;
     set_desired(&mut status, 1);
     let mut stopped: BTreeSet<AgentId> = BTreeSet::new();
+    if saved.stopped {
+        stopped.insert(id.clone());
+    }
     let mut recount: Option<tokio::time::Instant> = None;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
@@ -283,8 +292,12 @@ pub async fn main(args: SidecarArgs) -> Result<()> {
             .await?
         };
         status = new_status;
+        save(&state_dir, &status, &stopped)?;
         ready_marker(&pod, &status, &id)?;
         publish(&status_tx, &status, &id, pid, &failures);
+        if let Some(deps) = link.take() {
+            tokio::spawn(link::run(deps));
+        }
 
         let wake = tokio::time::sleep(next_deadline(&status, clean, clock.now()));
         tokio::pin!(wake);
@@ -300,12 +313,14 @@ pub async fn main(args: SidecarArgs) -> Result<()> {
                             stopped.remove(&id);
                         }
                     }
+                    save(&state_dir, &status, &stopped)?;
                     break;
                 }
                 Some(name) = events_rx.recv() => {
                     if name == READY_EVENT {
                         tracing::info!(agent = %id, "agent ready ({READY_EVENT} received)");
                         agent_ready(&mut status, &id, clock.now());
+                        save(&state_dir, &status, &stopped)?;
                         ready_marker(&pod, &status, &id)?;
                     }
                     publish(&status_tx, &status, &id, pid, &failures);
@@ -322,6 +337,16 @@ pub async fn main(args: SidecarArgs) -> Result<()> {
             }
         }
     }
+}
+
+fn save(dir: &std::path::Path, status: &FleetStatus, stopped: &BTreeSet<AgentId>) -> Result<()> {
+    state::save(
+        dir,
+        &state::Saved {
+            stopped: !stopped.is_empty(),
+            status: status.clone(),
+        },
+    )
 }
 
 async fn sleep_until(at: Option<tokio::time::Instant>) {

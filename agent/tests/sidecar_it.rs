@@ -170,6 +170,17 @@ impl Pod {
             .spawn()
             .unwrap();
         self.run = Some(Kill(run));
+        self.spawn_sidecar(tools, plain_http);
+    }
+
+    /// The sidecar container restarting (an OOM, a crash): the agent
+    /// container and its tmux server stay.
+    fn restart_sidecar(&mut self, tools: &support::Tools, plain_http: bool) {
+        self.sidecar.take();
+        self.spawn_sidecar(tools, plain_http);
+    }
+
+    fn spawn_sidecar(&mut self, tools: &support::Tools, plain_http: bool) {
         let mut cmd = Command::new(BIN);
         cmd.args(["sidecar", "--hook-port", "0"])
             .arg("--bundle")
@@ -186,10 +197,14 @@ impl Pod {
             .arg(&tools.balerix)
             .arg("--termination-log")
             .arg(self.root.join("termination-log"))
-            .env("RUST_LOG", "info")
+            .env("RUST_LOG", "info,balerix_agent::sidecar=debug")
             .stdout(Stdio::null())
             .stderr(Stdio::from(
-                std::fs::File::create(self.root.join("sidecar.log")).unwrap(),
+                std::fs::File::options()
+                    .create(true)
+                    .append(true)
+                    .open(self.root.join("sidecar.log"))
+                    .unwrap(),
             ));
         if plain_http {
             cmd.arg("--allow-plain-http");
@@ -197,6 +212,28 @@ impl Pod {
         self.sidecar = Some(Kill(cmd.spawn().unwrap()));
     }
 
+    /// The `start`-th sidecar start (from 1) has finished a planner pass.
+    fn passed_after_start(&self, start: usize) -> bool {
+        let log = std::fs::read_to_string(self.root.join("sidecar.log")).unwrap_or_default();
+        log.match_indices("materialised; tmux server up")
+            .nth(start - 1)
+            .is_some_and(|(at, _)| log[at..].contains("sidecar: pass"))
+    }
+    /// The pane pid of the agent's window, if it has one.
+    fn pane_pid(&self, tools: &support::Tools) -> Option<String> {
+        self.tmux(
+            tools,
+            &[
+                "list-windows",
+                "-t",
+                "=f/c",
+                "-F",
+                "#{window_name}\t#{pane_pid}",
+            ],
+        )
+        .lines()
+        .find_map(|l| l.strip_prefix("a\t").map(|p| p.trim().to_string()))
+    }
     fn socket(&self) -> PathBuf {
         self.root.join("run/tmux.sock")
     }
@@ -463,6 +500,26 @@ async fn the_sidecar_against_a_fake_daemon() {
         pod.agent_window_gone(&tools)
     });
     assert!(!pod.root.join("run/ready").exists());
+
+    // §6.3, a stop holds until a restart: the sidecar restarts with the
+    // Daemon away, and the agent stays stopped
+    let addr = daemon.addr;
+    daemon.stop();
+    pod.restart_sidecar(&tools, true);
+    support::wait_for("a pass after the restart", Duration::from_secs(60), || {
+        pod.passed_after_start(2)
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(pod.agent_window_gone(&tools), "the stop did not hold");
+    assert!(pod.still_running());
+    let mut daemon = FakeDaemon::start(Some(addr)).await;
+    let mut conn = tokio::time::timeout(Duration::from_secs(60), daemon.links.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let back = next_status(&mut conn, |_| true, "the first status after the restart").await;
+    assert_eq!(back.status.phase, AgentPhase::Stopped);
+
     assert_eq!(request(&mut conn, 6, LinkOp::Restart).await, LinkResult::Ok);
     next_status(
         &mut conn,
@@ -472,23 +529,26 @@ async fn the_sidecar_against_a_fake_daemon() {
     .await;
     next_event(&mut daemon, "SessionStart").await;
 
+    // a sidecar restart leaves a healthy Claude alone: the planner's
+    // status (the applied spec's hash) survives it
+    let before = pod.pane_pid(&tools).unwrap();
+    pod.restart_sidecar(&tools, true);
+    let mut conn = tokio::time::timeout(Duration::from_secs(60), daemon.links.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    support::wait_for("a pass after the restart", Duration::from_secs(60), || {
+        pod.passed_after_start(3)
+    });
+    let again = next_status(&mut conn, |_| true, "the first status after the restart").await;
+    assert_eq!(again.status.phase, AgentPhase::Ready);
+    assert_eq!(again.pid.map(|p| p.to_string()), Some(before.clone()));
+    assert_eq!(pod.pane_pid(&tools), Some(before), "Claude was relaunched");
+
     // a dead Claude restarts with the planner's back-off: the supervisor
     // is told to stop (its tree ends, the pane dies), the sidecar notes
     // the exit (`restarts` counts one) and restarts it in a new pane
-    let pid = pod
-        .tmux(
-            &tools,
-            &[
-                "list-windows",
-                "-t",
-                "=f/c",
-                "-F",
-                "#{window_name}\t#{pane_pid}",
-            ],
-        )
-        .lines()
-        .find_map(|l| l.strip_prefix("a\t").map(|p| p.trim().to_string()))
-        .unwrap();
+    let pid = pod.pane_pid(&tools).unwrap();
     assert!(
         Command::new("kill")
             .args(["-TERM", &pid])

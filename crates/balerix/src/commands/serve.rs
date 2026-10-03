@@ -170,6 +170,7 @@ fn run(
             policy: ReconcilePolicy::default(),
             hook_url: url.clone(),
             resync: RESYNC,
+            kube: None,
         };
         let fleets = existing.len();
         // One `Metrics` for the daemon and the chain: the handler's counters

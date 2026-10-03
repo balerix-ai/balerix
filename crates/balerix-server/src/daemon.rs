@@ -326,6 +326,34 @@ impl Daemon {
         self.ports.workspace.clone()
     }
 
+    /// Spec O §7: the link hub, when this daemon is in Kubernetes mode.
+    pub fn kube(&self) -> Option<&Arc<crate::kube::LinkHub>> {
+        self.ports.kube.as_ref()
+    }
+
+    /// A sidecar's `status` frame, to its fleet's actor. An unknown fleet
+    /// (the operator deleted it while the pod lived) is dropped.
+    pub async fn link_status(&self, agent: &AgentId, status: balerix_api::LinkStatus) {
+        if let Some(h) = self.fleets.read().await.get(&agent.fleet) {
+            let _ =
+                h.tx.send(Msg::LinkStatus {
+                    agent: agent.clone(),
+                    status,
+                })
+                .await;
+        }
+    }
+
+    pub async fn link_down(&self, agent: &AgentId) {
+        if let Some(h) = self.fleets.read().await.get(&agent.fleet) {
+            let _ =
+                h.tx.send(Msg::LinkDown {
+                    agent: agent.clone(),
+                })
+                .await;
+        }
+    }
+
     /// `origin/<ref>` of the agent's crew, from the fleet's record; `None`
     /// when the fleet or the crew is unknown.
     pub async fn base_ref(&self, agent: &AgentId) -> Option<String> {

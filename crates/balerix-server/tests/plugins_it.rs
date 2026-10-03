@@ -405,6 +405,7 @@ async fn a_stored_fleet_under_the_reserved_name_is_ignored() {
         policy: Default::default(),
         hook_url: "http://127.0.0.1:1".into(),
         resync: Duration::from_secs(3600),
+        kube: None,
     };
     // Not `Harness::daemon`: this test needs a *stored* record, which only
     // `Daemon::start` takes.

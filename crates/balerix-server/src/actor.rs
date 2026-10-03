@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use balerix_api::{CredentialBundle, FleetSpec, Timestamp};
-use balerix_core::reconcile::{ReconcileContext, agent_ready, reconcile_pass, set_desired};
+use balerix_core::reconcile::{
+    ReconcileContext, agent_ready, finish_pass, reconcile_pass, set_desired,
+};
 use balerix_core::{
     AgentId, AgentRunner, Clock, CredentialSource, Desired, Fleet, FleetName, FleetRecord,
     FleetResolver, FleetSecrets, FleetStore, HookTarget, Keep, Materializer, ReconcilePolicy,
@@ -54,6 +56,13 @@ pub enum Msg {
         name: String,
         at: Timestamp,
     },
+    /// Spec O §7.2: a sidecar's `status` frame; the Daemon mirrors it.
+    LinkStatus {
+        agent: AgentId,
+        status: balerix_api::LinkStatus,
+    },
+    /// The sidecar's link closed and no newer one replaced it.
+    LinkDown { agent: AgentId },
 }
 
 #[derive(Clone)]
@@ -63,6 +72,7 @@ pub struct FleetHandle {
 }
 
 /// Everything every actor shares read-only.
+#[derive(Clone)]
 pub struct Ports {
     pub materializer: Arc<dyn Materializer>,
     pub runner: Arc<dyn AgentRunner>,
@@ -81,6 +91,10 @@ pub struct Ports {
     /// `http://127.0.0.1:<port>`; every agent's hooks post here.
     pub hook_url: String,
     pub resync: Duration,
+    /// Spec O §7: set, this daemon is in Kubernetes mode: actors mirror
+    /// sidecar status frames and run no planner; the runner and the
+    /// workspace reader are the hub.
+    pub kube: Option<Arc<crate::kube::LinkHub>>,
 }
 
 /// Agent id → the bearer secret its hooks present. Ingress authenticates
@@ -232,6 +246,13 @@ impl Actor {
                     let _ = reply.send(self.record.clone());
                 }
                 Some(Msg::Event { agent, name, at }) => self.event(agent, name, at).await,
+                Some(Msg::LinkStatus { agent, status }) => self.link_status(agent, status).await,
+                Some(Msg::LinkDown { agent }) => {
+                    if let Some(a) = self.record.status.agents.get_mut(&agent.to_string()) {
+                        a.message = "link down".to_string();
+                    }
+                    self.publish();
+                }
                 None => self.pass().await,
             }
             if matches!(self.record.desired, Desired::Down { purge: true, .. })
@@ -337,7 +358,29 @@ impl Actor {
         self.publish();
     }
 
+    /// Spec O §7.2: the sidecar's status is the Daemon's observed state.
+    async fn link_status(&mut self, agent: AgentId, status: balerix_api::LinkStatus) {
+        self.record
+            .status
+            .agents
+            .insert(agent.to_string(), status.status);
+        self.mirror_pass().await;
+    }
+
+    /// Kubernetes mode's pass: no planner, the fleet phase recomputed from
+    /// the mirrored agents, persisted and published.
+    async fn mirror_pass(&mut self) {
+        let terminating = matches!(self.record.desired, Desired::Down { .. });
+        finish_pass(&mut self.record.status, terminating, true);
+        self.last_pass_clean = true;
+        self.persist().await;
+        self.publish();
+    }
+
     async fn pass(&mut self) {
+        if self.ports.kube.is_some() {
+            return self.mirror_pass().await;
+        }
         // Spec F §5: the daemon pool is a precondition, not the fleet's
         // fault. Skip the pass and leave status alone; a crew marked failed
         // here would move restart counters for a daemon-level condition.

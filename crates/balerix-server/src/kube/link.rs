@@ -58,8 +58,9 @@ struct Conn {
 pub struct LinkHub {
     conns: Mutex<HashMap<AgentId, Conn>>,
     epochs: AtomicU64,
-    /// `attach` calls waiting for their second socket, by session name.
-    attach_waiting: Mutex<HashMap<String, SyncSender<super::pty::WsPty>>>,
+    /// `attach` calls waiting for their second socket, by session name,
+    /// each with the agent whose sidecar alone may open it.
+    attach_waiting: Mutex<HashMap<String, (AgentId, SyncSender<super::pty::WsPty>)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -226,10 +227,24 @@ impl LinkHub {
         }
     }
 
-    /// The second socket: paired with the waiting `attach`, then pumped
-    /// until the viewer is done. A session nobody waits for is closed 1008.
-    pub async fn attach_arrived(self: Arc<Self>, session: String, mut socket: WebSocket) {
-        let Some(waiter) = lock(&self.attach_waiting).remove(&session) else {
+    /// The second socket, from `agent`'s authenticated sidecar: paired with
+    /// the waiting `attach`, then pumped until the viewer is done. A session
+    /// nobody waits for, or one waiting for another agent, is closed 1008
+    /// alike; the other agent's waiter stays.
+    pub async fn attach_arrived(
+        self: Arc<Self>,
+        agent: AgentId,
+        session: String,
+        mut socket: WebSocket,
+    ) {
+        let waiter = {
+            let mut waiting = lock(&self.attach_waiting);
+            match waiting.get(&session) {
+                Some((owner, _)) if *owner == agent => waiting.remove(&session).map(|(_, tx)| tx),
+                _ => None,
+            }
+        };
+        let Some(waiter) = waiter else {
             let _ = socket
                 .send(Message::Close(Some(CloseFrame {
                     code: 1008,
@@ -373,7 +388,7 @@ impl AgentRunner for LinkHub {
     fn attach(&self, agent: &AgentId) -> Result<Box<dyn PtyStream>, RunnerError> {
         let session = crate::vault::random_hex(16);
         let (tx, rx) = sync_channel(1);
-        lock(&self.attach_waiting).insert(session.clone(), tx);
+        lock(&self.attach_waiting).insert(session.clone(), (agent.clone(), tx));
         let forget = || {
             lock(&self.attach_waiting).remove(&session);
         };
@@ -459,10 +474,11 @@ impl WorkspaceReader for LinkHub {
     }
 }
 
-/// The two link routes' shared checks, in the order the link route has
-/// always made them: kubernetes mode (404), the path, then the agent's
-/// token (401 for a bad token or an unknown agent alike). The refusal is
-/// boxed: a `Response` is too large for an `Err` (clippy).
+/// The two link routes' shared checks before the upgrade, in the order the
+/// link route has always made them: kubernetes mode (404), the path, the
+/// agent's token (401 for a bad token or an unknown agent alike), then the
+/// protocol header (400). The refusal is boxed: a `Response` is too large
+/// for an `Err` (clippy).
 async fn authenticate(
     state: &AppState,
     path: Result<(String, String, String), PathRejection>,
@@ -494,6 +510,19 @@ async fn authenticate(
     if !state.daemon.verify_secret(&id, token).await {
         return Err(unauthorized());
     }
+    let got = headers
+        .get(LINK_PROTOCOL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u32>().ok());
+    if got != Some(LINK_PROTOCOL) {
+        return Err(refuse(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{LINK_PROTOCOL_HEADER}: this daemon speaks link protocol {LINK_PROTOCOL}, got {}",
+                got.map_or("nothing".to_string(), |v| v.to_string())
+            ),
+        )));
+    }
     Ok((hub, id))
 }
 
@@ -510,27 +539,13 @@ pub(crate) async fn link(
         Ok(ok) => ok,
         Err(refusal) => return *refusal,
     };
-    let got = headers
-        .get(LINK_PROTOCOL_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u32>().ok());
-    if got != Some(LINK_PROTOCOL) {
-        return ApiError::new(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "{LINK_PROTOCOL_HEADER}: this daemon speaks link protocol {LINK_PROTOCOL}, got {}",
-                got.map_or("nothing".to_string(), |v| v.to_string())
-            ),
-        )
-        .into_response();
-    }
     let daemon = state.daemon.clone();
     ws.on_upgrade(move |socket| hub.serve(daemon, id, socket))
 }
 
 /// `GET /v1/agents/{fleet}/{crew}/{agent}/link/attach/{session}`: the
-/// sidecar's second socket for one `attach` (Spec O §7.2), authenticated
-/// like the link route.
+/// sidecar's second socket for one `attach` (Spec O §7.2), checked like
+/// the link route; the session must be one waiting for this agent.
 pub(crate) async fn link_attach(
     State(state): State<AppState>,
     path: Result<Path<(String, String, String, String)>, PathRejection>,
@@ -541,9 +556,9 @@ pub(crate) async fn link_attach(
         Ok(Path((fleet, crew, agent, session))) => (Ok((fleet, crew, agent)), session),
         Err(e) => (Err(e), String::new()),
     };
-    let (hub, _) = match authenticate(&state, path, &headers).await {
+    let (hub, id) = match authenticate(&state, path, &headers).await {
         Ok(ok) => ok,
         Err(refusal) => return *refusal,
     };
-    ws.on_upgrade(move |socket| hub.attach_arrived(session, socket))
+    ws.on_upgrade(move |socket| hub.attach_arrived(id, session, socket))
 }

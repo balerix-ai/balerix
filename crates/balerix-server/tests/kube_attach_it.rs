@@ -20,6 +20,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+/// Agent `f/c/b`'s token: a second agent of the same crew.
+const TOKEN_B: &str = "fedcba9876543210fedcba9876543210";
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -32,7 +34,10 @@ fn spec() -> FleetSpec {
             CrewSpec {
                 repo: "acme/api".into(),
                 git_ref: "main".into(),
-                agents: BTreeMap::from([("a".to_string(), AgentSettings::default())]),
+                agents: BTreeMap::from([
+                    ("a".to_string(), AgentSettings::default()),
+                    ("b".to_string(), AgentSettings::default()),
+                ]),
                 ..CrewSpec::default()
             },
         )]),
@@ -40,21 +45,25 @@ fn spec() -> FleetSpec {
 }
 
 async fn ws(port: u16, path: &str) -> Result<Ws, tokio_tungstenite::tungstenite::Error> {
-    ws_with(port, path, TOKEN).await
+    ws_with(port, path, TOKEN, "1").await
 }
 
+/// An empty `protocol` sends no protocol header.
 async fn ws_with(
     port: u16,
     path: &str,
     token: &str,
+    protocol: &str,
 ) -> Result<Ws, tokio_tungstenite::tungstenite::Error> {
     let mut req = format!("ws://127.0.0.1:{port}{path}")
         .into_client_request()
         .unwrap();
     req.headers_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());
-    req.headers_mut()
-        .insert(LINK_PROTOCOL_HEADER, "1".parse().unwrap());
+    if !protocol.is_empty() {
+        req.headers_mut()
+            .insert(LINK_PROTOCOL_HEADER, protocol.parse().unwrap());
+    }
     tokio_tungstenite::connect_async(req).await.map(|(w, _)| w)
 }
 
@@ -105,7 +114,10 @@ async fn world() -> World {
         .apply_kube(
             &"f".parse().unwrap(),
             spec(),
-            BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+            BTreeMap::from([
+                ("f/c/a".to_string(), TOKEN.to_string()),
+                ("f/c/b".to_string(), TOKEN_B.to_string()),
+            ]),
         )
         .await
         .unwrap();
@@ -188,19 +200,35 @@ async fn attach_rides_a_second_socket_the_sidecar_opens() {
         .unwrap();
     let start = Instant::now();
     loop {
-        match pty_ws.next().await {
+        let left = Duration::from_secs(5).saturating_sub(start.elapsed());
+        match tokio::time::timeout(left, pty_ws.next())
+            .await
+            .expect("the second socket closes within 5 s")
+        {
             Some(Ok(Message::Close(_))) | None => break,
             Some(Ok(_)) => {}
             Some(Err(_)) => break,
         }
-        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     // a sidecar that never opens the socket: the attach fails within the bound
     let (hub2, id2) = (hub.clone(), id.clone());
     let attach = tokio::task::spawn_blocking(move || hub2.attach(&id2));
     let req = next_request(&mut link).await;
-    assert!(matches!(req.op, LinkOp::Attach { .. }));
+    let LinkOp::Attach { session } = &req.op else {
+        panic!("{req:?}");
+    };
+    // another agent's sidecar, with its own valid token, cannot claim A's
+    // session: it is closed as an unknown one, and A's waiter stays put
+    let mut thief = ws_with(
+        w.port,
+        &format!("/v1/agents/f/c/b/link/attach/{session}"),
+        TOKEN_B,
+        "1",
+    )
+    .await
+    .unwrap();
+    assert_unknown_session(&mut thief).await;
     link.send(Message::Text(
         serde_json::to_string(&SidecarFrame::Reply(LinkReply {
             id: req.id,
@@ -226,14 +254,22 @@ async fn attach_rides_a_second_socket_the_sidecar_opens() {
     let mut stray = ws(w.port, "/v1/agents/f/c/a/link/attach/nope")
         .await
         .unwrap();
-    match stray.next().await.unwrap().unwrap() {
-        Message::Close(Some(frame)) => assert_eq!(u16::from(frame.code), 1008),
+    assert_unknown_session(&mut stray).await;
+}
+
+async fn assert_unknown_session(socket: &mut Ws) {
+    match socket.next().await.unwrap().unwrap() {
+        Message::Close(Some(frame)) => {
+            assert_eq!(u16::from(frame.code), 1008);
+            assert_eq!(frame.reason.as_str(), "unknown attach session");
+        }
         other => panic!("{other:?}"),
     }
 }
 
 /// The attach route refuses exactly as the link route does: 401 for a bad
-/// token or an unknown agent, 404 on a daemon not in kubernetes mode.
+/// token or an unknown agent, 400 for a missing or wrong protocol header,
+/// 404 on a daemon not in kubernetes mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_attach_route_refuses_like_the_link_route() {
     let refusal = |e: tokio_tungstenite::tungstenite::Error| match e {
@@ -251,7 +287,7 @@ async fn the_attach_route_refuses_like_the_link_route() {
     let w = world().await;
     assert_eq!(
         refusal(
-            ws_with(w.port, "/v1/agents/f/c/a/link/attach/s", "wrong")
+            ws_with(w.port, "/v1/agents/f/c/a/link/attach/s", "wrong", "1")
                 .await
                 .unwrap_err()
         ),
@@ -264,6 +300,31 @@ async fn the_attach_route_refuses_like_the_link_route() {
                 .unwrap_err()
         ),
         unauthorized
+    );
+
+    let protocol = |got: &str| {
+        (
+            400,
+            serde_json::json!({
+                "error": format!("{LINK_PROTOCOL_HEADER}: this daemon speaks link protocol 1, got {got}")
+            }),
+        )
+    };
+    assert_eq!(
+        refusal(
+            ws_with(w.port, "/v1/agents/f/c/a/link/attach/s", TOKEN, "")
+                .await
+                .unwrap_err()
+        ),
+        protocol("nothing")
+    );
+    assert_eq!(
+        refusal(
+            ws_with(w.port, "/v1/agents/f/c/a/link/attach/s", TOKEN, "2")
+                .await
+                .unwrap_err()
+        ),
+        protocol("2")
     );
 
     let tmux = serve_daemon(&Harness::new(Duration::from_secs(3600))).await;

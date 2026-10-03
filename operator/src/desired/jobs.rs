@@ -596,6 +596,11 @@ mod tests {
             "the last commit fetched stays"
         );
 
+        // a success whose pod is gone reports no commit: the old one stays
+        let gone = JobOutcome::Succeeded(String::new());
+        let s = crew_status(&crew_object(Some("old")), &ok, &gone, &now);
+        assert_eq!(s.cache_ref.as_deref(), Some("old"));
+
         let cache =
             JobOutcome::Failed("cache: payments/backend: the remote has no branch nope".into());
         let s = crew_status(&crew_object(Some("old")), &ok, &cache, &now);

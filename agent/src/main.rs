@@ -22,18 +22,15 @@ fn main() -> ExitCode {
             }
         },
         Command::Sidecar(args) => {
-            // Task 13 replaces this arm with `sidecar::main(args)`; until
-            // then the one thing a sidecar does without a bundle is refuse.
             let termination_log = args.termination_log.clone();
-            let e = anyhow::anyhow!(
-                "cannot read the agent bundle at {}: {}",
-                args.bundle.display(),
-                std::fs::read(&args.bundle)
-                    .err()
-                    .map_or("the sidecar is not implemented yet".to_string(), |e| e
-                        .to_string())
-            );
-            balerix_agent::cli::terminate(&termination_log, &e)
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => return balerix_agent::cli::terminate(&termination_log, &e.into()),
+            };
+            match rt.block_on(balerix_agent::sidecar::main(args)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => balerix_agent::cli::terminate(&termination_log, &e),
+            }
         }
     }
 }

@@ -2,16 +2,15 @@
 //! Spec O §7.2 from the sidecar's side, against a fake Daemon on plain
 //! `ws://`: connect, status, requests and replies, attach, reconnect.
 
+mod support;
+
+use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::ws::{Message as AxMsg, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
-use axum::http::HeaderMap;
-use axum::response::Response;
 use axum::routing::get;
-use std::future::IntoFuture;
 
 use balerix_agent::link::{Control, LINK_IDLE, LinkDeps, run, run_with_idle};
 use balerix_agent::tls::client_config;
@@ -21,105 +20,10 @@ use balerix_api::{
 };
 use balerix_core::fakes::FakeRunner;
 use balerix_core::{AgentId, WorkspaceError, WorkspaceReader};
-use futures_util::SinkExt;
+use support::fake_daemon::{Conn, FakeDaemon};
 use tokio::sync::{mpsc, watch};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
-
-/// One link connection as the fake Daemon sees it.
-struct Conn {
-    headers: HeaderMap,
-    to_sidecar: mpsc::UnboundedSender<LinkRequest>,
-    from_sidecar: mpsc::UnboundedReceiver<SidecarFrame>,
-}
-
-/// One attach socket as the fake Daemon sees it.
-struct AttachConn {
-    headers: HeaderMap,
-    session: String,
-    to_sidecar: mpsc::UnboundedSender<AxMsg>,
-    from_sidecar: mpsc::UnboundedReceiver<AxMsg>,
-}
-
-#[derive(Clone)]
-struct Fake {
-    links: mpsc::UnboundedSender<Conn>,
-    attaches: mpsc::UnboundedSender<AttachConn>,
-}
-
-async fn link_route(State(f): State<Fake>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |mut socket: WebSocket| async move {
-        let (to_tx, mut to_rx) = mpsc::unbounded_channel::<LinkRequest>();
-        let (from_tx, from_rx) = mpsc::unbounded_channel::<SidecarFrame>();
-        let _ = f.links.send(Conn {
-            headers,
-            to_sidecar: to_tx,
-            from_sidecar: from_rx,
-        });
-        loop {
-            tokio::select! {
-                req = to_rx.recv() => match req {
-                    Some(r) => { let _ = socket.send(AxMsg::Text(serde_json::to_string(&r).unwrap().into())).await; }
-                    None => { let _ = socket.close().await; break; }
-                },
-                msg = socket.recv() => match msg {
-                    Some(Ok(AxMsg::Text(t))) => { let _ = from_tx.send(serde_json::from_str(t.as_str()).unwrap()); }
-                    Some(Ok(_)) => {}
-                    _ => break,
-                },
-            }
-        }
-    })
-}
-
-async fn attach_route(
-    State(f): State<Fake>,
-    Path((_f, _c, _a, session)): Path<(String, String, String, String)>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    ws.on_upgrade(move |mut socket: WebSocket| async move {
-        let (to_tx, mut to_rx) = mpsc::unbounded_channel::<AxMsg>();
-        let (from_tx, from_rx) = mpsc::unbounded_channel::<AxMsg>();
-        let _ = f.attaches.send(AttachConn {
-            headers,
-            session,
-            to_sidecar: to_tx,
-            from_sidecar: from_rx,
-        });
-        loop {
-            tokio::select! {
-                out = to_rx.recv() => match out {
-                    Some(m) => { if socket.send(m).await.is_err() { break; } }
-                    None => { let _ = socket.close().await; break; }
-                },
-                msg = socket.recv() => match msg {
-                    Some(Ok(m)) => { let _ = from_tx.send(m); }
-                    _ => break,
-                },
-            }
-        }
-    })
-}
-
-fn fake_router(f: Fake) -> Router {
-    Router::new()
-        .route("/v1/agents/{f}/{c}/{a}/link", get(link_route))
-        .route("/v1/agents/{f}/{c}/{a}/link/attach/{s}", get(attach_route))
-        .with_state(f)
-}
-
-async fn fake_daemon(
-    listener: tokio::net::TcpListener,
-) -> (
-    mpsc::UnboundedReceiver<Conn>,
-    mpsc::UnboundedReceiver<AttachConn>,
-) {
-    let (links, links_rx) = mpsc::unbounded_channel();
-    let (attaches, attaches_rx) = mpsc::unbounded_channel();
-    tokio::spawn(axum::serve(listener, fake_router(Fake { links, attaches })).into_future());
-    (links_rx, attaches_rx)
-}
 
 /// A reader of two paths: `f` is five bytes, anything else is absent;
 /// the other reads are never made here.
@@ -205,12 +109,11 @@ async fn reply(conn: &mut Conn) -> (u64, LinkResult) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_link_connects_answers_requests_and_reconnects() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let (mut links, mut attaches) = fake_daemon(listener).await;
+    let mut daemon = FakeDaemon::start(None).await;
+    let url = format!("http://{}", daemon.addr);
     let mut side = start_sidecar_link(&url);
 
-    let mut conn = tokio::time::timeout(Duration::from_secs(5), links.recv())
+    let mut conn = tokio::time::timeout(Duration::from_secs(5), daemon.links.recv())
         .await
         .unwrap()
         .unwrap();
@@ -295,7 +198,7 @@ async fn the_link_connects_answers_requests_and_reconnects() {
             },
         })
         .unwrap();
-    let mut att = tokio::time::timeout(Duration::from_secs(5), attaches.recv())
+    let mut att = tokio::time::timeout(Duration::from_secs(5), daemon.attaches.recv())
         .await
         .unwrap()
         .unwrap();
@@ -363,7 +266,7 @@ async fn the_link_connects_answers_requests_and_reconnects() {
     // the Daemon drops the link: the sidecar is back within the back-off,
     // and its first frame is the status the Daemon reconciles on
     drop(conn);
-    let mut again = tokio::time::timeout(Duration::from_secs(5), links.recv())
+    let mut again = tokio::time::timeout(Duration::from_secs(5), daemon.links.recv())
         .await
         .unwrap()
         .unwrap();
@@ -426,9 +329,8 @@ async fn a_daemon_that_is_not_up_yet_is_reached_when_it_comes_up() {
     drop(listener);
     let _side = start_sidecar_link(&format!("http://{addr}"));
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    let (mut links, _) = fake_daemon(listener).await;
-    let conn = tokio::time::timeout(Duration::from_secs(10), links.recv())
+    let mut daemon = FakeDaemon::start(Some(addr)).await;
+    let conn = tokio::time::timeout(Duration::from_secs(10), daemon.links.recv())
         .await
         .unwrap()
         .unwrap();

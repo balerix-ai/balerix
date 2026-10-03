@@ -6,8 +6,10 @@
 //! says the agent is ready to launch.
 
 pub mod attach;
+pub mod bundle;
 pub mod cli;
 pub mod hooks;
 pub mod link;
 pub mod run;
+pub mod sidecar;
 pub mod tls;

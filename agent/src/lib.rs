@@ -5,7 +5,9 @@
 //! container's entrypoint: it starts that tmux server once the sidecar
 //! says the agent is ready to launch.
 
+pub mod attach;
 pub mod cli;
 pub mod hooks;
+pub mod link;
 pub mod run;
 pub mod tls;

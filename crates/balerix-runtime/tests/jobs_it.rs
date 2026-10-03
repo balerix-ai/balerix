@@ -234,6 +234,38 @@ fn a_remote_that_is_not_there_is_a_cache_error_and_a_later_run_recovers() {
     .unwrap();
 }
 
+/// A branch the remote deleted is not served from the cache's stale
+/// remote-tracking ref.
+#[test]
+fn a_branch_deleted_on_the_remote_is_no_longer_synced() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git+mise", false));
+        return;
+    };
+    let root = support::temp_root("jobs-crew-sync-pruned");
+    let (repo, work) = upstream(&root);
+    let slice = slice(&root);
+    let scratch = root.join("scratch");
+    sync_crew(
+        &tools,
+        &slice,
+        &scratch,
+        &crew(),
+        &repo,
+        "main",
+        None,
+        &none(),
+    )
+    .unwrap();
+    git(&work, &["push", "-q", "up", "main:b"]);
+    sync_crew(&tools, &slice, &scratch, &crew(), &repo, "b", None, &none()).unwrap();
+    git(&work, &["push", "-q", "up", ":b"]);
+    let e = sync_crew(&tools, &slice, &scratch, &crew(), &repo, "b", None, &none())
+        .unwrap_err()
+        .to_string();
+    assert_eq!(e, "cache: f/c: the remote has no branch b");
+}
+
 /// Review focus 3, the upper pools.
 #[test]
 fn pool_sync_with_an_empty_table_still_leaves_the_pool_and_its_marker() {
@@ -253,8 +285,12 @@ fn pool_sync_with_an_empty_table_still_leaves_the_pool_and_its_marker() {
     assert!(slice.fleet().installed_marker().is_file());
     // a marker that outlived its pool must not short-circuit the install
     std::fs::remove_dir_all(slice.fleet().mise_pool()).unwrap();
+    std::fs::remove_file(&slice.fleet().mise_toml).unwrap();
     sync_pool(&tools, &slice, &scratch, &fleet, &none()).unwrap();
     assert!(slice.fleet().mise_pool().is_dir());
+    // the stale marker was dropped, so the install ran again and rewrote
+    // the level file; a short-circuit would have left it missing
+    assert!(slice.fleet().mise_toml.is_file());
 }
 
 /// A clone as the sidecar makes it, on a pod layout over `slice`, with

@@ -486,7 +486,15 @@ impl Workspace<'_> {
         self.git(
             id,
             crew,
-            &["-C", &cache, "fetch", "--quiet", "--no-auto-gc", "origin"],
+            &[
+                "-C",
+                &cache,
+                "fetch",
+                "--quiet",
+                "--no-auto-gc",
+                "--prune",
+                "origin",
+            ],
         )?;
         let remote = format!("refs/remotes/origin/{git_ref}^{{commit}}");
         // `--quiet` answers a missing ref with exit 1 and no text

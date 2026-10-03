@@ -3781,6 +3781,7 @@ git commit -m "feat(operator): a Fleet resolves beneath its Daemon's defaults in
   - `crew_sync_job(ctx: &JobContext, crew: &CrewSpec, gh_secret: Option<&str>) -> Result<Job, DesiredError>`
   - `harvest_job(ctx: &JobContext, agent_name: &str, agent: &AgentSpec) -> Result<Job, DesiredError>`
   - `job_outcome(existing: Option<&Job>, pods: &[Pod], wanted: &Job) -> JobOutcome`
+  - `crew_status(crew: &Crew, fleet_pool: &JobOutcome, sync: &JobOutcome, now: &Time) -> CrewStatus`
   - the mount paths `SHARED`, `SCRATCH`, `VOLUME`
 
 - [ ] **Step 1: Write the failing tests**
@@ -3940,8 +3941,69 @@ mod tests {
         let other = daemon_pool_job(&ctx(&newer)).unwrap();
         assert_eq!(job_outcome(Some(&done), &[], &other), JobOutcome::Stale);
     }
+
+    fn crew_object(cache_ref: Option<&str>) -> Crew {
+        let mut c = Crew::new("payments-backend", crew("gh"));
+        c.metadata.generation = Some(5);
+        c.status = cache_ref.map(|r| CrewStatus {
+            cache_ref: Some(r.to_string()),
+            ..Default::default()
+        });
+        c
+    }
+
+    fn crew_cond<'a>(status: &'a CrewStatus, type_: &str) -> (&'a str, &'a str, &'a str) {
+        let c = status.conditions.iter().find(|c| c.type_ == type_).unwrap();
+        (c.status.as_str(), c.reason.as_str(), c.message.as_str())
+    }
+
+    /// §5.3, §20.3: the sync Job's message says which half failed.
+    #[test]
+    fn a_crews_conditions_follow_the_two_jobs_and_the_messages_prefix() {
+        let now = Time(k8s_openapi::jiff::Timestamp::from_second(1_800_000_000).unwrap());
+        let ok = JobOutcome::Succeeded("synced".into());
+        let s = crew_status(&crew_object(None), &ok, &JobOutcome::Succeeded("abc123".into()), &now);
+        assert_eq!(crew_cond(&s, "CacheReady"), ("True", "Synced", ""));
+        assert_eq!(crew_cond(&s, "ToolsReady"), ("True", "Synced", ""));
+        assert_eq!(s.cache_ref.as_deref(), Some("abc123"));
+        assert_eq!(s.observed_generation, Some(5));
+
+        let s = crew_status(&crew_object(Some("old")), &ok, &JobOutcome::Running, &now);
+        assert_eq!(crew_cond(&s, "CacheReady"), ("False", "Syncing", ""));
+        assert_eq!(crew_cond(&s, "ToolsReady"), ("False", "Syncing", ""));
+        assert_eq!(s.cache_ref.as_deref(), Some("old"), "the last commit fetched stays");
+
+        let cache = JobOutcome::Failed("cache: payments/backend: the remote has no branch nope".into());
+        let s = crew_status(&crew_object(Some("old")), &ok, &cache, &now);
+        assert_eq!(
+            crew_cond(&s, "CacheReady"),
+            ("False", "SyncFailed", "cache: payments/backend: the remote has no branch nope")
+        );
+        assert_eq!(crew_cond(&s, "ToolsReady"), ("Unknown", "SyncFailed", ""));
+
+        let tools = JobOutcome::Failed("tools: payments/backend: crew payments/backend: mise install failed".into());
+        let s = crew_status(&crew_object(None), &ok, &tools, &now);
+        assert_eq!(crew_cond(&s, "CacheReady"), ("True", "Synced", ""));
+        assert_eq!(crew_cond(&s, "ToolsReady").0, "False");
+        assert_eq!(crew_cond(&s, "ToolsReady").1, "SyncFailed");
+
+        // the fleet's pool comes first; the crew's Job has not run
+        let s = crew_status(
+            &crew_object(None),
+            &JobOutcome::Failed("tools: payments: fleet payments: boom".into()),
+            &JobOutcome::Absent,
+            &now,
+        );
+        assert_eq!(
+            crew_cond(&s, "ToolsReady"),
+            ("False", "FleetPoolFailed", "tools: payments: fleet payments: boom")
+        );
+        assert_eq!(crew_cond(&s, "CacheReady"), ("False", "Syncing", ""));
+    }
 }
 ```
+
+In the test module's imports, `use crate::api::{AgentSpec, CrewSpec};` becomes `use crate::api::{AgentSpec, Crew, CrewSpec, CrewStatus};`.
 
 Run: `scripts/operator.sh check`
 Expected: compile errors.
@@ -4268,7 +4330,57 @@ pub fn job_outcome(existing: Option<&Job>, pods: &[Pod], wanted: &Job) -> JobOut
     }
     JobOutcome::Running
 }
+
+/// `CacheReady` and `ToolsReady` (§4.3) from the fleet's pool Job and the
+/// crew's sync Job. A sync that failed says which half in its message's
+/// prefix (`cache:` or `tools:`); the tools half runs after the cache, so
+/// a `tools:` failure means the cache is synced. `cacheRef` is the commit
+/// the last successful sync reported, and stays until the next one.
+pub fn crew_status(
+    crew: &Crew,
+    fleet_pool: &JobOutcome,
+    sync: &JobOutcome,
+    now: &Time,
+) -> CrewStatus {
+    let syncing = || Cond::no("CacheReady", "Syncing", "");
+    let (cache, tools, commit) = match (fleet_pool, sync) {
+        (JobOutcome::Failed(message), _) => (
+            syncing(),
+            Cond::no("ToolsReady", "FleetPoolFailed", message),
+            None,
+        ),
+        (JobOutcome::Succeeded(_), JobOutcome::Succeeded(commit)) => (
+            Cond::yes("CacheReady", "Synced", ""),
+            Cond::yes("ToolsReady", "Synced", ""),
+            Some(commit.clone()),
+        ),
+        (JobOutcome::Succeeded(_), JobOutcome::Failed(message)) if message.starts_with("tools:") => (
+            Cond::yes("CacheReady", "Synced", ""),
+            Cond::no("ToolsReady", "SyncFailed", message),
+            None,
+        ),
+        (JobOutcome::Succeeded(_), JobOutcome::Failed(message)) => (
+            Cond::no("CacheReady", "SyncFailed", message),
+            Cond::unknown("ToolsReady", "SyncFailed", ""),
+            None,
+        ),
+        _ => (syncing(), Cond::no("ToolsReady", "Syncing", ""), None),
+    };
+    let old = crew.status.as_ref();
+    CrewStatus {
+        observed_generation: crew.metadata.generation,
+        conditions: conditions(
+            old.map(|s| s.conditions.as_slice()).unwrap_or_default(),
+            &[cache, tools],
+            crew.metadata.generation,
+            now,
+        ),
+        cache_ref: commit.or_else(|| old.and_then(|s| s.cache_ref.clone())),
+    }
+}
 ```
+
+Its imports: add `Cond` and `conditions` to the `super::common` list, `use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;`, and `Crew` and `CrewStatus` to the `crate::api` list.
 
 Add `pub mod jobs;` to `desired/mod.rs`.
 
@@ -5811,6 +5923,22 @@ async fn a_real_kubernetes_mode_daemon_takes_the_operators_apply() {
         ClientError::Rejected("agent_tokens.other/c/a: a token is at least 32 characters".into())
     );
     assert_eq!(c.get("other").await.unwrap(), None);
+    // §7.4's 409s: a body without tokens is the CLI's, on a fleet of the
+    // operator's and on one that does not exist
+    let mut as_cli = request("payments", AGENT_TOKEN);
+    as_cli.agent_tokens = None;
+    assert_eq!(
+        c.apply(&as_cli).await.unwrap_err(),
+        ClientError::Conflict(
+            "fleet payments is managed by kubernetes; change it through its Fleet object".into()
+        )
+    );
+    let mut absent = request("cli-made", AGENT_TOKEN);
+    absent.agent_tokens = None;
+    assert_eq!(
+        c.apply(&absent).await.unwrap_err(),
+        ClientError::Conflict("this daemon is in kubernetes mode; create a Fleet object".into())
+    );
     c.down("payments").await.unwrap();
 
     // a client holding another authority does not trust this Daemon

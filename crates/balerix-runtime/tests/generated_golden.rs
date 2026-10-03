@@ -49,11 +49,7 @@ fn normalize(text: &str, root: &std::path::Path) -> String {
 fn payments_agents_generate_known_files() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let layout = StateLayout {
-        state_root: root.join("state"),
-        data_root: root.join("data"),
-        config_root: root.join("config"),
-    };
+    let layout = StateLayout::xdg(root.join("state"), root.join("data"), root.join("config"));
     // fixed tool paths so launch.sh is deterministic; nothing is executed
     let tools = ToolPaths {
         git: "/tools/git".into(),

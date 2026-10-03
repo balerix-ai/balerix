@@ -22,7 +22,9 @@ pub mod workspace;
 pub use env::agent_env;
 pub use home::{HOOK_EVENTS, HomeInputs, write_home};
 pub use launch::{hooks_port, render_launch, wants_continue};
-pub use layout::{AgentPaths, CrewPaths, FleetPaths, PluginPaths, StateLayout, shared_list};
+pub use layout::{
+    AgentPaths, CrewPaths, FleetPaths, PluginPaths, PodLayout, PodMounts, StateLayout, shared_list,
+};
 pub use materializer::{RenderOptions, RenderOutcome, Runtime};
 pub use plugin::{
     install_plugin_tools, plugin_env, plugin_grants, render_plugin_launch, write_plugin_home,

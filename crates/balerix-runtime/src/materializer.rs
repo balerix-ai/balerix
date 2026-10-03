@@ -431,11 +431,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn runtime(root: &std::path::Path) -> Runtime {
-        let layout = StateLayout {
-            state_root: root.join("state"),
-            data_root: root.join("data"),
-            config_root: root.join("config"),
-        };
+        let layout = StateLayout::xdg(root.join("state"), root.join("data"), root.join("config"));
         std::fs::create_dir_all(&layout.config_root).unwrap();
         std::fs::write(layout.system_mise_toml(), "[tools]\n").unwrap();
         let tools = ToolPaths {

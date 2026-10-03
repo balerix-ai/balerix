@@ -5,11 +5,57 @@ use std::path::{Path, PathBuf};
 
 use balerix_core::{AgentId, AgentName, CrewRef, FleetName};
 
+/// The three roots everything hangs off. On one machine they are the XDG
+/// roots (`from_env`); in a pod (`pod`) they sit under the agent claim and
+/// the one agent's and its crew's paths come from the mounts instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateLayout {
     pub state_root: PathBuf,
     pub data_root: PathBuf,
     pub config_root: PathBuf,
+    pod: Option<PodLayout>,
+}
+
+/// The three mounts of an agent pod (Spec O §6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodMounts {
+    /// The agent claim: `home/`, `workspace/`, `nono/`, `logs/`, the
+    /// profiles, `launch.sh`.
+    pub agent: PathBuf,
+    /// Read-only sub-paths of the Daemon's shared claim: `repo/.git/objects`
+    /// (the crew cache's objects) and `crew/mise`, `fleet/mise`,
+    /// `daemon/mise` (the three pools, §8.1).
+    pub shared: PathBuf,
+    /// An `emptyDir` both containers mount: the tmux socket and the markers.
+    pub run: PathBuf,
+}
+
+/// A pod layout: the mounts and the one agent they are for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodLayout {
+    pub mounts: PodMounts,
+    pub id: AgentId,
+}
+
+impl PodLayout {
+    /// The tmux server's socket, shared by the two containers (§6.2).
+    pub fn tmux_socket(&self) -> PathBuf {
+        self.mounts.run.join("tmux.sock")
+    }
+    /// Written by the sidecar once the agent is materialised and the
+    /// sandbox self-test passed; its content is the crew's tmux session
+    /// name. The `agent` container waits for it (§6.2 step 3).
+    pub fn start_marker(&self) -> PathBuf {
+        self.mounts.run.join("started")
+    }
+    /// Present while the agent is `Ready`; the pod's exec readiness probe.
+    pub fn ready_marker(&self) -> PathBuf {
+        self.mounts.run.join("ready")
+    }
+    /// The crew cache as the pod sees it: only `.git/objects` is mounted.
+    pub fn shared_repo(&self) -> PathBuf {
+        self.mounts.shared.join("repo")
+    }
 }
 
 /// Where one fleet's own files live. `mise_pool()` holds the tools declared
@@ -103,15 +149,49 @@ impl StateLayout {
                 .unwrap_or(default)
                 .join("balerix")
         };
+        Self::xdg(
+            pick("XDG_STATE_HOME", home.join(".local").join("state")),
+            pick("XDG_DATA_HOME", home.join(".local").join("share")),
+            pick("XDG_CONFIG_HOME", home.join(".config")),
+        )
+    }
+
+    /// The three roots given directly (tests, `dev materialize`).
+    pub fn xdg(state_root: PathBuf, data_root: PathBuf, config_root: PathBuf) -> Self {
         Self {
-            state_root: pick("XDG_STATE_HOME", home.join(".local").join("state")),
-            data_root: pick("XDG_DATA_HOME", home.join(".local").join("share")),
-            config_root: pick("XDG_CONFIG_HOME", home.join(".config")),
+            state_root,
+            data_root,
+            config_root,
+            pod: None,
         }
     }
 
+    /// Spec O §6.1: the one agent at the claim root, its crew's cache and
+    /// the three pools on the shared mount, and anything else that asks
+    /// for a root under `<agent>/.balerix/`, which is on the claim and so
+    /// writable in a pod whose root filesystem is not.
+    pub fn pod(mounts: PodMounts, id: &AgentId) -> Self {
+        let roots = mounts.agent.join(".balerix");
+        Self {
+            state_root: roots.join("state"),
+            data_root: roots.join("data"),
+            config_root: roots.join("config"),
+            pod: Some(PodLayout {
+                mounts,
+                id: id.clone(),
+            }),
+        }
+    }
+
+    pub fn pod_layout(&self) -> Option<&PodLayout> {
+        self.pod.as_ref()
+    }
+
     pub fn mise_data_dir(&self) -> PathBuf {
-        self.data_root.join("mise")
+        match &self.pod {
+            Some(p) => p.mounts.shared.join("daemon").join("mise"),
+            None => self.data_root.join("mise"),
+        }
     }
     pub fn system_mise_toml(&self) -> PathBuf {
         self.config_root.join("mise.toml")
@@ -137,6 +217,14 @@ impl StateLayout {
         self.fleet_dir(f).join("gh")
     }
     pub fn crew(&self, c: &CrewRef) -> CrewPaths {
+        if let Some(p) = &self.pod
+            && p.id.crew_ref() == *c
+        {
+            return CrewPaths {
+                repo: p.shared_repo(),
+                root: p.mounts.shared.join("crew"),
+            };
+        }
         let root = self.fleet_dir(&c.fleet).join("crews").join(c.crew.as_str());
         CrewPaths {
             repo: root.join("repo"),
@@ -144,6 +232,15 @@ impl StateLayout {
         }
     }
     pub fn fleet(&self, f: &FleetName) -> FleetPaths {
+        if let Some(p) = &self.pod
+            && p.id.fleet == *f
+        {
+            let root = p.mounts.shared.join("fleet");
+            return FleetPaths {
+                mise_toml: root.join("mise.toml"),
+                root,
+            };
+        }
         let root = self.fleet_dir(f);
         FleetPaths {
             mise_toml: root.join("mise.toml"),
@@ -151,11 +248,15 @@ impl StateLayout {
         }
     }
     pub fn agent(&self, id: &AgentId) -> AgentPaths {
-        let root = self
-            .crew(&id.crew_ref())
-            .root
-            .join("agents")
-            .join(id.agent.as_str());
+        let root = match &self.pod {
+            Some(p) if p.id == *id => p.mounts.agent.clone(),
+            _ => self
+                .fleet_dir(&id.fleet)
+                .join("crews")
+                .join(id.crew.as_str())
+                .join("agents")
+                .join(id.agent.as_str()),
+        };
         AgentPaths {
             home: root.join("home"),
             workspace: root.join("workspace"),

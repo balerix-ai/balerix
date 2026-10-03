@@ -220,7 +220,6 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "sha2",
- "tempfile",
  "thiserror",
  "time",
  "tokio",

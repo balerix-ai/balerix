@@ -53,6 +53,26 @@ fn unavailable(e: reqwest::Error) -> ClientError {
     ClientError::Unavailable(e.without_url().to_string())
 }
 
+/// A success answer's body as `T`. A body that does not decode is the
+/// Daemon answering something unexpected, not a Daemon that does not answer
+/// (§5.2): `Unexpected`, with the decode error's own text.
+async fn decoded<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, ClientError> {
+    let status = response.status().as_u16();
+    response.json().await.map_err(|e| {
+        if !e.is_decode() {
+            return unavailable(e);
+        }
+        let e = e.without_url();
+        let message = match std::error::Error::source(&e) {
+            Some(cause) => format!("{e}: {cause}"),
+            None => e.to_string(),
+        };
+        ClientError::Unexpected { status, message }
+    })
+}
+
 /// The answer's message: the `ErrorBody`'s `error`, or the body as plain
 /// text when it is not one. A body that cannot be read is reported as that,
 /// with the read error's own text.
@@ -69,8 +89,8 @@ async fn message(response: reqwest::Response) -> String {
 
 impl DaemonClient {
     /// `base_url` is the Daemon's `status.endpoint`; `authority_pem` the
-    /// one certificate trusted. A plain `http://` base (tests) never
-    /// touches the TLS settings.
+    /// one certificate trusted. A base that is not `https://` is refused:
+    /// the admin token is never sent in clear.
     pub fn new(
         base_url: &str,
         authority_pem: &str,
@@ -79,6 +99,15 @@ impl DaemonClient {
     ) -> Result<Self, ClientError> {
         let setup =
             |what: &str, e: &dyn std::fmt::Display| ClientError::Setup(format!("{what}: {e}"));
+        let scheme = reqwest::Url::parse(base_url)
+            .map_err(|e| setup("the Daemon's endpoint is not a URL", &e))?
+            .scheme()
+            .to_string();
+        if scheme != "https" {
+            return Err(ClientError::Setup(format!(
+                "the Daemon's endpoint is {scheme}://, not https://: the admin token is never sent in clear"
+            )));
+        }
         // one process-wide provider; `Err` only means one is already installed
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut roots = rustls::RootCertStore::empty();
@@ -106,6 +135,25 @@ impl DaemonClient {
             .timeout(timeout)
             .build()
             .map_err(|e| setup("the HTTP client", &e))?;
+        Ok(Self {
+            http,
+            base: base_url.trim_end_matches('/').to_string(),
+            token: admin_token.to_string(),
+        })
+    }
+
+    /// A client over plain HTTP with no TLS settings. It exists for the
+    /// stub tests in `tests/client_it.rs` alone and must never be called by
+    /// a controller: it sends the admin token in clear.
+    #[doc(hidden)]
+    pub fn insecure_for_tests(base_url: &str, admin_token: &str) -> Result<Self, ClientError> {
+        // reqwest builds with no provider of its own; as in `new`
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| ClientError::Setup(format!("the HTTP client: {e}")))?;
         Ok(Self {
             http,
             base: base_url.trim_end_matches('/').to_string(),
@@ -161,7 +209,7 @@ impl DaemonClient {
         if !response.status().is_success() {
             return Err(Self::refused(response).await);
         }
-        response.json().await.map_err(unavailable)
+        decoded(response).await
     }
 
     /// The fleet's record, with its status; `None` when the Daemon has
@@ -176,7 +224,7 @@ impl DaemonClient {
             .map_err(unavailable)?;
         match response.status() {
             StatusCode::NOT_FOUND => Ok(None),
-            s if s.is_success() => response.json().await.map(Some).map_err(unavailable),
+            s if s.is_success() => decoded(response).await.map(Some),
             _ => Err(Self::refused(response).await),
         }
     }

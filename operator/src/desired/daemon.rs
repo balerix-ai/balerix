@@ -6,7 +6,9 @@
 
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Secret, Service};
+use k8s_openapi::api::core::v1::{
+    ConfigMap, PersistentVolumeClaim, ResourceRequirements, Secret, Service,
+};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use serde_json::{Value, json};
@@ -217,7 +219,6 @@ pub fn daemon_objects(
                             "args": [
                                 "serve", "--mode", "kubernetes",
                                 "--bind", format!("0.0.0.0:{DAEMON_PORT}"),
-                                "--tmux-socket", "unused",
                                 "--tls-cert", "/balerix/tls/tls.crt",
                                 "--tls-key", "/balerix/tls/tls.key",
                                 "--admin-token-file", "/balerix/admin/token",
@@ -276,7 +277,9 @@ pub fn daemon_objects(
     })
 }
 
-/// `StorageReady`, `SystemToolsReady`, `PluginsReady`, `Ready` (§4.1).
+/// `StorageReady`, `SystemToolsReady`, `PluginsReady`, `Ready` (§4.1). A
+/// `spec.resources` that is not a `ResourceRequirements` makes `Ready`
+/// false, reason `InvalidResources`, before anything else.
 pub fn daemon_status(
     daemon: &Daemon,
     cfg: &OperatorConfig,
@@ -339,19 +342,25 @@ pub fn daemon_status(
                 ),
             )
         };
+        // what `daemon_objects` refuses as a `Shape`, with its config path
+        let resources =
+            serde_json::from_value::<ResourceRequirements>(daemon.spec.resources.clone())
+                .err()
+                .map(|e| Cond::no("Ready", "InvalidResources", &format!("spec.resources: {e}")));
         let pod_ready = observed
             .statefulset
             .and_then(|s| s.status.as_ref())
             .and_then(|s| s.ready_replicas)
             .unwrap_or(0) // no status yet: nothing is ready
             >= 1;
-        let ready = match [&storage, &tools, &plugins]
+        let failing = [&storage, &tools, &plugins]
             .into_iter()
-            .find(|c| c.status != Some(true))
-        {
-            Some(failing) => Cond::no("Ready", &failing.reason, &failing.message),
-            None if pod_ready => Cond::yes("Ready", "Ready", ""),
-            None => Cond::no("Ready", "DaemonNotReady", "the daemon pod is not ready"),
+            .find(|c| c.status != Some(true));
+        let ready = match (resources, failing) {
+            (Some(invalid), _) => invalid,
+            (None, Some(failing)) => Cond::no("Ready", &failing.reason, &failing.message),
+            (None, None) if pod_ready => Cond::yes("Ready", "Ready", ""),
+            (None, None) => Cond::no("Ready", "DaemonNotReady", "the daemon pod is not ready"),
         };
         vec![storage, tools, plugins, ready]
     };
@@ -545,6 +554,25 @@ mod tests {
         assert_eq!(
             cond(&s, "Ready"),
             ("False", "DaemonNotReady", "the daemon pod is not ready")
+        );
+    }
+
+    /// Like a Fleet's runner (§20.5): a `spec.resources` that is not a
+    /// `ResourceRequirements` is a condition with its config path, and the
+    /// objects are not built from it.
+    #[test]
+    fn resources_that_are_not_resource_requirements_are_a_condition() {
+        let d = daemon(json!({ "resources": { "requests": "lots" } }));
+        assert!(matches!(
+            daemon_objects(&d, &cfg(), 1_807_776_000),
+            Err(DesiredError::Shape(_))
+        ));
+        let s = status_of(&d, Some("Bound"), 1, JobOutcome::Succeeded(String::new()));
+        let (status, reason, message) = cond(&s, "Ready");
+        assert_eq!((status, reason), ("False", "InvalidResources"));
+        assert!(
+            message.starts_with("spec.resources: ") && message.len() > "spec.resources: ".len(),
+            "{message}"
         );
     }
 

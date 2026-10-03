@@ -41,8 +41,6 @@ spec:
             - kubernetes
             - "--bind"
             - "0.0.0.0:7643"
-            - "--tmux-socket"
-            - unused
             - "--tls-cert"
             - /balerix/tls/tls.crt
             - "--tls-key"

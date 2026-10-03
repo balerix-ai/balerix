@@ -62,7 +62,7 @@ impl Images {
     }
 }
 
-/// `component` is `daemon`, `agent`, `pool`, `sync` or `harvest`.
+/// `component` is `daemon`, `crew`, `agent`, `pool`, `sync` or `harvest`.
 pub fn labels(daemon: &str, component: &str, extra: &[(&str, &str)]) -> Value {
     let mut all = json!({
         "app.kubernetes.io/managed-by": MANAGER,

@@ -1162,7 +1162,11 @@ What 3a's plan decided beyond §20.1–§20.4, as built.
   object name's length, and the pod runner's shapes (`desired::fleet::
   check_runner`). `resources` must be a `ResourceRequirements`,
   `tolerations` a list of `Toleration`, and `storage.size`, when
-  `storage` is set, a non-empty string; it is not parsed as a quantity. A tmux-mode daemon also refuses a posted
+  `storage` is set, a non-empty string; it is not parsed as a quantity. A
+  Daemon's `spec.resources` is checked the same way: one that is not a
+  `ResourceRequirements` sets `Ready=False`, reason `InvalidResources`,
+  with the message `spec.resources: ` and the typing error, and no
+  object is built from it. A tmux-mode daemon also refuses a posted
   `pod` runner, since it trusts what it is posted (#24); a
   Kubernetes-mode daemon checks nothing, and its tests post specs with
   the default runner.
@@ -1241,6 +1245,12 @@ What 3a's plan decided beyond §20.1–§20.4, as built.
   it has none, or a hand-written one printing `<redacted>`. The
   operator's `Material`, `DaemonSecrets`, `AgentInputs` and
   `AgentObjects` have none.
+- **The Daemon client refuses a base that is not `https://`** with a
+  setup error naming the scheme, so the admin token is never sent in
+  clear. Its stub tests use `DaemonClient::insecure_for_tests`, which no
+  controller calls. A success answer whose body does not decode is
+  `Unexpected`, not `DaemonUnavailable` (§5.2 keeps that for a Daemon
+  that does not answer).
 - **`desired::common::hash` takes a `serde_json::Value`**, and the claim
   builder (`common::claim`) is shared by the Daemon's and the Agent's
   claims.
@@ -1252,8 +1262,6 @@ Known in 3a and left for 3b:
   cluster.
 - The agent and daemon containers have a read-only root and no writable
   `/tmp`.
-- The Daemon client accepts a plain `http://` base (its tests use one);
-  3b must build `https://` endpoints only.
 - Names derived from a Daemon's (`balerix-<daemon>…`) have no length
   bound.
 - A stale sidecar crash message can show `MaterializeFailed` after a

@@ -66,9 +66,9 @@ fn refusal(status: StatusCode, message: &str) -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
+/// The stubs speak plain HTTP; `new` refuses that.
 fn client(base: &str) -> DaemonClient {
-    let authority = pki::new_authority("team-a", "default", now()).unwrap();
-    DaemonClient::new(base, &authority.cert_pem, TOKEN, Duration::from_secs(5)).unwrap()
+    DaemonClient::insecure_for_tests(base, TOKEN).unwrap()
 }
 
 #[tokio::test]
@@ -201,6 +201,58 @@ async fn a_body_that_cannot_be_read_says_why_there_is_no_message() {
                 message.starts_with("the response body could not be read: "),
                 "{message}"
             );
+            assert!(!message.contains(TOKEN), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_success_body_that_is_not_a_record_is_unexpected_not_unavailable() {
+    // §5.2 keeps DaemonUnavailable for a Daemon that does not answer
+    let base = stub(
+        Router::new().route(
+            "/v1/fleets/garbled",
+            put(|| async { (StatusCode::OK, "not a fleet record") })
+                .get(|| async { (StatusCode::OK, "not a fleet record") }),
+        ),
+    )
+    .await;
+    let c = client(&base);
+    for got in [
+        c.apply(&request("garbled", AGENT_TOKEN)).await.unwrap_err(),
+        c.get("garbled").await.unwrap_err(),
+    ] {
+        match got {
+            ClientError::Unexpected {
+                status: 200,
+                message,
+            } => {
+                assert!(
+                    message.starts_with("error decoding response body: ")
+                        && !message.contains(&base),
+                    "{message}"
+                );
+                assert!(!message.contains(TOKEN), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_plain_http_base_is_refused_and_the_token_is_never_named() {
+    let authority = pki::new_authority("team-a", "default", now()).unwrap();
+    let refused = DaemonClient::new(
+        "http://127.0.0.1:1",
+        &authority.cert_pem,
+        TOKEN,
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    match &refused {
+        ClientError::Setup(message) => {
+            assert!(message.contains("http"), "{message}");
             assert!(!message.contains(TOKEN), "{message}");
         }
         other => panic!("{other:?}"),

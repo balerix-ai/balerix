@@ -135,6 +135,8 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
                         "name": "slice",
                         "image": ctx.images.agent,
                         "command": mkdir,
+                        // a failed `mkdir` reports its stderr as the message
+                        "terminationMessagePolicy": "FallbackToLogsOnError",
                         "securityContext": container_security(),
                         "volumeMounts": [{ "name": "shared", "mountPath": VOLUME }],
                     }],
@@ -335,44 +337,52 @@ pub fn job_outcome(existing: Option<&Job>, pods: &[Pod], wanted: &Job) -> JobOut
     JobOutcome::Running
 }
 
-/// `CacheReady` and `ToolsReady` (§4.3) from the fleet's pool Job and the
-/// crew's sync Job. A sync that failed says which half in its message's
-/// prefix (`cache:` or `tools:`); the tools half runs after the cache, so
-/// a `tools:` failure means the cache is synced. `cacheRef` is the commit
-/// the last successful sync reported, and stays until the next one.
+/// `CacheReady` and `ToolsReady` (§4.3). `CacheReady` follows the crew's
+/// sync Job alone; `ToolsReady` follows the fleet's pool Job, then the
+/// sync Job's tools half. A sync that failed says which half in its
+/// message's prefix (`cache:` or `tools:`); the tools half runs after the
+/// cache, so a `tools:` failure means the cache is synced. `cacheRef` is
+/// the commit the last successful sync reported, and stays until the next
+/// one.
 pub fn crew_status(
     crew: &Crew,
     fleet_pool: &JobOutcome,
     sync: &JobOutcome,
     now: &Time,
 ) -> CrewStatus {
-    let syncing = || Cond::no("CacheReady", "Syncing", "");
-    let (cache, tools, commit) = match (fleet_pool, sync) {
-        (JobOutcome::Failed(message), _) => (
-            syncing(),
-            Cond::no("ToolsReady", "FleetPoolFailed", message),
-            None,
-        ),
-        (JobOutcome::Succeeded(_), JobOutcome::Succeeded(commit)) => (
-            Cond::yes("CacheReady", "Synced", ""),
-            Cond::yes("ToolsReady", "Synced", ""),
-            Some(commit.clone()),
-        ),
+    // the cache follows the sync Job alone; the tools follow the fleet's
+    // pool Job, then the sync Job's tools half
+    let (cache, commit) = match sync {
+        JobOutcome::Succeeded(commit) => (Cond::yes("CacheReady", "Synced", ""), Some(commit)),
+        JobOutcome::Failed(message) if message.starts_with("tools:") => {
+            (Cond::yes("CacheReady", "Synced", ""), None)
+        }
+        JobOutcome::Failed(message) => (Cond::no("CacheReady", "SyncFailed", message), None),
+        JobOutcome::Running | JobOutcome::Stale | JobOutcome::Absent => {
+            (Cond::no("CacheReady", "Syncing", ""), None)
+        }
+    };
+    let tools = match (fleet_pool, sync) {
+        (JobOutcome::Failed(message), _) => Cond::no("ToolsReady", "FleetPoolFailed", message),
+        (JobOutcome::Running | JobOutcome::Stale | JobOutcome::Absent, _) => {
+            Cond::no("ToolsReady", "PoolSyncRunning", "")
+        }
+        (JobOutcome::Succeeded(_), JobOutcome::Succeeded(_)) => {
+            Cond::yes("ToolsReady", "Synced", "")
+        }
         (JobOutcome::Succeeded(_), JobOutcome::Failed(message))
             if message.starts_with("tools:") =>
         {
-            (
-                Cond::yes("CacheReady", "Synced", ""),
-                Cond::no("ToolsReady", "SyncFailed", message),
-                None,
-            )
+            Cond::no("ToolsReady", "SyncFailed", message)
         }
-        (JobOutcome::Succeeded(_), JobOutcome::Failed(message)) => (
-            Cond::no("CacheReady", "SyncFailed", message),
-            Cond::unknown("ToolsReady", "SyncFailed", ""),
-            None,
-        ),
-        _ => (syncing(), Cond::no("ToolsReady", "Syncing", ""), None),
+        // the cache half failed, so the tools half never ran
+        (JobOutcome::Succeeded(_), JobOutcome::Failed(_)) => {
+            Cond::unknown("ToolsReady", "SyncFailed", "")
+        }
+        (
+            JobOutcome::Succeeded(_),
+            JobOutcome::Running | JobOutcome::Stale | JobOutcome::Absent,
+        ) => Cond::no("ToolsReady", "Syncing", ""),
     };
     let old = crew.status.as_ref();
     CrewStatus {
@@ -387,6 +397,7 @@ pub fn crew_status(
         // a sync that reported no commit (its pod gone) keeps the old one
         cache_ref: commit
             .filter(|c| !c.is_empty())
+            .cloned()
             .or_else(|| old.and_then(|s| s.cache_ref.clone())),
     }
 }
@@ -638,5 +649,50 @@ mod tests {
             )
         );
         assert_eq!(crew_cond(&s, "CacheReady"), ("False", "Syncing", ""));
+
+        // the cache follows the sync Job alone: a fleet pool still running,
+        // or stale, beside a sync that succeeded leaves the cache ready
+        for pool in [JobOutcome::Running, JobOutcome::Stale, JobOutcome::Absent] {
+            let s = crew_status(
+                &crew_object(None),
+                &pool,
+                &JobOutcome::Succeeded("abc123".into()),
+                &now,
+            );
+            assert_eq!(
+                crew_cond(&s, "CacheReady"),
+                ("True", "Synced", ""),
+                "{pool:?}"
+            );
+            assert_eq!(s.cache_ref.as_deref(), Some("abc123"), "{pool:?}");
+            assert_eq!(
+                crew_cond(&s, "ToolsReady"),
+                ("False", "PoolSyncRunning", ""),
+                "{pool:?}"
+            );
+        }
+        // and a cache failure is reported beside a fleet pool that failed
+        let s = crew_status(
+            &crew_object(None),
+            &JobOutcome::Failed("tools: payments: fleet payments: boom".into()),
+            &cache,
+            &now,
+        );
+        assert_eq!(
+            crew_cond(&s, "CacheReady"),
+            (
+                "False",
+                "SyncFailed",
+                "cache: payments/backend: the remote has no branch nope"
+            )
+        );
+        assert_eq!(crew_cond(&s, "ToolsReady").1, "FleetPoolFailed");
+        // a `tools:` failure of the sync means the cache is synced, whatever the pool
+        let s = crew_status(&crew_object(None), &JobOutcome::Running, &tools, &now);
+        assert_eq!(crew_cond(&s, "CacheReady"), ("True", "Synced", ""));
+        assert_eq!(
+            crew_cond(&s, "ToolsReady"),
+            ("False", "PoolSyncRunning", "")
+        );
     }
 }

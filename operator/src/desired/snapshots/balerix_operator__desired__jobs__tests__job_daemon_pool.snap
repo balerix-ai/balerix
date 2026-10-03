@@ -74,6 +74,7 @@ spec:
             runAsNonRoot: true
             seccompProfile:
               type: RuntimeDefault
+          terminationMessagePolicy: FallbackToLogsOnError
           volumeMounts:
             - mountPath: /balerix/volume
               name: shared

@@ -277,18 +277,13 @@ fn scheduled(pod: Option<&Pod>) -> Cond {
         .flatten()
         .chain(status.container_statuses.iter().flatten())
         .filter_map(|c| c.state.as_ref()?.waiting.as_ref())
-        .find(|w| {
-            w.reason
-                .as_deref()
-                .is_some_and(|r| PULL_FAILURES.contains(&r))
+        .find_map(|w| {
+            let reason = w.reason.as_deref().filter(|r| PULL_FAILURES.contains(r))?;
+            // a waiting state may carry no message
+            Some((reason, w.message.as_deref().unwrap_or("")))
         });
-    if let Some(w) = pull {
-        // the filter above keeps only waiting states that have a reason
-        return Cond::no(
-            "Scheduled",
-            w.reason.as_deref().unwrap_or("ImagePullBackOff"),
-            w.message.as_deref().unwrap_or(""),
-        );
+    if let Some((reason, message)) = pull {
+        return Cond::no("Scheduled", reason, message);
     }
     match placed {
         Some(_) => Cond::yes("Scheduled", "Scheduled", ""),

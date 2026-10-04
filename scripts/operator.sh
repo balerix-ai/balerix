@@ -34,16 +34,15 @@ case "$1" in
       ENVTEST_DIR="$(dirname "$(command -v kube-apiserver)")"
       export ENVTEST_DIR
     fi
-    # Every test target but tests/e2e_k8s.rs, the journey, which needs the
-    # kind cluster and fails without it under BALERIX_REQUIRE_TOOLS=1 (the
-    # `e2e` mode runs it). An explicit list, not `-E 'not binary(e2e_k8s)'`:
-    # nextest 0.9.146 rejects a binary() filter that matches no binary, in
-    # any form (exact, /regex/, binary_id), so the filter is invalid until
-    # the journey exists. A new tests/*.rs joins this list.
+    # Every test but tests/e2e_k8s.rs, the journey, which needs the kind
+    # cluster and fails without it under BALERIX_REQUIRE_TOOLS=1 (the `e2e`
+    # mode runs it). A filter, not a list of targets, so a new tests/*.rs
+    # runs here without an edit; nextest rejects a binary() filter that
+    # matches no binary, so the journey's file must keep its name.
     CARGO_TARGET_DIR="$target" cargo nextest run \
       --config-file "$dir/.config/nextest.toml" \
       --manifest-path "$dir/Cargo.toml" \
-      --lib --bins --test client_it --test controllers_it --test crds_it
+      -E 'not binary(e2e_k8s)'
     ;;
   e2e)
     root="${CARGO_TARGET_DIR:-$repo/target}/tmp/kind"

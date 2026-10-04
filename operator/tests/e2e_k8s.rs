@@ -5,7 +5,9 @@
 //! Fleet with `retain: None` and find the crew's directories gone. The
 //! operator runs outside the cluster, as a child of this test. Needs
 //! `KUBECONFIG` (scripts/kind-up.sh) and `BALERIX_K8S_IMAGES`; skips
-//! without them, fails under `BALERIX_REQUIRE_TOOLS=1`.
+//! without them, fails under `BALERIX_REQUIRE_TOOLS=1`. kind's network
+//! plugin does not enforce NetworkPolicy: the operator's policies are
+//! applied here but inert.
 mod support;
 
 use std::os::unix::process::CommandExt;
@@ -46,8 +48,7 @@ fn gate() -> Option<(String, String)> {
     }
 }
 
-/// Ends a child (the operator, the port-forward) when the test ends,
-/// however it ends.
+/// Ends the operator child when the test ends, however it ends.
 struct Operator(Child);
 impl Drop for Operator {
     fn drop(&mut self) {

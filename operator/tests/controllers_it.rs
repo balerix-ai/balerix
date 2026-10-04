@@ -929,6 +929,21 @@ async fn a_crew_dropped_from_the_fleet_is_removed_and_its_agent_harvested() {
         jobs.get_opt("f-d-a-harvest").await.unwrap()
     })
     .await;
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    // the Agent says what its deletion waits for, and how to skip it
+    let ready = wait_for("Ready=False/Deleting", Duration::from_secs(60), || async {
+        let s = agents.get("f-d-a").await.unwrap().status?;
+        let c = condition(&s.conditions, "Ready").clone();
+        (c.reason == "Deleting" && c.message.contains("harvest")).then_some(c)
+    })
+    .await;
+    assert_eq!(ready.status, "False");
+    assert_eq!(
+        ready.message,
+        format!(
+            "Agent {ns}/f-d-a: harvest Job f-d-a-harvest not finished; the annotation balerix.ai/purge=true on the Agent or its Fleet skips the harvest"
+        )
+    );
     finish_job(
         &client,
         &ns,
@@ -937,7 +952,6 @@ async fn a_crew_dropped_from_the_fleet_is_removed_and_its_agent_harvested() {
         Some("harvested balerix/a"),
     )
     .await;
-    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
     wait_for("Agent f-d-a gone", Duration::from_secs(30), || async {
         agents
             .get_opt("f-d-a")
@@ -1177,7 +1191,7 @@ async fn fleet_deletion_with_retain_none_downs_the_daemon_and_runs_the_cleanup_j
     if envtest().await.is_none() {
         return;
     }
-    let (env, ns, stub, _clock, operator) = world("retainnone").await;
+    let (env, ns, stub, clock, operator) = world("retainnone").await;
     let client = env.client.clone();
     let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
     fleets
@@ -1194,13 +1208,58 @@ async fn fleet_deletion_with_retain_none_downs_the_daemon_and_runs_the_cleanup_j
     })
     .await;
 
+    // a finalizer of the test's own holds the Agent, so the Fleet's
+    // deletion has something to wait on
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let hold = |finalizers: serde_json::Value| {
+        Patch::Merge(serde_json::json!({ "metadata": { "finalizers": finalizers } }))
+    };
+    agents
+        .patch(
+            "f-c-a",
+            &PatchParams::default(),
+            &hold(serde_json::json!(["balerix.ai/harvest", "test/hold"])),
+        )
+        .await
+        .unwrap();
     fleets
         .delete("f", &kube::api::DeleteParams::default())
         .await
         .unwrap();
+    // the deletion waits on the Agent
+    let ready = wait_for("Ready=False/Deleting", Duration::from_secs(60), || async {
+        let s = fleets.get("f").await.unwrap().status?;
+        let c = condition(&s.conditions, "Ready").clone();
+        (c.reason == "Deleting").then_some(c)
+    })
+    .await;
+    assert_eq!(ready.status, "False");
+    assert!(
+        ready.message.contains("1 agents still exist (f-c-a)")
+            && ready.message.contains("balerix.ai/purge=true"),
+        "{}",
+        ready.message
+    );
     reap_pod(&client, &ns, "f-c-a", Duration::from_secs(30)).await;
+    // the operator's own finalizer comes off first; then the test's
+    wait_for(
+        "the harvest finalizer off",
+        Duration::from_secs(60),
+        || async {
+            let a = agents.get("f-c-a").await.unwrap();
+            (a.metadata.finalizers.unwrap_or_default() == ["test/hold"]).then_some(())
+        },
+    )
+    .await;
+    agents
+        .patch(
+            "f-c-a",
+            &PatchParams::default(),
+            &hold(serde_json::json!(null)),
+        )
+        .await
+        .unwrap();
     let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
-    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
     wait_for(
         "Agent gone without a harvest",
         Duration::from_secs(30),
@@ -1227,6 +1286,36 @@ async fn fleet_deletion_with_retain_none_downs_the_daemon_and_runs_the_cleanup_j
         fleets.get_opt("f").await.unwrap().is_some(),
         "the finalizer waits for the cleanup"
     );
+    // a failed cleanup says so on the Fleet, and is retried after the delay
+    let first = jobs.get("f-c-remove").await.unwrap();
+    finish_job(
+        &client,
+        &ns,
+        "f-c-remove",
+        false,
+        Some("cannot empty the slice at /balerix/shared"),
+    )
+    .await;
+    wait_for(
+        "Deleting with the cleanup's failure",
+        Duration::from_secs(60),
+        || async {
+            let s = fleets.get("f").await.unwrap().status?;
+            let c = condition(&s.conditions, "Ready").clone();
+            (c.reason == "Deleting"
+                && c.message.contains(
+                    "c (Job f-c-remove failed: cannot empty the slice at /balerix/shared)",
+                ))
+            .then_some(())
+        },
+    )
+    .await;
+    clock.advance(31);
+    wait_for("the cleanup retried", Duration::from_secs(60), || async {
+        let j = jobs.get_opt("f-c-remove").await.unwrap()?;
+        (j.metadata.uid != first.metadata.uid).then_some(())
+    })
+    .await;
     finish_job(&client, &ns, "f-c-remove", true, Some("removed")).await;
     wait_for("the Fleet gone", Duration::from_secs(30), || async {
         fleets.get_opt("f").await.unwrap().is_none().then_some(())
@@ -1477,4 +1566,169 @@ async fn a_stale_job_is_deleted_in_the_foreground_and_holds_the_crew_until_gone(
         new.metadata.annotations.unwrap()["balerix.ai/input-hash"],
         "new"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_harvest_keeps_the_agent_until_it_is_purged() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, _clock, operator) = world("harvestfail").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new(
+                "f",
+                fleet_spec("default", &[("c", &["a", "b"])], "Branches"),
+            ),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    wait_for("the pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-b").await.unwrap()
+    })
+    .await;
+    fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(
+                serde_json::json!({ "spec": { "crews": { "c": { "agents": { "b": null } } } } }),
+            ),
+        )
+        .await
+        .unwrap();
+    reap_pod(&client, &ns, "f-c-b", Duration::from_secs(60)).await;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    wait_for("the harvest Job", Duration::from_secs(60), || async {
+        jobs.get_opt("f-c-b-harvest").await.unwrap()
+    })
+    .await;
+    finish_job(
+        &client,
+        &ns,
+        "f-c-b-harvest",
+        false,
+        Some("harvest: f/c/b: the clone has uncommitted work"),
+    )
+    .await;
+    // §8.5: the failure holds the finalizer and says why, and how to skip it
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let ready = wait_for(
+        "Ready=False/HarvestFailed",
+        Duration::from_secs(60),
+        || async {
+            let s = agents.get("f-c-b").await.unwrap().status?;
+            let c = condition(&s.conditions, "Ready").clone();
+            (c.reason == "HarvestFailed").then_some(c)
+        },
+    )
+    .await;
+    assert_eq!(ready.status, "False");
+    assert_eq!(
+        ready.message,
+        "Job f-c-b-harvest failed: harvest: f/c/b: the clone has uncommitted work; the annotation balerix.ai/purge=true on the Agent or its Fleet skips the harvest"
+    );
+    hold_for(
+        "the Agent gone after a failed harvest",
+        Duration::from_secs(3),
+        || async {
+            agents
+                .get_opt("f-c-b")
+                .await
+                .unwrap()
+                .is_none()
+                .then_some(())
+        },
+    )
+    .await;
+    let b = agents.get("f-c-b").await.unwrap();
+    assert_eq!(
+        b.metadata.finalizers.as_deref(),
+        Some(&["balerix.ai/harvest".to_string()][..])
+    );
+    Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns)
+        .get("f-c-b")
+        .await
+        .unwrap();
+
+    // the escape the condition names
+    agents
+        .patch(
+            "f-c-b",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "metadata": { "annotations": { "balerix.ai/purge": "true" } } })),
+        )
+        .await
+        .unwrap();
+    wait_for("Agent f-c-b gone", Duration::from_secs(60), || async {
+        agents
+            .get_opt("f-c-b")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    reap_claim(&client, &ns, "f-c-b", Duration::from_secs(60)).await;
+    agents.get("f-c-a").await.unwrap();
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminating_namespace_skips_the_harvest() {
+    use k8s_openapi::api::core::v1::Namespace;
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, _clock, operator) = world("terminating").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    wait_for("the pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns)
+        .get("f-c-a")
+        .await
+        .unwrap();
+    // envtest has no namespace controller: the namespace stays
+    // Terminating, and the API server refuses every create in it
+    Api::<Namespace>::all(client.clone())
+        .delete(&ns, &Default::default())
+        .await
+        .unwrap();
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    agents.delete("f-c-a", &Default::default()).await.unwrap();
+    reap_pod(&client, &ns, "f-c-a", Duration::from_secs(60)).await;
+    wait_for("Agent f-c-a gone", Duration::from_secs(60), || async {
+        agents
+            .get_opt("f-c-a")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    assert!(
+        Api::<Job>::namespaced(client.clone(), &ns)
+            .get_opt("f-c-a-harvest")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    operator.abort();
 }

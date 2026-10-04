@@ -20,6 +20,7 @@ metadata:
       name: payments-backend
       uid: crew-uid
 spec:
+  activeDeadlineSeconds: 3600
   backoffLimit: 0
   template:
     metadata:

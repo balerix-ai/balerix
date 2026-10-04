@@ -18,12 +18,16 @@ use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher;
 use kube::{Api, ResourceExt};
 
+use super::agent::PURGE_ANNOTATION;
 use super::daemon::{authority_and_token, read_secret_string};
 use super::jobs::ensure_job;
-use super::{Context, Error, api_in, apply, error_policy, patch_status, reconciled, report};
+use super::{
+    Context, Error, api_in, apply, error_policy, patch_status, reconciled, replace_condition,
+    report,
+};
 use crate::api::{Agent, Crew, Daemon, Fleet, FleetStatus, Retain};
 use crate::daemon_client::{ClientError, DaemonClient};
-use crate::desired::common::{JobOutcome, conditions, labels, owner_of, typed};
+use crate::desired::common::{Cond, JobOutcome, conditions, labels, owner_of, typed};
 use crate::desired::fleet::{Accepted, FLEET_FINALIZER, FleetPlan, fleet_conditions, plan_fleet};
 use crate::desired::jobs::{JobContext, fleet_pool_job, remove_job};
 use crate::desired::names;
@@ -99,7 +103,13 @@ pub async fn reconcile(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
     finalizer(&fleets, FLEET_FINALIZER, fleet, |event| async move {
         match event {
             Event::Apply(fleet) => apply_fleet(fleet, ctx2).await,
-            Event::Cleanup(fleet) => cleanup_fleet(fleet, ctx2).await,
+            Event::Cleanup(fleet) => {
+                let result = cleanup_fleet(fleet.clone(), ctx2.clone()).await;
+                if let Err(e) = &result {
+                    deleting(&ctx2, &fleet, e).await;
+                }
+                result
+            }
         }
     })
     .await
@@ -330,6 +340,40 @@ async fn apply_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, Err
     Ok(Action::requeue(period.min(pool.again)))
 }
 
+/// While the Fleet's deletion waits or fails: `Ready=False`, reason
+/// `Deleting`, with why, the other conditions as they were. A status
+/// that cannot be written is logged: the cleanup's own error is the one
+/// `error_policy` sees.
+async fn deleting(ctx: &Context, fleet: &Fleet, why: &Error) {
+    let message = match why {
+        Error::Waiting(m) => m.clone(),
+        // the one Daemon call of a cleanup
+        Error::Daemon(e) => format!(
+            "Fleet {}: Daemon {} did not take the down: {e}",
+            fleet.name_any(),
+            fleet.spec.daemon
+        ),
+        other => other.to_string(),
+    };
+    let old = fleet
+        .status
+        .as_ref()
+        .map(|s| s.conditions.as_slice())
+        .unwrap_or(&[]);
+    let status = FleetStatus {
+        observed_generation: fleet.metadata.generation,
+        conditions: replace_condition(
+            old,
+            Cond::no("Ready", "Deleting", &message),
+            fleet.metadata.generation,
+            &ctx.k8s_now(),
+        ),
+    };
+    if let Err(e) = patch_status(&ctx.client, fleet, &status).await {
+        tracing::warn!(namespace = %fleet.namespace().unwrap_or_default(), name = %fleet.name_any(), "the Deleting condition was not written: {e}");
+    }
+}
+
 async fn cleanup_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, Error> {
     let namespace = fleet.namespace().unwrap_or_default();
     let name = fleet.name_any();
@@ -347,9 +391,11 @@ async fn cleanup_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
                     .await?;
             }
         }
+        let names: Vec<String> = remaining.iter().map(ResourceExt::name_any).collect();
         return Err(Error::Waiting(format!(
-            "Fleet {key}: {} agents still exist",
-            remaining.len()
+            "Fleet {key}: {} agents still exist ({}); an Agent's harvest is skipped by the annotation {PURGE_ANNOTATION}=true on the Agent or the Fleet",
+            remaining.len(),
+            names.join(", ")
         )));
     }
 
@@ -380,8 +426,16 @@ async fn cleanup_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
                 Some((&name, &crew.spec.crew)),
             )
             .await?;
-            if !matches!(ensured.outcome, JobOutcome::Succeeded(_)) {
-                pending.push(crew.spec.crew.clone());
+            match ensured.outcome {
+                JobOutcome::Succeeded(_) => {}
+                // the namespace goes, and the crew's slice is not in it
+                _ if ensured.namespace_terminating => {}
+                JobOutcome::Failed(message) => pending.push(format!(
+                    "{} (Job {} failed: {message})",
+                    crew.spec.crew,
+                    names::remove_job(&name, &crew.spec.crew)
+                )),
+                _ => pending.push(crew.spec.crew.clone()),
             }
         }
         if !pending.is_empty() {

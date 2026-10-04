@@ -23,7 +23,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::daemon_client::{ClientError, DaemonClient};
-use crate::desired::common::{DesiredError, Images, MANAGER, OperatorConfig, hash};
+use crate::desired::common::{
+    Cond, DesiredError, Images, MANAGER, OperatorConfig, conditions, hash,
+};
 use crate::desired::fleet::PlanError;
 use crate::pki::PkiError;
 
@@ -266,6 +268,24 @@ where
     )
     .await?;
     Ok(())
+}
+
+/// `old` with one condition replaced in place (appended when absent),
+/// its transition time kept while its status holds (`conditions`).
+pub fn replace_condition(
+    old: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+    new: Cond,
+    generation: Option<i64>,
+    now: &Time,
+) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+    let mut all = old.to_vec();
+    for c in conditions(old, &[new], generation, now) {
+        match all.iter_mut().find(|o| o.type_ == c.type_) {
+            Some(o) => *o = c,
+            None => all.push(c),
+        }
+    }
+    all
 }
 
 /// A reconcile that ended well resets the object's error count.

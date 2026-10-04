@@ -265,6 +265,19 @@ async fn apply_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Err
     Ok(Action::requeue(again))
 }
 
+/// A deletion that waits: the condition written (or the failure to write
+/// it logged), and the `Waiting` that requeues the cleanup in 2 s.
+async fn deleting(ctx: &Context, agent: &Agent, condition: Cond) -> Error {
+    let namespace = agent.namespace().unwrap_or_default();
+    let reported = reported(ctx, &namespace, agent);
+    let message = condition.message.clone();
+    let status = with_condition(ctx, agent, None, reported.as_ref(), condition);
+    if let Err(e) = patch_status(&ctx.client, agent, &status).await {
+        tracing::warn!(namespace = %namespace, name = %agent.name_any(), "the deletion's condition was not written: {e}");
+    }
+    Error::Waiting(message)
+}
+
 fn purged(agent: &Agent, fleet: Option<&Fleet>) -> bool {
     let marked = |a: &std::collections::BTreeMap<String, String>| {
         a.get(PURGE_ANNOTATION).is_some_and(|v| v == "true")
@@ -283,9 +296,16 @@ async fn cleanup_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, E
         if pod.metadata.deletion_timestamp.is_none() {
             pods.delete(&name, &DeleteParams::default()).await?;
         }
-        return Err(Error::Waiting(format!(
-            "Agent {namespace}/{name}: its pod still exists"
-        )));
+        return Err(deleting(
+            &ctx,
+            &agent,
+            Cond::no(
+                "Ready",
+                "Deleting",
+                &format!("Agent {namespace}/{name}: its pod still exists"),
+            ),
+        )
+        .await);
     }
 
     // 2. nothing to harvest without a claim
@@ -307,33 +327,49 @@ async fn cleanup_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, E
             images: &ctx.cfg.images,
             owner: owner_of(agent.as_ref())?,
         };
+        let job = harvest_job(&job_ctx, &name, &agent.spec)?;
+        let job_name = job.name_any();
         let ensured = ensure_job(
             ctx.as_ref(),
             agent.as_ref(),
-            harvest_job(&job_ctx, &name, &agent.spec)?,
+            job,
             Some((&agent.spec.fleet, &agent.spec.crew)),
         )
         .await?;
+        let purge = format!(
+            "the annotation {PURGE_ANNOTATION}=true on the Agent or its Fleet skips the harvest"
+        );
         match ensured.outcome {
             JobOutcome::Succeeded(message) => tracing::info!(agent = %name, "{message}"),
+            // the namespace takes the claim with it; there is nowhere to harvest to
+            _ if ensured.namespace_terminating => {
+                tracing::warn!(agent = %name, "not harvested: the namespace is being deleted");
+            }
             JobOutcome::Failed(message) => {
-                let reported = reported(&ctx, &namespace, &agent);
-                let status = with_condition(
+                return Err(deleting(
                     &ctx,
                     &agent,
-                    None,
-                    reported.as_ref(),
-                    Cond::no("Ready", "HarvestFailed", &message),
-                );
-                patch_status(&ctx.client, agent.as_ref(), &status).await?;
-                return Err(Error::Waiting(format!(
-                    "Agent {namespace}/{name}: harvest failed: {message}"
-                )));
+                    Cond::no(
+                        "Ready",
+                        "HarvestFailed",
+                        &format!("Job {job_name} failed: {message}; {purge}"),
+                    ),
+                )
+                .await);
             }
             _ => {
-                return Err(Error::Waiting(format!(
-                    "Agent {namespace}/{name}: harvest not finished"
-                )));
+                return Err(deleting(
+                    &ctx,
+                    &agent,
+                    Cond::no(
+                        "Ready",
+                        "Deleting",
+                        &format!(
+                            "Agent {namespace}/{name}: harvest Job {job_name} not finished; {purge}"
+                        ),
+                    ),
+                )
+                .await);
             }
         }
     }

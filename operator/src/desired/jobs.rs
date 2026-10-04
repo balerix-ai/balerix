@@ -30,6 +30,11 @@ pub const SCRATCH: &str = "/balerix/scratch";
 /// root to 0700 (`write_home`), which only its owner may do: the agent
 /// pod's `claim` init container makes this directory as uid 10001.
 pub const AGENT_DIR: &str = "agent";
+/// Every Job's `activeDeadlineSeconds`: a pod that never starts (an image
+/// that cannot be pulled, a claim that is gone) fails the Job, with the
+/// Job's own message, under the Job rule, instead of leaving it running
+/// forever. An hour, for a slow pool install.
+pub const JOB_DEADLINE_SECONDS: i64 = 3600;
 
 pub struct JobContext<'a> {
     pub namespace: &'a str,
@@ -131,6 +136,7 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
         "spec": {
             // the operator retries with back-off (§8.3); the Job does not
             "backoffLimit": 0,
+            "activeDeadlineSeconds": JOB_DEADLINE_SECONDS,
             "template": {
                 "metadata": { "labels": labels },
                 "spec": {
@@ -347,6 +353,26 @@ fn message(pods: &[Pod]) -> Option<String> {
     })
 }
 
+/// A failed Job with no pod message: its `Failed` condition's reason and
+/// message (`DeadlineExceeded: Job was active longer than specified
+/// deadline`) when the Job controller wrote them.
+fn failed_condition(job: &Job) -> String {
+    let condition = job
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|c| c.iter().find(|c| c.type_ == "Failed" && c.status == "True"))
+        .filter(|c| c.reason.as_deref().is_some_and(|r| !r.is_empty()));
+    match condition {
+        Some(c) => format!(
+            "the job failed: {}: {}",
+            c.reason.as_deref().unwrap_or_default(),
+            c.message.as_deref().unwrap_or_default()
+        ),
+        None => "the job failed and left no message".to_string(),
+    }
+}
+
 /// `existing` is the Job by `wanted`'s name, if there is one; `pods` are
 /// that Job's pods.
 pub fn job_outcome(existing: Option<&Job>, pods: &[Pod], wanted: &Job) -> JobOutcome {
@@ -362,9 +388,7 @@ pub fn job_outcome(existing: Option<&Job>, pods: &[Pod], wanted: &Job) -> JobOut
         return JobOutcome::Succeeded(message(pods).unwrap_or_default());
     }
     if status.and_then(|s| s.failed).unwrap_or(0) >= 1 {
-        return JobOutcome::Failed(
-            message(pods).unwrap_or_else(|| "the job failed and left no message".to_string()),
-        );
+        return JobOutcome::Failed(message(pods).unwrap_or_else(|| failed_condition(job)));
     }
     JobOutcome::Running
 }
@@ -592,6 +616,24 @@ mod tests {
         assert_eq!(
             job_outcome(Some(&failed), &[init], &wanted),
             JobOutcome::Failed("the job failed and left no message".into())
+        );
+
+        // past its deadline with no pod to speak: the Job's own condition
+        let expired = observed(
+            &wanted,
+            json!({ "failed": 1, "conditions": [{ "type": "Failed", "status": "True",
+                "reason": "DeadlineExceeded", "message": "Job was active longer than specified deadline" }] }),
+        );
+        assert_eq!(
+            job_outcome(Some(&expired), &[], &wanted),
+            JobOutcome::Failed(
+                "the job failed: DeadlineExceeded: Job was active longer than specified deadline"
+                    .into()
+            )
+        );
+        assert_eq!(
+            wanted.spec.as_ref().unwrap().active_deadline_seconds,
+            Some(JOB_DEADLINE_SECONDS)
         );
 
         let newer = Images::for_version("0.3.0");

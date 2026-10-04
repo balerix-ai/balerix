@@ -25,6 +25,11 @@ pub const VOLUME: &str = "/balerix/volume";
 pub const SHARED: &str = "/balerix/shared";
 /// A Job's emptyDir: the gh config, the git profile, nono's home, `HOME`.
 pub const SCRATCH: &str = "/balerix/scratch";
+/// The directory of an agent claim that is mounted at `/balerix/agent`.
+/// A volume's root belongs to root, and the sidecar narrows the agent
+/// root to 0700 (`write_home`), which only its owner may do: the agent
+/// pod's `claim` init container makes this directory as uid 10001.
+pub const AGENT_DIR: &str = "agent";
 
 pub struct JobContext<'a> {
     pub namespace: &'a str,
@@ -318,7 +323,7 @@ pub fn harvest_job(
                 "persistentVolumeClaim": { "claimName": agent_name, "readOnly": true },
             })],
             mounts: vec![
-                json!({ "name": "agent", "mountPath": "/balerix/agent", "readOnly": true }),
+                json!({ "name": "agent", "mountPath": "/balerix/agent", "subPath": AGENT_DIR, "readOnly": true }),
             ],
         },
     )

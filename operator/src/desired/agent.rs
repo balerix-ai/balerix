@@ -15,7 +15,7 @@ use super::common::{
     Cond, DesiredError, OperatorConfig, claim, conditions, container_security, labels, owner_of,
     pod_security, typed,
 };
-use super::jobs::SHARED;
+use super::jobs::{AGENT_DIR, SHARED};
 use super::names;
 use crate::api::{Agent, AgentStatus, ClaimSpec, Daemon};
 
@@ -134,7 +134,8 @@ pub fn agent_objects(inputs: &AgentInputs<'_>) -> Result<AgentObjects, DesiredEr
         shared(names::vol_daemon_pool(), "daemon"),
     ];
     let both = |extra: Vec<Value>| -> Vec<Value> {
-        let mut mounts = vec![json!({ "name": "agent", "mountPath": "/balerix/agent" })];
+        let mut mounts =
+            vec![json!({ "name": "agent", "mountPath": "/balerix/agent", "subPath": AGENT_DIR })];
         mounts.extend(slice.iter().cloned());
         mounts.push(json!({ "name": "run", "mountPath": "/balerix/run" }));
         mounts.push(json!({ "name": "tmp", "mountPath": "/tmp" }));
@@ -181,8 +182,18 @@ pub fn agent_objects(inputs: &AgentInputs<'_>) -> Result<AgentObjects, DesiredEr
                 "securityContext": pod_security(),
                 "nodeSelector": node_selector,
                 "tolerations": tolerations,
-                // a native sidecar: an init container that keeps running
                 "initContainers": [{
+                    // the claim's directory, made by the pods' own user:
+                    // the kubelet would make a missing sub-path as root
+                    "name": "claim",
+                    "image": inputs.cfg.images.agent,
+                    "command": ["mkdir", "-p", format!("/balerix/claim/{AGENT_DIR}")],
+                    // a failed `mkdir` reports its stderr as the message
+                    "terminationMessagePolicy": "FallbackToLogsOnError",
+                    "securityContext": container_security(),
+                    "volumeMounts": [{ "name": "agent", "mountPath": "/balerix/claim" }],
+                }, {
+                    // a native sidecar: an init container that keeps running
                     "name": "sidecar",
                     "image": inputs.cfg.images.agent,
                     "restartPolicy": "Always",
@@ -672,12 +683,16 @@ mod tests {
     #[test]
     fn both_containers_mount_an_empty_dir_at_tmp() {
         let spec = objects(json!({ "type": "pod" })).pod.spec.unwrap();
-        for c in spec
+        // the sidecar and the agent; the `claim` init container only runs `mkdir`
+        let both: Vec<_> = spec
             .init_containers
-            .unwrap()
             .iter()
+            .flatten()
             .chain(spec.containers.iter())
-        {
+            .filter(|c| c.name != "claim")
+            .collect();
+        assert_eq!(both.len(), 2);
+        for c in both {
             assert!(
                 c.volume_mounts
                     .as_ref()

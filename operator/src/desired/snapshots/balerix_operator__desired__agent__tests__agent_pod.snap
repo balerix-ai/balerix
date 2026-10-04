@@ -46,6 +46,7 @@ spec:
       volumeMounts:
         - mountPath: /balerix/agent
           name: agent
+          subPath: agent
         - mountPath: /balerix/shared/repo/.git/objects
           name: shared
           readOnly: true
@@ -68,6 +69,25 @@ spec:
           name: tmp
   enableServiceLinks: false
   initContainers:
+    - command:
+        - mkdir
+        - "-p"
+        - /balerix/claim/agent
+      image: "ghcr.io/balerix-ai/balerix-agent:0.2.0"
+      name: claim
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      terminationMessagePolicy: FallbackToLogsOnError
+      volumeMounts:
+        - mountPath: /balerix/claim
+          name: agent
     - command:
         - balerix-agent
         - sidecar
@@ -97,6 +117,7 @@ spec:
       volumeMounts:
         - mountPath: /balerix/agent
           name: agent
+          subPath: agent
         - mountPath: /balerix/shared/repo/.git/objects
           name: shared
           readOnly: true

@@ -6,7 +6,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   annotations:
-    balerix.ai/input-hash: b9b87000b8e034b0ee9a20c6995e9edd1396790380a6c06c9abd242fb2717284
+    balerix.ai/input-hash: 5b65c36014b82124d722f447cd625755f58292c92aa54281d8fa8bd05f16c8e6
   labels:
     app.kubernetes.io/managed-by: balerix-operator
     balerix.ai/agent: alice
@@ -72,6 +72,7 @@ spec:
             - mountPath: /balerix/agent
               name: agent
               readOnly: true
+              subPath: agent
       enableServiceLinks: false
       initContainers:
         - command:

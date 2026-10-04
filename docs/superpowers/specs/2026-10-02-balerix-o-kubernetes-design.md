@@ -866,7 +866,8 @@ its index by hand.
 - **End to end:** `mise run e2e-k8s`, the Phase 3 journey on `kind` with
   locally built images and `dev fake-claude`: apply a Daemon and a Fleet,
   wait `Ready`, a flow rule fires, evict the pod and resume, drop an agent
-  and find its branch in the cache.
+  and find its branch in the cache (`operator/tests/e2e_k8s.rs`, the
+  operator out of cluster; §21.4).
 - **Shared volume on kind:** every kind run (end to end, charts) gives the shared claim kind's local-path provisioner with
   `sharedFileSystemPath` set to one host directory mounted into every node
   (§19.3). kind's default class refuses ReadWriteMany. This class is for CI
@@ -902,7 +903,7 @@ Each gets its own plan.
    (PR #125).
 3. **Operator and CRDs.** §4, §5, §8. Done when `e2e-k8s` passes without
    plugins. Built as two plans, 3a without a cluster and 3b on one (§20,
-   §21). 3a done 2026-10.
+   §21). 3a done 2026-10; 3b done 2026-10 (PR #127).
 4. **Plugins.** §9. Done when `e2e-k8s` passes with flow and web, and the
    managed journey passes with `dev fake-plugin`.
 5. **Release and charts.** §13, §14. Done when a fork rehearsal publishes
@@ -1500,4 +1501,137 @@ Cases:
 
 ### 21.6 Decided by the plan
 
-Filled in as 3b's plan and build decide beyond §21.1–§21.5.
+What 3b's plan decided beyond §21.1–§21.5, as built.
+
+- **Owned objects are read by label-selected lists, not reflector stores.**
+  A reconcile lists its children by `balerix.ai/*` labels through the API
+  (`Api::list`), one call per kind it needs. Reflector stores for five child
+  kinds would be shared caches that lag a server-side apply by one watch
+  event, and the lists are small. The main kinds are still watched. This
+  amends §21.2's "from the controllers' reflector stores". A Job's pods are
+  selected by `batch.kubernetes.io/controller-uid`, not `job-name`: a
+  recreated Job's predecessor's pods keep `job-name` until they are
+  collected.
+- **The attempt count is one annotation on the owner,** `balerix.ai/attempts`,
+  a JSON object from Job name to count (`{"f-c-sync": 2}`), since a Fleet
+  owns its pool Job and, while deleting, one cleanup Job per crew. An entry
+  is removed when the Job succeeds or its input changes. The delay is
+  `30 × 2^(n−1)` seconds for attempt `n`, capped at 600, measured from the
+  failed Job's `Failed` condition's transition time, else its creation time.
+- **The Fleet's agents are re-reconciled through a Fleet watch.** The Agent
+  controller `watches` Fleets with a mapper that returns the Agent names the
+  Fleet controller last planned, kept in the `Context` per fleet, so a Fleet
+  change reaches its Agents at once. The Agent period equals the Fleet's
+  (15 s), so a phase change the poll brought lands within one period.
+  (`Controller::reconcile_on` is unstable in kube-runtime 4.2; a mapper
+  cannot list.) An Agent's `phase` therefore trails the Fleet's `Ready` by
+  one Agent reconcile: the phase comes from the cached record, `Ready` from
+  the pod.
+- **`--watch-namespaces` with several names starts one set of controllers per
+  namespace** in the same process, each on `Api::namespaced`, sharing the
+  `Context`; with none it is one set on `Api::all`. A single `Controller`
+  watches one namespace or all, and a per-namespace Role (§5.6) forbids a
+  cluster-wide list.
+- **Periods and the clock are configuration.** `RunConfig` carries the Fleet
+  period (15 s), the other period (60 s) and a `Clock`
+  (`Arc<dyn Fn() -> i64 + Send + Sync>`, unix seconds). Tests set periods of
+  1 s and a clock they can move, so the Job retry test needs no 30 s wait.
+- **An operator outside the cluster reaches a Daemon through
+  `--resolve host=ip:port`** (reqwest's resolver override on the Daemon
+  client). reqwest's override ignores the address's port, so `--resolve`
+  rewrites the endpoint's port instead; TLS still verifies the Service's
+  host name as in a pod. `e2e-k8s` runs `kubectl port-forward` in a restart
+  loop, since it exits while the pod is Pending and on restarts. The chart
+  never uses `--resolve`.
+- **A test-only Daemon URL override.** `RunConfig::insecure_daemon_url:
+  Option<String>` (the hidden flag `--insecure-daemon-url`, as
+  `balerix-agent sidecar` hides `--allow-http`) makes every Daemon client
+  `DaemonClient::insecure_for_tests` at that URL. The envtest tests' stub
+  Daemon is plain HTTP; a pod's Daemon is `https`.
+- **No claim, no harvest.** An Agent with no claim has nothing to harvest; its
+  finalizer drops at once.
+- **A failed harvest is `Ready=False`, reason `HarvestFailed`,** with the
+  Job's message; the Agent keeps its finalizer until the retry succeeds.
+- **An Agent waiting on its Crew is `Materialized=Unknown`, reason
+  `WaitingForCrew`,** with the Crew's failing condition's message when it has
+  one. The Fleet and Agent controllers unwrap kube's finalizer error so
+  `Error::Waiting` reaches `error_policy`: a 2 s requeue, not a warning and
+  back-off.
+- **A token Secret is owned by the Fleet,** not the Agent: §5.2 keeps it across
+  reconciles and pod replacements, and the Fleet's deletion removes it.
+- **The Daemon's `Ready` asks `/readyz` once per reconcile** only when the
+  StatefulSet reports a ready replica; without one `daemon_status` already
+  says `DaemonNotReady`. The override goes through `conditions()`, so an
+  unchanged `Ready=False/DaemonNotReady` keeps its transition time;
+  otherwise each status patch would re-trigger a reconcile and a probe.
+- **A newly minted authority always re-issues the serving certificate.** A
+  lost CA Secret would otherwise leave a certificate the new authority
+  cannot verify.
+- **The test is the kubelet.** In envtest nothing runs pods. A test patches a
+  Job's `status` and its pod's termination message, patches a Pod's
+  `status`, and deletes a Pod once the operator has set its deletion
+  timestamp. There is no scheduler either, so an unscheduled Pod deletes at
+  once; the helpers track the Pod's uid. Kubernetes 1.34's Job status
+  validation needs `startTime` and `FailureTarget=True` before
+  `Failed=True`, and `startTime`, `completionTime` and
+  `SuccessCriteriaMet=True` before `Complete=True`. The stand-in pod's
+  termination message is written before the Job status, since the Job patch
+  wakes the operator (Pods are not watched). A claim's
+  `kubernetes.io/pvc-protection` finalizer is removed by the test: there is
+  no controller-manager.
+- **The envtest binaries run under a parent-watching shell,** `bash -c '… &
+  while kill -0 $PPID; do sleep 0.5; done; kill $!'`, so a test process that
+  exits leaves no `etcd` or `kube-apiserver` behind. There is one instance
+  per test process, since nextest runs each test in its own, started on free
+  ports under `CARGO_TARGET_TMPDIR` and bounded to four at once by a nextest
+  test group in `operator/.config/nextest.toml`. Readiness is `GET /readyz`
+  returning `ok`; a start that hits a port collision is retried on new
+  ports; the watcher ends the servers with SIGKILL.
+- **`e2e-k8s` seeds its repository through a git server pod** from the agent
+  image (`git daemon`, a Service), since nothing on the runner is reachable
+  from the cluster; the crew uses `git: { push: false, auth: none }`. The
+  journey asserts the Fleet object and the crew's directories are gone after
+  a `retain: None` deletion. It does not assert §21.4 step 6's "the Daemon
+  lists no fleet": the Daemon's list is not reachable from the test without
+  a plugin token.
+- **`scripts/operator.sh check` leaves the journey out** with `-E 'not
+  binary(e2e_k8s)'`; `e2e` runs it alone under a nextest profile `e2e-k8s`
+  (45 minutes per test). The CI job has `timeout-minutes: 90`.
+- **The cleanup Job is `balerix-agent crew-remove --crew <fleet>/<crew>`,**
+  over `balerix_runtime::jobs::remove_crew`, which removes `repo/` and
+  `crew/` (the pool and logs) under the crew's slice and leaves the mount
+  points; its outcome line is `removed`. The Job is
+  `names::remove_job(fleet, crew)` = `<fleet>-<crew>-remove`, bounded as the
+  other Job names.
+- **`/tmp` is an `emptyDir`** in the agent pod (both containers) and in every
+  Job (the `job` container), mounted at `/tmp`. The daemon pod gets none.
+- **The agent claim is mounted through the sub-path `agent/`,** made by a
+  `claim` init container as uid 10001. A volume root is root-owned (local-path
+  0777; a CSI volume root:10001 with `fsGroup`), and the sidecar's 0700 chmod
+  of the root failed with EPERM. The sidecar, the agent and the harvest Job
+  see it at `/balerix/agent`. This is §21.5's slice pattern applied to the
+  agent claim.
+- **The kind config mounts the shared directory into every node,** the control
+  plane included, since local-path's helper pod may run there.
+- **Names derived from a Daemon's are bounded by `names::job_name`'s rule**
+  (truncate, `-`, eight hex characters of the hash, suffix), applied to every
+  `balerix-<daemon>…` name through one function, so no label value can
+  exceed 63 characters.
+
+Known in 3b and left open:
+
+- `fsGroupChangePolicy` on a CSI class may re-add group bits to the agent's
+  0700 tree. Not exercised: the journey runs on kind's local-path only.
+- The harvest Job and its pod are collected with the Agent, so the outcome
+  (`harvested <branch>`) survives only in the operator's log. Keep it
+  somewhere (an Event) if anything needs it.
+- A Fleet naming a Daemon that does not exist yet waits a period (15 s)
+  instead of a Daemon watch.
+- The envtest suite has load-sensitive waits (30 s `wait_for`, an
+  occasional 180 s hang under four API servers on one host).
+- What did not bite on kind (ubuntu-24.04): the `slice` init `mkdir`, the
+  `/tmp` emptyDirs and the sidecar's sandbox self-test. The crew cache is a
+  clone with a work tree (`repo/.git`). Pool Jobs took 4 to 19 s and the
+  journey one to two minutes.
+- The operator's RBAC, Deployment and metrics, and `verify-k8s`, are
+  sub-project 5; the Plugin controller is sub-project 4.

@@ -21,13 +21,27 @@ credentials, hook input, or sandbox rules.
 - `operator` — lint and test the standalone `operator/` project
   (`balerix-operator`, Spec O §12); builds `balerix` first, since its
   client test runs `balerix serve --mode kubernetes`. Fails when
-  `operator/crds/` differs from the Rust types. Its own CI job; not part
-  of `check`.
+  `operator/crds/` differs from the Rust types. The controller tests run
+  on the envtest binaries the task pins (a `kube-apiserver` and `etcd`, no
+  cluster, no kubelet: the test stands in for it). `scripts/operator.sh
+  check` leaves the journey out (`-E 'not binary(e2e_k8s)'`); `e2e` runs it
+  alone. `operator/.config/nextest.toml` holds the `envtest` test group
+  (four API servers at once) and the `e2e-k8s` profile. Its own CI job; not
+  part of `check`.
 - `crds` — regenerates `operator/crds/` from `operator/src/api/`.
 - `mutants` — nightly tier: mutation-tests `balerix-core` (the reconciler).
   `.cargo/mutants.toml` excludes `fakes.rs`: the fakes are exercised by
   `balerix-server`'s tests, which that run never executes.
 - `e2e` — the Phase 3 journey against a real daemon; needs the same tools as `test-it`.
+- `kind-up` — a kind cluster `balerix-e2e` for `e2e-k8s`: the shared
+  local-path class (§19.3), the CRDs, and the daemon and agent images built
+  from this tree and loaded (`balerix:e2e`, `balerix-agent:e2e`). Needs
+  docker; `mise run kind-up -- down` deletes it. This host has no docker:
+  CI only.
+- `e2e-k8s` — the Phase 3 journey on that cluster (`operator/tests/e2e_k8s.rs`):
+  the operator runs outside the cluster as the test's child; `dev fake-claude`
+  in the pods. Fails, not skips, without the cluster. Its own CI job,
+  path-filtered on pull requests.
 - `package-plugins [names…]` — builds the named in-tree plugins inside
   their own projects and assembles each as a directory source under
   `target/plugins/<name>/` (under `CARGO_TARGET_DIR` when set). No names
@@ -115,6 +129,10 @@ credentials, hook input, or sandbox rules.
   runner's Kubernetes shapes are opaque JSON in `balerix-api`.
   `operator/src/desired/` is pure: no clock, no random value, no I/O.
   Tokens and certificates are made by `pki` and passed in.
+- The controllers (`operator/src/controllers/`) are the dumb executor:
+  observe, call `desired`, apply with server-side apply under the field
+  manager `balerix-operator`, patch status. Every Job goes through
+  `controllers::jobs::ensure_job`.
 
 ## Gotchas
 - A `desired` function writes its manifest as JSON and returns the
@@ -139,6 +157,13 @@ credentials, hook input, or sandbox rules.
 - The cache directory can be a mount point (a sync Job): it can be
   emptied, never removed. `discard_half_made` accepts an emptied
   directory for that reason.
+- Envtest has an API server and etcd and nothing else: no scheduler, no
+  kubelet, no controller-manager. An unscheduled Pod is deleted at once, but
+  Jobs never run and claims never go. The tests play the missing parts:
+  `support::finish_job` writes a Job's stand-in pod (its termination
+  message first, then the Job status, since the Job patch wakes the
+  operator), `support::reap_pod` deletes a Pod by uid, and
+  `support::reap_claim` removes a claim's `pvc-protection` finalizer.
 - Run cargo through mise (`mise x -- cargo …`) or via a `mise run` task.
 - `mise run check` covers the core workspace only. Cargo unifies features
   across every member one invocation selects, so while the plugins were

@@ -161,7 +161,8 @@ pub fn daemon_objects(
     let owner = owner_of(daemon)?;
     let object = names::daemon(name);
     let labels = labels(name, "daemon", &[]);
-    let selector = json!({ "balerix.ai/daemon": name, "balerix.ai/component": "daemon" });
+    let selector =
+        json!({ "balerix.ai/daemon": names::daemon_label(name), "balerix.ai/component": "daemon" });
     let metadata = json!({
         "name": object,
         "namespace": namespace,
@@ -258,7 +259,7 @@ pub fn daemon_objects(
                 "policyTypes": ["Ingress"],
                 "ingress": [{
                     "from": [
-                        { "podSelector": { "matchLabels": { "balerix.ai/daemon": name } } },
+                        { "podSelector": { "matchLabels": { "balerix.ai/daemon": names::daemon_label(name) } } },
                         {
                             "namespaceSelector": { "matchLabels": { "kubernetes.io/metadata.name": cfg.namespace } },
                             "podSelector": { "matchLabels": { "app.kubernetes.io/name": MANAGER } },
@@ -446,6 +447,44 @@ mod tests {
     fn cond<'a>(status: &'a DaemonStatus, type_: &str) -> (&'a str, &'a str, &'a str) {
         let c = status.conditions.iter().find(|c| c.type_ == type_).unwrap();
         (c.status.as_str(), c.reason.as_str(), c.message.as_str())
+    }
+
+    #[test]
+    fn a_long_daemon_name_makes_valid_names_labels_and_selectors() {
+        let long = "d".repeat(70);
+        let mut d = daemon(json!({}));
+        d.metadata.name = Some(long.clone());
+        let o = daemon_objects(&d, &cfg(), 1_807_776_000).unwrap();
+        let set = o.statefulset.metadata.name.clone().unwrap();
+        assert!(set.len() <= 52, "{set}");
+        let label = names::daemon_label(&long);
+        assert!(label.len() <= 63);
+        let labelled = [
+            o.statefulset.metadata.labels.clone().unwrap(),
+            o.service.metadata.labels.clone().unwrap(),
+            o.policy.metadata.labels.clone().unwrap(),
+            o.pool_job.metadata.labels.clone().unwrap(),
+            o.claims[0].metadata.labels.clone().unwrap(),
+        ];
+        for labels in labelled {
+            assert_eq!(labels["balerix.ai/daemon"], label);
+            assert!(labels.values().all(|v| v.len() <= 63), "{labels:?}");
+        }
+        // the selectors find what the labels say
+        let spec = o.statefulset.spec.unwrap();
+        let selected = spec.selector.match_labels.unwrap();
+        let template = spec.template.metadata.unwrap().labels.unwrap();
+        assert!(selected.iter().all(|(k, v)| template.get(k) == Some(v)));
+        assert_eq!(selected["balerix.ai/daemon"], label);
+        assert_eq!(
+            o.service.spec.unwrap().selector.unwrap()["balerix.ai/daemon"],
+            label
+        );
+        let policy = serde_json::to_value(&o.policy.spec).unwrap();
+        assert_eq!(
+            policy["ingress"][0]["from"][0]["podSelector"]["matchLabels"]["balerix.ai/daemon"],
+            json!(label)
+        );
     }
 
     #[test]

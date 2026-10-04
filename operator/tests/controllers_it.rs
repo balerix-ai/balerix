@@ -553,7 +553,11 @@ async fn a_fleet_becomes_crews_agents_and_tokens_and_the_put_carries_them() {
             .await
             .unwrap()
             .status
-            .filter(|s| s.conditions.len() == 3)
+            // a reconcile before the Daemon's authority and admin Secret
+            // exist writes all three with Accepted=Unknown (DaemonUnavailable)
+            .filter(|s| {
+                s.conditions.len() == 3 && condition(&s.conditions, "Accepted").status == "True"
+            })
     })
     .await;
     assert_eq!(condition(&status.conditions, "Resolved").status, "True");

@@ -79,6 +79,10 @@ insta = { version = "1.49.0", features = ["yaml"] }
 proptest = "1.11.0"
 # the stub Daemon the client tests talk to
 axum = "0.8.9"
+# the envtest harness's raw `GET /readyz` through the kube client
+# (`Client::request_text` takes an `http::Request`); the version kube 4.2
+# already locks
+http = "1.5.0"
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -6,3 +6,14 @@
 # roots and sockets (`balerix_runtime::testing::TempRoot`) reaps them.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# The operator's controller tests each start a kube-apiserver and etcd of
+# their own (nextest runs a test per process; operator/tests/support/
+# envtest.rs): some 300 MiB and 8–12 s apiece. Four at a time keeps a
+# laptop and a CI runner inside their memory.
+[test-groups]
+envtest = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = 'binary(controllers_it)'
+test-group = 'envtest'

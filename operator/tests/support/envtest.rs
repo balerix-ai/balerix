@@ -1,13 +1,17 @@
 //! A real `kube-apiserver` and `etcd` (the envtest binaries, Spec O
-//! §21.3) started once per test binary on free ports under `target/tmp`,
-//! with the five definitions applied. No controller-manager, no kubelet:
-//! a test patches Job and Pod status itself and force-deletes pods.
+//! §21.3) started once per test process on free ports under `target/tmp`,
+//! with the five definitions applied. nextest runs each test in a process
+//! of its own, so that is one instance per test; the `envtest` test group
+//! in `.config/nextest.toml` bounds how many run at once. A start whose
+//! port was taken between `free_port` and the bind is retried on new
+//! ports. No controller-manager, no kubelet: a test patches Job and Pod
+//! status itself and force-deletes pods.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(dead_code)]
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
@@ -19,6 +23,8 @@ use tokio::sync::OnceCell;
 pub struct EnvTest {
     pub client: Client,
     pub kubeconfig: PathBuf,
+    /// The two watched shells; they end the servers with this process.
+    _shells: Vec<Child>,
 }
 
 static INSTANCE: OnceCell<Option<EnvTest>> = OnceCell::const_new();
@@ -48,19 +54,19 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// `bash -c`: run the binary, and end it when this test process is gone.
-/// A test binary that panics or is killed leaves no server behind. KILL,
-/// not TERM: both watchers fire together, and an API server whose etcd is
-/// already gone spends some 13 s in its graceful shutdown; nothing here
-/// outlives the test, so there is nothing to shut down gracefully.
+/// `bash -c`: run the binary, and end it when this test process is gone
+/// (or when the shell is sent TERM: a start retried on new ports). A test
+/// binary that panics or is killed leaves no server behind. KILL, not
+/// TERM, for the server: both watchers fire together, and an API server
+/// whose etcd is already gone spends some 13 s in its graceful shutdown;
+/// nothing here outlives the test, so there is nothing to shut down
+/// gracefully.
 const WATCHED: &str = r#""$0" "$@" & child=$!
+trap 'kill -KILL "$child" 2>/dev/null; wait "$child"; exit 0' TERM
 while kill -0 "$PPID" 2>/dev/null && kill -0 "$child" 2>/dev/null; do sleep 0.5; done
 kill -KILL "$child" 2>/dev/null; wait "$child""#;
 
-// never waited on: the shell outlives this call by design and ends with
-// the test process (WATCHED), which is what reaps it
-#[allow(clippy::zombie_processes)]
-fn spawn(bin: &Path, args: &[String], log: &Path) {
+fn spawn(bin: &Path, args: &[String], log: &Path) -> Child {
     let log = std::fs::File::create(log).unwrap();
     Command::new("bash")
         .arg("-c")
@@ -71,7 +77,37 @@ fn spawn(bin: &Path, args: &[String], log: &Path) {
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log))
         .spawn()
-        .unwrap();
+        .unwrap()
+}
+
+/// Ends a failed attempt's servers: TERM to each shell, whose trap kills
+/// its server; then reaps the shell.
+fn stop(shells: Vec<Child>) {
+    for mut shell in shells {
+        let _ = Command::new("kill").arg(shell.id().to_string()).status();
+        let _ = shell.wait();
+    }
+}
+
+/// Why an attempt failed. A `Collision` (a port taken by the time the
+/// server bound it, or a server that died) is retried on new ports.
+enum Failed {
+    Collision(String),
+    Fatal(String),
+}
+
+const ATTEMPTS: u32 = 4;
+
+/// A port taken under the server, or the server gone: retry material.
+fn collided(what: &str, log: &Path, shell: &mut Child) -> Option<String> {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    if text.contains("address already in use") {
+        return Some(format!("{what}: address already in use"));
+    }
+    if let Ok(Some(status)) = shell.try_wait() {
+        return Some(format!("{what} exited ({status})"));
+    }
+    None
 }
 
 async fn start() -> Option<EnvTest> {
@@ -87,21 +123,48 @@ async fn start() -> Option<EnvTest> {
     let root =
         Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("envtest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(root.join("etcd")).unwrap();
     std::fs::create_dir_all(root.join("certs")).unwrap();
 
     // the service-account signing key the API server insists on
     let key = rcgen::KeyPair::generate().unwrap();
     std::fs::write(root.join("certs/sa.key"), key.serialize_pem()).unwrap();
     std::fs::write(root.join("certs/sa.pub"), key.public_key_pem()).unwrap();
+
+    for attempt in 1..=ATTEMPTS {
+        match attempt_start(&bin, &root, attempt).await {
+            Ok(env) => return Some(env),
+            Err(Failed::Collision(why)) if attempt < ATTEMPTS => {
+                eprintln!("envtest: attempt {attempt}: {why}; retrying on new ports");
+            }
+            Err(Failed::Collision(why) | Failed::Fatal(why)) => panic!(
+                "{why} (attempt {attempt}); see {} and {}",
+                root.join("apiserver.log").display(),
+                root.join("etcd.log").display()
+            ),
+        }
+    }
+    unreachable!("the last attempt panics or returns")
+}
+
+/// One start on fresh ports: etcd serving, then the API server's
+/// `/readyz` answering `ok` (its post-start hooks done), then the five
+/// definitions applied and established.
+async fn attempt_start(bin: &Path, root: &Path, attempt: u32) -> Result<EnvTest, Failed> {
+    let etcd_log = root.join("etcd.log");
+    let api_log = root.join("apiserver.log");
+    let _ = std::fs::remove_dir_all(root.join("etcd"));
+    std::fs::create_dir_all(root.join("etcd")).unwrap();
+    // a token of this attempt's own: a client that reached another test's
+    // API server on a port taken under this one is refused there
+    let token = format!("envtest-{}-{attempt}", std::process::id());
     std::fs::write(
         root.join("token.csv"),
-        "envtest-token,admin,uid-admin,system:masters\n",
+        format!("{token},admin,uid-admin,system:masters\n"),
     )
     .unwrap();
 
     let (etcd_client, etcd_peer, api_port) = (free_port(), free_port(), free_port());
-    spawn(
+    let mut etcd = spawn(
         &bin.join("etcd"),
         &[
             format!("--data-dir={}", root.join("etcd").display()),
@@ -110,9 +173,32 @@ async fn start() -> Option<EnvTest> {
             format!("--listen-peer-urls=http://127.0.0.1:{etcd_peer}"),
             "--unsafe-no-fsync".to_string(),
         ],
-        &root.join("etcd.log"),
+        &etcd_log,
     );
-    spawn(
+    // etcd's own line for its client port, not a connect: a connect would
+    // succeed against another test's etcd on a port taken under this one
+    let serving = format!("\"address\":\"127.0.0.1:{etcd_client}\"");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(why) = collided("etcd", &etcd_log, &mut etcd) {
+            stop(vec![etcd]);
+            return Err(Failed::Collision(why));
+        }
+        let text = std::fs::read_to_string(&etcd_log).unwrap_or_default();
+        if text
+            .lines()
+            .any(|l| l.contains("serving client traffic") && l.contains(&serving))
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            stop(vec![etcd]);
+            return Err(Failed::Fatal("etcd did not come up".to_string()));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut api = spawn(
         &bin.join("kube-apiserver"),
         &[
             format!("--etcd-servers=http://127.0.0.1:{etcd_client}"),
@@ -135,14 +221,14 @@ async fn start() -> Option<EnvTest> {
             "--disable-admission-plugins=ServiceAccount".to_string(),
             "--allow-privileged=true".to_string(),
         ],
-        &root.join("apiserver.log"),
+        &api_log,
     );
 
     let kubeconfig = root.join("kubeconfig");
     std::fs::write(
         &kubeconfig,
         format!(
-            "apiVersion: v1\nkind: Config\nclusters:\n- name: envtest\n  cluster:\n    server: https://127.0.0.1:{api_port}\n    insecure-skip-tls-verify: true\nusers:\n- name: admin\n  user:\n    token: envtest-token\ncontexts:\n- name: envtest\n  context: {{ cluster: envtest, user: admin }}\ncurrent-context: envtest\n"
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: envtest\n  cluster:\n    server: https://127.0.0.1:{api_port}\n    insecure-skip-tls-verify: true\nusers:\n- name: admin\n  user:\n    token: {token}\ncontexts:\n- name: envtest\n  context: {{ cluster: envtest, user: admin }}\ncurrent-context: envtest\n"
         ),
     )
     .unwrap();
@@ -152,13 +238,30 @@ async fn start() -> Option<EnvTest> {
         .unwrap();
     let client = Client::try_from(config).unwrap();
 
+    // `/readyz`, not `/version`: the version answers before the post-start
+    // hooks (apiextensions, the system namespaces) are done
     let deadline = Instant::now() + Duration::from_secs(60);
-    while client.apiserver_version().await.is_err() {
-        assert!(
-            Instant::now() < deadline,
-            "kube-apiserver did not come up; see {}",
-            root.join("apiserver.log").display()
-        );
+    loop {
+        let why = collided("kube-apiserver", &api_log, &mut api)
+            .or_else(|| collided("etcd", &etcd_log, &mut etcd));
+        if let Some(why) = why {
+            stop(vec![etcd, api]);
+            return Err(Failed::Collision(why));
+        }
+        let readyz = http::Request::get("/readyz").body(Vec::new()).unwrap();
+        // bounded: whatever holds a port taken under this server may
+        // accept and never answer, and the collision check must come round
+        let answer =
+            tokio::time::timeout(Duration::from_secs(2), client.request_text(readyz)).await;
+        if matches!(answer, Ok(Ok(ref text)) if text.trim() == "ok") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            stop(vec![etcd, api]);
+            return Err(Failed::Fatal(
+                "kube-apiserver did not become ready".to_string(),
+            ));
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
@@ -167,6 +270,7 @@ async fn start() -> Option<EnvTest> {
         let crd: CustomResourceDefinition = serde_norway::from_str(&yaml).unwrap();
         crds.create(&PostParams::default(), &crd).await.unwrap();
     }
+
     // established: a list of each kind answers
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -199,5 +303,9 @@ async fn start() -> Option<EnvTest> {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Some(EnvTest { client, kubeconfig })
+    Ok(EnvTest {
+        client,
+        kubeconfig,
+        _shells: vec![etcd, api],
+    })
 }

@@ -163,8 +163,10 @@ credentials, hook input, or sandbox rules.
   Jobs never run and claims never go. The tests play the missing parts:
   `support::finish_job` writes a Job's stand-in pod (its termination
   message first, then the Job status, since the Job patch wakes the
-  operator), `support::reap_pod` deletes a Pod by uid, and
-  `support::reap_claim` removes a claim's `pvc-protection` finalizer.
+  operator), `support::reap_pod` deletes a Pod by uid,
+  `support::reap_claim` removes a claim's `pvc-protection` finalizer, and
+  `support::reap_job` the `foregroundDeletion` finalizer of a stale Job
+  `ensure_job` deleted (there is no garbage collector either).
 - Run cargo through mise (`mise x -- cargo …`) or via a `mise run` task.
 - `mise run check` covers the core workspace only. Cargo unifies features
   across every member one invocation selects, so while the plugins were

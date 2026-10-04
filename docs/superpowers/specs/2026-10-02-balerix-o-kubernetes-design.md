@@ -1552,6 +1552,38 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
   finalizer drops at once.
 - **A failed harvest is `Ready=False`, reason `HarvestFailed`,** with the
   Job's message; the Agent keeps its finalizer until the retry succeeds.
+- **A deletion that waits says why on the object.** While a Fleet's or an
+  Agent's cleanup waits or fails, its `Ready` is `False`, reason `Deleting`,
+  with the wait: the Agents that remain, the Daemon that did not take the
+  down, the crews whose cleanup Job is not finished (with a failed Job's
+  message), the Agent's pod, its unfinished harvest Job. The Fleet's other
+  conditions stay as they were. The Agent's harvest messages, `Deleting` and
+  `HarvestFailed` both, and the Fleet's "agents remain" name the escape: the
+  annotation `balerix.ai/purge=true` on the Agent or its Fleet.
+- **Every Job has `activeDeadlineSeconds: 3600`.** A pod that never starts
+  (an image that cannot be pulled, a claim that is gone) fails the Job
+  under the Job rule instead of leaving it running forever; a failed Job
+  with no pod message reports its `Failed` condition (`DeadlineExceeded:
+  …`). An hour, for a slow pool install.
+- **A Job the namespace's deletion refuses is skipped.** A create that the
+  API server refuses with the cause `NamespaceTerminating` is not retried:
+  a harvest or cleanup Job counts as done (with a warning), since the
+  namespace takes the claim and the objects with it.
+- **The crew lock (§5.3) is an in-process mutex** per `<ns>/<fleet>/<crew>`
+  in the controllers' `Context`, held by `ensure_job` across the busy check
+  and the create, so a sync and a harvest that both see the crew idle
+  cannot both start. The operator is one replica (§21.1); a second would
+  need a lease. A stale Job is deleted with foreground propagation: it
+  stays listed, deleting, until its pods are gone, and `ensure_job` and the
+  busy check treat a deleting Job as running, so a predecessor's pod holds
+  the crew.
+- **A credentials or token Secret the user must fix is `Materialized=False`,
+  reason `CredentialsInvalid`,** on the Agent: a missing Secret, a missing
+  key, or a `credentials.json` that does not parse (serde's line and
+  column only, since its message can quote the input). The message names
+  the Secret and the key, never what it holds; the reconcile requeues on
+  its period. This amends §21.2's error arms: `plan_fleet` cannot see
+  Secrets.
 - **An Agent waiting on its Crew is `Materialized=Unknown`, reason
   `WaitingForCrew`,** with the Crew's failing condition's message when it has
   one. The Fleet and Agent controllers unwrap kube's finalizer error so
@@ -1571,7 +1603,9 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
   Job's `status` and its pod's termination message, patches a Pod's
   `status`, and deletes a Pod once the operator has set its deletion
   timestamp. There is no scheduler either, so an unscheduled Pod deletes at
-  once; the helpers track the Pod's uid. Kubernetes 1.34's Job status
+  once; the helpers track the Pod's uid. There is no garbage collector: a
+  Job deleted in the foreground keeps its `foregroundDeletion` finalizer
+  until the test takes it off (`support::reap_job`). Kubernetes 1.34's Job status
   validation needs `startTime` and `FailureTarget=True` before
   `Failed=True`, and `startTime`, `completionTime` and
   `SuccessCriteriaMet=True` before `Complete=True`. The stand-in pod's
@@ -1586,7 +1620,9 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
   ports under `CARGO_TARGET_TMPDIR` and bounded to four at once by a nextest
   test group in `operator/.config/nextest.toml`. Readiness is `GET /readyz`
   returning `ok`; a start that hits a port collision is retried on new
-  ports; the watcher ends the servers with SIGKILL.
+  ports; the watcher ends the servers with SIGKILL. A start first removes
+  every `envtest-<pid>` root whose process is gone: each holds etcd's data
+  directory, about 120 MB.
 - **`e2e-k8s` seeds its repository through a git server pod** from the agent
   image (`git daemon`, a Service), since nothing on the runner is reachable
   from the cluster; the crew uses `git: { push: false, auth: none }`. After
@@ -1616,8 +1652,20 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
   plane included, since local-path's helper pod may run there.
 - **Names derived from a Daemon's are bounded by `names::job_name`'s rule**
   (truncate, `-`, eight hex characters of the hash, suffix), applied to every
-  `balerix-<daemon>…` name through one function, so no label value can
-  exceed 63 characters.
+  `balerix-<daemon>…` name through one function. The StatefulSet (and its
+  Service) is bounded to 52 characters, since its pods carry
+  `controller-revision-hash: <name>-<10 characters>`. The `balerix.ai/daemon`
+  label value is `names::daemon_label`, the Daemon's name under the same
+  rule at 63, wherever it is written or selected. The `balerix.ai/fleet`,
+  `crew` and `agent` values are the user's names as they are: a Fleet, crew
+  or agent name over 63 characters is refused at apply (a 422 in the log).
+- **The operator image is linted, not built, in 3b.** `mise run lint` (CI's
+  `check`) runs hadolint over every `docker/*/Dockerfile`. kind-up builds
+  the daemon and agent images only, since the operator runs outside the
+  cluster; the operator image needs the static (musl) release binary
+  `distroless/static` can run, which is the release pipeline's, so it is
+  first built there (sub-project 5). This amends §21.1's "built and
+  linted".
 
 Known in 3b and left open:
 
@@ -1628,8 +1676,15 @@ Known in 3b and left open:
   somewhere (an Event) if anything needs it.
 - A Fleet naming a Daemon that does not exist yet waits a period (15 s)
   instead of a Daemon watch.
-- The envtest suite has load-sensitive waits (30 s `wait_for`, an
+- The envtest suite has load-sensitive waits (60 s `wait_for`, an
   occasional 180 s hang under four API servers on one host).
+- §8.5's "the Agent's branch changed" row is not built: a branch change is
+  a spec change, so the Pod is replaced on the same claim, and the
+  sidecar's `ensure_clone` then wants to recreate the clone, which
+  harvests into a crew cache mounted read-only in the pod. The agent stays
+  down with a `Materialized=False` git error; the old clone is kept. The
+  fix is the controller's: note the branch the claim was made for, and on
+  a change run the harvest Job, delete the claim and make a new one.
 - What did not bite on kind (ubuntu-24.04): the `slice` init `mkdir`, the
   `/tmp` emptyDirs and the sidecar's sandbox self-test. The crew cache is a
   clone with a work tree (`repo/.git`). Pool Jobs took 4 to 19 s and the

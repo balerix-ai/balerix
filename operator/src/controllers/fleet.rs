@@ -4,7 +4,6 @@
 //! deletion it waits for the Agents, downs the fleet on the Daemon and,
 //! for `retain: None`, runs one cleanup Job per crew.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use balerix_api::AgentTokens;
@@ -195,8 +194,15 @@ async fn write_status(
     patch_status(&ctx.client, fleet, &status).await
 }
 
-/// Agents of this fleet whose `Ready` condition is true.
-async fn ready_agents(ctx: &Context, namespace: &str, fleet: &str) -> Result<usize, Error> {
+/// Agents of this fleet the plan has (`wanted`) whose `Ready` condition
+/// is true: a dropped Agent still deleting is not counted against the
+/// plan's total.
+async fn ready_agents(
+    ctx: &Context,
+    namespace: &str,
+    fleet: &str,
+    wanted: &[String],
+) -> Result<usize, Error> {
     let agents: Api<Agent> = Api::namespaced(ctx.client.clone(), namespace);
     let list = agents
         .list(&ListParams::default().labels(&format!("balerix.ai/fleet={fleet}")))
@@ -204,6 +210,7 @@ async fn ready_agents(ctx: &Context, namespace: &str, fleet: &str) -> Result<usi
     Ok(list
         .items
         .iter()
+        .filter(|a| wanted.contains(&a.name_any()))
         .filter(|a| {
             a.status.as_ref().is_some_and(|s| {
                 s.conditions
@@ -271,8 +278,9 @@ async fn apply_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, Err
         },
     };
     let total = plan.agents.len();
+    let wanted_agents: Vec<String> = plan.agents.iter().map(ResourceExt::name_any).collect();
     if accepted != Accepted::Yes {
-        let ready = ready_agents(&ctx, &namespace, &name).await?;
+        let ready = ready_agents(&ctx, &namespace, &name, &wanted_agents).await?;
         write_status(&ctx, &fleet, Ok(()), &accepted, ready, total).await?;
         reconciled(&ctx, fleet.as_ref());
         return Ok(Action::requeue(period));
@@ -310,7 +318,6 @@ async fn apply_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, Err
                 .await?;
         }
     }
-    let wanted_agents: Vec<String> = plan.agents.iter().map(ResourceExt::name_any).collect();
     for agent in agents.list(&selector).await?.items {
         if !wanted_agents.contains(&agent.name_any()) && agent.metadata.deletion_timestamp.is_none()
         {
@@ -323,7 +330,7 @@ async fn apply_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, Err
     ctx.fleet_agents
         .write()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(key.clone(), wanted_agents);
+        .insert(key.clone(), wanted_agents.clone());
 
     // the record the Agents mirror (§21.1)
     if let Ok(client) = client_for(&ctx, &daemon).await
@@ -334,7 +341,7 @@ async fn apply_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, Err
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.clone(), record);
     }
-    let ready = ready_agents(&ctx, &namespace, &name).await?;
+    let ready = ready_agents(&ctx, &namespace, &name, &wanted_agents).await?;
     write_status(&ctx, &fleet, Ok(()), &accepted, ready, total).await?;
     reconciled(&ctx, fleet.as_ref());
     Ok(Action::requeue(period.min(pool.again)))
@@ -465,6 +472,3 @@ async fn cleanup_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
     tracing::info!(fleet = %key, "removed");
     Ok(Action::await_change())
 }
-
-#[allow(dead_code)]
-fn _types(_: BTreeMap<String, String>) {}

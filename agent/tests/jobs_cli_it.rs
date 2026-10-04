@@ -248,7 +248,10 @@ fn crew_remove_ends_with_removed_and_empties_the_slice() {
     );
     assert!(shared.join("fleet/mise").is_dir());
 
-    // a bad crew name is the command's refusal, as the termination message
+    // a bad crew name is the command's refusal, as the termination message,
+    // before anything is removed: a full slice stays full
+    std::fs::create_dir_all(shared.join("repo/.git")).unwrap();
+    std::fs::create_dir_all(shared.join("crew/mise")).unwrap();
     let out = Command::new(BIN)
         .args(["crew-remove", "--crew", "not-a-crew"])
         .arg("--shared-dir")
@@ -263,4 +266,5 @@ fn crew_remove_ends_with_removed_and_empties_the_slice() {
             .unwrap()
             .starts_with("--crew not-a-crew:")
     );
+    assert!(shared.join("repo/.git").is_dir() && shared.join("crew/mise").is_dir());
 }

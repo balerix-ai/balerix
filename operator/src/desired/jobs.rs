@@ -169,7 +169,6 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
     }))
 }
 
-/// `pools/daemon`: the system table this image embeds (§20.3).
 /// The cleanup Job (§21.2): `crew-remove` over the crew's cache and pool,
 /// read-write, after the Fleet's Agents are gone.
 pub fn remove_job(ctx: &JobContext<'_>, fleet: &str, crew: &str) -> Result<Job, DesiredError> {
@@ -195,6 +194,7 @@ pub fn remove_job(ctx: &JobContext<'_>, fleet: &str, crew: &str) -> Result<Job, 
     )
 }
 
+/// `pools/daemon`: the system table this image embeds (§20.3).
 pub fn daemon_pool_job(ctx: &JobContext<'_>) -> Result<Job, DesiredError> {
     job(
         ctx,

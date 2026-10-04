@@ -299,8 +299,9 @@ pub fn reconciled<K: Resource>(ctx: &Context, object: &K) {
 /// 5 s, doubling per consecutive failure of the same object, at most 5 min.
 pub fn error_policy<K: Resource>(object: Arc<K>, error: &Error, ctx: Arc<Context>) -> Action {
     let key = object_key(object.as_ref());
+    let (namespace, name) = (object.namespace().unwrap_or_default(), object.name_any());
     if let Error::Waiting(why) = error {
-        tracing::debug!(object = %key, "{why}");
+        tracing::debug!(namespace = %namespace, name = %name, "{why}");
         return Action::requeue(Duration::from_secs(2));
     }
     let attempt = {
@@ -310,7 +311,7 @@ pub fn error_policy<K: Resource>(object: Arc<K>, error: &Error, ctx: Arc<Context
         *n
     };
     let delay = Duration::from_secs((5u64 << attempt.saturating_sub(1).min(6)).min(300));
-    tracing::warn!(object = %key, attempt, "reconcile failed: {error}");
+    tracing::warn!(namespace = %namespace, name = %name, attempt, "reconcile failed: {error}");
     Action::requeue(delay)
 }
 

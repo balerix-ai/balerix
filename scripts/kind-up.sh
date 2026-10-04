@@ -69,7 +69,8 @@ cp "${CARGO_TARGET_DIR:-$repo/target}/release/balerix" "$dist/balerix"
 context=$(scripts/release/image-context.sh core "$dist" "$root/context-core" | sed -n 's/^context=//p')
 secret=()
 [[ -n ${GITHUB_TOKEN:-} ]] && secret=(--secret "id=github_token,env=GITHUB_TOKEN")
-docker build "${secret[@]}" -t balerix:e2e -f docker/balerix/Dockerfile "$context"
+# bash 3.2 (macOS) calls an empty "${secret[@]}" unbound under set -u
+docker build ${secret[@]+"${secret[@]}"} -t balerix:e2e -f docker/balerix/Dockerfile "$context"
 rm -rf "$root/context-agent" && mkdir -p "$root/context-agent"
 cp "$repo/agent/target/release/balerix-agent" "$root/context-agent/balerix-agent"
 docker build --build-arg BASE=balerix:e2e -t balerix-agent:e2e -f docker/agent/Dockerfile "$root/context-agent"

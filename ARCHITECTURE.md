@@ -61,10 +61,9 @@ reconciles what exists against what was declared.
   observe, call `desired`, apply with server-side apply and patch status; the
   Daemon is polled into a per-fleet record cache every 15 s and the Agents
   mirror it. The Daemon holds no Kubernetes credentials, so the operator
-  pushes resolved fleets to it through `daemon_client`. The sync, pool and
-  harvest Jobs are `balerix-agent` commands over `balerix_runtime::jobs`. The
-  cleanup Job (`crew-remove`) joins the sync, pool and harvest Jobs as a
-  `balerix-agent` command.
+  pushes resolved fleets to it through `daemon_client`. The sync, pool,
+  harvest and cleanup (`crew-remove`) Jobs are `balerix-agent` commands over
+  `balerix_runtime::jobs`.
 - `balerix-plugin-sdk` — the plugin side of the host protocol; depends on
   `api` only. `Host` (async, one method per route, including
   `Host::attach`/`watch_fleets`), the `Plugin` trait (`Plugin::routes`) and

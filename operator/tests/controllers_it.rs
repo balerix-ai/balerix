@@ -321,7 +321,7 @@ async fn a_failed_pool_job_is_reported_and_retried_after_the_delay() {
     .await;
 
     clock.advance(31);
-    let second = wait_for("the retry", Duration::from_secs(60), || async {
+    wait_for("the retry", Duration::from_secs(60), || async {
         let j = jobs.get_opt("balerix-default-pool").await.unwrap()?;
         (j.metadata.uid != first.metadata.uid).then_some(j)
     })
@@ -369,7 +369,6 @@ async fn a_failed_pool_job_is_reported_and_retried_after_the_delay() {
         attempts.is_none() || attempts.as_deref() == Some("{}"),
         "{attempts:?}"
     );
-    let _ = second;
     operator.abort();
 }
 
@@ -650,6 +649,14 @@ async fn a_daemon_that_does_not_answer_leaves_the_children() {
         crews.get_opt("f-c").await.unwrap()
     })
     .await;
+    // accepted first: a `DaemonUnavailable` from before the Daemon's
+    // authority existed would otherwise satisfy the wait below
+    wait_for("Accepted=True", Duration::from_secs(60), || async {
+        let s = fleets.get("f").await.unwrap().status?;
+        (s.conditions.len() == 3 && condition(&s.conditions, "Accepted").status == "True")
+            .then_some(())
+    })
+    .await;
     stub.stop().await;
     let status = wait_for("DaemonUnavailable", Duration::from_secs(60), || async {
         let s = fleets.get("f").await.unwrap().status?;
@@ -788,7 +795,7 @@ async fn a_failed_sync_is_reported_and_retried_as_attempt_two() {
     );
 
     clock.advance(31);
-    let second = wait_for("the retry", Duration::from_secs(60), || async {
+    wait_for("the retry", Duration::from_secs(60), || async {
         let j = jobs.get_opt("f-c-sync").await.unwrap()?;
         (j.metadata.uid != first.metadata.uid).then_some(j)
     })
@@ -804,7 +811,6 @@ async fn a_failed_sync_is_reported_and_retried_as_attempt_two() {
         "{\"f-c-sync\":2}"
     );
     // the second run succeeds: both conditions true, cacheRef the commit
-    let _ = second;
     finish_job(&client, &ns, "f-c-sync", true, Some("0123abcd")).await;
     let status = wait_for("CacheReady=True", Duration::from_secs(10), || async {
         let s = crews.get("f-c").await.unwrap().status?;
@@ -996,7 +1002,7 @@ async fn an_agent_with_no_claim_is_removed_without_a_harvest() {
         .await
         .unwrap();
     let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
-    let a = wait_for("Agent f-d-a", Duration::from_secs(60), || async {
+    wait_for("Agent f-d-a", Duration::from_secs(60), || async {
         agents.get_opt("f-d-a").await.unwrap()
     })
     .await;
@@ -1009,7 +1015,6 @@ async fn an_agent_with_no_claim_is_removed_without_a_harvest() {
         condition(&status.conditions, "Materialized").status,
         "Unknown"
     );
-    let _ = a;
     // dropped before its crew ever synced: no claim, no harvest
     fleets
         .patch(
@@ -1360,10 +1365,18 @@ async fn agent_status_mirrors_the_daemons_record_and_readiness_counts() {
             "initContainerStatuses": [{ "name": "sidecar", "image": "x", "imageID": "x", "ready": true, "restartCount": 0, "state": { "running": { "startedAt": "2026-10-03T00:00:00Z" } } }] }
     }))).await.unwrap();
     let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
-    let status = wait_for("phase ready", Duration::from_secs(60), || async {
-        let s = agents.get("f-c-a").await.unwrap().status?;
-        (s.phase.as_deref() == Some("ready")).then_some(s)
-    })
+    let status = wait_for(
+        "phase ready and Ready=True",
+        Duration::from_secs(60),
+        || async {
+            let s = agents.get("f-c-a").await.unwrap().status?;
+            (s.phase.as_deref() == Some("ready")
+                && s.conditions
+                    .iter()
+                    .any(|c| c.type_ == "Ready" && c.status == "True"))
+            .then_some(s)
+        },
+    )
     .await;
     assert_eq!(status.restarts, Some(2));
     assert_eq!(status.pod.as_deref(), Some("f-c-a"));

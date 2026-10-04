@@ -24,10 +24,11 @@ credentials, hook input, or sandbox rules.
   `operator/crds/` differs from the Rust types. The controller tests run
   on the envtest binaries the task pins (a `kube-apiserver` and `etcd`, no
   cluster, no kubelet: the test stands in for it). `scripts/operator.sh
-  check` leaves the journey out (`-E 'not binary(e2e_k8s)'`); `e2e` runs it
-  alone. `operator/.config/nextest.toml` holds the `envtest` test group
-  (four API servers at once) and the `e2e-k8s` profile. Its own CI job; not
-  part of `check`.
+  check` leaves the journey out (`-E 'not binary(e2e_k8s)'`);
+  `scripts/operator.sh e2e` (the `e2e-k8s` task) runs it alone.
+  `operator/.config/nextest.toml` holds the `envtest` test group (four API
+  servers at once) and the `e2e-k8s` profile. Its own CI job; not part of
+  `check`.
 - `crds` — regenerates `operator/crds/` from `operator/src/api/`.
 - `mutants` — nightly tier: mutation-tests `balerix-core` (the reconciler).
   `.cargo/mutants.toml` excludes `fakes.rs`: the fakes are exercised by

@@ -3,7 +3,7 @@
 [tools]
 rust = { version = "1.99.0", components = ["rustfmt", "clippy"] }
 "cargo:cargo-nextest" = "0.9.146"
-cargo-insta = "1.48.0"
+cargo-insta = "1.49.0"
 "cargo:cargo-audit" = "0.22.2"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
 "github:sourcefrog/cargo-mutants" = "27.1.0"

@@ -9,7 +9,7 @@ use balerix_runtime::jobs::{self, PoolLevel};
 use balerix_runtime::layout::SharedSlice;
 use balerix_runtime::{ToolPaths, embedded_system_tools};
 
-use crate::cli::{CrewSyncArgs, HarvestArgs, Level, PoolSyncArgs};
+use crate::cli::{CrewRemoveArgs, CrewSyncArgs, HarvestArgs, Level, PoolSyncArgs};
 
 /// The tools on PATH. The `balerix` slot is this binary: a Job renders no
 /// `launch.sh` and runs no relay, the slot only has to name a file.
@@ -90,4 +90,19 @@ pub fn harvest(args: &HarvestArgs) -> Result<String> {
         Some(b) => format!("harvested {b}"),
         None => "nothing to harvest".to_string(),
     })
+}
+
+pub fn crew_remove(args: &CrewRemoveArgs) -> Result<String> {
+    // parsed for its refusal: a Job over a mistyped crew must say so
+    let _: CrewRef = args
+        .crew
+        .parse()
+        .map_err(|e| anyhow!("--crew {}: {e}", args.crew))?;
+    jobs::remove_crew(&SharedSlice::new(&args.dirs.shared_dir)).with_context(|| {
+        format!(
+            "cannot empty the slice at {}",
+            args.dirs.shared_dir.display()
+        )
+    })?;
+    Ok("removed".to_string())
 }

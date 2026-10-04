@@ -54,5 +54,10 @@ fn main() -> ExitCode {
             "harvest",
             balerix_agent::jobs::harvest(&args),
         ),
+        Command::CrewRemove(args) => balerix_agent::cli::finish(
+            &args.dirs.termination_log,
+            "crew-remove",
+            balerix_agent::jobs::crew_remove(&args),
+        ),
     }
 }

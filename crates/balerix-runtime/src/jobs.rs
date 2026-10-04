@@ -158,6 +158,29 @@ fn install(
     .install_level(id, label, toml, pool, parents, marker, table, log, None)
 }
 
+/// The cleanup Job of a Fleet deleted with `retain: None` (Spec O §5.2,
+/// §8.5): empties the crew's cache and its pool directory on the shared
+/// volume. The two directories are mount points in the Job, so they are
+/// emptied, not removed. Nothing the crew only reads (the fleet and
+/// daemon pools) is touched.
+pub fn remove_crew(slice: &SharedSlice) -> std::io::Result<()> {
+    let crew = slice.crew();
+    for dir in [&crew.repo, &crew.root] {
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The agent's branch into the crew cache, from a claim mounted read-only
 /// at `claim`: the checks and the fetch of `harvest_and_remove`, with the
 /// git profile, nono's home and its logs under `scratch`. Removes nothing.

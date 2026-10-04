@@ -285,3 +285,34 @@ pub async fn reap_claim(client: &Client, namespace: &str, name: &str, timeout: D
     })
     .await;
 }
+
+/// The garbage collector's part for a Job deleted in the foreground in
+/// envtest: once the Job with this uid has a deletion timestamp, its
+/// `foregroundDeletion` finalizer comes off (its pods, if any, are the
+/// test's to have deleted). Returns when that Job is gone or replaced;
+/// panics after `timeout` if it was never deleted.
+pub async fn reap_job(client: &Client, namespace: &str, name: &str, uid: &str, timeout: Duration) {
+    use k8s_openapi::api::batch::v1::Job;
+    use kube::api::{Patch, PatchParams};
+    let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+    wait_for(&format!("Job {name} deleted"), timeout, || async {
+        match jobs.get_opt(name).await.unwrap() {
+            Some(j) if j.metadata.uid.as_deref() == Some(uid) => {
+                if j.metadata.deletion_timestamp.is_some() {
+                    let _ = jobs
+                        .patch(
+                            name,
+                            &PatchParams::default(),
+                            &Patch::Merge(
+                                serde_json::json!({ "metadata": { "finalizers": null } }),
+                            ),
+                        )
+                        .await;
+                }
+                None
+            }
+            _ => Some(()),
+        }
+    })
+    .await;
+}

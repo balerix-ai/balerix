@@ -1120,6 +1120,15 @@ async fn the_crew_lock_holds_the_harvest_while_a_sync_runs() {
 
     // a changed crew tool table makes the sync Job stale: a new one runs, unfinished
     fleets.patch("f", &PatchParams::default(), &Patch::Merge(serde_json::json!({ "spec": { "crews": { "c": { "defaults": { "tools": { "node": "22.11.0" } } } } } }))).await.unwrap();
+    // the garbage collector: the stale Job, deleted in the foreground, goes
+    support::reap_job(
+        &client,
+        &ns,
+        "f-c-sync",
+        synced.metadata.uid.as_deref().unwrap(),
+        Duration::from_secs(60),
+    )
+    .await;
     wait_for("a new sync Job", Duration::from_secs(30), || async {
         let j = jobs.get_opt("f-c-sync").await.unwrap()?;
         (j.metadata.uid != synced.metadata.uid).then_some(j)
@@ -1143,6 +1152,16 @@ async fn the_crew_lock_holds_the_harvest_while_a_sync_runs() {
         || async { jobs.get_opt("f-c-b-harvest").await.unwrap() },
     )
     .await;
+    // not vacuous: agent b is still there, deleting, with its claim
+    let b = Api::<Agent>::namespaced(client.clone(), &ns)
+        .get("f-c-b")
+        .await
+        .unwrap();
+    assert!(b.metadata.deletion_timestamp.is_some());
+    Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns)
+        .get("f-c-b")
+        .await
+        .unwrap();
     finish_job(&client, &ns, "f-c-sync", true, Some("4567abcd")).await;
     wait_for(
         "the harvest after the sync",
@@ -1268,4 +1287,194 @@ async fn agent_status_mirrors_the_daemons_record_and_readiness_counts() {
     .await;
     assert_eq!(condition(&fleet.conditions, "Ready").reason, "AgentsReady");
     operator.abort();
+}
+
+/// A Job of crew `f/c` as `ensure_job` compares it: by name, labels and
+/// input hash. The API server needs a template; nothing runs it.
+fn crew_job(ns: &str, name: &str, input: &str) -> Job {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "batch/v1", "kind": "Job",
+        "metadata": { "name": name, "namespace": ns,
+            "labels": { "balerix.ai/fleet": "f", "balerix.ai/crew": "c" },
+            "annotations": { "balerix.ai/input-hash": input } },
+        "spec": { "backoffLimit": 0, "template": { "spec": {
+            "restartPolicy": "Never", "containers": [{ "name": "job", "image": "x" }] } } }
+    }))
+    .unwrap()
+}
+
+/// A `Context` of its own and an owner for the attempts annotation: the
+/// Job rule called directly, with no controller running.
+async fn job_rule(
+    label: &str,
+) -> (
+    &'static support::envtest::EnvTest,
+    String,
+    balerix_operator::controllers::Context,
+    ConfigMap,
+) {
+    let env = envtest().await.expect("envtest");
+    let ns = namespace(&env.client, label).await;
+    let owner: ConfigMap = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1", "kind": "ConfigMap", "metadata": { "name": "owner", "namespace": ns }
+    }))
+    .unwrap();
+    let owner = Api::<ConfigMap>::namespaced(env.client.clone(), &ns)
+        .create(&PostParams::default(), &owner)
+        .await
+        .unwrap();
+    let mut cfg = balerix_operator::controllers::RunConfig::new(
+        "0.2.0",
+        balerix_operator::desired::common::Images {
+            daemon: "balerix:test".into(),
+            agent: "balerix-agent:test".into(),
+        },
+        &ns,
+    );
+    cfg.period = Duration::from_secs(1);
+    let ctx = balerix_operator::controllers::Context::new(env.client.clone(), cfg);
+    (env, ns, ctx, owner)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_crew_lock_lets_one_of_two_racing_jobs_start() {
+    use balerix_operator::controllers::jobs::ensure_job;
+    use balerix_operator::desired::common::JobOutcome;
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, ctx, owner) = job_rule("race").await;
+    let jobs: Api<Job> = Api::namespaced(env.client.clone(), &ns);
+    // a sync and a harvest of one crew, both seeing it idle at once: the
+    // lock is held across the check and the create, so one of them waits.
+    // Twenty crews, each raced once: without the lock some round starts both
+    for round in 0..20 {
+        let crew = format!("c{round}");
+        let job = |name: &str, input: &str| {
+            let mut j = crew_job(&ns, name, input);
+            j.metadata
+                .labels
+                .as_mut()
+                .unwrap()
+                .insert("balerix.ai/crew".into(), crew.clone());
+            j
+        };
+        let (sync_name, harvest_name) = (format!("f-{crew}-sync"), format!("f-{crew}-a-harvest"));
+        let (sync, harvest) = tokio::join!(
+            ensure_job(&ctx, &owner, job(&sync_name, "s"), Some(("f", &crew))),
+            ensure_job(&ctx, &owner, job(&harvest_name, "h"), Some(("f", &crew))),
+        );
+        let (sync, harvest) = (sync.unwrap(), harvest.unwrap());
+        let made: Vec<String> = jobs
+            .list(&kube::api::ListParams::default().labels(&format!("balerix.ai/crew={crew}")))
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .map(|j| j.metadata.name.clone().unwrap())
+            .collect();
+        assert_eq!(made.len(), 1, "one Job of crew {crew} at a time: {made:?}");
+        // the one that waited saw the crew busy: `Absent`, not created
+        let (waited, other) = if made[0] == sync_name {
+            (&harvest, job(&harvest_name, "h"))
+        } else {
+            (&sync, job(&sync_name, "s"))
+        };
+        assert_eq!(waited.outcome, JobOutcome::Absent);
+        // and a later look still refuses while the first is unfinished
+        let again = ensure_job(&ctx, &owner, other, Some(("f", &crew)))
+            .await
+            .unwrap();
+        assert_eq!(again.outcome, JobOutcome::Absent);
+    }
+    assert_eq!(
+        jobs.list(&Default::default()).await.unwrap().items.len(),
+        20
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_job_is_deleted_in_the_foreground_and_holds_the_crew_until_gone() {
+    use balerix_operator::controllers::jobs::ensure_job;
+    use balerix_operator::desired::common::JobOutcome;
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, ctx, owner) = job_rule("stale").await;
+    let client = env.client.clone();
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    // a sync Job made from older input, still running
+    let old = jobs
+        .create(&PostParams::default(), &crew_job(&ns, "f-c-sync", "old"))
+        .await
+        .unwrap();
+    let ensured = ensure_job(
+        &ctx,
+        &owner,
+        crew_job(&ns, "f-c-sync", "new"),
+        Some(("f", "c")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ensured.outcome, JobOutcome::Stale);
+    // deleted in the foreground: still listed, deleting, until its pods go
+    let deleting = jobs.get("f-c-sync").await.unwrap();
+    assert_eq!(deleting.metadata.uid, old.metadata.uid);
+    assert!(deleting.metadata.deletion_timestamp.is_some());
+    assert!(
+        deleting
+            .metadata
+            .finalizers
+            .unwrap_or_default()
+            .contains(&"foregroundDeletion".to_string())
+    );
+    // the replacement waits for it, and so does a harvest of the crew
+    let sync = ensure_job(
+        &ctx,
+        &owner,
+        crew_job(&ns, "f-c-sync", "new"),
+        Some(("f", "c")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sync.outcome, JobOutcome::Running);
+    let harvest = ensure_job(
+        &ctx,
+        &owner,
+        crew_job(&ns, "f-c-a-harvest", "h"),
+        Some(("f", "c")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(harvest.outcome, JobOutcome::Absent);
+    assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_none());
+    assert_eq!(
+        jobs.get("f-c-sync").await.unwrap().metadata.uid,
+        old.metadata.uid
+    );
+
+    // the garbage collector: its pods gone, the Job goes; the new one is made
+    support::reap_job(
+        &client,
+        &ns,
+        "f-c-sync",
+        old.metadata.uid.as_deref().unwrap(),
+        Duration::from_secs(60),
+    )
+    .await;
+    let made = ensure_job(
+        &ctx,
+        &owner,
+        crew_job(&ns, "f-c-sync", "new"),
+        Some(("f", "c")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(made.outcome, JobOutcome::Running);
+    let new = jobs.get("f-c-sync").await.unwrap();
+    assert_ne!(new.metadata.uid, old.metadata.uid);
+    assert_eq!(
+        new.metadata.annotations.unwrap()["balerix.ai/input-hash"],
+        "new"
+    );
 }

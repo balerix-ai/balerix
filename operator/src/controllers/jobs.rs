@@ -2,7 +2,9 @@
 //! 0`, a stale Job is replaced, a failed one is retried by the operator
 //! after a doubling delay carried on its owner's `balerix.ai/attempts`
 //! annotation, and a crew's sync, harvest and cleanup Jobs never run at
-//! once (§5.3).
+//! once (§5.3): the crew's lock in the `Context` is held across the
+//! check and the create, and a stale Job is deleted in the foreground,
+//! so it stays listed, and keeps the crew busy, until its pods are gone.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -26,6 +28,30 @@ pub struct Ensured {
     /// When to look again: soon while a Job runs or a lock holds, the
     /// rest of the delay for a failed one, the caller's period otherwise.
     pub again: Duration,
+    /// The API server refused the create because the namespace is being
+    /// deleted: no Job will ever run there, and the namespace takes
+    /// whatever the Job would have cleaned up.
+    pub namespace_terminating: bool,
+}
+
+impl Ensured {
+    fn new(outcome: JobOutcome, again: Duration) -> Self {
+        Self {
+            outcome,
+            again,
+            namespace_terminating: false,
+        }
+    }
+}
+
+/// A create refused by the `NamespaceLifecycle` admission: the namespace
+/// has a deletion timestamp.
+fn namespace_terminating(status: &kube::core::Status) -> bool {
+    status.code == 403
+        && status
+            .details
+            .as_ref()
+            .is_some_and(|d| d.causes.iter().any(|c| c.reason == "NamespaceTerminating"))
 }
 
 /// 30 s for attempt 1, doubling, at most 10 min (§21.2).
@@ -65,7 +91,9 @@ fn unfinished(job: &Job) -> bool {
         && status.and_then(|s| s.failed).unwrap_or(0) == 0
 }
 
-/// Whether another unfinished Job of this crew exists (§5.3's lock).
+/// Whether another Job of this crew is unfinished or still being deleted
+/// (§5.3's lock): a stale Job deleted in the foreground is listed until
+/// its pods are gone.
 pub async fn crew_busy(
     ctx: &Context,
     namespace: &str,
@@ -80,10 +108,9 @@ pub async fn crew_busy(
                 .labels(&format!("balerix.ai/fleet={fleet},balerix.ai/crew={crew}")),
         )
         .await?;
-    Ok(list
-        .items
-        .iter()
-        .any(|j| j.name_any() != except && unfinished(j)))
+    Ok(list.items.iter().any(|j| {
+        j.name_any() != except && (unfinished(j) || j.metadata.deletion_timestamp.is_some())
+    }))
 }
 
 async fn set_attempts<K>(
@@ -150,20 +177,32 @@ where
     let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace);
     let existing = jobs.get_opt(&name).await?;
+    let soon = Duration::from_secs(5);
+    // a Job on its way out (a foreground delete waits for its pods) is
+    // neither the wanted one nor a failure to count: wait for it to go
+    if existing
+        .as_ref()
+        .is_some_and(|j| j.metadata.deletion_timestamp.is_some())
+    {
+        tracing::debug!(job = %name, "waiting: the previous Job is being deleted");
+        return Ok(Ensured::new(JobOutcome::Running, Duration::from_secs(2)));
+    }
     let job_pods = pods_of(&pods, existing.as_ref()).await?;
     let outcome = job_outcome(existing.as_ref(), &job_pods, &wanted);
-    let soon = Duration::from_secs(5);
     let mut attempts = attempts_of(owner);
     match &outcome {
         JobOutcome::Absent => {
+            // the crew's lock across the check and the create (§5.3)
+            let lock = crew_lock.map(|(fleet, crew)| ctx.crew_lock(&namespace, fleet, crew));
+            let _held = match &lock {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
             if let Some((fleet, crew)) = crew_lock
                 && crew_busy(ctx, &namespace, fleet, crew, &name).await?
             {
                 tracing::debug!(job = %name, "waiting: another Job of the crew runs");
-                return Ok(Ensured {
-                    outcome,
-                    again: soon,
-                });
+                return Ok(Ensured::new(outcome, soon));
             }
             match jobs.create(&PostParams::default(), &wanted).await {
                 Ok(_) => {
@@ -171,36 +210,33 @@ where
                 }
                 // made by a reconcile that raced this one: it is running
                 Err(kube::Error::Api(e)) if e.code == 409 => {}
+                Err(kube::Error::Api(e)) if namespace_terminating(&e) => {
+                    tracing::warn!(namespace = %namespace, job = %name, "not created: the namespace is being deleted");
+                    return Ok(Ensured {
+                        namespace_terminating: true,
+                        ..Ensured::new(outcome, ctx.run.period)
+                    });
+                }
                 Err(e) => return Err(e.into()),
             }
-            Ok(Ensured {
-                outcome: JobOutcome::Running,
-                again: soon,
-            })
+            Ok(Ensured::new(JobOutcome::Running, soon))
         }
         JobOutcome::Stale => {
-            jobs.delete(&name, &DeleteParams::background()).await?;
+            // foreground: the Job stays, deleting, until its pods are gone,
+            // so a running predecessor keeps the crew busy (§5.3)
+            jobs.delete(&name, &DeleteParams::foreground()).await?;
             if attempts.remove(&name).is_some() {
                 set_attempts(ctx, owner, &attempts).await?;
             }
             tracing::info!(job = %name, "stale: replaced");
-            Ok(Ensured {
-                outcome,
-                again: Duration::from_secs(2),
-            })
+            Ok(Ensured::new(outcome, Duration::from_secs(2)))
         }
-        JobOutcome::Running => Ok(Ensured {
-            outcome,
-            again: soon,
-        }),
+        JobOutcome::Running => Ok(Ensured::new(outcome, soon)),
         JobOutcome::Succeeded(_) => {
             if attempts.remove(&name).is_some() {
                 set_attempts(ctx, owner, &attempts).await?;
             }
-            Ok(Ensured {
-                outcome,
-                again: ctx.run.period,
-            })
+            Ok(Ensured::new(outcome, ctx.run.period))
         }
         JobOutcome::Failed(message) => {
             let attempt = attempts.get(&name).copied().unwrap_or(1);
@@ -217,15 +253,12 @@ where
                 attempts.insert(name.clone(), attempt + 1);
                 set_attempts(ctx, owner, &attempts).await?;
                 tracing::warn!(job = %name, attempt = attempt + 1, "failed: {message}; retrying");
-                return Ok(Ensured {
-                    outcome,
-                    again: Duration::from_secs(2),
-                });
+                return Ok(Ensured::new(outcome, Duration::from_secs(2)));
             }
-            Ok(Ensured {
+            Ok(Ensured::new(
                 outcome,
-                again: Duration::from_secs((due - now).max(1) as u64),
-            })
+                Duration::from_secs((due - now).max(1) as u64),
+            ))
         }
     }
 }

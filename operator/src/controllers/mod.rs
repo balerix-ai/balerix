@@ -122,6 +122,11 @@ pub struct Context {
     /// Daemon watch maps through this.
     pub daemon_fleets: RwLock<BTreeMap<String, Vec<String>>>,
     clients: Mutex<BTreeMap<String, CachedClient>>,
+    /// `<ns>/<fleet>/<crew>` to the crew's lock (§5.3): held across
+    /// `jobs::crew_busy` and the create, so a sync and a harvest that both
+    /// see the crew idle cannot both start. In-process: the operator is one
+    /// replica (§21.1).
+    crew_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Consecutive reconcile errors per object, for `error_policy`.
     errors: Mutex<BTreeMap<String, u32>>,
 }
@@ -141,6 +146,7 @@ impl Context {
             fleet_agents: RwLock::new(BTreeMap::new()),
             daemon_fleets: RwLock::new(BTreeMap::new()),
             clients: Mutex::new(BTreeMap::new()),
+            crew_locks: Mutex::new(BTreeMap::new()),
             errors: Mutex::new(BTreeMap::new()),
         }
     }
@@ -156,6 +162,21 @@ impl Context {
 
     pub fn key(namespace: &str, name: &str) -> String {
         format!("{namespace}/{name}")
+    }
+
+    /// The lock of one crew; the same `Arc` for every caller.
+    pub fn crew_lock(
+        &self,
+        namespace: &str,
+        fleet: &str,
+        crew: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.crew_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(format!("{namespace}/{fleet}/{crew}"))
+            .or_default()
+            .clone()
     }
 
     /// The client for one Daemon, rebuilt when its authority or token

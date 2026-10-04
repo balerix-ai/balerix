@@ -5,7 +5,7 @@ mod support;
 
 use std::time::Duration;
 
-use balerix_operator::api::{Daemon, DaemonSpec};
+use balerix_operator::api::{Agent, Crew, Daemon, DaemonSpec, Fleet, FleetSpec};
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Secret, Service};
@@ -13,6 +13,7 @@ use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::Api;
 use kube::api::{Patch, PatchParams, PostParams};
 use support::envtest::envtest;
+use support::stub_daemon::StubDaemon;
 use support::{TestClock, finish_job, hold_for, namespace, spawn_operator, wait_for};
 
 fn daemon_spec() -> DaemonSpec {
@@ -438,6 +439,276 @@ async fn a_daemon_that_fails_readyz_keeps_its_not_ready_transition_time() {
                 || now.last_transition_time != ready.last_transition_time)
                 .then_some(())
         },
+    )
+    .await;
+    operator.abort();
+}
+
+fn fleet_spec(daemon: &str, crews: &[(&str, &[&str])], retain: &str) -> FleetSpec {
+    let crews: serde_json::Map<String, serde_json::Value> = crews
+        .iter()
+        .map(|(crew, agents)| {
+            let agents: serde_json::Map<String, serde_json::Value> =
+                agents.iter().map(|a| (a.to_string(), serde_json::json!({}))).collect();
+            (crew.to_string(), serde_json::json!({ "repo": "acme/api", "git": { "auth": "none" }, "agents": agents }))
+        })
+        .collect();
+    serde_json::from_value(
+        serde_json::json!({ "daemon": daemon, "retain": retain, "crews": crews }),
+    )
+    .unwrap()
+}
+
+/// A Daemon, a stub, an operator over a fresh namespace.
+async fn world(
+    label: &str,
+) -> (
+    &'static support::envtest::EnvTest,
+    String,
+    StubDaemon,
+    TestClock,
+    tokio::task::AbortHandle,
+) {
+    let env = envtest().await.expect("envtest");
+    let ns = namespace(&env.client, label).await;
+    Api::<Daemon>::namespaced(env.client.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Daemon::new("default", daemon_spec()),
+        )
+        .await
+        .unwrap();
+    let stub = StubDaemon::start().await;
+    let clock = TestClock::default();
+    let operator = spawn_operator(env, &ns, Some(stub.url()), &clock);
+    (env, ns, stub, clock, operator)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fleet_becomes_crews_agents_and_tokens_and_the_put_carries_them() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("fleet").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new(
+                "f",
+                fleet_spec("default", &[("c", &["a", "b"])], "Branches"),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let crews: Api<Crew> = Api::namespaced(client.clone(), &ns);
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    wait_for("the Crew", Duration::from_secs(30), || async {
+        crews.get_opt("f-c").await.unwrap()
+    })
+    .await;
+    let a = wait_for("Agent f-c-a", Duration::from_secs(10), || async {
+        agents.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    agents.get("f-c-b").await.unwrap();
+    assert_eq!(
+        a.metadata.finalizers.as_deref(),
+        Some(&["balerix.ai/harvest".to_string()][..])
+    );
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), &ns);
+    let token = secrets.get("f-c-a-token").await.unwrap();
+    assert_eq!(token.data.as_ref().unwrap()["token"].0.len(), 64);
+    assert_eq!(
+        token.metadata.owner_references.as_ref().unwrap()[0].kind,
+        "Fleet"
+    );
+    Api::<Job>::namespaced(client.clone(), &ns)
+        .get("f-pool")
+        .await
+        .unwrap();
+
+    let puts = stub.puts();
+    assert!(!puts.is_empty());
+    let tokens = puts[0].agent_tokens.as_ref().unwrap();
+    assert_eq!(tokens.len(), 2);
+    assert_eq!(
+        String::from_utf8(token.data.as_ref().unwrap()["token"].0.clone()).unwrap(),
+        tokens["f/c/a"]
+    );
+    assert_eq!(puts[0].spec.crews["c"].agents.len(), 2);
+
+    let status = wait_for("Fleet status", Duration::from_secs(10), || async {
+        fleets
+            .get("f")
+            .await
+            .unwrap()
+            .status
+            .filter(|s| s.conditions.len() == 3)
+    })
+    .await;
+    assert_eq!(condition(&status.conditions, "Resolved").status, "True");
+    assert_eq!(condition(&status.conditions, "Accepted").status, "True");
+    let ready = condition(&status.conditions, "Ready");
+    assert_eq!(
+        (
+            ready.status.as_str(),
+            ready.reason.as_str(),
+            ready.message.as_str()
+        ),
+        ("False", "AgentsNotReady", "0 of 2 agents ready")
+    );
+    assert_eq!(
+        fleets
+            .get("f")
+            .await
+            .unwrap()
+            .metadata
+            .finalizers
+            .as_deref(),
+        Some(&["balerix.ai/fleet".to_string()][..])
+    );
+    // the token is kept across reconciles
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(secrets.get("f-c-a-token").await.unwrap().data, token.data);
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_fleet_lands_no_child() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("rejected").await;
+    stub.reject(Some("crews.c.agents.a.model: no such model"));
+    let fleets: Api<Fleet> = Api::namespaced(env.client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    let status = wait_for("Accepted=False", Duration::from_secs(30), || async {
+        let s = fleets.get("f").await.unwrap().status?;
+        (s.conditions.len() == 3 && condition(&s.conditions, "Accepted").status == "False")
+            .then_some(s)
+    })
+    .await;
+    let accepted = condition(&status.conditions, "Accepted");
+    assert_eq!(
+        (accepted.reason.as_str(), accepted.message.as_str()),
+        ("Rejected", "crews.c.agents.a.model: no such model")
+    );
+    assert_eq!(condition(&status.conditions, "Ready").reason, "Rejected");
+    let crews: Api<Crew> = Api::namespaced(env.client.clone(), &ns);
+    hold_for(
+        "a Crew of a rejected Fleet",
+        Duration::from_secs(3),
+        || async { crews.get_opt("f-c").await.unwrap() },
+    )
+    .await;
+    assert!(
+        Api::<Job>::namespaced(env.client.clone(), &ns)
+            .get_opt("f-pool")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_that_does_not_answer_leaves_the_children() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("unavailable").await;
+    let fleets: Api<Fleet> = Api::namespaced(env.client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    let crews: Api<Crew> = Api::namespaced(env.client.clone(), &ns);
+    wait_for("the Crew", Duration::from_secs(30), || async {
+        crews.get_opt("f-c").await.unwrap()
+    })
+    .await;
+    stub.stop().await;
+    let status = wait_for("DaemonUnavailable", Duration::from_secs(30), || async {
+        let s = fleets.get("f").await.unwrap().status?;
+        (condition(&s.conditions, "Ready").reason == "DaemonUnavailable").then_some(s)
+    })
+    .await;
+    assert_eq!(condition(&status.conditions, "Accepted").status, "Unknown");
+    crews.get("f-c").await.unwrap();
+    Api::<Agent>::namespaced(env.client.clone(), &ns)
+        .get("f-c-a")
+        .await
+        .unwrap();
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fleet_naming_no_daemon_is_not_resolved() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("ghost").await;
+    let fleets: Api<Fleet> = Api::namespaced(env.client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("ghost", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    let status = wait_for("Resolved=False", Duration::from_secs(30), || async {
+        let s = fleets.get("f").await.unwrap().status?;
+        (!s.conditions.is_empty()).then_some(s)
+    })
+    .await;
+    let resolved = condition(&status.conditions, "Resolved");
+    assert_eq!(
+        (resolved.status.as_str(), resolved.message.as_str()),
+        ("False", "spec.daemon: Daemon ghost does not exist")
+    );
+    assert!(stub.puts().is_empty());
+    assert!(
+        Api::<Crew>::namespaced(env.client.clone(), &ns)
+            .get_opt("f-c")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_namespaces_ignores_another_namespace() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, _ns, _stub, _clock, operator) = world("watched").await;
+    // the operator watches `_ns`; this Daemon is elsewhere
+    let other = namespace(&env.client, "unwatched").await;
+    Api::<Daemon>::namespaced(env.client.clone(), &other)
+        .create(
+            &PostParams::default(),
+            &Daemon::new("default", daemon_spec()),
+        )
+        .await
+        .unwrap();
+    let sts: Api<StatefulSet> = Api::namespaced(env.client.clone(), &other);
+    hold_for(
+        "a StatefulSet in an unwatched namespace",
+        Duration::from_secs(4),
+        || async { sts.get_opt("balerix-default").await.unwrap() },
     )
     .await;
     operator.abort();

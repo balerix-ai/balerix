@@ -91,6 +91,9 @@ pub enum Error {
     /// or `{what} {name} does not exist`.
     #[error("{0}")]
     Missing(String),
+    /// A cleanup that is not finished: requeued in 2 s, not an error.
+    #[error("waiting: {0}")]
+    Waiting(String),
 }
 
 impl From<kube::runtime::finalizer::Error<Error>> for Error {
@@ -115,6 +118,9 @@ pub struct Context {
     /// `<ns>/<fleet>` to the Agent object names the last plan made: the
     /// Agent controller's Fleet watch maps through this.
     pub fleet_agents: RwLock<BTreeMap<String, Vec<String>>>,
+    /// `<ns>/<daemon>` to the Fleets naming it: the Fleet controller's
+    /// Daemon watch maps through this.
+    pub daemon_fleets: RwLock<BTreeMap<String, Vec<String>>>,
     clients: Mutex<BTreeMap<String, CachedClient>>,
     /// Consecutive reconcile errors per object, for `error_policy`.
     errors: Mutex<BTreeMap<String, u32>>,
@@ -133,6 +139,7 @@ impl Context {
             run,
             records: RwLock::new(BTreeMap::new()),
             fleet_agents: RwLock::new(BTreeMap::new()),
+            daemon_fleets: RwLock::new(BTreeMap::new()),
             clients: Mutex::new(BTreeMap::new()),
             errors: Mutex::new(BTreeMap::new()),
         }
@@ -251,6 +258,10 @@ pub fn reconciled<K: Resource>(ctx: &Context, object: &K) {
 /// 5 s, doubling per consecutive failure of the same object, at most 5 min.
 pub fn error_policy<K: Resource>(object: Arc<K>, error: &Error, ctx: Arc<Context>) -> Action {
     let key = object_key(object.as_ref());
+    if let Error::Waiting(why) = error {
+        tracing::debug!(object = %key, "{why}");
+        return Action::requeue(Duration::from_secs(2));
+    }
     let attempt = {
         let mut errors = ctx.errors.lock().unwrap_or_else(|e| e.into_inner());
         let n = errors.entry(key.clone()).or_insert(0);
@@ -308,7 +319,7 @@ async fn set(ctx: Arc<Context>, namespace: Option<String>) {
     let ns = namespace.as_deref();
     let controllers: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> = vec![
         Box::pin(daemon::controller(ctx.clone(), ns)),
-        // Task 6: Box::pin(fleet::controller(ctx.clone(), ns)),
+        Box::pin(fleet::controller(ctx.clone(), ns)),
         // Task 7: Box::pin(crew::controller(ctx.clone(), ns)),
         // Task 8: Box::pin(agent::controller(ctx.clone(), ns)),
     ];

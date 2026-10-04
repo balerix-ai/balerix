@@ -99,10 +99,12 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
         })
         .collect();
     mounts.push(json!({ "name": "scratch", "mountPath": SCRATCH }));
+    mounts.push(json!({ "name": "tmp", "mountPath": "/tmp" }));
     mounts.extend(parts.mounts);
     let mut volumes = vec![
         json!({ "name": "shared", "persistentVolumeClaim": { "claimName": names::shared_claim(ctx.daemon) } }),
         json!({ "name": "scratch", "emptyDir": {} }),
+        json!({ "name": "tmp", "emptyDir": {} }),
     ];
     volumes.extend(parts.volumes);
     let input = hash(&json!({
@@ -157,6 +159,31 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
 }
 
 /// `pools/daemon`: the system table this image embeds (§20.3).
+/// The cleanup Job (§21.2): `crew-remove` over the crew's cache and pool,
+/// read-write, after the Fleet's Agents are gone.
+pub fn remove_job(ctx: &JobContext<'_>, fleet: &str, crew: &str) -> Result<Job, DesiredError> {
+    let mut args = strings(&["crew-remove", "--crew"]);
+    args.push(format!("{fleet}/{crew}"));
+    job(
+        ctx,
+        Parts {
+            name: names::remove_job(fleet, crew),
+            component: "remove",
+            extra_labels: vec![
+                ("balerix.ai/fleet", fleet.to_string()),
+                ("balerix.ai/crew", crew.to_string()),
+            ],
+            args,
+            slices: vec![
+                slice(names::vol_crew_repo(fleet, crew), "repo", true),
+                slice(names::vol_crew_pool(fleet, crew), "crew", true),
+            ],
+            volumes: vec![],
+            mounts: vec![],
+        },
+    )
+}
+
 pub fn daemon_pool_job(ctx: &JobContext<'_>) -> Result<Job, DesiredError> {
     job(
         ctx,
@@ -693,6 +720,32 @@ mod tests {
         assert_eq!(
             crew_cond(&s, "ToolsReady"),
             ("False", "PoolSyncRunning", "")
+        );
+    }
+
+    #[test]
+    fn the_remove_job_runs_crew_remove_over_the_crews_writable_slice() {
+        let images = images();
+        let job = remove_job(&ctx(&images), "f", "c").unwrap();
+        insta::assert_yaml_snapshot!(job);
+    }
+
+    #[test]
+    fn every_job_mounts_an_empty_dir_at_tmp() {
+        let images = images();
+        let job = daemon_pool_job(&ctx(&images)).unwrap();
+        let spec = job.spec.unwrap().template.spec.unwrap();
+        let mounts = spec.containers[0].volume_mounts.clone().unwrap();
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.mount_path == "/tmp" && m.name == "tmp")
+        );
+        assert!(
+            spec.volumes
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "tmp" && v.empty_dir.is_some())
         );
     }
 }

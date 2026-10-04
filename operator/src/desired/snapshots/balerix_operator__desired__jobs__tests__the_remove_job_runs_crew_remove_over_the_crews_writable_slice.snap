@@ -1,17 +1,19 @@
 ---
 source: src/desired/jobs.rs
-expression: daemon_pool_job(&c).unwrap()
+expression: job
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
   annotations:
-    balerix.ai/input-hash: f356e3320d1a1bba7f25a4b57cd8b45b544abac7f0f48505e7814eeb6f1cfa1d
+    balerix.ai/input-hash: e87bcb74b68a36130a641d859524c6bcd492640b4f264513cbb0d71b05c03483
   labels:
     app.kubernetes.io/managed-by: balerix-operator
-    balerix.ai/component: pool
+    balerix.ai/component: remove
+    balerix.ai/crew: c
     balerix.ai/daemon: default
-  name: balerix-default-pool
+    balerix.ai/fleet: f
+  name: f-c-remove
   namespace: team-a
   ownerReferences:
     - apiVersion: balerix.ai/v1alpha1
@@ -25,15 +27,17 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/managed-by: balerix-operator
-        balerix.ai/component: pool
+        balerix.ai/component: remove
+        balerix.ai/crew: c
         balerix.ai/daemon: default
+        balerix.ai/fleet: f
     spec:
       automountServiceAccountToken: false
       containers:
         - args:
-            - pool-sync
-            - "--level"
-            - daemon
+            - crew-remove
+            - "--crew"
+            - f/c
           command:
             - balerix-agent
           env:
@@ -51,10 +55,14 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           volumeMounts:
-            - mountPath: /balerix/shared/daemon
+            - mountPath: /balerix/shared/repo
               name: shared
               readOnly: false
-              subPath: pools/daemon
+              subPath: fleets/f/crews/c/repo
+            - mountPath: /balerix/shared/crew
+              name: shared
+              readOnly: false
+              subPath: fleets/f/crews/c/pool
             - mountPath: /balerix/scratch
               name: scratch
             - mountPath: /tmp
@@ -64,7 +72,8 @@ spec:
         - command:
             - mkdir
             - "-p"
-            - /balerix/volume/pools/daemon
+            - /balerix/volume/fleets/f/crews/c/repo
+            - /balerix/volume/fleets/f/crews/c/pool
           image: "ghcr.io/balerix-ai/balerix-agent:0.2.0"
           name: slice
           securityContext:

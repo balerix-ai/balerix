@@ -6,7 +6,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   annotations:
-    balerix.ai/input-hash: bba42f41954b61d3f74191b74cd7f0c0c9a22be64895d4cfac7c18cd5044ec0c
+    balerix.ai/input-hash: b9b87000b8e034b0ee9a20c6995e9edd1396790380a6c06c9abd242fb2717284
   labels:
     app.kubernetes.io/managed-by: balerix-operator
     balerix.ai/agent: alice
@@ -67,6 +67,8 @@ spec:
               subPath: fleets/payments/crews/backend/pool
             - mountPath: /balerix/scratch
               name: scratch
+            - mountPath: /tmp
+              name: tmp
             - mountPath: /balerix/agent
               name: agent
               readOnly: true
@@ -106,6 +108,8 @@ spec:
             claimName: balerix-default-shared
         - emptyDir: {}
           name: scratch
+        - emptyDir: {}
+          name: tmp
         - name: agent
           persistentVolumeClaim:
             claimName: payments-backend-alice

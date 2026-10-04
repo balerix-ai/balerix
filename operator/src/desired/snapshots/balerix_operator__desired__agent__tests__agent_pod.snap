@@ -64,6 +64,8 @@ spec:
           subPath: pools/daemon
         - mountPath: /balerix/run
           name: run
+        - mountPath: /tmp
+          name: tmp
   enableServiceLinks: false
   initContainers:
     - command:
@@ -113,6 +115,8 @@ spec:
           subPath: pools/daemon
         - mountPath: /balerix/run
           name: run
+        - mountPath: /tmp
+          name: tmp
         - mountPath: /balerix/secret
           name: bundle
           readOnly: true
@@ -142,6 +146,8 @@ spec:
         readOnly: true
     - emptyDir: {}
       name: run
+    - emptyDir: {}
+      name: tmp
     - name: bundle
       secret:
         defaultMode: 288

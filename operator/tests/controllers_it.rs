@@ -1732,3 +1732,90 @@ async fn a_terminating_namespace_skips_the_harvest() {
     );
     operator.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_or_malformed_credentials_secret_is_on_the_agent() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, _clock, operator) = world("creds").await;
+    let client = env.client.clone();
+    // the Daemon names a claude credentials Secret nobody made
+    Api::<Daemon>::namespaced(client.clone(), &ns)
+        .patch(
+            "default",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": { "credentials": { "claude": { "secretName": "claude-creds" } } } })),
+        )
+        .await
+        .unwrap();
+    Api::<Fleet>::namespaced(client.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let materialized = |reason: &'static str| {
+        let agents = agents.clone();
+        async move {
+            let s = agents.get("f-c-a").await.unwrap().status?;
+            let c = condition(&s.conditions, "Materialized").clone();
+            (c.reason == reason).then_some(c)
+        }
+    };
+    let c = wait_for("CredentialsInvalid", Duration::from_secs(60), || {
+        materialized("CredentialsInvalid")
+    })
+    .await;
+    assert_eq!(
+        (c.status.as_str(), c.message.as_str()),
+        (
+            "False",
+            "Secret claude-creds (the Daemon's spec.credentials.claude) does not exist"
+        )
+    );
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    assert!(pods.get_opt("f-c-a").await.unwrap().is_none());
+
+    // a Secret whose file is not JSON: the message names the Secret and the
+    // key, and never quotes what it holds
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), &ns);
+    let secret: Secret = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1", "kind": "Secret",
+        "metadata": { "name": "claude-creds", "namespace": ns },
+        "stringData": { "credentials.json": "sk-ant-not-json-at-all" }
+    }))
+    .unwrap();
+    secrets
+        .create(&PostParams::default(), &secret)
+        .await
+        .unwrap();
+    let c = wait_for("the parse failure", Duration::from_secs(60), || async {
+        let c = materialized("CredentialsInvalid").await?;
+        c.message.contains("not JSON").then_some(c)
+    })
+    .await;
+    assert_eq!(
+        c.message,
+        "Secret claude-creds key credentials.json is not JSON (line 1, column 1)"
+    );
+    assert!(!c.message.contains("sk-ant"));
+
+    // fixed: the pod is made
+    secrets
+        .patch(
+            "claude-creds",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "stringData": { "credentials.json": "{\"claudeAiOauth\":{}}" } })),
+        )
+        .await
+        .unwrap();
+    wait_for("the pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    operator.abort();
+}

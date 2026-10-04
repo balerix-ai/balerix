@@ -112,41 +112,55 @@ fn reported(ctx: &Context, namespace: &str, agent: &Agent) -> Option<balerix_api
 }
 
 /// The credentials the Daemon names (§5.2 step 2), from their Secrets.
+/// The inner `Err` is the user's to fix (a Secret or key that is not
+/// there, a file that does not parse): it names the Secret and the key,
+/// never what the Secret holds.
 async fn credentials(
     ctx: &Context,
     namespace: &str,
     daemon: &Daemon,
-) -> Result<CredentialBundle, Error> {
+) -> Result<Result<CredentialBundle, String>, Error> {
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
     let mut bundle = CredentialBundle::default();
     if let Some(r) = &daemon.spec.credentials.claude {
-        let secret = secrets.get_opt(&r.secret_name).await?.ok_or_else(|| {
-            Error::Missing(format!(
-                "Secret {} (spec.credentials.claude) does not exist",
+        let Some(secret) = secrets.get_opt(&r.secret_name).await? else {
+            return Ok(Err(format!(
+                "Secret {} (the Daemon's spec.credentials.claude) does not exist",
                 r.secret_name
-            ))
-        })?;
-        let text = read_secret_string(&secret, "credentials.json").ok_or_else(|| {
-            Error::Missing(format!("Secret {} has no credentials.json", r.secret_name))
-        })?;
-        bundle.claude_credentials =
-            Some(serde_json::from_str(&text).map_err(crate::desired::common::DesiredError::from)?);
+            )));
+        };
+        let Some(text) = read_secret_string(&secret, "credentials.json") else {
+            return Ok(Err(format!(
+                "Secret {} has no key credentials.json",
+                r.secret_name
+            )));
+        };
+        // serde's message can quote the input: only the position is kept
+        match serde_json::from_str(&text) {
+            Ok(credentials) => bundle.claude_credentials = Some(credentials),
+            Err(e) => {
+                return Ok(Err(format!(
+                    "Secret {} key credentials.json is not JSON (line {}, column {})",
+                    r.secret_name,
+                    e.line(),
+                    e.column()
+                )));
+            }
+        }
     }
     if let Some(r) = &daemon.spec.credentials.github {
-        let secret = secrets.get_opt(&r.secret_name).await?.ok_or_else(|| {
-            Error::Missing(format!(
-                "Secret {} (spec.credentials.github) does not exist",
+        let Some(secret) = secrets.get_opt(&r.secret_name).await? else {
+            return Ok(Err(format!(
+                "Secret {} (the Daemon's spec.credentials.github) does not exist",
                 r.secret_name
-            ))
-        })?;
-        bundle.gh_token = Some(
-            read_secret_string(&secret, "token")
-                .ok_or_else(|| Error::Missing(format!("Secret {} has no token", r.secret_name)))?
-                .trim_end()
-                .to_string(),
-        );
+            )));
+        };
+        let Some(token) = read_secret_string(&secret, "token") else {
+            return Ok(Err(format!("Secret {} has no key token", r.secret_name)));
+        };
+        bundle.gh_token = Some(token.trim_end().to_string());
     }
-    Ok(bundle)
+    Ok(Ok(bundle))
 }
 
 /// `agent_status` with one condition replaced (its transition time kept
@@ -209,18 +223,38 @@ async fn apply_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Err
         return Ok(Action::requeue(period));
     }
 
+    // a Secret the user must fix is a condition, looked at again each period
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &namespace);
+    let token_secret = names::token(&name);
     let token = secrets
-        .get_opt(&names::token(&name))
+        .get_opt(&token_secret)
         .await?
         .as_ref()
-        .and_then(|s| read_secret_string(s, "token"))
-        .ok_or_else(|| {
-            Error::Missing(format!(
-                "Agent {namespace}/{name}: its token Secret does not exist yet"
-            ))
-        })?;
-    let credentials = credentials(&ctx, &namespace, &daemon).await?;
+        .and_then(|s| read_secret_string(s, "token"));
+    let resolved = match token {
+        None => Err(format!(
+            "Secret {token_secret} (the agent's Daemon token, minted by the Fleet) does not exist or has no key token"
+        )),
+        Some(token) => credentials(&ctx, &namespace, &daemon)
+            .await?
+            .map(|c| (token, c)),
+    };
+    let (token, credentials) = match resolved {
+        Ok(both) => both,
+        Err(why) => {
+            let pod = pods.get_opt(&name).await?;
+            let status = with_condition(
+                &ctx,
+                &agent,
+                pod.as_ref(),
+                reported.as_ref(),
+                Cond::no("Materialized", "CredentialsInvalid", &why),
+            );
+            patch_status(&ctx.client, agent.as_ref(), &status).await?;
+            reconciled(&ctx, agent.as_ref());
+            return Ok(Action::requeue(period));
+        }
+    };
     let objects = agent_objects(&AgentInputs {
         agent: &agent,
         daemon: &daemon,

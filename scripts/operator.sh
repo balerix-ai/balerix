@@ -35,7 +35,7 @@ case "$1" in
       export ENVTEST_DIR
     fi
     CARGO_TARGET_DIR="$target" cargo nextest run \
-      --config-file "$repo/.config/nextest.toml" \
+      --config-file "$dir/.config/nextest.toml" \
       --manifest-path "$dir/Cargo.toml"
     ;;
   *)

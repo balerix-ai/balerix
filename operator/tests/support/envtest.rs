@@ -2,10 +2,10 @@
 //! §21.3) started once per test process on free ports under `target/tmp`,
 //! with the five definitions applied. nextest runs each test in a process
 //! of its own, so that is one instance per test; the `envtest` test group
-//! in `.config/nextest.toml` bounds how many run at once. A start whose
-//! port was taken between `free_port` and the bind is retried on new
-//! ports. No controller-manager, no kubelet: a test patches Job and Pod
-//! status itself and force-deletes pods.
+//! in `operator/.config/nextest.toml` bounds how many run at once. A start
+//! whose port was taken between `free_port` and the bind is retried on
+//! new ports. No controller-manager, no kubelet: a test patches Job and
+//! Pod status itself and force-deletes pods.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(dead_code)]
 

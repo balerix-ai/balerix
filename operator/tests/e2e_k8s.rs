@@ -10,12 +10,15 @@ mod support;
 
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use balerix_operator::api::{Agent, Crew, Daemon, DaemonSpec, Fleet, FleetSpec};
+use futures_util::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Service};
-use kube::api::{DeleteParams, ListParams, PostParams};
+use kube::api::{DeleteParams, PostParams};
+use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Api, Client};
 use support::wait_for;
 
@@ -241,17 +244,15 @@ async fn the_phase_3_journey_on_kind() {
     })
     .await;
     let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
-    assert_eq!(
-        agents
-            .get("f-c-alice")
-            .await
-            .unwrap()
-            .status
-            .unwrap()
-            .phase
-            .as_deref(),
-        Some("ready")
-    );
+    // an Agent's phase is the Daemon's record, which the Fleet's reconcile
+    // caches and the Agent's next reconcile copies: it can trail the
+    // Fleet's Ready by a reconcile (seen on kind: alice `pending` the
+    // moment the Fleet was Ready)
+    wait_for("alice's phase ready", Duration::from_secs(60), || async {
+        let phase = agents.get("f-c-alice").await.unwrap().status?.phase;
+        (phase.as_deref() == Some("ready")).then_some(())
+    })
+    .await;
     assert!(
         Api::<Crew>::namespaced(client.clone(), &ns)
             .get("f-c")
@@ -280,6 +281,16 @@ async fn the_phase_3_journey_on_kind() {
         if p.metadata.uid == first.metadata.uid {
             return None;
         }
+        // the new pod's own readiness, not only the Agent's condition,
+        // which still says the old pod's until the Agent reconciles
+        let pod_ready = p
+            .status?
+            .conditions?
+            .iter()
+            .any(|c| c.type_ == "Ready" && c.status == "True");
+        if !pod_ready {
+            return None;
+        }
         let a = agents.get("f-c-alice").await.unwrap().status?;
         condition_true(&a.conditions, "Ready").then_some(())
     })
@@ -292,7 +303,44 @@ async fn the_phase_3_journey_on_kind() {
     )
     .unwrap();
 
-    // 5. drop bob: harvested into the crew cache
+    // 5. drop bob: harvested into the crew cache. The harvest Job and its
+    // pod are bob's Agent's and go with it, so their outcome is watched
+    // as it happens, not read after
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let succeeded = Arc::new(Mutex::new(None::<i32>));
+    let message = Arc::new(Mutex::new(None::<String>));
+    let job_watch = tokio::spawn({
+        let (jobs, succeeded) = (jobs.clone(), succeeded.clone());
+        async move {
+            let config = watcher::Config::default().fields("metadata.name=f-c-bob-harvest");
+            let mut events =
+                std::pin::pin!(watcher(jobs, config).default_backoff().applied_objects());
+            while let Some(event) = events.next().await {
+                if let Some(n) = event.ok().and_then(|j| j.status?.succeeded) {
+                    *succeeded.lock().unwrap() = Some(n);
+                }
+            }
+        }
+    });
+    let pod_watch = tokio::spawn({
+        let (pods, message) = (pods.clone(), message.clone());
+        async move {
+            let config = watcher::Config::default().labels("job-name=f-c-bob-harvest");
+            let mut events =
+                std::pin::pin!(watcher(pods, config).default_backoff().applied_objects());
+            while let Some(event) = events.next().await {
+                let found = event.ok().and_then(|p| {
+                    p.status?
+                        .container_statuses?
+                        .into_iter()
+                        .find_map(|c| c.state?.terminated?.message)
+                });
+                if let Some(m) = found {
+                    *message.lock().unwrap() = Some(m);
+                }
+            }
+        }
+    });
     fleets
         .patch(
             "f",
@@ -312,23 +360,13 @@ async fn the_phase_3_journey_on_kind() {
             .then_some(())
     })
     .await;
-    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
-    let harvest = jobs.get("f-c-bob-harvest").await.unwrap();
-    assert_eq!(harvest.status.as_ref().and_then(|s| s.succeeded), Some(1));
-    let message = pods
-        .list(&ListParams::default().labels("job-name=f-c-bob-harvest"))
-        .await
+    job_watch.abort();
+    pod_watch.abort();
+    assert_eq!(*succeeded.lock().unwrap(), Some(1));
+    let message = message
+        .lock()
         .unwrap()
-        .items
-        .iter()
-        .find_map(|p| {
-            p.status
-                .as_ref()?
-                .container_statuses
-                .as_ref()?
-                .iter()
-                .find_map(|c| c.state.as_ref()?.terminated.as_ref()?.message.clone())
-        })
+        .clone()
         .expect("the harvest Job's message");
     let branch = message
         .trim()

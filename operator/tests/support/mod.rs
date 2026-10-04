@@ -204,3 +204,84 @@ pub async fn finish_job(
         .await
         .unwrap();
 }
+
+/// The kubelet's part for a deleted Pod in envtest: once the operator has
+/// set its deletion timestamp, remove it with grace period 0. Returns
+/// when the Pod that exists now is gone (a new one by the same name may
+/// already stand in its place: a Pod with no node is deleted at once,
+/// and the operator makes the next at once). Panics after `timeout` if
+/// it was never deleted.
+pub async fn reap_pod(client: &Client, namespace: &str, name: &str, timeout: Duration) {
+    use k8s_openapi::api::core::v1::Pod;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let Some(uid) = pods
+        .get_opt(name)
+        .await
+        .unwrap()
+        .and_then(|p| p.metadata.uid)
+    else {
+        return;
+    };
+    reap_pod_uid(client, namespace, name, &uid, timeout).await;
+}
+
+/// `reap_pod` for the Pod with this uid, which the caller saw earlier.
+pub async fn reap_pod_uid(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    uid: &str,
+    timeout: Duration,
+) {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::{DeleteParams, Preconditions};
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    wait_for(&format!("pod {name} to be deleted"), timeout, || async {
+        match pods.get_opt(name).await.unwrap() {
+            Some(p) if p.metadata.uid.as_deref() == Some(uid) => {
+                if p.metadata.deletion_timestamp.is_some() {
+                    let params = DeleteParams {
+                        grace_period_seconds: Some(0),
+                        preconditions: Some(Preconditions {
+                            uid: Some(uid.to_string()),
+                            resource_version: None,
+                        }),
+                        ..DeleteParams::default()
+                    };
+                    let _ = pods.delete(name, &params).await;
+                }
+                None
+            }
+            // gone, or replaced
+            _ => Some(()),
+        }
+    })
+    .await;
+}
+
+/// The controller-manager's part for a deleted claim in envtest: the
+/// `kubernetes.io/pvc-protection` finalizer comes off once the claim has
+/// a deletion timestamp. Returns when the claim is gone; panics after
+/// `timeout` if it was never deleted.
+pub async fn reap_claim(client: &Client, namespace: &str, name: &str, timeout: Duration) {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+    use kube::api::{Patch, PatchParams};
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+    wait_for(&format!("claim {name} gone"), timeout, || async {
+        match claims.get_opt(name).await.unwrap() {
+            None => Some(()),
+            Some(c) if c.metadata.deletion_timestamp.is_some() => {
+                let _ = claims
+                    .patch(
+                        name,
+                        &PatchParams::default(),
+                        &Patch::Merge(serde_json::json!({ "metadata": { "finalizers": null } })),
+                    )
+                    .await;
+                None
+            }
+            Some(_) => None,
+        }
+    })
+    .await;
+}

@@ -5,16 +5,20 @@ mod support;
 
 use std::time::Duration;
 
+use balerix_api::{AgentPhase, AgentStatus as DaemonAgentStatus};
 use balerix_operator::api::{Agent, Crew, Daemon, DaemonSpec, Fleet, FleetSpec};
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::Api;
 use kube::api::{Patch, PatchParams, PostParams};
 use support::envtest::envtest;
 use support::stub_daemon::StubDaemon;
-use support::{TestClock, finish_job, hold_for, namespace, spawn_operator, wait_for};
+use support::{
+    TestClock, finish_job, hold_for, namespace, reap_claim, reap_pod, reap_pod_uid, spawn_operator,
+    wait_for,
+};
 
 fn daemon_spec() -> DaemonSpec {
     serde_json::from_value(serde_json::json!({
@@ -845,5 +849,419 @@ async fn two_fleets_sharing_a_crew_name_sync_at_once() {
         Some((p, b))
     })
     .await;
+    operator.abort();
+}
+
+/// Both Jobs of crew `c` succeeded: its Agents may have pods.
+async fn crew_ready(client: &kube::Client, ns: &str, fleet: &str, crew: &str) {
+    let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
+    let pool = format!("{fleet}-pool");
+    let sync = format!("{fleet}-{crew}-sync");
+    wait_for("the Jobs", Duration::from_secs(30), || async {
+        jobs.get_opt(&pool).await.unwrap()?;
+        jobs.get_opt(&sync).await.unwrap()
+    })
+    .await;
+    // the pool is the Fleet's: a second crew finds it finished, and a
+    // finished Job's status is immutable
+    let pool_done = jobs
+        .get(&pool)
+        .await
+        .unwrap()
+        .status
+        .and_then(|s| s.succeeded)
+        .is_some_and(|n| n > 0);
+    if !pool_done {
+        finish_job(client, ns, &pool, true, Some("synced")).await;
+    }
+    finish_job(client, ns, &sync, true, Some("0123abcd")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crew_dropped_from_the_fleet_is_removed_and_its_agent_harvested() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, _clock, operator) = world("dropped").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new(
+                "f",
+                fleet_spec("default", &[("c", &["a"]), ("d", &["a"])], "Branches"),
+            ),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    crew_ready(&client, &ns, "f", "d").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+    wait_for("the pods", Duration::from_secs(30), || async {
+        pods.get_opt("f-c-a").await.unwrap()?;
+        pods.get_opt("f-d-a").await.unwrap()
+    })
+    .await;
+    claims.get("f-d-a").await.unwrap();
+    Api::<Secret>::namespaced(client.clone(), &ns)
+        .get("f-d-a-bundle")
+        .await
+        .unwrap();
+
+    // crew d leaves the Fleet
+    fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": { "crews": { "d": null } } })),
+        )
+        .await
+        .unwrap();
+    reap_pod(&client, &ns, "f-d-a", Duration::from_secs(30)).await;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    wait_for("the harvest Job", Duration::from_secs(30), || async {
+        jobs.get_opt("f-d-a-harvest").await.unwrap()
+    })
+    .await;
+    finish_job(
+        &client,
+        &ns,
+        "f-d-a-harvest",
+        true,
+        Some("harvested balerix/a"),
+    )
+    .await;
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    wait_for("Agent f-d-a gone", Duration::from_secs(30), || async {
+        agents
+            .get_opt("f-d-a")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    // the controller-manager: the claim's protection comes off
+    reap_claim(&client, &ns, "f-d-a", Duration::from_secs(10)).await;
+    wait_for("Crew f-d gone", Duration::from_secs(10), || async {
+        Api::<Crew>::namespaced(client.clone(), &ns)
+            .get_opt("f-d")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    agents.get("f-c-a").await.unwrap();
+    pods.get("f-c-a").await.unwrap();
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_with_no_claim_is_removed_without_a_harvest() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, _clock, operator) = world("noclaim").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new(
+                "f",
+                fleet_spec("default", &[("c", &["a"]), ("d", &["a"])], "Branches"),
+            ),
+        )
+        .await
+        .unwrap();
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let a = wait_for("Agent f-d-a", Duration::from_secs(30), || async {
+        agents.get_opt("f-d-a").await.unwrap()
+    })
+    .await;
+    let status = wait_for("WaitingForCrew", Duration::from_secs(10), || async {
+        let s = agents.get("f-d-a").await.unwrap().status?;
+        (condition(&s.conditions, "Materialized").reason == "WaitingForCrew").then_some(s)
+    })
+    .await;
+    assert_eq!(
+        condition(&status.conditions, "Materialized").status,
+        "Unknown"
+    );
+    let _ = a;
+    // dropped before its crew ever synced: no claim, no harvest
+    fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": { "crews": { "d": null } } })),
+        )
+        .await
+        .unwrap();
+    wait_for("Agent f-d-a gone", Duration::from_secs(30), || async {
+        agents
+            .get_opt("f-d-a")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    assert!(
+        Api::<Job>::namespaced(client.clone(), &ns)
+            .get_opt("f-d-a-harvest")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_spec_hash_replaces_the_pod_and_keeps_the_claim() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, _clock, operator) = world("spechash").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let first = wait_for("the pod", Duration::from_secs(30), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    let claim = Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns)
+        .get("f-c-a")
+        .await
+        .unwrap();
+    let old_hash = first.metadata.annotations.as_ref().unwrap()["balerix.ai/spec-hash"].clone();
+
+    fleets.patch("f", &PatchParams::default(), &Patch::Merge(serde_json::json!({
+        "spec": { "crews": { "c": { "agents": { "a": { "claude": { "settings": { "model": "opus" } } } } } } }
+    }))).await.unwrap();
+    reap_pod_uid(
+        &client,
+        &ns,
+        "f-c-a",
+        first.metadata.uid.as_deref().unwrap(),
+        Duration::from_secs(30),
+    )
+    .await;
+    let second = wait_for("the new pod", Duration::from_secs(30), || async {
+        let p = pods.get_opt("f-c-a").await.unwrap()?;
+        (p.metadata.uid != first.metadata.uid).then_some(p)
+    })
+    .await;
+    let new_hash = &second.metadata.annotations.as_ref().unwrap()["balerix.ai/spec-hash"];
+    assert_ne!(*new_hash, old_hash);
+    assert_eq!(
+        Api::<Agent>::namespaced(client.clone(), &ns)
+            .get("f-c-a")
+            .await
+            .unwrap()
+            .spec
+            .spec_hash,
+        *new_hash
+    );
+    assert_eq!(
+        Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns)
+            .get("f-c-a")
+            .await
+            .unwrap()
+            .metadata
+            .uid,
+        claim.metadata.uid
+    );
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_crew_lock_holds_the_harvest_while_a_sync_runs() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, _clock, operator) = world("lock").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new(
+                "f",
+                fleet_spec("default", &[("c", &["a", "b"])], "Branches"),
+            ),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    wait_for("the pods", Duration::from_secs(30), || async {
+        pods.get_opt("f-c-a").await.unwrap()?;
+        pods.get_opt("f-c-b").await.unwrap()
+    })
+    .await;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let synced = jobs.get("f-c-sync").await.unwrap();
+
+    // a changed crew tool table makes the sync Job stale: a new one runs, unfinished
+    fleets.patch("f", &PatchParams::default(), &Patch::Merge(serde_json::json!({ "spec": { "crews": { "c": { "defaults": { "tools": { "node": "22.11.0" } } } } } }))).await.unwrap();
+    wait_for("a new sync Job", Duration::from_secs(30), || async {
+        let j = jobs.get_opt("f-c-sync").await.unwrap()?;
+        (j.metadata.uid != synced.metadata.uid).then_some(j)
+    })
+    .await;
+    // agent b leaves while it runs
+    fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(
+                serde_json::json!({ "spec": { "crews": { "c": { "agents": { "b": null } } } } }),
+            ),
+        )
+        .await
+        .unwrap();
+    reap_pod(&client, &ns, "f-c-b", Duration::from_secs(30)).await;
+    hold_for(
+        "a harvest while the sync runs",
+        Duration::from_secs(4),
+        || async { jobs.get_opt("f-c-b-harvest").await.unwrap() },
+    )
+    .await;
+    finish_job(&client, &ns, "f-c-sync", true, Some("4567abcd")).await;
+    wait_for(
+        "the harvest after the sync",
+        Duration::from_secs(30),
+        || async { jobs.get_opt("f-c-b-harvest").await.unwrap() },
+    )
+    .await;
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fleet_deletion_with_retain_none_downs_the_daemon_and_runs_the_cleanup_job() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("retainnone").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "None")),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    wait_for("the pod", Duration::from_secs(30), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+
+    fleets
+        .delete("f", &kube::api::DeleteParams::default())
+        .await
+        .unwrap();
+    reap_pod(&client, &ns, "f-c-a", Duration::from_secs(30)).await;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    wait_for(
+        "Agent gone without a harvest",
+        Duration::from_secs(30),
+        || async {
+            agents
+                .get_opt("f-c-a")
+                .await
+                .unwrap()
+                .is_none()
+                .then_some(())
+        },
+    )
+    .await;
+    assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_none());
+    wait_for("the Daemon's DELETE", Duration::from_secs(30), || async {
+        stub.deletes().contains(&"f".to_string()).then_some(())
+    })
+    .await;
+    wait_for("the cleanup Job", Duration::from_secs(30), || async {
+        jobs.get_opt("f-c-remove").await.unwrap()
+    })
+    .await;
+    assert!(
+        fleets.get_opt("f").await.unwrap().is_some(),
+        "the finalizer waits for the cleanup"
+    );
+    finish_job(&client, &ns, "f-c-remove", true, Some("removed")).await;
+    wait_for("the Fleet gone", Duration::from_secs(30), || async {
+        fleets.get_opt("f").await.unwrap().is_none().then_some(())
+    })
+    .await;
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_status_mirrors_the_daemons_record_and_readiness_counts() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("mirror").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    wait_for("the pod", Duration::from_secs(30), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    stub.set_agent(
+        "f",
+        "f/c/a",
+        DaemonAgentStatus {
+            phase: AgentPhase::Ready,
+            restarts: 2,
+            ..Default::default()
+        },
+    );
+    // the kubelet: the sidecar is ready
+    pods.patch_status("f-c-a", &PatchParams::default(), &Patch::Merge(serde_json::json!({
+        "status": { "phase": "Running", "conditions": [{ "type": "PodScheduled", "status": "True" }],
+            "initContainerStatuses": [{ "name": "sidecar", "image": "x", "imageID": "x", "ready": true, "restartCount": 0, "state": { "running": { "startedAt": "2026-10-03T00:00:00Z" } } }] }
+    }))).await.unwrap();
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let status = wait_for("phase ready", Duration::from_secs(30), || async {
+        let s = agents.get("f-c-a").await.unwrap().status?;
+        (s.phase.as_deref() == Some("ready")).then_some(s)
+    })
+    .await;
+    assert_eq!(status.restarts, Some(2));
+    assert_eq!(status.pod.as_deref(), Some("f-c-a"));
+    assert_eq!(condition(&status.conditions, "Ready").status, "True");
+    assert_eq!(condition(&status.conditions, "Materialized").status, "True");
+    let fleet = wait_for("Fleet Ready", Duration::from_secs(30), || async {
+        let s = fleets.get("f").await.unwrap().status?;
+        (condition(&s.conditions, "Ready").status == "True").then_some(s)
+    })
+    .await;
+    assert_eq!(condition(&fleet.conditions, "Ready").reason, "AgentsReady");
     operator.abort();
 }

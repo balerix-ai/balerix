@@ -321,7 +321,7 @@ async fn set(ctx: Arc<Context>, namespace: Option<String>) {
         Box::pin(daemon::controller(ctx.clone(), ns)),
         Box::pin(fleet::controller(ctx.clone(), ns)),
         Box::pin(crew::controller(ctx.clone(), ns)),
-        // Task 8: Box::pin(agent::controller(ctx.clone(), ns)),
+        Box::pin(agent::controller(ctx.clone(), ns)),
     ];
     futures_util::future::join_all(controllers).await;
 }

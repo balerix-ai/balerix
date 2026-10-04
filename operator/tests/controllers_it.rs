@@ -212,6 +212,53 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
         secrets.get("balerix-default-admin").await.unwrap().data,
         admin.data
     );
+
+    // a lost authority is minted again, and the serving certificate with it
+    secrets
+        .delete("balerix-default-ca", &Default::default())
+        .await
+        .unwrap();
+    wait_for("a new authority", Duration::from_secs(30), || async {
+        let s = secrets.get_opt("balerix-default-ca").await.unwrap()?;
+        (s.data.as_ref()?.get("ca.crt") != ca.data.as_ref().unwrap().get("ca.crt")).then_some(())
+    })
+    .await;
+    let reissued = wait_for(
+        "a serving certificate from the new authority",
+        Duration::from_secs(30),
+        || async {
+            let s = secrets.get("balerix-default-tls").await.unwrap();
+            (s.data.as_ref().unwrap()["tls.crt"] != renewed.1.data.as_ref().unwrap()["tls.crt"])
+                .then_some(s)
+        },
+    )
+    .await;
+    let reissued_not_after =
+        reissued.metadata.annotations.as_ref().unwrap()["balerix.ai/not-after"].clone();
+    wait_for(
+        "the pod template to follow",
+        Duration::from_secs(30),
+        || async {
+            let s = Api::<StatefulSet>::namespaced(client.clone(), &ns)
+                .get("balerix-default")
+                .await
+                .unwrap();
+            (s.spec
+                .unwrap()
+                .template
+                .metadata
+                .unwrap()
+                .annotations
+                .unwrap()["balerix.ai/not-after"]
+                == reissued_not_after)
+                .then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        secrets.get("balerix-default-admin").await.unwrap().data,
+        admin.data
+    );
     operator.abort();
 }
 

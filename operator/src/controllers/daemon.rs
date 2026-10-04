@@ -110,25 +110,31 @@ async fn ensure_material(
 ) -> Result<i64, Error> {
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
     let now = ctx.now();
-    let authority = match read_issued(
+    let (authority, minted) = match read_issued(
         secrets.get_opt(&names::authority(name)).await?.as_ref(),
         "ca.crt",
         "ca.key",
     ) {
-        Some(a) => a,
+        Some(a) => (a, false),
         None => {
             tracing::info!(daemon = %name, "minting the authority");
-            pki::new_authority(namespace, name, now)?
+            (pki::new_authority(namespace, name, now)?, true)
         }
     };
+    // a serving certificate its authority cannot verify is missing (§21.2)
     let serving = match read_issued(
         secrets.get_opt(&names::serving(name)).await?.as_ref(),
         "tls.crt",
         "tls.key",
     ) {
-        Some(s) if !pki::needs_renewal(s.not_after, now) => s,
+        Some(s) if !minted && !pki::needs_renewal(s.not_after, now) => s,
         existing => {
-            tracing::info!(daemon = %name, renewal = existing.is_some(), "issuing the serving certificate");
+            let renewal = match (minted, existing.is_some()) {
+                (true, _) => "authority",
+                (false, true) => "expiring",
+                (false, false) => "absent",
+            };
+            tracing::info!(daemon = %name, renewal, "issuing the serving certificate");
             pki::issue_serving(
                 &authority,
                 namespace,

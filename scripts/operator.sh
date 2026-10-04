@@ -8,7 +8,7 @@
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 
-usage() { echo "usage: $0 {build|fmt|check|crds}" >&2; exit 2; }
+usage() { echo "usage: $0 {build|fmt|check|crds|e2e}" >&2; exit 2; }
 [[ $# -eq 1 ]] || usage
 dir="$repo/operator"
 target="$dir/target"
@@ -34,9 +34,26 @@ case "$1" in
       ENVTEST_DIR="$(dirname "$(command -v kube-apiserver)")"
       export ENVTEST_DIR
     fi
+    # Every test target but tests/e2e_k8s.rs, the journey, which needs the
+    # kind cluster and fails without it under BALERIX_REQUIRE_TOOLS=1 (the
+    # `e2e` mode runs it). An explicit list, not `-E 'not binary(e2e_k8s)'`:
+    # nextest 0.9.146 rejects a binary() filter that matches no binary, in
+    # any form (exact, /regex/, binary_id), so the filter is invalid until
+    # the journey exists. A new tests/*.rs joins this list.
     CARGO_TARGET_DIR="$target" cargo nextest run \
       --config-file "$dir/.config/nextest.toml" \
-      --manifest-path "$dir/Cargo.toml"
+      --manifest-path "$dir/Cargo.toml" \
+      --lib --bins --test client_it --test controllers_it --test crds_it
+    ;;
+  e2e)
+    root="${CARGO_TARGET_DIR:-$repo/target}/tmp/kind"
+    export KUBECONFIG="$root/kubeconfig"
+    export BALERIX_K8S_IMAGES="${BALERIX_K8S_IMAGES:-balerix:e2e,balerix-agent:e2e}"
+    # the e2e-k8s profile: the journey waits minutes per step, past the
+    # default profile's three-minute termination
+    CARGO_TARGET_DIR="$target" cargo nextest run \
+      --config-file "$dir/.config/nextest.toml" --profile e2e-k8s \
+      --manifest-path "$dir/Cargo.toml" --test e2e_k8s --no-capture
     ;;
   *)
     usage

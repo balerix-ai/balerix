@@ -143,6 +143,20 @@ depends = ["package-plugins flow web"]
 env = { BALERIX_REQUIRE_TOOLS = "1" }
 run = "cargo nextest run -p balerix --test e2e"
 
+[tasks.kind-up]
+description = "A kind cluster for e2e-k8s with the shared local-path class, the CRDs and the daemon and agent images built from this tree (needs docker; `-- down` deletes it)"
+# kind and kubectl are pinned here, not in [tools], so only this task and
+# e2e-k8s download them. kind 0.33.0 ships the node image the script pins.
+tools = { kind = "0.33.0", kubectl = "1.34.12" }
+usage = 'arg "[mode]" default="up" help="up or down"'
+run = 'scripts/kind-up.sh "$usage_mode"'
+
+[tasks.e2e-k8s]
+description = "The Phase 3 journey on the kind cluster kind-up made: operator out of cluster, fake claude in the pods; fails (not skips) without the cluster"
+tools = { kind = "0.33.0", kubectl = "1.34.12" }
+env = { BALERIX_REQUIRE_TOOLS = "1" }
+run = "scripts/operator.sh e2e"
+
 [tasks.serve]
 # HOME alone is not enough: StateLayout prefers XDG_STATE_HOME/XDG_DATA_HOME/
 # XDG_CONFIG_HOME whenever they are set, so on a machine that exports them the

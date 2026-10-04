@@ -102,7 +102,10 @@ impl DaemonClient {
 
     /// `new`, where `resolve` maps a Service host to a socket address for
     /// an operator outside the cluster; the certificate is still verified
-    /// against the host.
+    /// against the host. The address's port replaces the endpoint's:
+    /// reqwest's own `resolve` keeps a URL's port and ignores the
+    /// address's, which would send a port-forwarded client to the
+    /// Service's port on the forward's host.
     pub fn new_resolving(
         base_url: &str,
         authority_pem: &str,
@@ -112,10 +115,9 @@ impl DaemonClient {
     ) -> Result<Self, ClientError> {
         let setup =
             |what: &str, e: &dyn std::fmt::Display| ClientError::Setup(format!("{what}: {e}"));
-        let scheme = reqwest::Url::parse(base_url)
-            .map_err(|e| setup("the Daemon's endpoint is not a URL", &e))?
-            .scheme()
-            .to_string();
+        let mut url = reqwest::Url::parse(base_url)
+            .map_err(|e| setup("the Daemon's endpoint is not a URL", &e))?;
+        let scheme = url.scheme().to_string();
         if scheme != "https" {
             return Err(ClientError::Setup(format!(
                 "the Daemon's endpoint is {scheme}://, not https://: the admin token is never sent in clear"
@@ -150,9 +152,21 @@ impl DaemonClient {
             builder = builder.resolve(host, *addr);
         }
         let http = builder.build().map_err(|e| setup("the HTTP client", &e))?;
+        let resolved = url
+            .host_str()
+            .and_then(|h| resolve.iter().find(|(host, _)| host == h))
+            .map(|(_, addr)| addr.port());
+        if let Some(port) = resolved {
+            url.set_port(Some(port))
+                .map_err(|()| ClientError::Setup(format!("{base_url}: cannot carry a port")))?;
+        }
+        let base = match resolved {
+            Some(_) => url.as_str(),
+            None => base_url,
+        };
         Ok(Self {
             http,
-            base: base_url.trim_end_matches('/').to_string(),
+            base: base.trim_end_matches('/').to_string(),
             token: admin_token.to_string(),
         })
     }

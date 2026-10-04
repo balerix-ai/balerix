@@ -1470,7 +1470,8 @@ Cases:
      branch is listed in the crew cache, read from a probe pod mounting
      the shared claim;
   6. the Fleet deleted with `retain: None`; the crew's directories are
-     gone and the Daemon lists no fleet.
+     gone and the Daemon still lists the fleet, down (O-16: `retain: None`
+     is a plain `down`, which keeps the record).
   `kind`'s network plugin does not enforce NetworkPolicy, so the policies
   are inert here; the test says so. §15's flow-rule step arrives with
   plugins; `verify-k8s` waits for a cluster.
@@ -1627,8 +1628,9 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
   image (`git daemon`, a Service), since nothing on the runner is reachable
   from the cluster; the crew uses `git: { push: false, auth: none }`. After
   a `retain: None` deletion the journey asserts the Fleet object is gone, the
-  crew's `repo/` and `pool/` exist and are empty, and the Daemon lists no
-  fleet: `GET /v1/fleets/f` answers 404 to a `DaemonClient` built from the
+  crew's `repo/` and `pool/` exist and are empty, and the Daemon still lists
+  the fleet, down with no agents (O-16: a plain `down` keeps the record):
+  `GET /v1/fleets/f` answers it to a `DaemonClient` built from the
   `balerix-default-admin` Secret and the `balerix-default-ca` ConfigMap,
   through the port-forward under the Service's name.
 - **`scripts/operator.sh check` leaves the journey out** with `-E 'not
@@ -1669,6 +1671,9 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
 
 Known in 3b and left open:
 
+- On Kubernetes nothing purges a down record once the Fleet object is
+  gone, so down records accumulate on the Daemon's volume until a purge
+  path exists (an issue).
 - `fsGroupChangePolicy` on a CSI class may re-add group bits to the agent's
   0700 tree. Not exercised: the journey runs on kind's local-path only.
 - The harvest Job and its pod are collected with the Agent, so the outcome

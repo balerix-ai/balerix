@@ -422,7 +422,9 @@ async fn the_phase_3_journey_on_kind() {
     )
     .unwrap();
 
-    // and the Daemon lists no fleet: asked as the operator asks, with the
+    // and the Daemon still lists the fleet, downed (O-16: `retain: None` is a
+    // plain `down`, which keeps the record; only a purge drops it): asked as
+    // the operator asks, with the
     // admin token and the authority the operator minted, through the
     // port-forward under the Service's own name
     let admin = Api::<Secret>::namespaced(client.clone(), &ns)
@@ -453,5 +455,16 @@ async fn the_phase_3_journey_on_kind() {
         daemon.get("f").await.ok()
     })
     .await;
-    assert!(listed.is_none(), "the Daemon still lists fleet f");
+    // the Down reply is sent after the mirror pass, so the phase is already
+    // Down and the Daemon's view of the pods is cleared
+    let record = listed.expect("the Daemon keeps the downed fleet f");
+    assert!(
+        record.is_down(),
+        "fleet f is not down: {:?}",
+        record.desired
+    );
+    assert!(
+        record.status.agents.is_empty(),
+        "the downed fleet f still lists agents"
+    );
 }

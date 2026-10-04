@@ -513,7 +513,10 @@ async fn a_fleet_becomes_crews_agents_and_tokens_and_the_put_carries_them() {
         agents.get_opt("f-c-a").await.unwrap()
     })
     .await;
-    agents.get("f-c-b").await.unwrap();
+    wait_for("Agent f-c-b", Duration::from_secs(10), || async {
+        agents.get_opt("f-c-b").await.unwrap()
+    })
+    .await;
     assert_eq!(
         a.metadata.finalizers.as_deref(),
         Some(&["balerix.ai/harvest".to_string()][..])
@@ -710,6 +713,137 @@ async fn watch_namespaces_ignores_another_namespace() {
         Duration::from_secs(4),
         || async { sts.get_opt("balerix-default").await.unwrap() },
     )
+    .await;
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_sync_is_reported_and_retried_as_attempt_two() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, clock, operator) = world("sync").await;
+    let client = env.client.clone();
+    Api::<Fleet>::namespaced(client.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let crews: Api<Crew> = Api::namespaced(client.clone(), &ns);
+    let first = wait_for("the sync Job", Duration::from_secs(30), || async {
+        jobs.get_opt("f-c-sync").await.unwrap()
+    })
+    .await;
+    let args = first
+        .spec
+        .as_ref()
+        .unwrap()
+        .template
+        .spec
+        .as_ref()
+        .unwrap()
+        .containers[0]
+        .args
+        .clone()
+        .unwrap();
+    assert_eq!(
+        &args[..3],
+        &[
+            "crew-sync".to_string(),
+            "--crew".to_string(),
+            "f/c".to_string()
+        ]
+    );
+    // the fleet pool succeeded; the sync failed on the cache
+    finish_job(&client, &ns, "f-pool", true, Some("synced")).await;
+    finish_job(
+        &client,
+        &ns,
+        "f-c-sync",
+        false,
+        Some("cache: f/c: the remote has no branch nope"),
+    )
+    .await;
+    let status = wait_for("CacheReady=SyncFailed", Duration::from_secs(10), || async {
+        let s = crews.get("f-c").await.unwrap().status?;
+        // False/Syncing comes first, while the Job runs
+        (condition(&s.conditions, "CacheReady").reason == "SyncFailed").then_some(s)
+    })
+    .await;
+    let cache = condition(&status.conditions, "CacheReady");
+    assert_eq!(
+        (cache.reason.as_str(), cache.message.as_str()),
+        ("SyncFailed", "cache: f/c: the remote has no branch nope")
+    );
+
+    clock.advance(31);
+    let second = wait_for("the retry", Duration::from_secs(30), || async {
+        let j = jobs.get_opt("f-c-sync").await.unwrap()?;
+        (j.metadata.uid != first.metadata.uid).then_some(j)
+    })
+    .await;
+    assert_eq!(
+        crews
+            .get("f-c")
+            .await
+            .unwrap()
+            .metadata
+            .annotations
+            .unwrap()["balerix.ai/attempts"],
+        "{\"f-c-sync\":2}"
+    );
+    // the second run succeeds: both conditions true, cacheRef the commit
+    let _ = second;
+    finish_job(&client, &ns, "f-c-sync", true, Some("0123abcd")).await;
+    let status = wait_for("CacheReady=True", Duration::from_secs(10), || async {
+        let s = crews.get("f-c").await.unwrap().status?;
+        (condition(&s.conditions, "CacheReady").status == "True"
+            && condition(&s.conditions, "ToolsReady").status == "True"
+            // the Job's status lands before its pod's message
+            && s.cache_ref.is_some())
+        .then_some(s)
+    })
+    .await;
+    assert_eq!(status.cache_ref.as_deref(), Some("0123abcd"));
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_fleets_sharing_a_crew_name_sync_at_once() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, _clock, operator) = world("twocrews").await;
+    let fleets: Api<Fleet> = Api::namespaced(env.client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new(
+                "payments",
+                fleet_spec("default", &[("backend", &["a"])], "Branches"),
+            ),
+        )
+        .await
+        .unwrap();
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new(
+                "billing",
+                fleet_spec("default", &[("backend", &["a"])], "Branches"),
+            ),
+        )
+        .await
+        .unwrap();
+    let jobs: Api<Job> = Api::namespaced(env.client.clone(), &ns);
+    wait_for("both sync Jobs", Duration::from_secs(30), || async {
+        let p = jobs.get_opt("payments-backend-sync").await.unwrap()?;
+        let b = jobs.get_opt("billing-backend-sync").await.unwrap()?;
+        Some((p, b))
+    })
     .await;
     operator.abort();
 }

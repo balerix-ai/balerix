@@ -113,6 +113,21 @@ where
     Ok(())
 }
 
+/// A Job's pods, by the Job's uid and not `job-name`: a deleted Job's
+/// pods keep the name until garbage collection, and their messages are
+/// not this Job's.
+pub async fn pods_of(pods: &Api<Pod>, job: Option<&Job>) -> Result<Vec<Pod>, Error> {
+    match job.and_then(|j| j.metadata.uid.as_deref()) {
+        Some(uid) => Ok(pods
+            .list(
+                &ListParams::default().labels(&format!("batch.kubernetes.io/controller-uid={uid}")),
+            )
+            .await?
+            .items),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// `wanted` exists and is current, or is on its way: creates an absent
 /// one, replaces a stale one, leaves a running one, retries a failed one
 /// after its delay. `crew_lock` is the `(fleet, crew)` whose other Jobs
@@ -135,18 +150,7 @@ where
     let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace);
     let existing = jobs.get_opt(&name).await?;
-    // by the Job's uid, not `job-name`: a deleted Job's pods keep the name
-    // until garbage collection, and their messages are not this Job's
-    let job_pods = match existing.as_ref().and_then(|j| j.metadata.uid.as_deref()) {
-        Some(uid) => {
-            pods.list(
-                &ListParams::default().labels(&format!("batch.kubernetes.io/controller-uid={uid}")),
-            )
-            .await?
-            .items
-        }
-        None => Vec::new(),
-    };
+    let job_pods = pods_of(&pods, existing.as_ref()).await?;
     let outcome = job_outcome(existing.as_ref(), &job_pods, &wanted);
     let soon = Duration::from_secs(5);
     let mut attempts = attempts_of(owner);

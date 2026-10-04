@@ -1819,3 +1819,20 @@ async fn a_missing_or_malformed_credentials_secret_is_on_the_agent() {
     .await;
     operator.abort();
 }
+
+#[test]
+fn the_harness_sweeps_the_roots_of_dead_test_processes() {
+    let tmp = support::temp_root("sweep");
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    child.wait().unwrap();
+    let dead = tmp.join(format!("envtest-{}", child.id()));
+    let live = tmp.join(format!("envtest-{}", std::process::id()));
+    let other = tmp.join("client-real-daemon-1");
+    for dir in [&dead, &live, &other] {
+        std::fs::create_dir_all(dir.join("etcd")).unwrap();
+    }
+    let removed = support::envtest::sweep_dead_roots(&tmp);
+    assert_eq!(removed, vec![dead.clone()]);
+    assert!(!dead.exists() && live.is_dir() && other.is_dir());
+    std::fs::remove_dir_all(&tmp).unwrap();
+}

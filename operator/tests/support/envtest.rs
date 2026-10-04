@@ -110,6 +110,50 @@ fn collided(what: &str, log: &Path, shell: &mut Child) -> Option<String> {
     None
 }
 
+/// Whether `pid` is a live process: `/proc/<pid>/stat` exists and its
+/// state is not a zombie's. Off Linux (no `/proc`), every pid is taken
+/// for alive, so nothing is swept.
+fn pid_alive(pid: u32) -> bool {
+    if !Path::new("/proc/self").exists() {
+        return true;
+    }
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.chars().next())
+        .is_some_and(|state| state != 'Z')
+}
+
+/// Removes every `envtest-<pid>` root under `tmp` whose test process is
+/// gone. Each holds an etcd data directory with its preallocated WAL
+/// (about 120 MB), and the watcher shell that ends the servers cannot
+/// remove it: the servers may still be writing when it fires. Returns the
+/// roots removed.
+pub fn sweep_dead_roots(tmp: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("envtest-"))
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() || pid_alive(pid) {
+            continue;
+        }
+        if std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed.push(entry.path());
+        }
+    }
+    removed
+}
+
 async fn start() -> Option<EnvTest> {
     let Some(bin) = binaries() else {
         if std::env::var("BALERIX_REQUIRE_TOOLS").as_deref() == Ok("1") {
@@ -120,8 +164,9 @@ async fn start() -> Option<EnvTest> {
         eprintln!("skip: envtest binaries (kube-apiserver, etcd) missing");
         return None;
     };
-    let root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("envtest-{}", std::process::id()));
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    sweep_dead_roots(tmp);
+    let root = tmp.join(format!("envtest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("certs")).unwrap();
 

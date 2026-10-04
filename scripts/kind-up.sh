@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# A kind cluster for e2e-k8s (Spec O §15, §19.3, §21.4): two workers that
-# share one host directory, the local-path provisioner told to provision
-# ReadWriteMany claims from it, the five definitions applied, and the
-# daemon and agent images built from this tree and loaded. Nothing here is
+# A kind cluster for e2e-k8s (Spec O §15, §19.3, §21.4): every node (the
+# control plane and two workers) mounts one host directory, the local-path
+# provisioner told to provision ReadWriteMany claims from it, the five
+# definitions applied, and the daemon and agent images built from this
+# tree and loaded. The control plane mounts it too: local-path's helper
+# pod, which creates each volume's directory, tolerates the control plane
+# and may run there. Nothing here is
 # a production class: the shared directory is one host path, not a network
 # filesystem.
 #
@@ -41,6 +44,7 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 - role: control-plane
+  extraMounts: [{ hostPath: "$shared", containerPath: /var/local-path-shared }]
 - role: worker
   extraMounts: [{ hostPath: "$shared", containerPath: /var/local-path-shared }]
 - role: worker

@@ -116,6 +116,7 @@ jobs:
   # can change it; always on main and the nightly.
   e2e-k8s:
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     env:
       BALERIX_REQUIRE_TOOLS: "1"
     steps:

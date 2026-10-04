@@ -131,3 +131,56 @@ pub fn spawn_operator(
     cfg.insecure_daemon_url = daemon_url;
     tokio::spawn(balerix_operator::controllers::run(env.client.clone(), cfg)).abort_handle()
 }
+
+/// The kubelet's part for a Job in envtest: marks it succeeded or failed
+/// (with a `Failed` condition stamped now), and when `message` is given,
+/// leaves a pod labelled `job-name` whose container terminated with it.
+pub async fn finish_job(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    succeeded: bool,
+    message: Option<&str>,
+) {
+    use k8s_openapi::api::batch::v1::Job;
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::{Patch, PatchParams};
+    let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+    let now = k8s_openapi::jiff::Timestamp::now().to_string();
+    // Kubernetes 1.34 refuses a finished Job without `startTime`, a
+    // `Complete=True` without `completionTime` and `SuccessCriteriaMet=True`,
+    // and a `Failed=True` without `FailureTarget=True`
+    let status = if succeeded {
+        serde_json::json!({ "status": { "startTime": now, "completionTime": now, "succeeded": 1, "conditions": [
+            { "type": "SuccessCriteriaMet", "status": "True", "lastTransitionTime": now },
+            { "type": "Complete", "status": "True", "lastTransitionTime": now }
+        ] } })
+    } else {
+        serde_json::json!({ "status": { "startTime": now, "failed": 1, "conditions": [
+            { "type": "FailureTarget", "status": "True", "lastTransitionTime": now },
+            { "type": "Failed", "status": "True", "lastTransitionTime": now }
+        ] } })
+    };
+    jobs.patch_status(name, &PatchParams::default(), &Patch::Merge(&status))
+        .await
+        .unwrap();
+    if let Some(message) = message {
+        let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+        let pod_name = format!("{name}-pod");
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": pod_name, "namespace": namespace, "labels": { "job-name": name } },
+            "spec": { "containers": [{ "name": "job", "image": "x" }], "restartPolicy": "Never" }
+        })).unwrap();
+        if pods.get_opt(&pod_name).await.unwrap().is_none() {
+            pods.create(&PostParams::default(), &pod).await.unwrap();
+        }
+        let phase = if succeeded { "Succeeded" } else { "Failed" };
+        pods.patch_status(&pod_name, &PatchParams::default(), &Patch::Merge(&serde_json::json!({
+            "status": { "phase": phase, "containerStatuses": [{
+                "name": "job", "image": "x", "imageID": "x", "ready": false, "restartCount": 0,
+                "state": { "terminated": { "exitCode": if succeeded { 0 } else { 1 }, "message": message } }
+            }] }
+        }))).await.unwrap();
+    }
+}

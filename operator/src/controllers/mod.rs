@@ -262,6 +262,22 @@ pub fn error_policy<K: Resource>(object: Arc<K>, error: &Error, ctx: Arc<Context
     Action::requeue(delay)
 }
 
+/// What a controller's stream yields, as a log line.
+pub fn report<K: Resource>(
+    kind: &'static str,
+    result: Result<
+        (kube::runtime::reflector::ObjectRef<K>, Action),
+        kube::runtime::controller::Error<Error, kube::runtime::watcher::Error>,
+    >,
+) where
+    K::DynamicType: std::fmt::Debug + std::hash::Hash + Eq + Clone,
+{
+    match result {
+        Ok((object, _)) => tracing::debug!(kind, object = %object, "reconciled"),
+        Err(e) => tracing::warn!(kind, "{e}"),
+    }
+}
+
 /// The Api a controller set works on: one namespace, or every one.
 pub fn api_in<K>(client: &Client, namespace: Option<&str>) -> Api<K>
 where
@@ -291,11 +307,10 @@ async fn set(ctx: Arc<Context>, namespace: Option<String>) {
     tracing::info!(namespace = namespace.as_deref().unwrap_or("*"), "watching");
     let ns = namespace.as_deref();
     let controllers: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> = vec![
-        // Task 5: Box::pin(daemon::controller(ctx.clone(), ns)),
+        Box::pin(daemon::controller(ctx.clone(), ns)),
         // Task 6: Box::pin(fleet::controller(ctx.clone(), ns)),
         // Task 7: Box::pin(crew::controller(ctx.clone(), ns)),
         // Task 8: Box::pin(agent::controller(ctx.clone(), ns)),
     ];
-    let _ = (&ctx, ns);
     futures_util::future::join_all(controllers).await;
 }

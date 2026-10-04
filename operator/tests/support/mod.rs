@@ -135,6 +135,10 @@ pub fn spawn_operator(
 /// The kubelet's part for a Job in envtest: marks it succeeded or failed
 /// (with a `Failed` condition stamped now), and when `message` is given,
 /// leaves a pod labelled `job-name` whose container terminated with it.
+/// The pod comes first and the Job's status last: the Job's patch wakes
+/// the operator at once, pods are not watched, and a reconcile that ran
+/// before the message existed would report the wrong one until the next
+/// requeue.
 pub async fn finish_job(
     client: &Client,
     namespace: &str,
@@ -161,9 +165,6 @@ pub async fn finish_job(
             { "type": "Failed", "status": "True", "lastTransitionTime": now }
         ] } })
     };
-    jobs.patch_status(name, &PatchParams::default(), &Patch::Merge(&status))
-        .await
-        .unwrap();
     if let Some(message) = message {
         let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
         let pod_name = format!("{name}-pod");
@@ -199,4 +200,7 @@ pub async fn finish_job(
             }] }
         }))).await.unwrap();
     }
+    jobs.patch_status(name, &PatchParams::default(), &Patch::Merge(&status))
+        .await
+        .unwrap();
 }

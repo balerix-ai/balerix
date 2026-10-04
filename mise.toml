@@ -39,7 +39,7 @@ run = [
 ]
 
 [tasks.lint]
-description = "Static tier: rustfmt check + clippy with warnings denied, then the core dependency-isolation guard, and the published crates package cleanly"
+description = "Static tier: rustfmt check + clippy with warnings denied, then the core dependency-isolation guard, the published crates package cleanly, and the workflow, script and Dockerfile linters"
 run = [
   "cargo fmt --all --check",
   "cargo clippy --workspace --all-targets -- -D warnings",
@@ -53,6 +53,9 @@ run = [
   "actionlint",
   "zizmor --offline --min-severity medium .github",
   "shellcheck -x scripts/release/*.sh",
+  # every Dockerfile, the two images `build-image` never builds included
+  # (docker/operator, docker/agent: Spec O §21.6)
+  "hadolint docker/*/Dockerfile",
 ]
 
 [tasks.test]

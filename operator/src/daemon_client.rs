@@ -97,6 +97,19 @@ impl DaemonClient {
         admin_token: &str,
         timeout: Duration,
     ) -> Result<Self, ClientError> {
+        Self::new_resolving(base_url, authority_pem, admin_token, timeout, &[])
+    }
+
+    /// `new`, where `resolve` maps a Service host to a socket address for
+    /// an operator outside the cluster; the certificate is still verified
+    /// against the host.
+    pub fn new_resolving(
+        base_url: &str,
+        authority_pem: &str,
+        admin_token: &str,
+        timeout: Duration,
+        resolve: &[(String, std::net::SocketAddr)],
+    ) -> Result<Self, ClientError> {
         let setup =
             |what: &str, e: &dyn std::fmt::Display| ClientError::Setup(format!("{what}: {e}"));
         let scheme = reqwest::Url::parse(base_url)
@@ -129,12 +142,14 @@ impl DaemonClient {
         .map_err(|e| setup("TLS", &e))?
         .with_root_certificates(roots)
         .with_no_client_auth();
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .use_preconfigured_tls(tls)
             .no_proxy()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| setup("the HTTP client", &e))?;
+            .timeout(timeout);
+        for (host, addr) in resolve {
+            builder = builder.resolve(host, *addr);
+        }
+        let http = builder.build().map_err(|e| setup("the HTTP client", &e))?;
         Ok(Self {
             http,
             base: base_url.trim_end_matches('/').to_string(),

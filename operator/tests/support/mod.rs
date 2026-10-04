@@ -1,9 +1,22 @@
-//! The `balerix` binary `scripts/operator.sh` built, and a temp root
-//! under `target/tmp`.
+//! The `balerix` binary `scripts/operator.sh` built, a temp root under
+//! `target/tmp`, and the controllers' test support: a namespace per test,
+//! polling, a clock the test moves, the operator as a task.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(dead_code)]
 
+pub mod envtest;
+pub mod stub_daemon;
+
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant};
+
+use balerix_operator::controllers::{Clock, RunConfig};
+use balerix_operator::desired::common::Images;
+use k8s_openapi::api::core::v1::Namespace;
+use kube::api::PostParams;
+use kube::{Api, Client};
 
 /// From `BALERIX_BIN`; `None` after printing a skip (a failure under
 /// `BALERIX_REQUIRE_TOOLS=1`).
@@ -28,4 +41,93 @@ pub fn temp_root(label: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     root
+}
+
+/// A namespace of this test's own: `t-<label>-<pid>`.
+pub async fn namespace(client: &Client, label: &str) -> String {
+    let name = format!("t-{label}-{}", std::process::id());
+    let ns: Namespace = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1", "kind": "Namespace", "metadata": { "name": name }
+    }))
+    .unwrap();
+    Api::<Namespace>::all(client.clone())
+        .create(&PostParams::default(), &ns)
+        .await
+        .unwrap();
+    name
+}
+
+/// Polls `probe` every 200 ms until it answers `Some`, or panics with
+/// `what` after `timeout`.
+pub async fn wait_for<T, F, Fut>(what: &str, timeout: Duration, mut probe: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(t) = probe().await {
+            return t;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Holds `what` true for `hold`: panics the first time `probe` answers `Some`.
+pub async fn hold_for<T, F, Fut>(what: &str, hold: Duration, mut probe: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = Instant::now() + hold;
+    while Instant::now() < deadline {
+        assert!(probe().await.is_none(), "{what} happened; it must not");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The system clock plus an offset the test moves.
+#[derive(Clone, Default)]
+pub struct TestClock {
+    pub offset: Arc<AtomicI64>,
+}
+
+impl TestClock {
+    pub fn clock(&self) -> Clock {
+        let offset = self.offset.clone();
+        Arc::new(move || {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            now + offset.load(Ordering::SeqCst)
+        })
+    }
+    pub fn advance(&self, secs: i64) {
+        self.offset.fetch_add(secs, Ordering::SeqCst);
+    }
+}
+
+/// The controllers over one namespace, as a task the test aborts at its end.
+pub fn spawn_operator(
+    env: &envtest::EnvTest,
+    namespace: &str,
+    daemon_url: Option<String>,
+    clock: &TestClock,
+) -> tokio::task::AbortHandle {
+    let mut cfg = RunConfig::new(
+        "0.2.0",
+        Images {
+            daemon: "balerix:test".into(),
+            agent: "balerix-agent:test".into(),
+        },
+        namespace,
+    );
+    cfg.watch_namespaces = Some(vec![namespace.to_string()]);
+    cfg.fleet_period = Duration::from_secs(1);
+    cfg.period = Duration::from_secs(1);
+    cfg.clock = clock.clock();
+    cfg.insecure_daemon_url = daemon_url;
+    tokio::spawn(balerix_operator::controllers::run(env.client.clone(), cfg)).abort_handle()
 }

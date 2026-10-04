@@ -32,11 +32,16 @@ balerix-core = { path = "../crates/balerix-core" }
 balerix-config = { path = "../crates/balerix-config" }
 # Error context on the entrypoint's failures.
 anyhow = "1.0.104"
-# The command line: `crds` now, `run` with the controllers (sub-project 3b).
-clap = { version = "4.6.6", features = ["derive"] }
-# The CustomResource derive and the CRD type only: no client, no runtime
-# until the controllers exist, which keeps hyper and tower out for now.
-kube = { version = "4.2.0", default-features = false, features = ["derive"] }
+# The command line: `crds` and `run`; `env` for `--namespace`'s POD_NAMESPACE.
+clap = { version = "4.6.6", features = ["derive", "env"] }
+# The client, the controller runtime and the derive. `rustls-tls` + `ring`
+# is kube 4.2's default TLS stack, on the provider the Daemon client uses.
+kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ring"] }
+# The controllers' streams: `for_each` over a Controller's results.
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+# The controllers' logs: namespace, name, reason; never a token.
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # Typed Pods, Jobs, claims and policies. `v1_32` is the oldest API this
 # release offers; `schemars` so `Condition` can sit in a status schema.
 k8s-openapi = { version = "0.28.0", features = ["v1_32", "schemars"] }
@@ -63,8 +68,9 @@ time = "0.3.55"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
-# The client's async calls, and their tests.
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net"] }
+# The controllers' runtime, SIGTERM, the record cache's locks, the
+# envtest harness's child processes in tests.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync", "process"] }
 
 [dev-dependencies]
 # every `desired` function is pinned by a YAML snapshot (Spec O §15)

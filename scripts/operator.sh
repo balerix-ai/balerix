@@ -28,6 +28,12 @@ case "$1" in
     export BALERIX_BIN="${CARGO_TARGET_DIR:-$repo/target}/debug/balerix"
     CARGO_TARGET_DIR="$target" cargo fmt --manifest-path "$dir/Cargo.toml" --all --check
     CARGO_TARGET_DIR="$target" cargo clippy --manifest-path "$dir/Cargo.toml" --all-targets -- -D warnings
+    # the envtest binaries the task pins; the harness skips (fails under
+    # BALERIX_REQUIRE_TOOLS=1) without them
+    if command -v kube-apiserver >/dev/null; then
+      ENVTEST_DIR="$(dirname "$(command -v kube-apiserver)")"
+      export ENVTEST_DIR
+    fi
     CARGO_TARGET_DIR="$target" cargo nextest run \
       --config-file "$repo/.config/nextest.toml" \
       --manifest-path "$dir/Cargo.toml"

@@ -84,7 +84,12 @@ description = "Lint and test the standalone agent project (balerix-agent, Spec O
 run = "scripts/agent.sh check"
 
 [tasks.operator]
-description = "Lint and test the standalone operator project (balerix-operator, Spec O §12): builds balerix first for its client test against a Kubernetes-mode daemon; fails when operator/crds differs from the Rust types. Its own tier; not part of `check`"
+description = "Lint and test the standalone operator project (balerix-operator, Spec O §12): builds balerix first for its client test against a Kubernetes-mode daemon; the controller tests run on the envtest binaries this task pins (a kube-apiserver and etcd, no cluster); fails when operator/crds differs from the Rust types. Its own tier; not part of `check`"
+# envtest (kube-apiserver, etcd, kubectl) is pinned here, not in [tools], so
+# only this task downloads the ~160 MB tarball. The tag is the spike's 1.34
+# line (§19); the binaries sit under controller-tools/envtest/ in it, and
+# mise strips the single top directory, so bin_path is envtest.
+tools = { "github:kubernetes-sigs/controller-tools" = { version = "envtest-v1.34.1", bin_path = "envtest" } }
 run = "scripts/operator.sh check"
 
 [tasks.crds]

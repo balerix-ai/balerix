@@ -101,7 +101,9 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with: { version: 2026.9.2, install: false, cache: true }
-      - run: mise install rust cargo:cargo-nextest tmux nono gh
+      # the envtest binaries are the operator task's own tool, which
+      # MISE_AUTO_INSTALL=false never installs on its own
+      - run: mise install rust cargo:cargo-nextest tmux nono gh github:kubernetes-sigs/controller-tools@envtest-v1.34.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |

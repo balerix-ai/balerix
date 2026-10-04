@@ -390,11 +390,12 @@ async fn the_phase_3_journey_on_kind() {
             .filter(|p| p == "Running")
     })
     .await;
+    // the cache is a clone with a work tree: its objects are `repo/.git`'s
     let listed = exec(
         &ns,
         "probe",
         "probe",
-        &format!("git --git-dir=/balerix/volume/fleets/f/crews/c/repo branch --list {branch}"),
+        &format!("git --git-dir=/balerix/volume/fleets/f/crews/c/repo/.git branch --list {branch}"),
     )
     .unwrap();
     assert!(

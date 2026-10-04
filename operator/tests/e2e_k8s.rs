@@ -8,6 +8,7 @@
 //! without them, fails under `BALERIX_REQUIRE_TOOLS=1`.
 mod support;
 
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -48,6 +49,32 @@ struct Operator(Child);
 impl Drop for Operator {
     fn drop(&mut self) {
         let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A shell loop and the `kubectl` it runs, in a process group of their
+/// own, killed whole when the test ends.
+struct Forward(Child);
+impl Forward {
+    fn start(script: &str) -> Self {
+        Forward(
+            Command::new("bash")
+                .args(["-c", script])
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        )
+    }
+}
+impl Drop for Forward {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", self.0.id())])
+            .status();
         let _ = self.0.wait();
     }
 }
@@ -181,21 +208,12 @@ async fn the_phase_3_journey_on_kind() {
         services.get_opt("balerix-default").await.unwrap()
     })
     .await;
-    let _forward = Operator(
-        Command::new("kubectl")
-            .args([
-                "-n",
-                &ns,
-                "port-forward",
-                "svc/balerix-default",
-                &format!("{forward_port}:7643"),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
+    // `kubectl port-forward` exits when the pod behind the Service is not
+    // running yet ("pod is not running. Current status=Pending") and when
+    // it restarts, so a loop restarts it
+    let _forward = Forward::start(&format!(
+        "while :; do kubectl -n {ns} port-forward svc/balerix-default {forward_port}:7643 >/dev/null; sleep 1; done"
+    ));
     // the pool Job installs claude and gh with mise inside the cluster:
     // minutes, and GitHub's unauthenticated rate limit if the runner's
     // address is busy (a finding for §21.6 if it bites)

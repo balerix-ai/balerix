@@ -2,8 +2,9 @@
 //! The Phase 3 journey on a kind cluster (Spec O §15, §21.4): apply a
 //! Daemon and a Fleet, wait Ready, evict a pod and see it resume on its
 //! claim, drop an agent and find its branch in the crew cache, delete the
-//! Fleet with `retain: None` and find the crew's directories gone. The
-//! operator runs outside the cluster, as a child of this test. Needs
+//! Fleet with `retain: None` and find the crew's directories emptied and
+//! the fleet gone from the Daemon's list. The operator runs outside the
+//! cluster, as a child of this test. Needs
 //! `KUBECONFIG` (scripts/kind-up.sh) and `BALERIX_K8S_IMAGES`; skips
 //! without them, fails under `BALERIX_REQUIRE_TOOLS=1`. kind's network
 //! plugin does not enforce NetworkPolicy: the operator's policies are
@@ -16,9 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use balerix_operator::api::{Agent, Crew, Daemon, DaemonSpec, Fleet, FleetSpec};
+use balerix_operator::daemon_client::DaemonClient;
 use futures_util::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Namespace, Pod, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, Secret, Service};
 use kube::api::{DeleteParams, PostParams};
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Api, Client};
@@ -410,5 +412,46 @@ async fn the_phase_3_journey_on_kind() {
         fleets.get_opt("f").await.unwrap().is_none().then_some(())
     })
     .await;
-    exec(&ns, "probe", "probe", "test -z \"$(ls -A /balerix/volume/fleets/f/crews/c/repo)\" && test -z \"$(ls -A /balerix/volume/fleets/f/crews/c/pool)\"").unwrap();
+    // emptied, not removed: the directories are mount points of the Jobs,
+    // and a directory that never existed would pass an emptiness test
+    exec(
+        &ns,
+        "probe",
+        "probe",
+        "set -e; for d in repo pool; do p=/balerix/volume/fleets/f/crews/c/$d; test -d \"$p\"; test -z \"$(ls -A \"$p\")\"; done",
+    )
+    .unwrap();
+
+    // and the Daemon lists no fleet: asked as the operator asks, with the
+    // admin token and the authority the operator minted, through the
+    // port-forward under the Service's own name
+    let admin = Api::<Secret>::namespaced(client.clone(), &ns)
+        .get("balerix-default-admin")
+        .await
+        .unwrap();
+    let token = String::from_utf8(admin.data.unwrap()["token"].0.clone()).unwrap();
+    let authority = Api::<ConfigMap>::namespaced(client.clone(), &ns)
+        .get("balerix-default-ca")
+        .await
+        .unwrap()
+        .data
+        .unwrap()["ca.crt"]
+        .clone();
+    let daemon = DaemonClient::new_resolving(
+        &format!("https://balerix-default.{ns}.svc:7643"),
+        &authority,
+        &token,
+        Duration::from_secs(10),
+        &[(
+            format!("balerix-default.{ns}.svc"),
+            std::net::SocketAddr::from(([127, 0, 0, 1], forward_port)),
+        )],
+    )
+    .unwrap();
+    // the port-forward restarts now and then: retry the transport, not the answer
+    let listed = wait_for("the Daemon to answer", Duration::from_secs(60), || async {
+        daemon.get("f").await.ok()
+    })
+    .await;
+    assert!(listed.is_none(), "the Daemon still lists fleet f");
 }

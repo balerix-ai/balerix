@@ -1589,11 +1589,12 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
   ports; the watcher ends the servers with SIGKILL.
 - **`e2e-k8s` seeds its repository through a git server pod** from the agent
   image (`git daemon`, a Service), since nothing on the runner is reachable
-  from the cluster; the crew uses `git: { push: false, auth: none }`. The
-  journey asserts the Fleet object and the crew's directories are gone after
-  a `retain: None` deletion. It does not assert §21.4 step 6's "the Daemon
-  lists no fleet": the Daemon's list is not reachable from the test without
-  a plugin token.
+  from the cluster; the crew uses `git: { push: false, auth: none }`. After
+  a `retain: None` deletion the journey asserts the Fleet object is gone, the
+  crew's `repo/` and `pool/` exist and are empty, and the Daemon lists no
+  fleet: `GET /v1/fleets/f` answers 404 to a `DaemonClient` built from the
+  `balerix-default-admin` Secret and the `balerix-default-ca` ConfigMap,
+  through the port-forward under the Service's name.
 - **`scripts/operator.sh check` leaves the journey out** with `-E 'not
   binary(e2e_k8s)'`; `e2e` runs it alone under a nextest profile `e2e-k8s`
   (45 minutes per test). The CI job has `timeout-minutes: 90`.

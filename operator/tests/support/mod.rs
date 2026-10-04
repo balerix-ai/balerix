@@ -167,13 +167,29 @@ pub async fn finish_job(
     if let Some(message) = message {
         let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
         let pod_name = format!("{name}-pod");
+        // the operator reads a Job's pods by its uid; a pod reused across a
+        // retry follows the new Job's
+        let uid = jobs.get(name).await.unwrap().metadata.uid.unwrap();
+        let labels =
+            serde_json::json!({ "job-name": name, "batch.kubernetes.io/controller-uid": uid });
         let pod: Pod = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1", "kind": "Pod",
-            "metadata": { "name": pod_name, "namespace": namespace, "labels": { "job-name": name } },
+            "metadata": { "name": pod_name, "namespace": namespace, "labels": labels },
             "spec": { "containers": [{ "name": "job", "image": "x" }], "restartPolicy": "Never" }
-        })).unwrap();
+        }))
+        .unwrap();
         if pods.get_opt(&pod_name).await.unwrap().is_none() {
             pods.create(&PostParams::default(), &pod).await.unwrap();
+        } else {
+            pods.patch(
+                &pod_name,
+                &PatchParams::default(),
+                &Patch::Merge(&serde_json::json!({
+                    "metadata": { "labels": labels }
+                })),
+            )
+            .await
+            .unwrap();
         }
         let phase = if succeeded { "Succeeded" } else { "Failed" };
         pods.patch_status(&pod_name, &PatchParams::default(), &Patch::Merge(&serde_json::json!({

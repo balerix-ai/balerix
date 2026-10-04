@@ -161,21 +161,30 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
 
     // the serving certificate expires in ten days: inside the renewal window
     let soon = clock.clock()() + 10 * 86_400;
+    let expiring = Patch::Merge(serde_json::json!({
+        "metadata": { "annotations": { "balerix.ai/not-after": soon.to_string() } }
+    }));
     secrets
-        .patch(
-            "balerix-default-tls",
-            &PatchParams::default(),
-            &Patch::Merge(serde_json::json!({
-                "metadata": { "annotations": { "balerix.ai/not-after": soon.to_string() } }
-            })),
-        )
+        .patch("balerix-default-tls", &PatchParams::default(), &expiring)
         .await
         .unwrap();
+    // a reconcile that read the Secret before the patch applies the old
+    // annotation back: wait for a new certificate, patching again until
+    // the operator has seen the expiry
     let renewed = wait_for("a renewed certificate", Duration::from_secs(30), || async {
         let s = secrets.get("balerix-default-tls").await.unwrap();
         let t: i64 = s.metadata.annotations.as_ref().unwrap()["balerix.ai/not-after"]
             .parse()
             .unwrap();
+        if s.data.as_ref().unwrap()["tls.crt"] == tls.data.as_ref().unwrap()["tls.crt"] {
+            if t != soon {
+                secrets
+                    .patch("balerix-default-tls", &PatchParams::default(), &expiring)
+                    .await
+                    .unwrap();
+            }
+            return None;
+        }
         (t > soon + 60 * 86_400).then_some((t, s))
     })
     .await;
@@ -356,5 +365,80 @@ async fn a_failed_pool_job_is_reported_and_retried_after_the_delay() {
         "{attempts:?}"
     );
     let _ = second;
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_that_fails_readyz_keeps_its_not_ready_transition_time() {
+    let Some(env) = envtest().await else { return };
+    let ns = namespace(&env.client, "readyz").await;
+    let client = env.client.clone();
+    let daemons: Api<Daemon> = Api::namespaced(client.clone(), &ns);
+    daemons
+        .create(
+            &PostParams::default(),
+            &Daemon::new("default", daemon_spec()),
+        )
+        .await
+        .unwrap();
+    let clock = TestClock::default();
+    // a closed port: every `/readyz` fails
+    let operator = spawn_operator(env, &ns, Some("http://127.0.0.1:1".into()), &clock);
+    let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), &ns);
+    wait_for("the StatefulSet", Duration::from_secs(30), || async {
+        statefulsets.get_opt("balerix-default").await.unwrap()
+    })
+    .await;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    wait_for("the pool Job", Duration::from_secs(30), || async {
+        jobs.get_opt("balerix-default-pool").await.unwrap()
+    })
+    .await;
+
+    // the kubelet: the pool synced, the claim bound, the pod ready
+    finish_job(&client, &ns, "balerix-default-pool", true, Some("synced")).await;
+    Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns)
+        .patch_status(
+            "balerix-default-shared",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "status": { "phase": "Bound" } })),
+        )
+        .await
+        .unwrap();
+    statefulsets
+        .patch_status(
+            "balerix-default",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "status": { "replicas": 1, "readyReplicas": 1 } })),
+        )
+        .await
+        .unwrap();
+
+    let ready = wait_for(
+        "Ready=False/DaemonNotReady",
+        Duration::from_secs(30),
+        || async {
+            let s = daemons.get("default").await.unwrap().status?;
+            let ready = condition(&s.conditions, "Ready").clone();
+            (ready.status == "False"
+                && ready.reason == "DaemonNotReady"
+                && ready.message != "the daemon pod is not ready")
+                .then_some(ready)
+        },
+    )
+    .await;
+    hold_for(
+        "Ready's transition time to move",
+        Duration::from_secs(3),
+        || async {
+            let s = daemons.get("default").await.unwrap().status?;
+            let now = condition(&s.conditions, "Ready").clone();
+            (now.status != ready.status
+                || now.reason != ready.reason
+                || now.last_transition_time != ready.last_transition_time)
+                .then_some(())
+        },
+    )
+    .await;
     operator.abort();
 }

@@ -10,6 +10,7 @@ use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::api::PostParams;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
@@ -18,6 +19,7 @@ use kube::{Api, ResourceExt};
 use super::jobs::ensure_job;
 use super::{Context, Error, api_in, apply, error_policy, patch_status, reconciled, report};
 use crate::api::Daemon;
+use crate::desired::common::{Cond, conditions};
 use crate::desired::daemon::{
     DaemonObserved, Material, NOT_AFTER_ANNOTATION, daemon_objects, daemon_secrets, daemon_status,
     version_ok,
@@ -166,6 +168,22 @@ async fn ensure_material(
     Ok(serving.not_after)
 }
 
+/// Replaces `cond`'s entry in `computed`, judged against the Daemon's
+/// previous status: an unchanged status keeps its transition time, so a
+/// repeated failure patches nothing.
+fn with_condition(computed: &mut [Condition], daemon: &Daemon, cond: Cond, now: &Time) {
+    let old = daemon
+        .status
+        .as_ref()
+        .map_or(&[][..], |s| s.conditions.as_slice());
+    let generation = daemon.metadata.generation;
+    if let Some(slot) = computed.iter_mut().find(|c| c.type_ == cond.type_)
+        && let Some(replacement) = conditions(old, &[cond], generation, now).pop()
+    {
+        *slot = replacement;
+    }
+}
+
 pub async fn reconcile(daemon: Arc<Daemon>, ctx: Arc<Context>) -> Result<Action, Error> {
     let namespace = daemon.namespace().unwrap_or_default();
     let name = daemon.name_any();
@@ -213,13 +231,9 @@ pub async fn reconcile(daemon: Arc<Daemon>, ctx: Arc<Context>) -> Result<Action,
             &authority,
             &token,
         )?;
-        if let Err(e) = client.ready().await
-            && let Some(ready) = status.conditions.iter_mut().find(|c| c.type_ == "Ready")
-        {
-            ready.status = "False".to_string();
-            ready.reason = "DaemonNotReady".to_string();
-            ready.message = e.to_string();
-            ready.last_transition_time = ctx.k8s_now();
+        if let Err(e) = client.ready().await {
+            let not_ready = Cond::no("Ready", "DaemonNotReady", &e.to_string());
+            with_condition(&mut status.conditions, &daemon, not_ready, &ctx.k8s_now());
         }
     }
     patch_status(&ctx.client, daemon.as_ref(), &status).await?;

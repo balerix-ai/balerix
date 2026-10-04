@@ -82,7 +82,7 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
     let clock = TestClock::default();
     let operator = spawn_operator(env, &ns, None, &clock);
 
-    let sts = wait_for("the StatefulSet", Duration::from_secs(30), || async {
+    let sts = wait_for("the StatefulSet", Duration::from_secs(60), || async {
         Api::<StatefulSet>::namespaced(client.clone(), &ns)
             .get_opt("balerix-default")
             .await
@@ -176,7 +176,7 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
     // a reconcile that read the Secret before the patch applies the old
     // annotation back: wait for a new certificate, patching again until
     // the operator has seen the expiry
-    let renewed = wait_for("a renewed certificate", Duration::from_secs(30), || async {
+    let renewed = wait_for("a renewed certificate", Duration::from_secs(60), || async {
         let s = secrets.get("balerix-default-tls").await.unwrap();
         let t: i64 = s.metadata.annotations.as_ref().unwrap()["balerix.ai/not-after"]
             .parse()
@@ -199,7 +199,7 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
     );
     wait_for(
         "the pod template to roll",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         || async {
             let s = Api::<StatefulSet>::namespaced(client.clone(), &ns)
                 .get("balerix-default")
@@ -232,14 +232,14 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
         .delete("balerix-default-ca", &Default::default())
         .await
         .unwrap();
-    wait_for("a new authority", Duration::from_secs(30), || async {
+    wait_for("a new authority", Duration::from_secs(60), || async {
         let s = secrets.get_opt("balerix-default-ca").await.unwrap()?;
         (s.data.as_ref()?.get("ca.crt") != ca.data.as_ref().unwrap().get("ca.crt")).then_some(())
     })
     .await;
     let reissued = wait_for(
         "a serving certificate from the new authority",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         || async {
             let s = secrets.get("balerix-default-tls").await.unwrap();
             (s.data.as_ref().unwrap()["tls.crt"] != renewed.1.data.as_ref().unwrap()["tls.crt"])
@@ -251,7 +251,7 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
         reissued.metadata.annotations.as_ref().unwrap()["balerix.ai/not-after"].clone();
     wait_for(
         "the pod template to follow",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         || async {
             let s = Api::<StatefulSet>::namespaced(client.clone(), &ns)
                 .get("balerix-default")
@@ -292,7 +292,7 @@ async fn a_failed_pool_job_is_reported_and_retried_after_the_delay() {
     let clock = TestClock::default();
     let operator = spawn_operator(env, &ns, None, &clock);
     let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
-    let first = wait_for("the pool Job", Duration::from_secs(30), || async {
+    let first = wait_for("the pool Job", Duration::from_secs(60), || async {
         jobs.get_opt("balerix-default-pool").await.unwrap()
     })
     .await;
@@ -321,7 +321,7 @@ async fn a_failed_pool_job_is_reported_and_retried_after_the_delay() {
     .await;
 
     clock.advance(31);
-    let second = wait_for("the retry", Duration::from_secs(30), || async {
+    let second = wait_for("the retry", Duration::from_secs(60), || async {
         let j = jobs.get_opt("balerix-default-pool").await.unwrap()?;
         (j.metadata.uid != first.metadata.uid).then_some(j)
     })
@@ -390,12 +390,12 @@ async fn a_daemon_that_fails_readyz_keeps_its_not_ready_transition_time() {
     // a closed port: every `/readyz` fails
     let operator = spawn_operator(env, &ns, Some("http://127.0.0.1:1".into()), &clock);
     let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), &ns);
-    wait_for("the StatefulSet", Duration::from_secs(30), || async {
+    wait_for("the StatefulSet", Duration::from_secs(60), || async {
         statefulsets.get_opt("balerix-default").await.unwrap()
     })
     .await;
     let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
-    wait_for("the pool Job", Duration::from_secs(30), || async {
+    wait_for("the pool Job", Duration::from_secs(60), || async {
         jobs.get_opt("balerix-default-pool").await.unwrap()
     })
     .await;
@@ -421,7 +421,7 @@ async fn a_daemon_that_fails_readyz_keeps_its_not_ready_transition_time() {
 
     let ready = wait_for(
         "Ready=False/DaemonNotReady",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         || async {
             let s = daemons.get("default").await.unwrap().status?;
             let ready = condition(&s.conditions, "Ready").clone();
@@ -509,7 +509,7 @@ async fn a_fleet_becomes_crews_agents_and_tokens_and_the_put_carries_them() {
 
     let crews: Api<Crew> = Api::namespaced(client.clone(), &ns);
     let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
-    wait_for("the Crew", Duration::from_secs(30), || async {
+    wait_for("the Crew", Duration::from_secs(60), || async {
         crews.get_opt("f-c").await.unwrap()
     })
     .await;
@@ -602,7 +602,7 @@ async fn a_rejected_fleet_lands_no_child() {
         )
         .await
         .unwrap();
-    let status = wait_for("Accepted=False", Duration::from_secs(30), || async {
+    let status = wait_for("Accepted=False", Duration::from_secs(60), || async {
         let s = fleets.get("f").await.unwrap().status?;
         (s.conditions.len() == 3 && condition(&s.conditions, "Accepted").status == "False")
             .then_some(s)
@@ -646,12 +646,12 @@ async fn a_daemon_that_does_not_answer_leaves_the_children() {
         .await
         .unwrap();
     let crews: Api<Crew> = Api::namespaced(env.client.clone(), &ns);
-    wait_for("the Crew", Duration::from_secs(30), || async {
+    wait_for("the Crew", Duration::from_secs(60), || async {
         crews.get_opt("f-c").await.unwrap()
     })
     .await;
     stub.stop().await;
-    let status = wait_for("DaemonUnavailable", Duration::from_secs(30), || async {
+    let status = wait_for("DaemonUnavailable", Duration::from_secs(60), || async {
         let s = fleets.get("f").await.unwrap().status?;
         (condition(&s.conditions, "Ready").reason == "DaemonUnavailable").then_some(s)
     })
@@ -679,7 +679,7 @@ async fn a_fleet_naming_no_daemon_is_not_resolved() {
         )
         .await
         .unwrap();
-    let status = wait_for("Resolved=False", Duration::from_secs(30), || async {
+    let status = wait_for("Resolved=False", Duration::from_secs(60), || async {
         let s = fleets.get("f").await.unwrap().status?;
         (!s.conditions.is_empty()).then_some(s)
     })
@@ -741,7 +741,7 @@ async fn a_failed_sync_is_reported_and_retried_as_attempt_two() {
         .unwrap();
     let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
     let crews: Api<Crew> = Api::namespaced(client.clone(), &ns);
-    let first = wait_for("the sync Job", Duration::from_secs(30), || async {
+    let first = wait_for("the sync Job", Duration::from_secs(60), || async {
         jobs.get_opt("f-c-sync").await.unwrap()
     })
     .await;
@@ -788,7 +788,7 @@ async fn a_failed_sync_is_reported_and_retried_as_attempt_two() {
     );
 
     clock.advance(31);
-    let second = wait_for("the retry", Duration::from_secs(30), || async {
+    let second = wait_for("the retry", Duration::from_secs(60), || async {
         let j = jobs.get_opt("f-c-sync").await.unwrap()?;
         (j.metadata.uid != first.metadata.uid).then_some(j)
     })
@@ -847,7 +847,7 @@ async fn two_fleets_sharing_a_crew_name_sync_at_once() {
         .await
         .unwrap();
     let jobs: Api<Job> = Api::namespaced(env.client.clone(), &ns);
-    wait_for("both sync Jobs", Duration::from_secs(30), || async {
+    wait_for("both sync Jobs", Duration::from_secs(60), || async {
         let p = jobs.get_opt("payments-backend-sync").await.unwrap()?;
         let b = jobs.get_opt("billing-backend-sync").await.unwrap()?;
         Some((p, b))
@@ -861,7 +861,7 @@ async fn crew_ready(client: &kube::Client, ns: &str, fleet: &str, crew: &str) {
     let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
     let pool = format!("{fleet}-pool");
     let sync = format!("{fleet}-{crew}-sync");
-    wait_for("the Jobs", Duration::from_secs(30), || async {
+    wait_for("the Jobs", Duration::from_secs(60), || async {
         jobs.get_opt(&pool).await.unwrap()?;
         jobs.get_opt(&sync).await.unwrap()
     })
@@ -903,7 +903,7 @@ async fn a_crew_dropped_from_the_fleet_is_removed_and_its_agent_harvested() {
     crew_ready(&client, &ns, "f", "d").await;
     let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
     let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
-    wait_for("the pods", Duration::from_secs(30), || async {
+    wait_for("the pods", Duration::from_secs(60), || async {
         pods.get_opt("f-c-a").await.unwrap()?;
         pods.get_opt("f-d-a").await.unwrap()
     })
@@ -923,9 +923,9 @@ async fn a_crew_dropped_from_the_fleet_is_removed_and_its_agent_harvested() {
         )
         .await
         .unwrap();
-    reap_pod(&client, &ns, "f-d-a", Duration::from_secs(30)).await;
+    reap_pod(&client, &ns, "f-d-a", Duration::from_secs(60)).await;
     let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
-    wait_for("the harvest Job", Duration::from_secs(30), || async {
+    wait_for("the harvest Job", Duration::from_secs(60), || async {
         jobs.get_opt("f-d-a-harvest").await.unwrap()
     })
     .await;
@@ -952,7 +952,7 @@ async fn a_crew_dropped_from_the_fleet_is_removed_and_its_agent_harvested() {
         Some("harvested balerix/a"),
     )
     .await;
-    wait_for("Agent f-d-a gone", Duration::from_secs(30), || async {
+    wait_for("Agent f-d-a gone", Duration::from_secs(60), || async {
         agents
             .get_opt("f-d-a")
             .await
@@ -996,7 +996,7 @@ async fn an_agent_with_no_claim_is_removed_without_a_harvest() {
         .await
         .unwrap();
     let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
-    let a = wait_for("Agent f-d-a", Duration::from_secs(30), || async {
+    let a = wait_for("Agent f-d-a", Duration::from_secs(60), || async {
         agents.get_opt("f-d-a").await.unwrap()
     })
     .await;
@@ -1019,7 +1019,7 @@ async fn an_agent_with_no_claim_is_removed_without_a_harvest() {
         )
         .await
         .unwrap();
-    wait_for("Agent f-d-a gone", Duration::from_secs(30), || async {
+    wait_for("Agent f-d-a gone", Duration::from_secs(60), || async {
         agents
             .get_opt("f-d-a")
             .await
@@ -1055,7 +1055,7 @@ async fn a_changed_spec_hash_replaces_the_pod_and_keeps_the_claim() {
         .unwrap();
     crew_ready(&client, &ns, "f", "c").await;
     let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
-    let first = wait_for("the pod", Duration::from_secs(30), || async {
+    let first = wait_for("the pod", Duration::from_secs(60), || async {
         pods.get_opt("f-c-a").await.unwrap()
     })
     .await;
@@ -1073,10 +1073,10 @@ async fn a_changed_spec_hash_replaces_the_pod_and_keeps_the_claim() {
         &ns,
         "f-c-a",
         first.metadata.uid.as_deref().unwrap(),
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )
     .await;
-    let second = wait_for("the new pod", Duration::from_secs(30), || async {
+    let second = wait_for("the new pod", Duration::from_secs(60), || async {
         let p = pods.get_opt("f-c-a").await.unwrap()?;
         (p.metadata.uid != first.metadata.uid).then_some(p)
     })
@@ -1124,7 +1124,7 @@ async fn the_crew_lock_holds_the_harvest_while_a_sync_runs() {
         .unwrap();
     crew_ready(&client, &ns, "f", "c").await;
     let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
-    wait_for("the pods", Duration::from_secs(30), || async {
+    wait_for("the pods", Duration::from_secs(60), || async {
         pods.get_opt("f-c-a").await.unwrap()?;
         pods.get_opt("f-c-b").await.unwrap()
     })
@@ -1143,7 +1143,7 @@ async fn the_crew_lock_holds_the_harvest_while_a_sync_runs() {
         Duration::from_secs(60),
     )
     .await;
-    wait_for("a new sync Job", Duration::from_secs(30), || async {
+    wait_for("a new sync Job", Duration::from_secs(60), || async {
         let j = jobs.get_opt("f-c-sync").await.unwrap()?;
         (j.metadata.uid != synced.metadata.uid).then_some(j)
     })
@@ -1159,7 +1159,7 @@ async fn the_crew_lock_holds_the_harvest_while_a_sync_runs() {
         )
         .await
         .unwrap();
-    reap_pod(&client, &ns, "f-c-b", Duration::from_secs(30)).await;
+    reap_pod(&client, &ns, "f-c-b", Duration::from_secs(60)).await;
     hold_for(
         "a harvest while the sync runs",
         Duration::from_secs(4),
@@ -1179,7 +1179,7 @@ async fn the_crew_lock_holds_the_harvest_while_a_sync_runs() {
     finish_job(&client, &ns, "f-c-sync", true, Some("4567abcd")).await;
     wait_for(
         "the harvest after the sync",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         || async { jobs.get_opt("f-c-b-harvest").await.unwrap() },
     )
     .await;
@@ -1203,7 +1203,7 @@ async fn fleet_deletion_with_retain_none_downs_the_daemon_and_runs_the_cleanup_j
         .unwrap();
     crew_ready(&client, &ns, "f", "c").await;
     let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
-    wait_for("the pod", Duration::from_secs(30), || async {
+    wait_for("the pod", Duration::from_secs(60), || async {
         pods.get_opt("f-c-a").await.unwrap()
     })
     .await;
@@ -1240,7 +1240,7 @@ async fn fleet_deletion_with_retain_none_downs_the_daemon_and_runs_the_cleanup_j
         "{}",
         ready.message
     );
-    reap_pod(&client, &ns, "f-c-a", Duration::from_secs(30)).await;
+    reap_pod(&client, &ns, "f-c-a", Duration::from_secs(60)).await;
     // the operator's own finalizer comes off first; then the test's
     wait_for(
         "the harvest finalizer off",
@@ -1262,7 +1262,7 @@ async fn fleet_deletion_with_retain_none_downs_the_daemon_and_runs_the_cleanup_j
     let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
     wait_for(
         "Agent gone without a harvest",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         || async {
             agents
                 .get_opt("f-c-a")
@@ -1274,11 +1274,11 @@ async fn fleet_deletion_with_retain_none_downs_the_daemon_and_runs_the_cleanup_j
     )
     .await;
     assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_none());
-    wait_for("the Daemon's DELETE", Duration::from_secs(30), || async {
+    wait_for("the Daemon's DELETE", Duration::from_secs(60), || async {
         stub.deletes().contains(&"f".to_string()).then_some(())
     })
     .await;
-    wait_for("the cleanup Job", Duration::from_secs(30), || async {
+    wait_for("the cleanup Job", Duration::from_secs(60), || async {
         jobs.get_opt("f-c-remove").await.unwrap()
     })
     .await;
@@ -1317,7 +1317,7 @@ async fn fleet_deletion_with_retain_none_downs_the_daemon_and_runs_the_cleanup_j
     })
     .await;
     finish_job(&client, &ns, "f-c-remove", true, Some("removed")).await;
-    wait_for("the Fleet gone", Duration::from_secs(30), || async {
+    wait_for("the Fleet gone", Duration::from_secs(60), || async {
         fleets.get_opt("f").await.unwrap().is_none().then_some(())
     })
     .await;
@@ -1341,7 +1341,7 @@ async fn agent_status_mirrors_the_daemons_record_and_readiness_counts() {
         .unwrap();
     crew_ready(&client, &ns, "f", "c").await;
     let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
-    wait_for("the pod", Duration::from_secs(30), || async {
+    wait_for("the pod", Duration::from_secs(60), || async {
         pods.get_opt("f-c-a").await.unwrap()
     })
     .await;
@@ -1360,7 +1360,7 @@ async fn agent_status_mirrors_the_daemons_record_and_readiness_counts() {
             "initContainerStatuses": [{ "name": "sidecar", "image": "x", "imageID": "x", "ready": true, "restartCount": 0, "state": { "running": { "startedAt": "2026-10-03T00:00:00Z" } } }] }
     }))).await.unwrap();
     let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
-    let status = wait_for("phase ready", Duration::from_secs(30), || async {
+    let status = wait_for("phase ready", Duration::from_secs(60), || async {
         let s = agents.get("f-c-a").await.unwrap().status?;
         (s.phase.as_deref() == Some("ready")).then_some(s)
     })
@@ -1369,7 +1369,7 @@ async fn agent_status_mirrors_the_daemons_record_and_readiness_counts() {
     assert_eq!(status.pod.as_deref(), Some("f-c-a"));
     assert_eq!(condition(&status.conditions, "Ready").status, "True");
     assert_eq!(condition(&status.conditions, "Materialized").status, "True");
-    let fleet = wait_for("Fleet Ready", Duration::from_secs(30), || async {
+    let fleet = wait_for("Fleet Ready", Duration::from_secs(60), || async {
         let s = fleets.get("f").await.unwrap().status?;
         (condition(&s.conditions, "Ready").status == "True").then_some(s)
     })

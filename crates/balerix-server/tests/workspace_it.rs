@@ -123,6 +123,7 @@ async fn workspace_routes_are_gated_by_capability_activation_and_the_path_rule()
             spec: spec(&["a", "b"]),
             credentials: Default::default(),
             agent_tokens: None,
+            managed_by: None,
         })),
     );
     assert_eq!(s, 200, "{v}");

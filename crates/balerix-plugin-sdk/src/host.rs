@@ -132,6 +132,7 @@ impl Host {
             version: version.to_string(),
             protocol: PLUGIN_PROTOCOL,
             listen: listen.to_string(),
+            manifest: None,
         };
         self.json(self.http.post(self.url("hello")).json(&req))
             .await

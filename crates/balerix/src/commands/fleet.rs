@@ -228,6 +228,7 @@ fn apply(args: &ApplyArgs, replace: bool) -> Result<String> {
         spec,
         credentials,
         agent_tokens: None,
+        managed_by: None,
     };
     let record = if replace {
         client.update(&req)?

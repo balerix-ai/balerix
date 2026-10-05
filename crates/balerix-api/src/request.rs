@@ -19,6 +19,10 @@ pub struct FleetRequest {
     /// Kubernetes mode. Absent from every CLI request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_tokens: Option<AgentTokens>,
+    /// Spec O §23.3: the plugin a managed Fleet belongs to. Only with
+    /// `agent_tokens`; the record keeps that plugin as its owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<String>,
 }
 
 /// Hand-written: `agent_tokens` holds plaintext tokens.
@@ -31,6 +35,7 @@ impl fmt::Debug for FleetRequest {
                 "agent_tokens",
                 &self.agent_tokens.as_ref().map(|_| "<redacted>"),
             )
+            .field("managed_by", &self.managed_by)
             .finish()
     }
 }
@@ -95,6 +100,7 @@ mod tests {
             },
             credentials: CredentialBundle::default(),
             agent_tokens: None,
+            managed_by: None,
         };
         let back: FleetRequest = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.spec, r.spec);
@@ -111,6 +117,7 @@ mod tests {
             },
             credentials: CredentialBundle::default(),
             agent_tokens: None,
+            managed_by: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert!(v.get("agent_tokens").is_none());

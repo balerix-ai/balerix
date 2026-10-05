@@ -47,6 +47,7 @@ fn request(name: &str, token: &str) -> FleetRequest {
         },
         credentials: Default::default(),
         agent_tokens: Some(BTreeMap::from([(format!("{name}/c/a"), token.to_string())])),
+        managed_by: None,
     }
 }
 

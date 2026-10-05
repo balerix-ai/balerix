@@ -200,6 +200,9 @@ impl PluginHost {
                     format!("manifest says {:?}", manifest.name),
                 ));
             }
+            if let Some(reason) = balerix_core::reserved_plugin_reason(&entry.name) {
+                return Err(entry_error(i, "name", reason.to_string()));
+            }
             let name: AgentName = entry
                 .name
                 .parse()

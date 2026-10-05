@@ -157,6 +157,7 @@ async fn a_plugin_with_manage_applies_and_downs_a_fleet_it_owns() {
         spec: spec("f"),
         credentials: Default::default(),
         agent_tokens: None,
+        managed_by: None,
     });
     let (s, v) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(
@@ -205,6 +206,7 @@ async fn a_plugin_with_manage_applies_and_downs_a_fleet_it_owns() {
         spec: spec("g"),
         credentials: Default::default(),
         agent_tokens: None,
+        managed_by: None,
     });
     let (s, _) = w.api.admin("POST", "/v1/fleets", Some(&g));
     assert_eq!(s, 200);

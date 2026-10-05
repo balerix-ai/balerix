@@ -31,8 +31,9 @@ pub use link::{
     LinkRequest, LinkResult, LinkStatus, SidecarFrame,
 };
 pub use plugin::{
-    Capability, HelloRequest, HelloResponse, HookSubscriptions, PLUGIN_KIND, PLUGIN_PROTOCOL,
-    PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport,
+    Capability, DeclaredPlugin, DeclaredPlugins, HelloRequest, HelloResponse, HookSubscriptions,
+    ManagedFleet, PLUGIN_KIND, PLUGIN_PROTOCOL, PluginEntry, PluginManifest, PluginStatus,
+    PluginsFile, SyncReport,
 };
 pub use protocol::{
     ActivateRequest, CHAIN_BUDGET_MS, DEFAULT_KEY_DELAY_MS, DeactivateRequest, EventBatch,

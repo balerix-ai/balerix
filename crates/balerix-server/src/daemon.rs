@@ -1384,6 +1384,7 @@ mod tests {
                     version: "0.1.0".into(),
                     protocol: balerix_api::PLUGIN_PROTOCOL,
                     listen: listen.into(),
+                    manifest: None,
                 },
             )
             .await

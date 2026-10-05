@@ -30,6 +30,16 @@ pub fn is_reserved_fleet(name: &str) -> bool {
     name == RESERVED_FLEET
 }
 
+/// Why a plugin may not take `name`, if it may not (Spec O §23.2):
+/// `kubernetes` is the owner of the operator's fleets, so a plugin of that
+/// name would own them.
+pub fn reserved_plugin_reason(name: &str) -> Option<&'static str> {
+    match name {
+        "kubernetes" => Some("reserved: it is the owner name of the operator's fleets"),
+        _ => None,
+    }
+}
+
 /// Why a user fleet may not take `name`, if it may not. `balerix` is the
 /// plugin fleet; `watch` is a legal label that `GET
 /// /v1/plugin-host/fleets/watch` would shadow, so a fleet of that name
@@ -474,5 +484,11 @@ mod tests {
         // the empty list is a valid fleet with one empty crew
         let empty = plugin_fleet(&[]);
         assert!(empty.crews[&PLUGIN_CREW.parse().unwrap()].agents.is_empty());
+    }
+
+    #[test]
+    fn kubernetes_is_not_a_plugin_name() {
+        assert!(reserved_plugin_reason("kubernetes").is_some());
+        assert_eq!(reserved_plugin_reason("flow"), None);
     }
 }

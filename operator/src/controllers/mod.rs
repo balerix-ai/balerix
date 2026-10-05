@@ -82,6 +82,9 @@ impl RunConfig {
 pub enum Error {
     #[error("{0}")]
     Kube(#[from] kube::Error),
+    /// The task that held a crew's lock across a create ended early.
+    #[error("the Job create task ended early: {0}")]
+    Join(#[from] tokio::task::JoinError),
     #[error("{0}")]
     Daemon(#[from] ClientError),
     #[error("{0}")]
@@ -180,6 +183,49 @@ struct CachedClient {
     client: Arc<DaemonClient>,
 }
 
+type CrewLocks = Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// One crew's lock, held (§5.3). Dropping it releases the lock and, when
+/// nobody else holds or awaits it, removes the crew's entry (§22.3, #133).
+pub struct CrewGuard {
+    key: String,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    locks: CrewLocks,
+}
+
+impl CrewGuard {
+    /// Runs `work` in a task of its own that keeps the lock until `work`
+    /// ends: a reconcile dropped at its bound while its create is at the
+    /// API server does not let a second one see the crew idle (§22.3).
+    pub fn hold_through<T: Send + 'static>(
+        self,
+        work: impl Future<Output = T> + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        tokio::spawn(async move {
+            let out = work.await;
+            drop(self);
+            out
+        })
+    }
+}
+
+impl Drop for CrewGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        // the map's and this guard's: nobody holds or awaits it. A caller
+        // that clones it takes the map's mutex first, so it is counted
+        if Arc::strong_count(&self.lock) == 2
+            && locks
+                .get(&self.key)
+                .is_some_and(|l| Arc::ptr_eq(l, &self.lock))
+        {
+            locks.remove(&self.key);
+        }
+    }
+}
+
 pub struct Context {
     pub client: Client,
     pub cfg: OperatorConfig,
@@ -194,10 +240,14 @@ pub struct Context {
     pub daemon_fleets: RwLock<BTreeMap<String, Vec<String>>>,
     clients: Mutex<BTreeMap<String, CachedClient>>,
     /// `<ns>/<fleet>/<crew>` to the crew's lock (§5.3): held across
-    /// `jobs::crew_busy` and the create, so a sync and a harvest that both
+    /// the busy check and the create, so a sync and a harvest that both
     /// see the crew idle cannot both start. In-process: the operator is one
-    /// replica (§21.1).
-    crew_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// replica (§21.1). Holds only the crews that are locked or awaited: a
+    /// released lock nobody awaits removes its entry (§22.3). One leftover
+    /// is possible: a waiter dropped in the instant between its holder's
+    /// release and its own wake-up leaves the entry, and the next lock of
+    /// that crew removes it.
+    crew_locks: CrewLocks,
     /// Consecutive reconcile errors per object, for `error_policy`.
     errors: Mutex<BTreeMap<String, u32>>,
     /// Warning Events on the objects (§22.5).
@@ -226,7 +276,7 @@ impl Context {
             fleet_agents: RwLock::new(BTreeMap::new()),
             daemon_fleets: RwLock::new(BTreeMap::new()),
             clients: Mutex::new(BTreeMap::new()),
-            crew_locks: Mutex::new(BTreeMap::new()),
+            crew_locks: Arc::default(),
             errors: Mutex::new(BTreeMap::new()),
             recorder,
         }
@@ -287,19 +337,32 @@ impl Context {
         format!("{namespace}/{name}")
     }
 
-    /// The lock of one crew; the same `Arc` for every caller.
-    pub fn crew_lock(
-        &self,
-        namespace: &str,
-        fleet: &str,
-        crew: &str,
-    ) -> Arc<tokio::sync::Mutex<()>> {
+    /// Takes one crew's lock: the same lock for every caller while anyone
+    /// holds or awaits it.
+    pub async fn lock_crew(&self, namespace: &str, fleet: &str, crew: &str) -> CrewGuard {
+        let key = format!("{namespace}/{fleet}/{crew}");
+        let lock = self
+            .crew_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        let guard = lock.clone().lock_owned().await;
+        CrewGuard {
+            key,
+            lock,
+            guard: Some(guard),
+            locks: self.crew_locks.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn crew_lock_entries(&self) -> usize {
         self.crew_locks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(format!("{namespace}/{fleet}/{crew}"))
-            .or_default()
-            .clone()
+            .len()
     }
 
     /// The client for one Daemon, rebuilt when its authority or token
@@ -506,6 +569,66 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use k8s_openapi::api::core::v1::ConfigMap;
+
+    #[tokio::test]
+    async fn a_released_crew_lock_leaves_no_entry_but_one_awaited_is_kept() {
+        let ctx = context();
+        let held = ctx.lock_crew("ns", "f", "c").await;
+        assert_eq!(ctx.crew_lock_entries(), 1);
+        // another caller waits on it
+        let mut waiting = std::pin::pin!(ctx.lock_crew("ns", "f", "c"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert_eq!(ctx.crew_lock_entries(), 1, "the waiter's lock is kept");
+        drop(waiting.await);
+        assert_eq!(ctx.crew_lock_entries(), 0);
+        // crews do not share a lock
+        let a = ctx.lock_crew("ns", "f", "a").await;
+        let b = tokio::time::timeout(Duration::from_millis(100), ctx.lock_crew("ns", "f", "b"))
+            .await
+            .expect("another crew's lock is free");
+        drop((a, b));
+        assert_eq!(ctx.crew_lock_entries(), 0);
+    }
+
+    #[tokio::test]
+    async fn work_run_through_a_crew_lock_holds_it_after_its_caller_is_dropped() {
+        let ctx = context();
+        let (answer, answered) = tokio::sync::oneshot::channel::<()>();
+        // a reconcile that sent a create and was dropped at its bound
+        let caller = {
+            let ctx = ctx.clone();
+            async move {
+                let guard = ctx.lock_crew("ns", "f", "c").await;
+                guard
+                    .hold_through(async move {
+                        let _ = answered.await;
+                    })
+                    .await
+            }
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), caller)
+                .await
+                .is_err()
+        );
+        // the create is still at the API server: the crew stays locked
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), ctx.lock_crew("ns", "f", "c"))
+                .await
+                .is_err()
+        );
+        answer.send(()).unwrap();
+        let after = tokio::time::timeout(Duration::from_secs(5), ctx.lock_crew("ns", "f", "c"))
+            .await
+            .expect("the lock is released once the work is answered");
+        drop(after);
+        assert_eq!(ctx.crew_lock_entries(), 0);
+    }
 
     fn object() -> Arc<ConfigMap> {
         let mut c = ConfigMap::default();

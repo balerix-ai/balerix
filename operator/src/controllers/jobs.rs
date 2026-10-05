@@ -3,7 +3,7 @@
 //! after a doubling delay carried on its owner's `balerix.ai/attempts`
 //! annotation, and a crew's sync, harvest and cleanup Jobs never run at
 //! once (§5.3): the crew's lock in the `Context` is held across the
-//! check and the create, and a stale Job is deleted in the foreground,
+//! check and the create, by a task that outlives a dropped reconcile, and a stale Job is deleted in the foreground,
 //! so it stays listed, and keeps the crew busy, until its pods are gone.
 
 use std::collections::BTreeMap;
@@ -12,7 +12,7 @@ use std::time::Duration;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
-use kube::{Api, Resource, ResourceExt};
+use kube::{Api, Client, Resource, ResourceExt};
 use serde::de::DeserializeOwned;
 
 use super::{Context, Error};
@@ -93,13 +93,13 @@ fn unfinished(job: &Job) -> bool {
 /// (§5.3's lock): a stale Job deleted in the foreground is listed until
 /// its pods are gone.
 pub async fn crew_busy(
-    ctx: &Context,
+    client: &Client,
     namespace: &str,
     fleet: &str,
     crew: &str,
     except: &str,
 ) -> Result<bool, Error> {
-    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
     let list = jobs
         .list(
             &ListParams::default()
@@ -153,6 +153,37 @@ pub async fn pods_of(pods: &Api<Pod>, job: Option<&Job>) -> Result<Vec<Pod>, Err
     }
 }
 
+/// What the busy check and the create came to.
+enum Created {
+    Made,
+    /// Made by a reconcile that raced this one: it is running.
+    Raced,
+    Busy,
+    NamespaceTerminating,
+}
+
+/// The crew's busy check and the create, under the crew's lock when
+/// `crew` is given. Owns everything, so it can run in a task of its own.
+async fn check_and_create(
+    client: Client,
+    namespace: String,
+    crew: Option<(String, String)>,
+    wanted: Job,
+) -> Result<Created, Error> {
+    if let Some((fleet, crew)) = &crew
+        && crew_busy(&client, &namespace, fleet, crew, &wanted.name_any()).await?
+    {
+        return Ok(Created::Busy);
+    }
+    let jobs: Api<Job> = Api::namespaced(client, &namespace);
+    match jobs.create(&PostParams::default(), &wanted).await {
+        Ok(_) => Ok(Created::Made),
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(Created::Raced),
+        Err(kube::Error::Api(e)) if namespace_terminating(&e) => Ok(Created::NamespaceTerminating),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// `wanted` exists and is current, or is on its way: creates an absent
 /// one, replaces a stale one, leaves a running one, retries a failed one
 /// after its delay. `crew_lock` is the `(fleet, crew)` whose other Jobs
@@ -190,34 +221,41 @@ where
     let mut attempts = attempts_of(owner);
     match &outcome {
         JobOutcome::Absent => {
-            // the crew's lock across the check and the create (§5.3)
-            let lock = crew_lock.map(|(fleet, crew)| ctx.crew_lock(&namespace, fleet, crew));
-            let _held = match &lock {
-                Some(lock) => Some(lock.lock().await),
-                None => None,
-            };
-            if let Some((fleet, crew)) = crew_lock
-                && crew_busy(ctx, &namespace, fleet, crew, &name).await?
-            {
-                tracing::debug!(job = %name, "waiting: another Job of the crew runs");
-                return Ok(Ensured::new(outcome, soon));
-            }
-            match jobs.create(&PostParams::default(), &wanted).await {
-                Ok(_) => {
-                    tracing::info!(job = %name, attempt = attempts.get(&name).copied().unwrap_or(1), "created")
+            // the crew's lock across the check and the create (§5.3), kept
+            // by a task of its own until the create is answered (§22.3)
+            let work = check_and_create(
+                ctx.client.clone(),
+                namespace.clone(),
+                crew_lock.map(|(fleet, crew)| (fleet.to_string(), crew.to_string())),
+                wanted,
+            );
+            let created = match crew_lock {
+                Some((fleet, crew)) => {
+                    ctx.lock_crew(&namespace, fleet, crew)
+                        .await
+                        .hold_through(work)
+                        .await??
                 }
-                // made by a reconcile that raced this one: it is running
-                Err(kube::Error::Api(e)) if e.code == 409 => {}
-                Err(kube::Error::Api(e)) if namespace_terminating(&e) => {
+                None => work.await?,
+            };
+            match created {
+                Created::Busy => {
+                    tracing::debug!(job = %name, "waiting: another Job of the crew runs");
+                    Ok(Ensured::new(outcome, soon))
+                }
+                Created::NamespaceTerminating => {
                     tracing::warn!(namespace = %namespace, job = %name, "not created: the namespace is being deleted");
-                    return Ok(Ensured {
+                    Ok(Ensured {
                         namespace_terminating: true,
                         ..Ensured::new(outcome, ctx.run.period)
-                    });
+                    })
                 }
-                Err(e) => return Err(e.into()),
+                Created::Made => {
+                    tracing::info!(job = %name, attempt = attempts.get(&name).copied().unwrap_or(1), "created");
+                    Ok(Ensured::new(JobOutcome::Running, soon))
+                }
+                Created::Raced => Ok(Ensured::new(JobOutcome::Running, soon)),
             }
-            Ok(Ensured::new(JobOutcome::Running, soon))
         }
         JobOutcome::Stale => {
             // foreground: the Job stays, deleting, until its pods are gone,

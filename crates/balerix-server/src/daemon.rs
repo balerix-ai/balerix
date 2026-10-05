@@ -532,13 +532,13 @@ impl Daemon {
                 "this daemon was started without --tls-ca; it cannot call plugins".into(),
             ));
         }
+        let listed: Vec<String> = list.plugins.iter().map(|p| p.name.clone()).collect();
         let dropped = d
             .replace(list.plugins)
             .map_err(|e| DaemonError::Invalid(e.to_string()))?;
         if let Some(m) = &self.managed {
-            for name in &dropped {
-                m.forget_plugin(name.as_str());
-            }
+            let listed: Vec<&str> = listed.iter().map(String::as_str).collect();
+            m.retain_plugins(&listed);
         }
         self.bump();
         Ok(dropped)
@@ -1216,12 +1216,18 @@ impl Daemon {
             )
             .await?;
         if let (Some(m), Some(file)) = (&self.managed, stored) {
-            m.put(balerix_api::ManagedFleet {
+            let declared = self.plugins.declared();
+            let row = balerix_api::ManagedFleet {
                 name: name.to_string(),
                 plugin: plugin.to_string(),
                 file,
                 down: None,
-            });
+            };
+            // A list that dropped the plugin while this apply ran must not
+            // leave its request behind for the operator (§23.2).
+            if !m.put(row, |p| declared.is_some_and(|d| d.is_listed(p))) {
+                tracing::warn!(fleet = %name, plugin = %plugin, "not storing a managed fleet: its plugin left the list");
+            }
         }
         Ok(record)
     }

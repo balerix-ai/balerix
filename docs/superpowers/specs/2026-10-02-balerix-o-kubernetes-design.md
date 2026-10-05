@@ -2171,3 +2171,9 @@ Rulings made while building it:
   set`), by `Env::from_env` and again by `Host::new`, since `Env`'s fields
   are public. Without an authority, reqwest would verify against the
   system's roots and tungstenite against webpki's bundle.
+- **Every `PUT /v1/plugins` keeps only the listed plugins' managed
+  requests,** not just those of the plugins it dropped since the previous
+  list. After a restart the Daemon has no previous list, and a plugin
+  dropped while it was down would keep its rows forever. A plugin's apply
+  stores its request only while the plugin is still listed, checked under
+  the store's lock, so a drop racing the apply leaves no row behind.

@@ -44,12 +44,19 @@ impl ManagedStore {
 
     /// A plugin's apply: the request is live again (`down` cleared).
     /// Every write holds the lock across its file, so memory and disk
-    /// agree under concurrent calls.
-    pub fn put(&self, row: ManagedFleet) {
+    /// agree under concurrent calls. `listed` is asked under that lock:
+    /// a list that drops the plugin either comes first and refuses the
+    /// row here, or `retain_plugins` runs after and takes it (§23.2).
+    /// `false` when the row was not stored.
+    pub fn put(&self, row: ManagedFleet, listed: impl FnOnce(&str) -> bool) -> bool {
         let row = ManagedFleet { down: None, ..row };
         let mut rows = self.lock();
+        if !listed(&row.plugin) {
+            return false;
+        }
         self.persist(&row);
         rows.insert(row.name.clone(), row);
+        true
     }
 
     /// The plugin's `DELETE`: the row stays, carrying its query, until the
@@ -69,13 +76,15 @@ impl ManagedStore {
         }
     }
 
-    /// A plugin dropped from the operator's list takes its requests with
-    /// it (§23.2); the names it had, by name.
-    pub fn forget_plugin(&self, plugin: &str) -> Vec<String> {
+    /// The operator's list is the whole truth (§23.2): every request of a
+    /// plugin not on it goes, including one dropped while the Daemon was
+    /// down, which no diff against the previous list could name. The
+    /// names forgotten, by name.
+    pub fn retain_plugins(&self, plugins: &[&str]) -> Vec<String> {
         let mut rows = self.lock();
         let names: Vec<String> = rows
             .values()
-            .filter(|r| r.plugin == plugin)
+            .filter(|r| !plugins.contains(&r.plugin.as_str()))
             .map(|r| r.name.clone())
             .collect();
         for name in &names {
@@ -145,7 +154,7 @@ mod tests {
     fn a_put_survives_a_reload() {
         let dir = tempfile::tempdir().unwrap();
         let store = ManagedStore::load(dir.path().join("managed"));
-        store.put(row("gh-1", "fake"));
+        store.put(row("gh-1", "fake"), |_| true);
         let again = ManagedStore::load(dir.path().join("managed"));
         assert_eq!(again.list(), vec![row("gh-1", "fake")]);
     }
@@ -154,7 +163,7 @@ mod tests {
     fn mark_down_keeps_the_row_with_its_query() {
         let dir = tempfile::tempdir().unwrap();
         let store = ManagedStore::load(dir.path().to_path_buf());
-        store.put(row("gh-1", "fake"));
+        store.put(row("gh-1", "fake"), |_| true);
         let q = DownQuery {
             keep_repos: true,
             ..DownQuery::default()
@@ -168,18 +177,18 @@ mod tests {
         assert_eq!(store.list(), want);
         assert_eq!(ManagedStore::load(dir.path().to_path_buf()).list(), want);
         // a new apply of the name makes it live again
-        store.put(row("gh-1", "fake"));
+        store.put(row("gh-1", "fake"), |_| true);
         assert_eq!(store.list(), vec![row("gh-1", "fake")]);
     }
 
     #[test]
-    fn forget_plugin_removes_and_returns_only_that_plugins_names() {
+    fn retain_plugins_removes_and_returns_only_the_unlisted_plugins_names() {
         let dir = tempfile::tempdir().unwrap();
         let store = ManagedStore::load(dir.path().to_path_buf());
-        store.put(row("a", "fake"));
-        store.put(row("b", "other"));
-        store.put(row("c", "fake"));
-        assert_eq!(store.forget_plugin("fake"), vec!["a", "c"]);
+        store.put(row("a", "fake"), |_| true);
+        store.put(row("b", "other"), |_| true);
+        store.put(row("c", "fake"), |_| true);
+        assert_eq!(store.retain_plugins(&["other"]), vec!["a", "c"]);
         assert_eq!(store.list(), vec![row("b", "other")]);
         assert_eq!(
             ManagedStore::load(dir.path().to_path_buf()).list(),
@@ -191,11 +200,37 @@ mod tests {
     }
 
     #[test]
+    fn retain_plugins_forgets_every_row_of_an_unlisted_plugin_on_disk_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ManagedStore::load(dir.path().to_path_buf());
+        store.put(row("a", "fake"), |_| true);
+        store.put(row("b", "other"), |_| true);
+        store.put(row("c", "gone"), |_| true);
+        // a restart: the store knows its rows only from disk
+        let store = ManagedStore::load(dir.path().to_path_buf());
+        assert_eq!(store.retain_plugins(&["fake", "absent"]), vec!["b", "c"]);
+        assert_eq!(store.list(), vec![row("a", "fake")]);
+        assert_eq!(
+            ManagedStore::load(dir.path().to_path_buf()).list(),
+            vec![row("a", "fake")]
+        );
+    }
+
+    #[test]
+    fn a_put_for_a_plugin_no_longer_listed_is_not_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ManagedStore::load(dir.path().to_path_buf());
+        assert!(!store.put(row("a", "fake"), |p| p != "fake"));
+        assert_eq!(store.list(), vec![]);
+        assert_eq!(ManagedStore::load(dir.path().to_path_buf()).list(), vec![]);
+    }
+
+    #[test]
     fn a_corrupt_file_is_skipped_with_the_others_loaded() {
         let dir = tempfile::tempdir().unwrap();
         let store = ManagedStore::load(dir.path().to_path_buf());
-        store.put(row("a", "fake"));
-        store.put(row("c", "fake"));
+        store.put(row("a", "fake"), |_| true);
+        store.put(row("c", "fake"), |_| true);
         std::fs::write(dir.path().join("b.json"), b"{ not json").unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"ignored").unwrap();
         assert_eq!(

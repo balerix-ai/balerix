@@ -235,6 +235,10 @@ impl DeclaredPlugins {
             .map(|e| e.name.clone())
     }
 
+    pub fn is_listed(&self, name: &str) -> bool {
+        self.lock().iter().any(|e| e.name.as_str() == name)
+    }
+
     pub fn config(&self, name: &AgentName) -> Option<Value> {
         self.lock()
             .iter()

@@ -510,6 +510,49 @@ async fn a_managed_request_survives_a_restart_and_managed_by_is_checked() {
     );
 }
 
+/// §23.2: dropping a plugin drops its stored requests, even when it was
+/// dropped while the Daemon was down. The first list after a restart is
+/// the whole truth, and the Daemon then remembers no plugin to diff with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plugin_dropped_across_a_restart_takes_its_managed_fleets() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let (client, stub) = tls_stub(dir.path()).await;
+    let h = Harness::kube(Duration::from_secs(3600));
+    let w = world_at(&h, client.clone(), state.path()).await;
+    let token = declare_fake(&w, &h, &stub.listen).await;
+    let file = json!({ "crews": { "c": { "repo": "acme/api", "agents": { "a": {} } } } });
+    let (s, _) = w
+        .call(
+            "PUT",
+            "/v1/plugin-host/fleets/gh-1",
+            Some(&token),
+            Some(json!({ "file": file })),
+        )
+        .await;
+    assert_eq!(s, 200);
+    drop(w);
+
+    let again = world_at(&h, client, state.path()).await;
+    let (s, _) = again
+        .call(
+            "PUT",
+            "/v1/plugins",
+            Some(ADMIN),
+            Some(json!({ "plugins": [entry("flow", &stub.listen, &["kv"])] })),
+        )
+        .await;
+    assert_eq!(s, 204);
+    let (s, rows) = again
+        .call("GET", "/v1/managed-fleets", Some(ADMIN), None)
+        .await;
+    assert_eq!((s, rows), (200, json!([])));
+    assert!(
+        !state.path().join("managed/gh-1.json").exists(),
+        "gone from disk, so a second restart does not bring it back"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tmux_daemon_has_no_managed_fleets() {
     let h = Harness::new(Duration::from_secs(3600));

@@ -1,0 +1,17 @@
+# A standalone reproducer for balerix-ai/balerix#129: hyper-util's legacy
+# Client hands a request to a pooled HTTP/1 connection that is still
+# streaming an earlier response, so the request waits for that body to end.
+[workspace]
+
+[package]
+name = "hyper-stale-want-repro"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bytes = "1"
+http-body-util = "0.1.3"
+hyper = { version = "=1.11.1", features = ["client", "server", "http1"] }
+hyper-util = { version = "=0.1.21", features = ["client-legacy", "http1", "tokio"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }

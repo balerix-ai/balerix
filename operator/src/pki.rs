@@ -121,6 +121,16 @@ pub fn verifies(authority_pem: &str, serving_pem: &str, name: &str, now: i64) ->
     check(authority_pem, serving_pem, name, now).is_ok()
 }
 
+/// Whether `authority`'s key signs serving certificates its certificate
+/// verifies: a key paired with another authority's certificate, or either
+/// unparseable, does not (§22.4). Checked by issuing one, so no X.509
+/// parser is needed.
+pub fn authority_works(authority: &Issued, namespace: &str, daemon: &str, now: i64) -> bool {
+    let names = daemon_names(namespace, daemon);
+    issue_serving(authority, namespace, daemon, &names, now)
+        .is_ok_and(|leaf| verifies(&authority.cert_pem, &leaf.cert_pem, &names[0], now))
+}
+
 fn check(authority_pem: &str, serving_pem: &str, name: &str, now: i64) -> Result<(), String> {
     let mut roots = rustls::RootCertStore::empty();
     let authority =
@@ -204,6 +214,28 @@ mod tests {
         assert!(wrong.contains("NotValidForName"), "{wrong}");
         let late = verify(&ca, &leaf, &names[2], NOW + 91 * DAY).unwrap_err();
         assert!(late.contains("Expired"), "{late}");
+    }
+
+    #[test]
+    fn an_authority_works_only_with_its_own_key() {
+        let mine = new_authority("ns", "default", NOW).unwrap();
+        let other = new_authority("ns", "default", NOW).unwrap();
+        assert!(authority_works(&mine, "ns", "default", NOW));
+        let mismatched = Issued {
+            key_pem: other.key_pem.clone(),
+            ..mine.clone()
+        };
+        assert!(!authority_works(&mismatched, "ns", "default", NOW));
+        let garbage = Issued {
+            key_pem: "not a key".into(),
+            ..mine.clone()
+        };
+        assert!(!authority_works(&garbage, "ns", "default", NOW));
+        let no_cert = Issued {
+            cert_pem: String::new(),
+            ..mine
+        };
+        assert!(!authority_works(&no_cert, "ns", "default", NOW));
     }
 
     /// The controller keeps only the authority's PEM pair in a Secret: a

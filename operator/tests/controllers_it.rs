@@ -377,6 +377,102 @@ async fn a_serving_certificate_the_authority_cannot_verify_is_reissued() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_ca_secret_whose_key_is_not_its_certificates_is_reminted_once() {
+    let Some(env) = envtest().await else { return };
+    let ns = namespace(&env.client, "camismatch").await;
+    let client = env.client.clone();
+    Api::<Daemon>::namespaced(client.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Daemon::new("default", daemon_spec()),
+        )
+        .await
+        .unwrap();
+    let clock = TestClock::default();
+    let operator = spawn_operator(env, &ns, None, &clock);
+    let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), &ns);
+    wait_for("the StatefulSet", Duration::from_secs(60), || async {
+        statefulsets.get_opt("balerix-default").await.unwrap()
+    })
+    .await;
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), &ns);
+    let text =
+        |s: &Secret, key: &str| String::from_utf8(s.data.as_ref().unwrap()[key].0.clone()).unwrap();
+    let ca = secrets.get("balerix-default-ca").await.unwrap();
+    let (old_crt, old_key) = (text(&ca, "ca.crt"), text(&ca, "ca.key"));
+
+    // a day on, so a reissued serving certificate's expiry differs
+    clock.advance(86_400);
+    let other = pki::new_authority(&ns, "default", clock.clock()()).unwrap();
+    // the certificate kept, the key another authority's
+    let broken = Patch::Merge(serde_json::json!({ "stringData": { "ca.key": other.key_pem } }));
+    // a reconcile that read the old pair before the patch applies it back:
+    // patch again while the old key is there
+    let reminted = wait_for("a new authority", Duration::from_secs(60), || async {
+        let ca = secrets.get("balerix-default-ca").await.unwrap();
+        if text(&ca, "ca.crt") != old_crt {
+            return Some(ca);
+        }
+        if text(&ca, "ca.key") == old_key {
+            secrets
+                .patch("balerix-default-ca", &PatchParams::default(), &broken)
+                .await
+                .unwrap();
+        }
+        None
+    })
+    .await;
+    let new_crt = text(&reminted, "ca.crt");
+    assert_ne!(new_crt, other.cert_pem);
+    let now = clock.clock()();
+    let names = pki::daemon_names(&ns, "default");
+    let not_after = wait_for(
+        "a serving certificate from the new authority in the pod template",
+        Duration::from_secs(60),
+        || async {
+            let tls = secrets.get("balerix-default-tls").await.unwrap();
+            if !pki::verifies(&new_crt, &text(&tls, "tls.crt"), &names[0], now) {
+                return None;
+            }
+            let not_after = tls.metadata.annotations.unwrap()["balerix.ai/not-after"].clone();
+            let template = statefulsets.get("balerix-default").await.unwrap();
+            (template
+                .spec
+                .unwrap()
+                .template
+                .metadata
+                .unwrap()
+                .annotations
+                .unwrap()["balerix.ai/not-after"]
+                == not_after)
+                .then_some(not_after)
+        },
+    )
+    .await;
+    // once: the authority and the pod template hold across reconciles (period 1 s)
+    hold_for(
+        "a second re-mint or roll",
+        Duration::from_secs(5),
+        || async {
+            let ca = secrets.get("balerix-default-ca").await.unwrap();
+            let template = statefulsets.get("balerix-default").await.unwrap();
+            let rolled = template
+                .spec
+                .unwrap()
+                .template
+                .metadata
+                .unwrap()
+                .annotations
+                .unwrap()["balerix.ai/not-after"]
+                != not_after;
+            (text(&ca, "ca.crt") != new_crt || rolled).then_some(())
+        },
+    )
+    .await;
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_failed_pool_job_is_reported_and_retried_after_the_delay() {
     let Some(env) = envtest().await else { return };
     let ns = namespace(&env.client, "pooljob").await;

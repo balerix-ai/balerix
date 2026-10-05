@@ -114,12 +114,20 @@ async fn ensure_material(
 ) -> Result<i64, Error> {
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
     let now = ctx.now();
-    let authority = match read_issued(
+    let read = read_issued(
         secrets.get_opt(&names::authority(name)).await?.as_ref(),
         "ca.crt",
         "ca.key",
-    ) {
-        Some(a) => a,
+    );
+    // an authority whose key does not sign what its certificate verifies is
+    // missing (§22.4): kept, every serving certificate it issued would fail
+    // `verifies`, and be reissued on every reconcile
+    let authority = match read {
+        Some(a) if pki::authority_works(&a, namespace, name, now) => a,
+        Some(_) => {
+            tracing::warn!(daemon = %name, "the authority's key does not match its certificate: minting a new one");
+            pki::new_authority(namespace, name, now)?
+        }
         None => {
             tracing::info!(daemon = %name, "minting the authority");
             pki::new_authority(namespace, name, now)?

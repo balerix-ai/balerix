@@ -9,7 +9,7 @@ use balerix_api::{
     AgentPhase, Capability, DeclaredPlugin, HelloRequest, HelloResponse, PLUGIN_PROTOCOL,
     PluginManifest, PluginStatus,
 };
-use balerix_core::{AgentName, reserved_plugin_reason};
+use balerix_core::{AgentName, ManifestError, reserved_plugin_reason, validate_manifest_fields};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -67,8 +67,13 @@ fn hash(plugin: &DeclaredPlugin) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// The manifest's name and needs against the plugin and its grant.
+/// One machine's manifest rules, then the manifest's name and needs
+/// against the plugin and its grant.
 fn check_manifest(plugin: &DeclaredPlugin, m: &PluginManifest) -> Result<(), String> {
+    validate_manifest_fields(m).map_err(|e| match e {
+        ManifestError::Manifest { path, message } => format!("hello.manifest.{path}: {message}"),
+        other => format!("hello.manifest: {other}"),
+    })?;
     if m.name != plugin.name {
         return Err(format!(
             "hello.manifest.name: {:?} does not match the plugin {:?}",
@@ -519,6 +524,56 @@ mod tests {
             reg.ready_addr(&n("flow")).unwrap().base(),
             "https://flow.ns.svc:7644"
         );
+    }
+
+    /// One machine's manifest rules hold for a manifest that arrives in
+    /// `hello`; only the package's `mise.toml` has nothing to check.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn the_hello_manifest_is_held_to_one_machines_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = DeclaredPlugins::new(dir.path().into(), PluginRegistry::new());
+        d.replace(vec![entry("flow", &[Capability::Kv])]).unwrap();
+        let cases: Vec<(Box<dyn Fn(&mut PluginManifest)>, &str)> = vec![
+            (
+                Box::new(|m| m.api_version = "balerix/v2".into()),
+                "hello.manifest.apiVersion: expected \"balerix/v1\", got \"balerix/v2\"",
+            ),
+            (
+                Box::new(|m| m.kind = "Fleet".into()),
+                "hello.manifest.kind: expected \"Plugin\", got \"Fleet\"",
+            ),
+            (
+                Box::new(|m| m.version = " ".into()),
+                "hello.manifest.version: must not be empty",
+            ),
+            (
+                Box::new(|m| m.protocol = 2),
+                "hello.manifest.protocol: this daemon speaks protocol 1, got 2",
+            ),
+            (
+                Box::new(|m| {
+                    m.hooks.intercept.insert("Foo".into());
+                }),
+                "hello.manifest.hooks.intercept: unknown event \"Foo\"",
+            ),
+            (
+                Box::new(|m| {
+                    m.hooks.observe.insert("Bar".into());
+                }),
+                "hello.manifest.hooks.observe: unknown event \"Bar\"",
+            ),
+        ];
+        for (mutate, want) in cases {
+            let mut req = hello("flow", "kv");
+            if let Some(m) = req.manifest.as_mut() {
+                mutate(m);
+            }
+            let err = d.hello(&n("flow"), &req).unwrap_err().to_string();
+            assert!(err.ends_with(want), "{err} / {want}");
+            assert_eq!(d.list(|_| 0)[0].message, want);
+        }
+        d.hello(&n("flow"), &hello("flow", "kv")).unwrap();
     }
 
     #[test]

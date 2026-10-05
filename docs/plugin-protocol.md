@@ -105,8 +105,13 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 only when it was given an authority (`BALERIX_CA_FILE`): `hello` rejects
 unknown fields, so a one-machine Daemon of the 0.2.0 release would answer
 400 to it. On one machine the Daemon reads the package's manifest and
-ignores `hello`'s copy. In Kubernetes mode a refused `hello` takes the
-plugin out of the interceptor chain and deletes its stored `hello.json`.
+ignores `hello`'s copy. In Kubernetes mode the manifest is required and
+held to the package rules that need no package (`apiVersion`, `kind`,
+`name`, a non-empty `version`, `protocol` 1, `start`, known hook events,
+`sandbox` a mapping), refused as `hello.manifest.<field>: <reason>`; then
+its `name` must be the plugin's and its `needs` within the grant. A
+refused `hello` takes the plugin out of the interceptor chain and deletes
+its stored `hello.json`.
 
 A `FleetRecord` is `{ spec: { name, crews }, owner?, generation, desired: { state },
 stopped, status: { generation, observed_generation, phase, agents } }`

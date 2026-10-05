@@ -2181,3 +2181,9 @@ Rulings made while building it:
   `plugins[<i>].token: listed twice`, beside §23.2's duplicate name. A
   token names its plugin; with two alike, the later plugin would
   authenticate as the earlier one.
+- **`hello`'s manifest gets one machine's manifest rules,** all but
+  `mise.toml`'s: `balerix_core::validate_manifest_fields`, split out of
+  `validate_manifest`, runs before the name and grant checks, refusing as
+  `hello.manifest.<field>: <reason>` (`hello.manifest.hooks.intercept:
+  unknown event "Foo"`), the config-path form of the name and needs
+  refusals. A restored `hello.json` is held to the same rules.

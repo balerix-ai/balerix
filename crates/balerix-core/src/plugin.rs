@@ -134,6 +134,14 @@ pub enum ManifestError {
 /// Plugins spec §2 rules, applied to a parsed manifest and the text of the
 /// package's `mise.toml`.
 pub fn validate_manifest(m: &PluginManifest, mise_toml: &str) -> Result<(), ManifestError> {
+    validate_manifest_fields(m)?;
+    validate_mise_toml(mise_toml, &m.start)
+}
+
+/// The rules on the manifest alone, always a `ManifestError::Manifest`.
+/// Kubernetes mode has no package, so a `hello`'s manifest gets only
+/// these (Spec O §23.2).
+pub fn validate_manifest_fields(m: &PluginManifest) -> Result<(), ManifestError> {
     let bad = |path: &str, message: String| ManifestError::Manifest {
         path: path.to_string(),
         message,
@@ -182,7 +190,7 @@ pub fn validate_manifest(m: &PluginManifest, mise_toml: &str) -> Result<(), Mani
     if !m.sandbox.is_object() {
         return Err(bad("sandbox", "expected a mapping".into()));
     }
-    validate_mise_toml(mise_toml, &m.start)
+    Ok(())
 }
 
 fn validate_mise_toml(text: &str, start: &str) -> Result<(), ManifestError> {

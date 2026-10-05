@@ -2,8 +2,11 @@
 //! stack with a bound on every request, so a request lost on a pooled
 //! connection (hyperium/hyper#4207, #129) fails after `REQUEST_TIMEOUT`
 //! instead of waiting forever. The bound covers the response head; kube
-//! reads the body after it. Watches never run on this client: they get
-//! `watch_client`'s, where a bound would cut an idle watch.
+//! reads the body after it. It sits outside kube's default stack, so it
+//! also covers kube's own 429/503/504 retries and a credential refresh: a
+//! throttled or restarting API server fails as `Error::Kube`, not a long
+//! wait. Watches never run on this client: they get `watch_client`'s,
+//! where a bound would cut an idle watch.
 
 use std::time::Duration;
 

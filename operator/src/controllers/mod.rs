@@ -106,7 +106,8 @@ pub enum Error {
     /// A cleanup that is not finished: requeued in 2 s, not an error.
     #[error("waiting: {0}")]
     Waiting(String),
-    /// The reconcile ran past `RECONCILE_TIMEOUT` and was dropped: requeued in 2 s twice in a row, then backed off with an Event (§22.2).
+    /// The reconcile ran past `RECONCILE_TIMEOUT` and was dropped: requeued
+    /// in 2 s twice in a row, then backed off with an Event (§22.2).
     #[error("the reconcile did not finish in {0:?}")]
     TimedOut(Duration),
 }
@@ -484,7 +485,8 @@ pub fn reconciled<K: Resource>(ctx: &Context, object: &K) {
         .remove(&object_key(object));
 }
 
-/// The requeue after a failed reconcile: `Waiting` in 2 s, `TimedOut` per §22.2, anything else by `backoff`.
+/// The requeue after a failed reconcile: `Waiting` in 2 s, `TimedOut` per
+/// §22.2, anything else by `backoff`.
 pub fn error_policy<K: Resource>(object: Arc<K>, error: &Error, ctx: Arc<Context>) -> Action {
     let key = object_key(object.as_ref());
     let (namespace, name) = (object.namespace().unwrap_or_default(), object.name_any());

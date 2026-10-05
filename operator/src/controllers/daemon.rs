@@ -119,13 +119,13 @@ async fn ensure_material(
         "ca.crt",
         "ca.key",
     );
-    // an authority whose key does not sign what its certificate verifies is
-    // missing (§22.4): kept, every serving certificate it issued would fail
+    // an authority that cannot verify what it issues (key not matching its
+    // certificate, unparseable, or expired) is missing (§22.4): kept, every serving certificate it issued would fail
     // `verifies`, and be reissued on every reconcile
     let authority = match read {
         Some(a) if pki::authority_works(&a, namespace, name, now) => a,
         Some(_) => {
-            tracing::warn!(daemon = %name, "the authority's key does not match its certificate: minting a new one");
+            tracing::warn!(daemon = %name, "the authority cannot verify what it issues (a key that does not match its certificate, unparseable, or expired): minting a new one");
             pki::new_authority(namespace, name, now)?
         }
         None => {

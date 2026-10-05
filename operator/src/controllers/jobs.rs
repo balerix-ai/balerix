@@ -3,8 +3,9 @@
 //! after a doubling delay carried on its owner's `balerix.ai/attempts`
 //! annotation, and a crew's sync, harvest and cleanup Jobs never run at
 //! once (§5.3): the crew's lock in the `Context` is held across the
-//! check and the create, by a task that outlives a dropped reconcile, and a stale Job is deleted in the foreground,
-//! so it stays listed, and keeps the crew busy, until its pods are gone.
+//! check and the create, by a task that outlives a dropped reconcile, and
+//! a stale Job is deleted in the foreground, so it stays listed, and keeps
+//! the crew busy, until its pods are gone.
 
 use std::collections::BTreeMap;
 use std::time::Duration;

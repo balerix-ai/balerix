@@ -1737,7 +1737,10 @@ down-record purge path (#135); the runtime flakes #136 and #137.
   service call, which resolves when the head arrives; kube then reads the
   body outside it. A lost request (hyper#4207) never gets a head, so it is
   covered. A body that stalls after its head is not, and stays under the
-  reconcile bound.
+  reconcile bound. The layer sits outside kube's default stack, so the
+  bound also covers kube's own 429/503/504 retries and a credential
+  refresh: a throttled or restarting API server surfaces as `Error::Kube`
+  and the usual back-off rather than a long wait.
 - **The test harness builds its client through `request_client` too,** so
   no direct API call in a test can wait past 10 s, inside `wait_for` and
   `hold_for` or outside them (#138). The operator under test keeps sharing
@@ -1789,8 +1792,10 @@ down-record purge path (#135); the runtime flakes #136 and #137.
   while it is being deleted. A dropped crew's sync pod, whose Job the
   garbage collector took when the Crew was deleted in the background, then
   keeps a harvest of that crew's agents from starting until the pod is gone.
-  The busy check runs only when the wanted Job is absent, so the wanted
-  Job's own pods are never counted.
+  `crew_holders` leaves the wanted Job out of the Job list by name only, so
+  pods labelled `job-name=<wanted>` that a same-named predecessor left
+  (collected in the background) are counted while unfinished or deleting,
+  which is the intended conservative behaviour.
 - **A crew held by something being deleted for too long says so** (#132,
   gap 2). `crew_holders` returns what holds the crew, not a bare `bool`. When
   that is a Job or a pod whose deletion timestamp is older than

@@ -138,17 +138,26 @@ pub async fn within<K: Resource>(
     object: Arc<K>,
     reconcile: impl Future<Output = Result<Action, Error>>,
 ) -> Result<Action, Error> {
-    match tokio::time::timeout(limit, reconcile).await {
-        Ok(result) => result,
-        Err(_) => {
-            tracing::warn!(
-                namespace = %object.namespace().unwrap_or_default(),
-                name = %object.name_any(),
-                "the reconcile did not finish in {limit:?}: dropped and requeued"
-            );
-            Err(Error::TimedOut(limit))
-        }
+    // Spike (balerix#129): a select, not `timeout`, so the stuck request's
+    // future is still alive while the connections are dumped.
+    let reconcile = std::pin::pin!(reconcile);
+    tokio::select! {
+        result = reconcile => return result,
+        () = tokio::time::sleep(limit) => {}
     }
+    tracing::warn!(
+        target: "spike",
+        namespace = %object.namespace().unwrap_or_default(),
+        name = %object.name_any(),
+        "SPIKE lost request: reconcile stuck for {limit:?}; live hyper connections:\n{}",
+        hyper::spike::dump()
+    );
+    tracing::warn!(
+        namespace = %object.namespace().unwrap_or_default(),
+        name = %object.name_any(),
+        "the reconcile did not finish in {limit:?}: dropped and requeued"
+    );
+    Err(Error::TimedOut(limit))
 }
 
 /// A Daemon client and what it was built from, so a changed authority or

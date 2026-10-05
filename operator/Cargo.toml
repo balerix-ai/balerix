@@ -71,6 +71,11 @@ rustls-pki-types = { version = "1.15.1", features = ["std"] }
 # The controllers' runtime, SIGTERM, the record cache's locks, the
 # envtest harness's child processes in tests.
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync", "process"] }
+# Spike (balerix#129): hyper's and hyper-util's internal tracing (hyper's
+# needs RUSTFLAGS="--cfg hyper_unstable_tracing"), and `hyper::spike::dump`
+# from the instrumented copy patched in below.
+hyper = { version = "1.11.1", features = ["tracing"] }
+hyper-util = { version = "0.1.21", features = ["tracing"] }
 
 [dev-dependencies]
 # every `desired` function is pinned by a YAML snapshot (Spec O §15)
@@ -94,3 +99,10 @@ expect_used = "warn"
 
 [profile.release]
 strip = true
+
+# Spike (balerix#129): hyper 1.11.1 plus per-connection ids and a registry of
+# live client connections, and want 0.3.1 plus `Taker::unwant` (used only by
+# the candidate fix); spike/hyper-lost-request/setup.sh [--fix] creates both.
+[patch.crates-io]
+hyper = { path = "../spike/hyper-lost-request/vendor/hyper" }
+want = { path = "../spike/hyper-lost-request/vendor/want" }

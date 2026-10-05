@@ -1,0 +1,21 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -337,6 +337,18 @@
+         self.signal(State::Want)
+     }
+ 
++    /// Withdraw a `want` that no `Giver` has consumed yet (`Want` to
++    /// `Idle`), after the value it asked for arrived by another path.
++    #[inline]
++    pub fn unwant(&mut self) {
++        let _ = self.inner.state.compare_exchange(
++            State::Want.into(),
++            State::Idle.into(),
++            SeqCst,
++            SeqCst,
++        );
++    }
++
+     #[inline]
+     fn signal(&mut self, state: State) {
+         let old_state = self.inner.state.swap(state.into(), SeqCst).into();

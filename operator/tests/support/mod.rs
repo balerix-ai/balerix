@@ -35,6 +35,28 @@ pub fn balerix() -> Option<PathBuf> {
     found
 }
 
+/// Spike (balerix#129): with `SPIKE_LOG_DIR` set, every test process logs
+/// to `<dir>/<pid>.log` under `RUST_LOG`. Called by the envtest harness.
+pub fn spike_tracing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(dir) = std::env::var_os("SPIKE_LOG_DIR") else {
+            return;
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let file =
+            std::fs::File::create(Path::new(&dir).join(format!("{}.log", std::process::id())))
+                .unwrap();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::sync::Mutex::new(file))
+            .with_thread_ids(true)
+            .with_ansi(false)
+            .try_init();
+        tracing::info!(target: "spike", "test process {}", std::process::id());
+    });
+}
+
 pub fn temp_root(label: &str) -> PathBuf {
     let root =
         Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{label}-{}", std::process::id()));
@@ -67,11 +89,20 @@ async fn probe_once<T, Fut>(probe: Fut) -> Option<Option<T>>
 where
     Fut: std::future::Future<Output = Option<T>>,
 {
-    let answer = tokio::time::timeout(PROBE_TIMEOUT, probe).await.ok();
-    if answer.is_none() {
-        eprintln!("a probe took over {PROBE_TIMEOUT:?}: dropped");
+    let probe = std::pin::pin!(probe);
+    tokio::select! {
+        answer = probe => Some(answer),
+        () = tokio::time::sleep(PROBE_TIMEOUT) => {
+            // Spike (balerix#129): dump while the lost request is alive
+            tracing::warn!(
+                target: "spike",
+                "SPIKE lost probe: a probe took over {PROBE_TIMEOUT:?}; live hyper connections:\n{}",
+                hyper::spike::dump()
+            );
+            eprintln!("a probe took over {PROBE_TIMEOUT:?}: dropped");
+            None
+        }
     }
-    answer
 }
 
 /// Polls `probe` every 200 ms until it answers `Some`, or panics with

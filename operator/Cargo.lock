@@ -298,6 +298,8 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "hyper",
+ "hyper-util",
  "insta",
  "k8s-openapi",
  "kube",
@@ -1036,8 +1038,6 @@ dependencies = [
 [[package]]
 name = "hyper"
 version = "1.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27b501faa50e7a26c3d3560ca625132f4078a17771f4810baf70475ae48cbe43"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1051,6 +1051,7 @@ dependencies = [
  "pin-project-lite",
  "smallvec",
  "tokio",
+ "tracing",
  "want",
 ]
 
@@ -2977,8 +2978,6 @@ dependencies = [
 [[package]]
 name = "want"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfa7760aed19e106de2c7c0b581b509f2f25d3dacaf737cb82ac61bc6d760b0e"
 dependencies = [
  "try-lock",
 ]

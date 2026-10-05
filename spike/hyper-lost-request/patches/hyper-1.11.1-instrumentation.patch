@@ -1,0 +1,360 @@
+--- a/src/client/conn/http1.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/src/client/conn/http1.rs	2026-10-05 08:24:23.436868639 +0000
+@@ -22,6 +22,7 @@
+ /// The sender side of an established connection.
+ pub struct SendRequest<B> {
+     dispatch: dispatch::Sender<Request<B>, Response<IncomingBody>>,
++    spike_id: u64,
+ }
+ 
+ /// Deconstructed parts of a `Connection`.
+@@ -260,12 +261,24 @@
+         &mut self,
+         req: Request<B>,
+     ) -> impl Future<Output = Result<Response<IncomingBody>, TrySendError<Request<B>>>> {
++        let id = self.spike_id;
++        let what = format!("{} {}", req.method(), req.uri());
+         let sent = self.dispatch.try_send(req);
++        trace!("spike: try_send_request conn={} {} queued={}", id, what, sent.is_ok());
++        if sent.is_ok() {
++            crate::spike::on_send(id, what.clone());
++        }
+         async move {
+             match sent {
+                 Ok(rx) => match rx.await {
+-                    Ok(Ok(res)) => Ok(res),
+-                    Ok(Err(err)) => Err(err),
++                    Ok(Ok(res)) => {
++                        trace!("spike: try_send_request conn={} {} answered {}", id, what, res.status());
++                        Ok(res)
++                    }
++                    Ok(Err(err)) => {
++                        trace!("spike: try_send_request conn={} {} error {:?}", id, what, err.error);
++                        Err(err)
++                    }
+                     // this is definite bug if it happens, but it shouldn't happen!
+                     Err(_) => panic!("dispatch dropped without returning error"),
+                 },
+@@ -603,9 +616,18 @@
+                 conn.set_max_buf_size(max);
+             }
+             let cd = proto::h1::dispatch::Client::new(rx);
+-            let proto = proto::h1::Dispatcher::new(cd, conn);
+-
+-            Ok((SendRequest { dispatch: tx }, Connection { inner: proto }))
++            let mut proto = proto::h1::Dispatcher::new(cd, conn);
++            let spike_id = crate::spike::next_id();
++            proto.set_spike_id(spike_id);
++            trace!("spike: handshake conn={}", spike_id);
++
++            Ok((
++                SendRequest {
++                    dispatch: tx,
++                    spike_id,
++                },
++                Connection { inner: proto },
++            ))
+         }
+     }
+ }
+--- a/src/client/dispatch.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/src/client/dispatch.rs	2026-10-05 08:24:09.812586223 +0000
+@@ -91,7 +91,14 @@
+ 
+     #[cfg(feature = "http1")]
+     fn can_send(&mut self) -> bool {
+-        if self.giver.give() || !self.buffered_once {
++        let gave = self.giver.give();
++        trace!(
++            "spike: can_send give={} buffered_once={} giver={:?}",
++            gave,
++            self.buffered_once,
++            self.giver
++        );
++        if gave || !self.buffered_once {
+             // If the receiver is ready *now*, then of course we can send.
+             //
+             // If the receiver isn't ready yet, but we don't have anything
+@@ -206,6 +213,17 @@
+     }
+ }
+ 
++impl<T, U> Receiver<T, U> {
++    pub(crate) fn spike_state(&self) -> String {
++        format!(
++            "rx_len={} rx_closed_chan={} taker={:?}",
++            self.inner.len(),
++            self.inner.is_closed(),
++            self.taker
++        )
++    }
++}
++
+ impl<T, U> Drop for Receiver<T, U> {
+     fn drop(&mut self) {
+         // Notify the giver about the closure first, before dropping
+--- a/src/lib.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/src/lib.rs	2026-10-05 08:24:09.808586140 +0000
+@@ -136,6 +136,8 @@
+ mod mock;
+ pub mod rt;
+ pub mod service;
++#[cfg(feature = "client")]
++pub mod spike;
+ pub mod upgrade;
+ 
+ #[cfg(feature = "ffi")]
+--- a/src/proto/h1/conn.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/src/proto/h1/conn.rs	2026-10-05 08:24:23.436868639 +0000
+@@ -47,6 +47,19 @@
+     B: Buf,
+     T: Http1Transaction,
+ {
++    #[cfg(feature = "client")]
++    pub(crate) fn spike_state(&self) -> String {
++        format!(
++            "{:?} method={:?} wbuf={} rbuf={} read_blocked={} wants_read_again={}",
++            self.state,
++            self.state.method,
++            self.io.has_buffered_write(),
++            self.io.read_buf().len(),
++            self.io.is_read_blocked(),
++            self.state.notify_read,
++        )
++    }
++
+     pub(crate) fn new(io: I) -> Conn<I, B, T> {
+         Conn {
+             io: Buffered::new(io),
+--- a/src/proto/h1/dispatch.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/src/proto/h1/dispatch.rs	2026-10-05 08:25:21.326072037 +0000
+@@ -25,9 +25,14 @@
+     body_tx: SenderDropGuard,
+     body_rx: Pin<Box<Option<Bs>>>,
+     is_closing: bool,
++    #[cfg(feature = "client")]
++    spike: crate::spike::Guard,
+ }
+ 
+ pub(crate) trait Dispatch {
++    fn spike_state(&self) -> String {
++        String::new()
++    }
+     type PollItem;
+     type PollBody;
+     type PollError;
+@@ -84,9 +89,29 @@
+             body_tx: SenderDropGuard::none(),
+             body_rx: Box::pin(None),
+             is_closing: false,
++            #[cfg(feature = "client")]
++            spike: crate::spike::Guard(0),
+         }
+     }
+ 
++    #[cfg(feature = "client")]
++    pub(crate) fn set_spike_id(&mut self, id: u64) {
++        self.spike = crate::spike::Guard(id);
++        crate::spike::on_create(id);
++    }
++
++    #[cfg(feature = "client")]
++    fn spike_state(&self) -> String {
++        format!(
++            "{} closing={} body_rx={} body_tx={} {}",
++            self.conn.spike_state(),
++            self.is_closing,
++            self.body_rx.is_some(),
++            self.body_tx.0.is_some(),
++            self.dispatch.spike_state(),
++        )
++    }
++
+     #[cfg(feature = "server")]
+     pub(crate) fn disable_keep_alive(&mut self) {
+         self.conn.disable_keep_alive();
+@@ -501,6 +526,27 @@
+ 
+     #[inline]
+     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        #[cfg(feature = "client")]
++        {
++            let id = self.spike.0;
++            if id != 0 {
++                #[cfg(all(feature = "tracing", hyper_unstable_tracing))]
++                let _g = tracing::trace_span!("h1conn", conn = id).entered();
++                trace!("spike: poll begin: {}", self.spike_state());
++                let ret = self.poll_catch(cx, true);
++                let state = self.spike_state();
++                match &ret {
++                    Poll::Pending => {
++                        trace!("spike: poll end Pending: {}", state);
++                    }
++                    Poll::Ready(r) => {
++                        trace!("spike: poll end Ready(ok={}): {}", r.is_ok(), state);
++                    }
++                }
++                crate::spike::on_poll(id, state);
++                return ret;
++            }
++        }
+         self.poll_catch(cx, true)
+     }
+ }
+@@ -669,6 +715,15 @@
+         type PollError = Infallible;
+         type RecvItem = crate::proto::ResponseHead;
+ 
++        fn spike_state(&self) -> String {
++            format!(
++                "callback={} rx_closed={} {}",
++                self.callback.is_some(),
++                self.rx_closed,
++                self.rx.spike_state(),
++            )
++        }
++
+         fn poll_msg(
+             mut self: Pin<&mut Self>,
+             cx: &mut Context<'_>,
+@@ -684,6 +739,7 @@
+                             Poll::Ready(None)
+                         }
+                         Poll::Pending => {
++                            trace!("spike: poll_msg took {} {}", req.method(), req.uri());
+                             let (parts, body) = req.into_parts();
+                             let head = RequestHead {
+                                 version: parts.version,
+@@ -702,11 +758,19 @@
+                     this.rx_closed = true;
+                     Poll::Ready(None)
+                 }
+-                Poll::Pending => Poll::Pending,
++                Poll::Pending => {
++                    trace!("spike: poll_msg Pending (rx empty, want signalled)");
++                    Poll::Pending
++                }
+             }
+         }
+ 
+         fn recv_msg(&mut self, msg: crate::Result<(Self::RecvItem, IncomingBody)>) -> crate::Result<()> {
++            trace!(
++                "spike: client recv_msg ok={} callback={}",
++                msg.is_ok(),
++                self.callback.is_some()
++            );
+             match msg {
+                 Ok((msg, body)) => {
+                     if let Some(cb) = self.callback.take() {
+--- a/src/spike.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/src/spike.rs	2026-10-05 08:24:09.784585643 +0000
+@@ -0,0 +1,109 @@
++//! Spike instrumentation (balerix-ai/balerix#129), not part of hyper:
++//! an id per client HTTP/1 connection, shared by its `SendRequest` and its
++//! dispatcher, and a registry of the live connections' last-seen state, so
++//! a caller that has waited too long can dump every connection at once.
++use std::collections::BTreeMap;
++use std::fmt::Write as _;
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::Instant;
++
++static NEXT: AtomicU64 = AtomicU64::new(1);
++
++pub(crate) fn next_id() -> u64 {
++    NEXT.fetch_add(1, Ordering::Relaxed)
++}
++
++struct Snap {
++    created: Instant,
++    last_poll: Option<Instant>,
++    polls: u64,
++    state: String,
++    sends: u64,
++    last_send: Option<(Instant, String)>,
++}
++
++static CONNS: Mutex<BTreeMap<u64, Snap>> = Mutex::new(BTreeMap::new());
++
++fn with<F: FnOnce(&mut Snap)>(id: u64, f: F) {
++    if id == 0 {
++        return;
++    }
++    let mut map = CONNS.lock().unwrap_or_else(|e| e.into_inner());
++    let snap = map.entry(id).or_insert_with(|| Snap {
++        created: Instant::now(),
++        last_poll: None,
++        polls: 0,
++        state: String::new(),
++        sends: 0,
++        last_send: None,
++    });
++    f(snap);
++}
++
++pub(crate) fn on_create(id: u64) {
++    with(id, |_| {});
++}
++
++pub(crate) fn on_poll(id: u64, state: String) {
++    with(id, |s| {
++        s.last_poll = Some(Instant::now());
++        s.polls += 1;
++        s.state = state;
++    });
++}
++
++pub(crate) fn on_send(id: u64, what: String) {
++    with(id, |s| {
++        s.sends += 1;
++        s.last_send = Some((Instant::now(), what));
++    });
++}
++
++pub(crate) fn on_drop(id: u64) {
++    if id == 0 {
++        return;
++    }
++    CONNS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
++}
++
++/// Removes the connection from the registry when its dispatcher is dropped.
++pub(crate) struct Guard(pub(crate) u64);
++
++impl Drop for Guard {
++    fn drop(&mut self) {
++        if self.0 != 0 {
++            #[cfg(all(feature = "tracing", hyper_unstable_tracing))]
++            tracing::trace!(conn = self.0, "spike: dispatcher dropped");
++            on_drop(self.0);
++        }
++    }
++}
++
++/// One line per live client HTTP/1 connection: its age, the time since its
++/// task last polled the dispatcher, the dispatcher's state after that poll,
++/// and the last request handed to it.
++pub fn dump() -> String {
++    let now = Instant::now();
++    let map = CONNS.lock().unwrap_or_else(|e| e.into_inner());
++    let mut out = String::new();
++    for (id, s) in map.iter() {
++        let _ = write!(
++            out,
++            "conn={id} age={:.3}s polls={} since_poll={} sends={} since_send={} last_send={:?} state={}\n",
++            now.duration_since(s.created).as_secs_f64(),
++            s.polls,
++            s.last_poll
++                .map(|t| format!("{:.3}s", now.duration_since(t).as_secs_f64()))
++                .unwrap_or_else(|| "never".into()),
++            s.sends,
++            s.last_send
++                .as_ref()
++                .map(|(t, _)| format!("{:.3}s", now.duration_since(*t).as_secs_f64()))
++                .unwrap_or_else(|| "never".into()),
++            s.last_send.as_ref().map(|(_, w)| w.as_str()).unwrap_or(""),
++            s.state,
++        );
++    }
++    out
++}

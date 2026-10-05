@@ -155,6 +155,7 @@ pub fn sweep_dead_roots(tmp: &Path) -> Vec<PathBuf> {
 }
 
 async fn start() -> Option<EnvTest> {
+    super::spike_tracing();
     let Some(bin) = binaries() else {
         if std::env::var("BALERIX_REQUIRE_TOOLS").as_deref() == Ok("1") {
             panic!(

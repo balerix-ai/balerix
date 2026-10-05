@@ -211,17 +211,9 @@ impl DeclaredPlugins {
 
     fn persist(&self, name: &str, file: &HelloFile) {
         let path = self.hello_path(name);
-        let result = (|| -> std::io::Result<()> {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(
-                &tmp,
-                serde_json::to_vec(file).map_err(std::io::Error::other)?,
-            )?;
-            std::fs::rename(&tmp, &path)
-        })();
+        let result = serde_json::to_vec(file)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| crate::fsutil::write_private(&path, &bytes));
         if let Err(e) = result {
             // Persistence only saves a re-hello after a restart.
             tracing::warn!(plugin = name, path = %path.display(), "could not persist hello: {e}");
@@ -607,6 +599,26 @@ mod tests {
             AgentPhase::Starting,
             "web waits for a new hello"
         );
+    }
+
+    #[test]
+    fn the_hello_file_is_private_and_written_through_a_sibling() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let d = DeclaredPlugins::new(dir.path().into(), PluginRegistry::new());
+        d.replace(vec![entry("flow", &[Capability::Kv])]).unwrap();
+        d.hello(&n("flow"), &hello("flow", "kv")).unwrap();
+        d.hello(&n("flow"), &hello("flow", "kv")).unwrap();
+        let path = dir.path().join("flow/hello.json");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let names: Vec<String> = std::fs::read_dir(dir.path().join("flow"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["hello.json"], "no temp file left");
     }
 
     #[test]

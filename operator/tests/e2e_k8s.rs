@@ -21,9 +21,9 @@ use balerix_operator::daemon_client::DaemonClient;
 use futures_util::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, Secret, Service};
+use kube::Api;
 use kube::api::{DeleteParams, PostParams};
 use kube::runtime::{WatchStreamExt, watcher};
-use kube::{Api, Client};
 use support::wait_for;
 
 const OPERATOR: &str = env!("CARGO_BIN_EXE_balerix-operator");
@@ -117,7 +117,9 @@ async fn the_phase_3_journey_on_kind() {
     let Some((daemon_image, agent_image)) = gate() else {
         return;
     };
-    let client = Client::try_default().await.unwrap();
+    let client =
+        balerix_operator::request_client::request_client(kube::Config::infer().await.unwrap())
+            .unwrap();
     let ns = format!("e2e-{}", std::process::id());
     let namespace: Namespace = serde_json::from_value(
         serde_json::json!({ "apiVersion": "v1", "kind": "Namespace", "metadata": { "name": ns } }),

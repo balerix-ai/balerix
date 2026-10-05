@@ -110,10 +110,10 @@ impl From<kube::runtime::finalizer::Error<Error>> for Error {
     }
 }
 
-/// How long one reconcile may run. A kube request can be lost on a pooled
-/// connection and never answered, and the client has no read timeout; a
-/// reconcile awaiting it would hold its object for good, since the runtime
-/// never starts a second reconcile of an object whose first still runs.
+/// How long one reconcile may run. Each request is bounded
+/// (`request_client`, 10 s), but a reconcile makes many, and the runtime
+/// never starts a second reconcile of an object whose first still runs: a
+/// reconcile that never ends would hold its object for good.
 pub const RECONCILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A controller's reconcile under `RECONCILE_TIMEOUT`, for `.run(...)`.

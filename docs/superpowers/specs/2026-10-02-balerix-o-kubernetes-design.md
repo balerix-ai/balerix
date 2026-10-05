@@ -1690,12 +1690,12 @@ Known in 3b and left open:
   somewhere (an Event) if anything needs it.
 - A Fleet naming a Daemon that does not exist yet waits a period (15 s)
   instead of a Daemon watch.
-- The envtest suite has load-sensitive waits (60 s `wait_for`, an
-  occasional 180 s hang under four API servers on one host).
-- A per-request client timeout for production (`Config::read_timeout` cuts
-  idle watches too, so a tower timeout layer on non-watch requests). The lost
-  requests are hyper#4207 (a stale HTTP/1 want pools a connection mid-watch);
-  until a fixed hyper ships, the watches run on an unpooled client (#129).
+- The envtest suite has load-sensitive waits (60 s `wait_for`). A lost
+  request no longer hangs a test: probes are bounded at 5 s and every
+  other request at 10 s (§22.1).
+- The lost requests are hyper#4207 (a stale HTTP/1 want pools a connection
+  mid-watch); until a fixed hyper ships, the watches run on an unpooled
+  client (#129). The per-request timeout is §22.1.
 - §8.5's "the Agent's branch changed" row is not built: a branch change is
   a spec change, so the Pod is replaced on the same claim, and the
   sidecar's `ensure_clone` then wants to recreate the clone, which

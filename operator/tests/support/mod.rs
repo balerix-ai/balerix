@@ -57,9 +57,9 @@ pub async fn namespace(client: &Client, label: &str) -> String {
     name
 }
 
-/// How long one probe of `wait_for` or `hold_for` may take. A kube request
-/// is now and then lost on a pooled connection and never answered (the
-/// client has no read timeout); the probe is dropped and polled again.
+/// How long one probe of `wait_for` or `hold_for` may take. Every request
+/// is bounded at 10 s (`request_client`, §22.1); a probe gives up sooner,
+/// so a lost one is polled again within the wait.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One probe: `Some(answer)`, or `None` when it was lost.

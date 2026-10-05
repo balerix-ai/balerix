@@ -8,8 +8,9 @@
 //! controller gets no events at all. The watches therefore get a client whose
 //! pool keeps no idle connection: every request has a connection of its own,
 //! and nothing is ever queued behind a stream. Reconciles keep the pooled
-//! client. Remove this, and use one `Client::try_from(config)`, once a hyper
-//! with the fix (hyperium/hyper#4208) ships.
+//! client. Remove this, and run the watches on `Client::try_from(config)`, once a
+//! hyper with the fix (hyperium/hyper#4208) ships; the reconciles keep
+//! `request_client`.
 
 use hyper::body::Incoming;
 use hyper::http::header::HeaderMap;

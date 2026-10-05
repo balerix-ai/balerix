@@ -197,7 +197,7 @@ agent's `branch` setting names an existing remote branch to work on
 | Route | Request | Response | Status |
 |---|---|---|---|
 | `PUT /v1/plugins` | `{ "plugins": [{ name, grant, config?, fleetDefaults?, token, url }] }`, the whole list in interceptor order; a plugin not on it loses its stored managed requests, also after a Daemon restart | — | 204 |
-| `PUT /v1/plugins`, bad entry | same | `{ error }`: `plugins[<i>].url: must be https://`, `plugins[<i>].token: a token is at least 32 characters`, `plugins[<i>].name: <reason>` or `plugins[<i>].name: listed twice`; an unknown capability in `grant` | 400 |
+| `PUT /v1/plugins`, bad entry | same | `{ error }`: `plugins[<i>].url: must be https://`, `plugins[<i>].token: a token is at least 32 characters`, `plugins[<i>].token: listed twice`, `plugins[<i>].name: <reason>` or `plugins[<i>].name: listed twice`; an unknown capability in `grant` | 400 |
 | `PUT /v1/plugins`, tmux mode | same | `this daemon reads plugins.yaml` | 409 |
 | `PUT /v1/plugins`, no `--tls-ca` | same | `this daemon was started without --tls-ca; it cannot call plugins` | 409 |
 | `POST /v1/plugins/sync`, `DELETE /v1/plugins/{name}` | — | `this daemon is in kubernetes mode; change its plugins through the Daemon's spec.plugins` | 409 |

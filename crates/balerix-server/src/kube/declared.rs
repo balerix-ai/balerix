@@ -125,6 +125,11 @@ impl DeclaredPlugins {
                     format!("a token is at least {MIN_TOKEN} characters"),
                 ));
             }
+            // `plugin_for_token` takes the first match: a shared token
+            // would let the later plugin act as the earlier one.
+            if list[..index].iter().any(|q| q.token == p.token) {
+                return Err(err("token", "listed twice".into()));
+            }
             if !p.url.starts_with("https://") {
                 return Err(err("url", "must be https://".into()));
             }
@@ -427,7 +432,15 @@ mod tests {
         short.token = "short".into();
         let mut plain = entry("web", &[]);
         plain.url = "http://web:7644".into();
+        // the token is the plugin's identity: a shared one would let web
+        // authenticate as flow
+        let mut same_token = entry("web", &[]);
+        same_token.token = entry("flow", &[]).token;
         let cases = [
+            (
+                vec![entry("flow", &[]), same_token],
+                "plugins[1].token: listed twice",
+            ),
             (
                 vec![entry("flow", &[]), entry("flow", &[])],
                 "plugins[1].name: listed twice",

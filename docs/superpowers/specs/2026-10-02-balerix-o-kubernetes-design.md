@@ -2177,3 +2177,7 @@ Rulings made while building it:
   dropped while it was down would keep its rows forever. A plugin's apply
   stores its request only while the plugin is still listed, checked under
   the store's lock, so a drop racing the apply leaves no row behind.
+- **Two list entries with the same token are refused,** 400
+  `plugins[<i>].token: listed twice`, beside §23.2's duplicate name. A
+  token names its plugin; with two alike, the later plugin would
+  authenticate as the earlier one.

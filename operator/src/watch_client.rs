@@ -11,6 +11,9 @@
 //! client. Remove this, and use one `Client::try_from(config)`, once a hyper
 //! with the fix (hyperium/hyper#4208) ships.
 
+use hyper::body::Incoming;
+use hyper::http::header::HeaderMap;
+use hyper::http::{Request, Response};
 use hyper_timeout::TimeoutConnector;
 use hyper_util::client::legacy::Builder;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -18,19 +21,33 @@ use hyper_util::rt::TokioExecutor;
 use kube::client::retry::RetryPolicy;
 use kube::client::{Body, ConfigExt};
 use kube::{Client, Config};
+use std::time::Duration;
 use tower::retry::RetryLayer;
 use tower::{BoxError, ServiceBuilder};
+use tower_http::classify::ServerErrorsFailureClass;
+use tower_http::trace::TraceLayer;
+use tracing::Span;
 
 /// A `Client` for watches only: kube 4.2's own stack (`ClientBuilder`'s
 /// `TryFrom<Config>` with the operator's features: rustls, no proxy, no
-/// gzip) over a hyper-util client that pools nothing. Unlike kube's, it
-/// carries no `valid_until` (an exec plugin's client certificate, which the
-/// operator does not use) and no `HTTP` trace span.
+/// gzip) over a hyper-util client that pools nothing, with kube's `HTTP`
+/// trace span and failure logs. Unlike kube's, it carries no `valid_until`
+/// (an exec plugin's client certificate, which the operator does not use).
 pub fn watch_client(config: Config) -> kube::Result<Client> {
     if let Some(proxy_url) = config.proxy_url.clone() {
         // the operator's kube has neither proxy feature: the pooled client
-        // refuses it too
-        return Err(kube::Error::ProxyProtocolUnsupported { proxy_url });
+        // refuses it with these same errors
+        return Err(match proxy_url.scheme_str() {
+            Some("socks5") => kube::Error::ProxyProtocolDisabled {
+                proxy_url,
+                protocol_feature: "kube/socks5",
+            },
+            Some("http" | "https") => kube::Error::ProxyProtocolDisabled {
+                proxy_url,
+                protocol_feature: "kube/http-proxy",
+            },
+            _ => kube::Error::ProxyProtocolUnsupported { proxy_url },
+        });
     }
     let mut http = HttpConnector::new();
     http.enforce_http(false);
@@ -48,6 +65,51 @@ pub fn watch_client(config: Config) -> kube::Result<Client> {
         )
         .option_layer(config.auth_layer()?)
         .layer(config.extra_headers_layer()?)
+        // kube's own span and logs, copied from `make_generic_builder`
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|req: &Request<Body>| {
+                    tracing::debug_span!(
+                        "HTTP",
+                        http.method = %req.method(),
+                        http.url = %req.uri(),
+                        http.status_code = tracing::field::Empty,
+                        otel.name = req.extensions().get::<&'static str>().unwrap_or(&"HTTP"),
+                        otel.kind = "client",
+                        otel.status_code = tracing::field::Empty,
+                    )
+                })
+                .on_request(|_req: &Request<Body>, _span: &Span| {
+                    tracing::debug!("requesting");
+                })
+                .on_response(
+                    |res: &Response<Incoming>, _latency: Duration, span: &Span| {
+                        let status = res.status();
+                        span.record("http.status_code", status.as_u16());
+                        if status.is_client_error() || status.is_server_error() {
+                            span.record("otel.status_code", "ERROR");
+                        }
+                    },
+                )
+                .on_body_chunk(())
+                .on_eos(|_: Option<&HeaderMap>, _duration: Duration, _span: &Span| {
+                    tracing::debug!("stream closed");
+                })
+                .on_failure(
+                    |ec: ServerErrorsFailureClass, _latency: Duration, span: &Span| {
+                        span.record("otel.status_code", "ERROR");
+                        match ec {
+                            ServerErrorsFailureClass::StatusCode(status) => {
+                                span.record("http.status_code", status.as_u16());
+                                tracing::error!("failed with status {}", status)
+                            }
+                            ServerErrorsFailureClass::Error(err) => {
+                                tracing::error!("failed with error {}", err)
+                            }
+                        }
+                    },
+                ),
+        )
         .map_err(BoxError::from)
         .service(hyper);
     Ok(Client::new(service, config.default_namespace))

@@ -191,7 +191,7 @@ async fn plugins_sync_hello_list_and_purge() {
         let d = daemon.clone();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let rows = d.plugins().list().await;
+                let rows = d.plugin_host().unwrap().list().await;
                 if rows[0].phase == AgentPhase::Ready {
                     assert_eq!(rows[0].listen.as_deref(), Some("127.0.0.1:4000"));
                     break;
@@ -320,7 +320,11 @@ async fn plugins_sync_hello_list_and_purge() {
         body["error"],
         "plugins.yaml: plugins[1]: balerix-plugin.yaml: protocol: this daemon speaks protocol 1, got 7"
     );
-    assert_eq!(daemon.plugins().list().await.len(), 1, "previous set kept");
+    assert_eq!(
+        daemon.plugin_host().unwrap().list().await.len(),
+        1,
+        "previous set kept"
+    );
 
     // purge refuses while declared; removal stops; purge then deletes
     let (s, body) = api.call("DELETE", "/v1/plugins/hello", admin, None);
@@ -333,7 +337,7 @@ async fn plugins_sync_hello_list_and_purge() {
     let (s, report) = api.call("POST", "/v1/plugins/sync", admin, None);
     assert_eq!(s, 200);
     assert_eq!(report["stopped"], json!(["hello"]));
-    assert!(daemon.plugins().list().await.is_empty());
+    assert!(daemon.plugin_host().unwrap().list().await.is_empty());
     assert!(
         daemon.hook_secret(&id).await.is_none(),
         "a removed plugin's token is revoked"
@@ -352,7 +356,8 @@ async fn plugins_sync_hello_list_and_purge() {
     );
     assert!(
         !daemon
-            .plugins()
+            .plugin_host()
+            .unwrap()
             .record()
             .status
             .agents
@@ -416,7 +421,7 @@ async fn a_stored_fleet_under_the_reserved_name_is_ignored() {
         Metrics::new().unwrap(),
         "admin-tok".into(),
         vec![(record, Default::default())],
-        plugin_config_in(dir.path()),
+        balerix_server::PluginSetup::Packages(plugin_config_in(dir.path())),
         h.registry.clone(),
         h.client.clone(),
         h.kv.clone(),

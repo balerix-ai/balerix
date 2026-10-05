@@ -23,8 +23,8 @@ use crate::hooks::ParsedEvent;
 use crate::metrics::Metrics;
 use crate::plugins::activation::{self, Pair};
 use crate::plugins::{
-    ActivationRow, CallFailure, PluginClient, PluginError, PluginHost, PluginHostConfig, PluginKv,
-    PluginRegistry,
+    ActivationRow, CallFailure, PluginClient, PluginError, PluginHost, PluginKv, PluginRegistry,
+    PluginSetup, PluginSource,
 };
 use crate::sessions::Sessions;
 use crate::system_pool::{SystemPoolConfig, SystemPoolState};
@@ -48,6 +48,11 @@ impl HelloObserver for crate::plugins::PluginEventHandler {
 pub trait DaemonHandler: EventHandler + HelloObserver {}
 impl<T: EventHandler + HelloObserver> DaemonHandler for T {}
 
+/// `POST /v1/plugins/sync` and `DELETE /v1/plugins/{name}` in Kubernetes
+/// mode (Spec O §23.2).
+const KUBERNETES_PLUGINS: &str =
+    "this daemon is in kubernetes mode; change its plugins through the Daemon's spec.plugins";
+
 /// How often every ready plugin's `GET /v1/health` is polled (§16.5).
 pub const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -57,7 +62,7 @@ pub struct Daemon {
     shared: Shared,
     handler: Arc<dyn DaemonHandler>,
     token: String,
-    plugins: Arc<PluginHost>,
+    plugins: PluginSource,
     registry: Arc<PluginRegistry>,
     client: PluginClient,
     /// The reverse proxy's own connection pool for the plugin mount.
@@ -142,7 +147,7 @@ impl Daemon {
         metrics: Metrics,
         token: String,
         existing: Vec<(FleetRecord, FleetSecrets)>,
-        plugin_config: PluginHostConfig,
+        plugins: PluginSetup,
         registry: Arc<PluginRegistry>,
         client: PluginClient,
         kv: Arc<PluginKv>,
@@ -152,7 +157,19 @@ impl Daemon {
         // Spec F §4: one owner for the daemon pool. Spawned before the fleet
         // actors, though they gate on readiness rather than on spawn order.
         crate::system_pool::spawn(system_toolchain, pool_tx, SystemPoolConfig::default());
-        let plugins = PluginHost::start(plugin_config, &ports, shared.clone(), registry.clone());
+        let plugins = match plugins {
+            PluginSetup::Packages(config) => PluginSource::Packages(PluginHost::start(
+                config,
+                &ports,
+                shared.clone(),
+                registry.clone(),
+            )),
+            // Kubernetes mode launches nothing: the operator runs the
+            // plugins and sends their list (§23.2).
+            PluginSetup::Declared { state_dir } => PluginSource::Declared(
+                crate::kube::DeclaredPlugins::new(state_dir, registry.clone()),
+            ),
+        };
         let ports = Arc::new(ports);
         let changes = Arc::new(watch::channel(0u64).0);
         let mut fleets = BTreeMap::new();
@@ -230,7 +247,21 @@ impl Daemon {
 
     /// One round: every ready plugin's `/v1/health`; a failure sets its
     /// degraded message, a success clears it. Never restarts anything.
+    /// A declared plugin's readiness itself comes from here (§23.2).
     pub async fn poll_health(&self) {
+        if let Some(d) = self.plugins.declared() {
+            for (name, addr) in d.pollable() {
+                let result = self.client.health(&addr).await.map_err(|e| e.to_string());
+                if let Err(e) = &result {
+                    tracing::warn!(plugin = %name, "health check failed: {e}");
+                }
+                if d.health(&name, result) {
+                    self.reactivate(&name).await;
+                    self.bump();
+                }
+            }
+            return;
+        }
         for name in self.registry.names() {
             let Some(addr) = self.registry.ready_addr(&name) else {
                 continue;
@@ -263,8 +294,13 @@ impl Daemon {
         &self.shared.metrics
     }
 
-    pub fn plugins(&self) -> &Arc<PluginHost> {
-        &self.plugins
+    /// The one-machine plugin host; `None` in Kubernetes mode.
+    pub fn plugin_host(&self) -> Option<&Arc<PluginHost>> {
+        self.plugins.packages()
+    }
+
+    pub fn is_kubernetes(&self) -> bool {
+        self.ports.kube.is_some()
     }
 
     pub fn registry(&self) -> &Arc<PluginRegistry> {
@@ -383,7 +419,10 @@ impl Daemon {
     /// every entry or fails whole, before anything here runs, so a
     /// transient install failure downs nothing.
     pub async fn sync_plugins(&self) -> Result<SyncReport, PluginError> {
-        let mut report = self.plugins.sync().await?;
+        let Some(host) = self.plugins.packages() else {
+            return Err(PluginError::Managed(KUBERNETES_PLUGINS.into()));
+        };
+        let mut report = host.sync().await?;
         let declared: BTreeSet<&str> = report
             .installed
             .iter()
@@ -440,23 +479,82 @@ impl Daemon {
         Ok(report)
     }
 
-    /// `hello` authenticates with the plugin's token — the hook secret the
-    /// actor minted for `balerix/plugins/<name>` — and is otherwise the
-    /// plugin's `SessionStart`.
+    /// `plugin remove --purge`; refused in Kubernetes mode, where the
+    /// operator's list is the only way to change the plugin set.
+    pub async fn purge_plugin(&self, name: &AgentName) -> Result<(), PluginError> {
+        let Some(host) = self.plugins.packages() else {
+            return Err(PluginError::Managed(KUBERNETES_PLUGINS.into()));
+        };
+        host.purge(name).await
+    }
+
+    /// `PUT /v1/plugins` (Spec O §23.2). The rows of a dropped plugin go
+    /// with it; its stored managed requests too (Task 7).
+    pub async fn declare_plugins(
+        &self,
+        list: balerix_api::DeclaredPlugins,
+    ) -> Result<Vec<AgentName>, DaemonError> {
+        let Some(d) = self.plugins.declared() else {
+            return Err(DaemonError::Managed(
+                "this daemon reads plugins.yaml".into(),
+            ));
+        };
+        // Refused up front: accepting the list would only fail every call
+        // later with an opaque TLS error (§23.1).
+        if !self.client.trusts() {
+            return Err(DaemonError::Managed(
+                "this daemon was started without --tls-ca; it cannot call plugins".into(),
+            ));
+        }
+        let dropped = d
+            .replace(list.plugins)
+            .map_err(|e| DaemonError::Invalid(e.to_string()))?;
+        self.bump();
+        Ok(dropped)
+    }
+
+    /// `GET /v1/plugins`: one row per plugin, from whichever source.
+    pub async fn list_plugins(&self) -> Vec<balerix_api::PluginStatus> {
+        match &self.plugins {
+            PluginSource::Packages(host) => host.list().await,
+            PluginSource::Declared(d) => d.list(|n| self.registry.active_agents(n)),
+        }
+    }
+
+    /// `hello` authenticates with the plugin's token — on one machine the
+    /// hook secret the actor minted for `balerix/plugins/<name>`, in
+    /// Kubernetes mode the list entry's — and is otherwise the plugin's
+    /// `SessionStart`.
     pub async fn plugin_hello(
         &self,
         name: &AgentName,
         token: &str,
         req: HelloRequest,
     ) -> Result<HelloResponse, DaemonError> {
-        if !self.verify_secret(&plugin_id(name), token).await {
-            return Err(DaemonError::Unauthorized);
-        }
-        let response = self.plugins.hello(name, req, token).await?;
+        let response = match &self.plugins {
+            PluginSource::Packages(host) => {
+                if !self.verify_secret(&plugin_id(name), token).await {
+                    return Err(DaemonError::Unauthorized);
+                }
+                host.hello(name, req, token).await?
+            }
+            PluginSource::Declared(d) => {
+                if d.plugin_for_token(token).as_ref() != Some(name) {
+                    return Err(DaemonError::Unauthorized);
+                }
+                d.hello(name, &req)?
+            }
+        };
         self.handler.on_hello(name);
-        // Restart recovery (§16.2): the plugin knows nothing about the
-        // pairs it had; every row is offered again, and a refusal now is
-        // the pair's state, not an error for the plugin.
+        self.reactivate(name).await;
+        self.bump();
+        Ok(response)
+    }
+
+    /// Restart recovery (§16.2): the plugin knows nothing about the
+    /// pairs it had; every row is offered again, and a refusal now is
+    /// the pair's state, not an error for the plugin.
+    async fn reactivate(&self, name: &AgentName) {
         if let Some(addr) = self.registry.ready_addr(name) {
             for (agent, row) in self.registry.rows_for_plugin(name) {
                 let req = ActivateRequest {
@@ -473,8 +571,6 @@ impl Daemon {
                 self.registry.set_state(&agent, name, activation);
             }
         }
-        self.bump();
-        Ok(response)
     }
 
     /// `CallFailure::Status` carries the plugin's own error verbatim; every
@@ -1041,7 +1137,7 @@ impl Daemon {
 
     pub async fn get(&self, name: &FleetName) -> Option<FleetRecord> {
         if is_reserved_fleet(name.as_str()) {
-            return Some(self.plugins.record());
+            return self.plugins.packages().map(|host| host.record());
         }
         self.fleets
             .read()
@@ -1059,7 +1155,9 @@ impl Daemon {
             .values()
             .map(|h| self.overlay(h.status.borrow().clone()))
             .collect();
-        out.push(self.plugins.record());
+        if let Some(host) = self.plugins.packages() {
+            out.push(host.record());
+        }
         out
     }
 
@@ -1091,6 +1189,9 @@ impl Daemon {
     /// Which plugin presents this token: the `balerix` fleet's entries of
     /// the secret index, each compared in constant time. Plugins are few.
     pub async fn plugin_for_token(&self, token: &str) -> Option<AgentName> {
+        if let Some(d) = self.plugins.declared() {
+            return d.plugin_for_token(token);
+        }
         let idx = self.shared.hook_secrets.read().await;
         idx.iter()
             .filter(|(id, _)| is_reserved_fleet(id.fleet.as_str()))
@@ -1398,7 +1499,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if w.daemon
-                    .plugins()
+                    .plugin_host()
+                    .unwrap()
                     .list()
                     .await
                     .first()
@@ -1580,7 +1682,10 @@ mod tests {
         assert_eq!(activates.len(), 2);
         assert_eq!(activates[0]["agent"], "f/c/a");
         assert_eq!(activates[0]["config"]["v"], 1);
-        assert_eq!(w.daemon.plugins().list().await[0].active_agents, 1);
+        assert_eq!(
+            w.daemon.plugin_host().unwrap().list().await[0].active_agents,
+            1
+        );
         // a second hello re-activates everything again (restart recovery)
         hello(&w, &stub.listen).await;
         assert_eq!(stub.calls_named("activate").len(), 4);
@@ -2209,12 +2314,12 @@ mod tests {
         hello(&w, &stub.listen).await;
         wait_plugin_ready(&w).await;
         w.daemon.poll_health().await;
-        let rows = w.daemon.plugins().list().await;
+        let rows = w.daemon.plugin_host().unwrap().list().await;
         assert_eq!(rows[0].message, "degraded: HTTP 503");
         assert_eq!(rows[0].phase, AgentPhase::Ready, "never restarted for it");
         hello(&w, &stub.listen).await;
         assert_eq!(
-            w.daemon.plugins().list().await[0].message,
+            w.daemon.plugin_host().unwrap().list().await[0].message,
             "",
             "hello clears it"
         );

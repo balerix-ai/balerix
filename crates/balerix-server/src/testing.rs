@@ -19,7 +19,7 @@ use crate::actor::Ports;
 use crate::daemon::{Daemon, DaemonHandler};
 use crate::kube::LinkHub;
 use crate::metrics::Metrics;
-use crate::plugins::{PluginClient, PluginKv, PluginRegistry};
+use crate::plugins::{PluginClient, PluginKv, PluginRegistry, PluginSetup};
 use crate::vault::Vault;
 
 #[derive(Default)]
@@ -204,6 +204,29 @@ impl Harness {
         )
     }
 
+    /// Kubernetes mode's plugin source (Spec O §23.2): the operator's list,
+    /// hellos persisted under `dir/plugins`, plugins called with `client`
+    /// (with or without an authority).
+    pub fn daemon_declared(
+        &self,
+        handler: Arc<dyn DaemonHandler>,
+        dir: &Path,
+        token: &str,
+        client: PluginClient,
+    ) -> Arc<Daemon> {
+        self.start(
+            handler,
+            token,
+            Metrics::new().unwrap_or_else(|e| panic!("metrics: {e}")),
+            Vec::new(),
+            ready_toolchain(),
+            PluginSetup::Declared {
+                state_dir: dir.join("plugins"),
+            },
+            client,
+        )
+    }
+
     fn daemon_full(
         &self,
         handler: Arc<dyn DaemonHandler>,
@@ -212,6 +235,28 @@ impl Harness {
         metrics: Metrics,
         existing: Vec<(FleetRecord, FleetSecrets)>,
         toolchain: Arc<dyn SystemToolchain>,
+    ) -> Arc<Daemon> {
+        self.start(
+            handler,
+            token,
+            metrics,
+            existing,
+            toolchain,
+            PluginSetup::Packages(plugin_config_in(plugin_dir)),
+            self.client.clone(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        &self,
+        handler: Arc<dyn DaemonHandler>,
+        token: &str,
+        metrics: Metrics,
+        existing: Vec<(FleetRecord, FleetSecrets)>,
+        toolchain: Arc<dyn SystemToolchain>,
+        plugins: PluginSetup,
+        client: PluginClient,
     ) -> Arc<Daemon> {
         // The runner, the workspace reader and `kube` come from `self.ports`:
         // `Harness::kube` swaps those three for the link hub.
@@ -229,9 +274,9 @@ impl Harness {
             metrics,
             token.to_string(),
             existing,
-            plugin_config_in(plugin_dir),
+            plugins,
             self.registry.clone(),
-            self.client.clone(),
+            client,
             self.kv.clone(),
             toolchain,
         )

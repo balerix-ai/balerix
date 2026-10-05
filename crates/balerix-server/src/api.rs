@@ -100,6 +100,7 @@ impl From<PluginError> for ApiError {
             PluginError::Fetch { .. } => StatusCode::BAD_GATEWAY,
             PluginError::Capability(_) => StatusCode::FORBIDDEN,
             PluginError::NotActive(_) => StatusCode::NOT_FOUND,
+            PluginError::Managed(_) => StatusCode::CONFLICT,
             PluginError::Io { .. } | PluginError::Internal(_) | PluginError::Kv { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -145,7 +146,7 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
             "/v1/fleets/{name}",
             get(get_fleet).put(update_fleet).delete(delete_fleet),
         )
-        .route("/v1/plugins", get(list_plugins))
+        .route("/v1/plugins", get(list_plugins).put(declare_plugins))
         .route("/v1/plugins/sync", post(sync_plugins))
         .route("/v1/plugins/{name}", delete(purge_plugin))
         .route("/v1/sessions", post(create_session))
@@ -418,7 +419,17 @@ async fn plugin_hello(
 }
 
 async fn list_plugins(State(state): State<AppState>) -> Json<Vec<PluginStatus>> {
-    Json(state.daemon.plugins().list().await)
+    Json(state.daemon.list_plugins().await)
+}
+
+/// `PUT /v1/plugins` (Spec O §23.2): the operator's whole list.
+async fn declare_plugins(
+    State(state): State<AppState>,
+    b: Result<Json<balerix_api::DeclaredPlugins>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let Json(list) = b.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    state.daemon.declare_plugins(list).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn sync_plugins(State(state): State<AppState>) -> Result<Json<SyncReport>, ApiError> {
@@ -432,7 +443,7 @@ async fn purge_plugin(
     let name: AgentName = path_name(name)?
         .parse()
         .map_err(|e: NameError| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
-    state.daemon.plugins().purge(&name).await?;
+    state.daemon.purge_plugin(&name).await?;
     Ok(Json(json!({})))
 }
 

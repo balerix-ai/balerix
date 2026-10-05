@@ -11,6 +11,7 @@ pub mod manifest;
 pub mod materializer;
 pub mod package;
 pub mod registry;
+pub mod source;
 
 use std::path::PathBuf;
 
@@ -22,6 +23,7 @@ pub use kv::{PluginKv, validate_key};
 pub use manifest::read_manifest;
 pub use materializer::{NullStore, PluginMaterializer};
 pub use registry::{ActivationRow, PluginAddr, PluginInfo, PluginRegistry};
+pub use source::{PluginSetup, PluginSource};
 
 /// Every plugin failure, with the config path or file first.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -58,6 +60,9 @@ pub enum PluginError {
     NotActive(String),
     #[error("{path}: {message}")]
     Kv { path: PathBuf, message: String },
+    /// A 409: the plugin set is not this path's to change (Spec O §23.2).
+    #[error("{0}")]
+    Managed(String),
 }
 
 impl PluginError {

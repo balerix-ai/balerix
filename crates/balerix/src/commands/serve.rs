@@ -15,7 +15,7 @@ use balerix_runtime::{Runtime, StateLayout, TmuxRunner};
 use balerix_server::kube::{self, LinkHub, NoFiles, NoPool, serve_tls};
 use balerix_server::{
     Daemon, FileFleetStore, Metrics, PluginClient, PluginEventHandler, PluginHostConfig, PluginKv,
-    PluginRegistry, Ports, ServerPaths, Vault, load_or_create_token, read_endpoint,
+    PluginRegistry, PluginSetup, Ports, ServerPaths, Vault, load_or_create_token, read_endpoint,
     remove_if_exists, router, serve, write_endpoint, write_pid,
 };
 use serde::Deserialize;
@@ -188,9 +188,10 @@ struct KubeFiles<'a> {
 
 /// Spec O §7.3: TLS on the pod address, the operator's admin token, the
 /// link hub as the runner and the workspace reader, no files to
-/// materialise, a pool that is a Job's, and no `plugins.yaml` (§9 brings
-/// `PUT /v1/plugins`): the startup plugin sync is not run. One process per
-/// pod, so there is no `already_running` check and no detach.
+/// materialise, a pool that is a Job's, and no `plugins.yaml`: the
+/// plugins are the operator's list, sent with `PUT /v1/plugins` (§23.2),
+/// so there is no startup plugin sync. One process per pod, so there is
+/// no `already_running` check and no detach.
 fn run_kubernetes(
     layout: &StateLayout,
     paths: &ServerPaths,
@@ -250,9 +251,8 @@ fn run_kubernetes(
             metrics,
             token,
             existing,
-            PluginHostConfig {
-                plugins_file: layout.config_root.join("plugins.yaml"),
-                install_root: layout.plugins_data_dir(),
+            PluginSetup::Declared {
+                state_dir: layout.plugins_state_dir(),
             },
             registry,
             client,
@@ -330,10 +330,10 @@ fn run(
             metrics,
             token,
             existing,
-            PluginHostConfig {
+            PluginSetup::Packages(PluginHostConfig {
                 plugins_file: layout.config_root.join("plugins.yaml"),
                 install_root: layout.plugins_data_dir(),
-            },
+            }),
             registry,
             client,
             kv,

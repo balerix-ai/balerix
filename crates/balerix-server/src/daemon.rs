@@ -63,6 +63,9 @@ pub struct Daemon {
     handler: Arc<dyn DaemonHandler>,
     token: String,
     plugins: PluginSource,
+    /// Kubernetes mode's stored managed fleet requests (Spec O §23.3);
+    /// `None` on one machine, where the Daemon applies them itself.
+    managed: Option<Arc<crate::kube::managed::ManagedStore>>,
     registry: Arc<PluginRegistry>,
     client: PluginClient,
     /// The reverse proxy's own connection pool for the plugin mount.
@@ -107,8 +110,10 @@ pub enum Caller {
     Admin { force: bool },
     /// A plugin with `manage`, by name.
     Plugin(AgentName),
-    /// The operator (Spec O §7.3): a `PUT` carrying `agent_tokens`.
-    Kubernetes,
+    /// The operator (Spec O §7.3): a `PUT` carrying `agent_tokens`, and
+    /// with `managed_by` the plugin it applies a managed fleet for
+    /// (§23.3).
+    Kubernetes { managed_by: Option<AgentName> },
 }
 
 impl Caller {
@@ -116,7 +121,13 @@ impl Caller {
         match self {
             Caller::Admin { .. } => None,
             Caller::Plugin(p) => Some(p.to_string()),
-            Caller::Kubernetes => Some(crate::kube::KUBERNETES_OWNER.to_string()),
+            // the record of a managed fleet keeps the plugin as its owner
+            Caller::Kubernetes {
+                managed_by: Some(p),
+            } => Some(p.to_string()),
+            Caller::Kubernetes { managed_by: None } => {
+                Some(crate::kube::KUBERNETES_OWNER.to_string())
+            }
         }
     }
 }
@@ -157,17 +168,28 @@ impl Daemon {
         // Spec F §4: one owner for the daemon pool. Spawned before the fleet
         // actors, though they gate on readiness rather than on spawn order.
         crate::system_pool::spawn(system_toolchain, pool_tx, SystemPoolConfig::default());
-        let plugins = match plugins {
-            PluginSetup::Packages(config) => PluginSource::Packages(PluginHost::start(
-                config,
-                &ports,
-                shared.clone(),
-                registry.clone(),
-            )),
+        let (plugins, managed) = match plugins {
+            PluginSetup::Packages(config) => (
+                PluginSource::Packages(PluginHost::start(
+                    config,
+                    &ports,
+                    shared.clone(),
+                    registry.clone(),
+                )),
+                None,
+            ),
             // Kubernetes mode launches nothing: the operator runs the
-            // plugins and sends their list (§23.2).
-            PluginSetup::Declared { state_dir } => PluginSource::Declared(
-                crate::kube::DeclaredPlugins::new(state_dir, registry.clone()),
+            // plugins and sends their list (§23.2), and applies their
+            // fleets from the stored requests (§23.3).
+            PluginSetup::Declared {
+                state_dir,
+                managed_dir,
+            } => (
+                PluginSource::Declared(crate::kube::DeclaredPlugins::new(
+                    state_dir,
+                    registry.clone(),
+                )),
+                Some(crate::kube::managed::ManagedStore::load(managed_dir)),
             ),
         };
         let ports = Arc::new(ports);
@@ -222,6 +244,7 @@ impl Daemon {
             handler,
             token,
             plugins,
+            managed,
             registry,
             client,
             proxy_client,
@@ -282,6 +305,9 @@ impl Daemon {
                 return;
             };
             d.fleets.write().await.remove(&name);
+            if let Some(m) = &d.managed {
+                m.forget(name.as_str());
+            }
             d.bump();
         }
     }
@@ -489,7 +515,7 @@ impl Daemon {
     }
 
     /// `PUT /v1/plugins` (Spec O §23.2). The rows of a dropped plugin go
-    /// with it; its stored managed requests too (Task 7).
+    /// with it; its stored managed requests too (§23.3).
     pub async fn declare_plugins(
         &self,
         list: balerix_api::DeclaredPlugins,
@@ -509,8 +535,30 @@ impl Daemon {
         let dropped = d
             .replace(list.plugins)
             .map_err(|e| DaemonError::Invalid(e.to_string()))?;
+        if let Some(m) = &self.managed {
+            for name in &dropped {
+                m.forget_plugin(name.as_str());
+            }
+        }
         self.bump();
         Ok(dropped)
+    }
+
+    /// `GET /v1/managed-fleets` (Spec O §23.3): the plugins' stored
+    /// requests, for the operator.
+    pub fn managed_fleets(&self) -> Result<Vec<balerix_api::ManagedFleet>, DaemonError> {
+        self.managed
+            .as_ref()
+            .map(|m| m.list())
+            .ok_or_else(|| DaemonError::Managed("this daemon reads plugins.yaml".into()))
+    }
+
+    /// A plugin downed a managed fleet: its stored request says so
+    /// (§23.3). Nothing to do on one machine.
+    pub fn managed_down(&self, name: &FleetName, q: balerix_api::DownQuery) {
+        if let Some(m) = &self.managed {
+            m.mark_down(name.as_str(), q);
+        }
     }
 
     /// `GET /v1/plugins`: one row per plugin, from whichever source.
@@ -658,9 +706,27 @@ impl Daemon {
             (Caller::Plugin(_), None) => Err(DaemonError::Managed(format!(
                 "fleet {name} is not managed by a plugin"
             ))),
-            (Caller::Kubernetes, Some(p)) if p != crate::kube::KUBERNETES_OWNER => Err(managed(p)),
+            // §23.3: the operator acting for a plugin applies or downs
+            // only that plugin's fleets
+            (
+                Caller::Kubernetes {
+                    managed_by: Some(me),
+                },
+                Some(p),
+            ) if p != me.as_str() => Err(managed(p)),
+            (
+                Caller::Kubernetes {
+                    managed_by: Some(_),
+                },
+                _,
+            ) => Ok(()),
+            (Caller::Kubernetes { managed_by: None }, Some(p))
+                if p != crate::kube::KUBERNETES_OWNER =>
+            {
+                Err(managed(p))
+            }
             // the operator never adopts a record it did not create
-            (Caller::Kubernetes, None) => Err(DaemonError::Managed(format!(
+            (Caller::Kubernetes { managed_by: None }, None) => Err(DaemonError::Managed(format!(
                 "fleet {name} is not managed by kubernetes"
             ))),
             _ => Ok(()),
@@ -696,11 +762,14 @@ impl Daemon {
     /// presents it on the hook route and on the link). An upsert: the
     /// operator re-sends on every reconcile. The tokens are checked
     /// against the spec before the owner rule or any plugin is consulted.
+    /// `managed_by` names the plugin a managed fleet is applied for
+    /// (§23.3); its record keeps that plugin as owner.
     pub async fn apply_kube(
         &self,
         name: &FleetName,
         spec: FleetSpec,
         agent_tokens: balerix_api::AgentTokens,
+        managed_by: Option<AgentName>,
     ) -> Result<FleetRecord, DaemonError> {
         if self.ports.kube.is_none() {
             return Err(DaemonError::Invalid(
@@ -740,7 +809,7 @@ impl Daemon {
             spec,
             CredentialBundle::default(),
             ApplyMode::Upsert,
-            &Caller::Kubernetes,
+            &Caller::Kubernetes { managed_by },
             agent_tokens,
         )
         .await
@@ -1114,6 +1183,9 @@ impl Daemon {
             })?;
         let resolver = self.ports.resolver.clone();
         let resolve_name = name.clone();
+        // kept for the operator: in Kubernetes mode it resolves the file
+        // into a Fleet itself (§23.3)
+        let stored = self.managed.is_some().then(|| file.clone());
         let spec =
             tokio::task::spawn_blocking(move || resolver.resolve(&file, &resolve_name, &layer))
                 .await
@@ -1124,15 +1196,25 @@ impl Daemon {
             .await
             .map_err(|e| DaemonError::Internal(e.to_string()))?
             .map_err(DaemonError::Internal)?;
-        self.apply_as(
-            name,
-            spec,
-            credentials,
-            ApplyMode::Upsert,
-            &caller,
-            BTreeMap::new(),
-        )
-        .await
+        let record = self
+            .apply_as(
+                name,
+                spec,
+                credentials,
+                ApplyMode::Upsert,
+                &caller,
+                BTreeMap::new(),
+            )
+            .await?;
+        if let (Some(m), Some(file)) = (&self.managed, stored) {
+            m.put(balerix_api::ManagedFleet {
+                name: name.to_string(),
+                plugin: plugin.to_string(),
+                file,
+                down: None,
+            });
+        }
+        Ok(record)
     }
 
     pub async fn get(&self, name: &FleetName) -> Option<FleetRecord> {

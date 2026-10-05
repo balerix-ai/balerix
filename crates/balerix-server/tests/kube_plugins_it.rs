@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Spec O §23.2: the plugin list, hello against the grant, the 409s.
+//! Spec O §23.3: managed fleets, stored for the operator and applied by it
+//! on the plugin's behalf.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -112,6 +114,13 @@ async fn world_with(h: &Harness, client: PluginClient) -> World {
     serve_world(daemon, dir).await
 }
 
+/// A Kubernetes-mode daemon over the state under `state` (a restart);
+/// the caller keeps the directory.
+async fn world_at(h: &Harness, client: PluginClient, state: &std::path::Path) -> World {
+    let daemon = h.daemon_declared(Arc::new(PassThrough), state, ADMIN, client);
+    serve_world(daemon, tempfile::tempdir().unwrap()).await
+}
+
 /// A tmux-mode daemon: `plugins.yaml` and packages.
 async fn tmux_world(h: &Harness) -> World {
     let dir = tempfile::tempdir().unwrap();
@@ -120,7 +129,16 @@ async fn tmux_world(h: &Harness) -> World {
 }
 
 fn request(tokens: Option<Value>) -> Value {
-    let mut v = json!({ "spec": serde_json::to_value(spec()).unwrap() });
+    request_for("f", tokens)
+}
+
+/// `request` for the fleet `name`: crew `c`, agent `a`.
+fn request_for(name: &str, tokens: Option<Value>) -> Value {
+    let spec = FleetSpec {
+        name: name.into(),
+        ..spec()
+    };
+    let mut v = json!({ "spec": serde_json::to_value(spec).unwrap() });
     if let Some(t) = tokens {
         v["agent_tokens"] = t;
     }
@@ -300,5 +318,205 @@ async fn a_fleet_naming_a_declared_plugin_applies_with_its_pair_pending() {
     assert_eq!(
         rec["status"]["agents"]["f/c/a"]["plugins"]["flow"]["state"],
         "pending"
+    );
+}
+
+/// A TLS stub plugin `fake` declared with `fleets` and `manage`, hello'd
+/// with those needs; returns its token. The resolver answers `spec()`.
+async fn declare_fake(w: &World, h: &Harness, listen: &str) -> String {
+    let (s, _) = w
+        .call(
+            "PUT",
+            "/v1/plugins",
+            Some(ADMIN),
+            Some(json!({ "plugins": [entry("fake", listen, &["fleets", "manage"])] })),
+        )
+        .await;
+    assert_eq!(s, 204);
+    let token = entry("fake", "", &[])["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hello = json!({ "name": "fake", "version": "1.0.0", "protocol": 1,
+        "listen": "0.0.0.0:7644", "manifest": { "apiVersion": "balerix/v1", "kind": "Plugin",
+        "name": "fake", "version": "1.0.0", "protocol": 1, "start": "serve",
+        "needs": ["fleets", "manage"] } });
+    let (s, v) = w
+        .call("POST", "/v1/plugin-host/hello", Some(&token), Some(hello))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    h.resolver.set(Ok(spec()));
+    token
+}
+
+async fn tls_stub(dir: &std::path::Path) -> (PluginClient, balerix_server::testing::StubPlugin) {
+    let (ca, cert, key) = balerix_server::testing::test_authority(dir);
+    let stub = stub_plugin(StubScript {
+        health_ok: true,
+        tls: Some((cert, key)),
+        ..Default::default()
+    })
+    .await;
+    let tls = balerix_server::kube::tls::client_config(&ca).unwrap();
+    (PluginClient::new(Some(tls)).unwrap(), stub)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_managed_put_is_stored_listed_and_applied_by_the_operator_as_the_plugins() {
+    let dir = tempfile::tempdir().unwrap();
+    let (client, stub) = tls_stub(dir.path()).await;
+    let h = Harness::kube(Duration::from_secs(3600));
+    let w = world_with(&h, client).await;
+    let token = declare_fake(&w, &h, &stub.listen).await;
+
+    // the plugin applies a fleet file: answered now, with the record
+    let file = json!({ "crews": { "c": { "repo": "acme/api", "agents": { "a": {} } } } });
+    let (s, rec) = w
+        .call(
+            "PUT",
+            "/v1/plugin-host/fleets/gh-1",
+            Some(&token),
+            Some(json!({ "file": file })),
+        )
+        .await;
+    assert_eq!((s, rec["owner"].as_str()), (200, Some("fake")), "{rec}");
+    // the restricted surface is still checked synchronously (the real
+    // resolver's refusal, played by the fake)
+    let bad = "defaults.env: not allowed in a plugin-applied fleet file";
+    h.resolver.set(Err(bad.into()));
+    let (s, v) = w
+        .call(
+            "PUT",
+            "/v1/plugin-host/fleets/gh-2",
+            Some(&token),
+            Some(json!({ "file": { "defaults": { "env": { "X": "1" } }, "crews": {} } })),
+        )
+        .await;
+    assert_eq!((s, v["error"].as_str()), (400, Some(bad)), "{v}");
+    // the operator sees it
+    let (s, rows) = w.call("GET", "/v1/managed-fleets", Some(ADMIN), None).await;
+    assert_eq!((s, rows.as_array().unwrap().len()), (200, 1), "{rows}");
+    assert_eq!(
+        (rows[0]["name"].as_str(), rows[0]["plugin"].as_str()),
+        (Some("gh-1"), Some("fake"))
+    );
+    assert_eq!(rows[0]["file"], file);
+    assert!(rows[0].get("down").is_none());
+    // the operator applies it on the plugin's behalf; the owner stays the plugin
+    let mut req = request_for("gh-1", Some(json!({ "gh-1/c/a": "a".repeat(32) })));
+    req["managed_by"] = json!("fake");
+    let (s, rec) = w
+        .call("PUT", "/v1/fleets/gh-1", Some(ADMIN), Some(req.clone()))
+        .await;
+    assert_eq!((s, rec["owner"].as_str()), (200, Some("fake")), "{rec}");
+    // the operator without managed_by, or for another plugin, is refused
+    req["managed_by"] = json!("other");
+    let (s, _) = w
+        .call("PUT", "/v1/fleets/gh-1", Some(ADMIN), Some(req.clone()))
+        .await;
+    assert_eq!(s, 409);
+    req.as_object_mut().unwrap().remove("managed_by");
+    let (s, v) = w
+        .call("PUT", "/v1/fleets/gh-1", Some(ADMIN), Some(req))
+        .await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (409, Some("fleet gh-1 is managed by plugin fake"))
+    );
+    // the CLI is refused as on one machine
+    let (s, _) = w
+        .call(
+            "PUT",
+            "/v1/fleets/gh-1",
+            Some(ADMIN),
+            Some(json!({ "spec": rec["spec"] })),
+        )
+        .await;
+    assert_eq!(s, 409);
+    // the plugin downs it: the row says so
+    let (s, _) = w
+        .call(
+            "DELETE",
+            "/v1/plugin-host/fleets/gh-1?keep_repos=true&keep_sessions=false&purge=false&force=false",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(s, 200);
+    let (_, rows) = w.call("GET", "/v1/managed-fleets", Some(ADMIN), None).await;
+    assert_eq!(rows[0]["down"]["keep_repos"], true);
+    // dropping the plugin drops its requests
+    let (s, _) = w
+        .call(
+            "PUT",
+            "/v1/plugins",
+            Some(ADMIN),
+            Some(json!({ "plugins": [] })),
+        )
+        .await;
+    assert_eq!(s, 204);
+    let (_, rows) = w.call("GET", "/v1/managed-fleets", Some(ADMIN), None).await;
+    assert_eq!(rows, json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_managed_request_survives_a_restart_and_managed_by_is_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let (client, stub) = tls_stub(dir.path()).await;
+    let h = Harness::kube(Duration::from_secs(3600));
+    let w = world_at(&h, client.clone(), state.path()).await;
+    let token = declare_fake(&w, &h, &stub.listen).await;
+    let file = json!({ "crews": { "c": { "repo": "acme/api", "agents": { "a": {} } } } });
+    let (s, _) = w
+        .call(
+            "PUT",
+            "/v1/plugin-host/fleets/gh-1",
+            Some(&token),
+            Some(json!({ "file": file })),
+        )
+        .await;
+    assert_eq!(s, 200);
+    // `managed_by` rides only with the operator's tokens, and is a name
+    let mut req = request_for("gh-1", None);
+    req["managed_by"] = json!("fake");
+    let (s, v) = w
+        .call("PUT", "/v1/fleets/gh-1", Some(ADMIN), Some(req.clone()))
+        .await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (400, Some("managed_by is sent only with agent_tokens"))
+    );
+    req["agent_tokens"] = json!({ "gh-1/c/a": "a".repeat(32) });
+    req["managed_by"] = json!("Not A Name");
+    let (s, v) = w
+        .call("PUT", "/v1/fleets/gh-1", Some(ADMIN), Some(req))
+        .await;
+    assert_eq!(s, 400, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().starts_with("managed_by: "),
+        "{v}"
+    );
+    drop(w);
+
+    let again = world_at(&h, client, state.path()).await;
+    let (s, rows) = again
+        .call("GET", "/v1/managed-fleets", Some(ADMIN), None)
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        rows,
+        json!([{ "name": "gh-1", "plugin": "fake", "file": file }])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tmux_daemon_has_no_managed_fleets() {
+    let h = Harness::new(Duration::from_secs(3600));
+    let w = tmux_world(&h).await;
+    let (s, v) = w.call("GET", "/v1/managed-fleets", Some(ADMIN), None).await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (409, Some("this daemon reads plugins.yaml"))
     );
 }

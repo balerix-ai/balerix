@@ -312,12 +312,12 @@ async fn a_kubernetes_daemon_takes_no_fleet_but_the_operators() {
     }
     assert!(daemon.get(&"f".parse().unwrap()).await.is_none());
     let e = daemon
-        .apply_kube(&"u".parse().unwrap(), named("u"), tokens("u"))
+        .apply_kube(&"u".parse().unwrap(), named("u"), tokens("u"), None)
         .await
         .unwrap_err();
     assert_eq!(e.to_string(), "fleet u is not managed by kubernetes");
     let e = daemon
-        .apply_kube(&"p".parse().unwrap(), named("p"), tokens("p"))
+        .apply_kube(&"p".parse().unwrap(), named("p"), tokens("p"), None)
         .await
         .unwrap_err();
     assert_eq!(e.to_string(), "fleet p is managed by plugin github");
@@ -429,6 +429,7 @@ async fn the_stopped_set_travels_over_the_link_and_is_reconciled_on_reconnect() 
             &name,
             spec(),
             BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+            None,
         )
         .await
         .unwrap();
@@ -522,6 +523,7 @@ async fn a_sidecar_that_links_after_a_down_is_told_to_stop() {
             &name,
             spec(),
             BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+            None,
         )
         .await
         .unwrap();
@@ -570,7 +572,7 @@ async fn an_operator_apply_keeps_a_plugins_stop() {
         ("f/c/b".to_string(), TOKEN_B.to_string()),
     ]);
     w.daemon
-        .apply_kube(&name, two.clone(), both.clone())
+        .apply_kube(&name, two.clone(), both.clone(), None)
         .await
         .unwrap();
     let mut ws = link(w.port, TOKEN).await;
@@ -593,7 +595,7 @@ async fn an_operator_apply_keeps_a_plugins_stop() {
     ws.send(status_frame(AgentPhase::Stopped)).await.unwrap();
 
     // the routine re-apply: the stop holds and nothing is sent
-    let record = w.daemon.apply_kube(&name, two, both).await.unwrap();
+    let record = w.daemon.apply_kube(&name, two, both, None).await.unwrap();
     assert!(record.stopped.contains("f/c/a"), "{:?}", record.stopped);
     assert!(record.stopped.contains("f/c/b"), "{:?}", record.stopped);
     assert_no_request(&mut ws, Duration::from_millis(500)).await;
@@ -612,6 +614,7 @@ async fn an_operator_apply_keeps_a_plugins_stop() {
             &name,
             spec(),
             BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+            None,
         )
         .await
         .unwrap();
@@ -630,7 +633,7 @@ async fn an_apply_after_a_down_restarts_the_linked_agents() {
     let name: balerix_core::FleetName = "f".parse().unwrap();
     let tokens = BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]);
     w.daemon
-        .apply_kube(&name, spec(), tokens.clone())
+        .apply_kube(&name, spec(), tokens.clone(), None)
         .await
         .unwrap();
     let mut ws = link(w.port, TOKEN).await;
@@ -656,7 +659,7 @@ async fn an_apply_after_a_down_restarts_the_linked_agents() {
     ws.send(status_frame(AgentPhase::Stopped)).await.unwrap();
 
     let (d, n) = (w.daemon.clone(), name.clone());
-    let up = tokio::spawn(async move { d.apply_kube(&n, spec(), tokens).await });
+    let up = tokio::spawn(async move { d.apply_kube(&n, spec(), tokens, None).await });
     let req = next_request(&mut ws).await;
     assert_eq!(req.op, LinkOp::Restart);
     reply_ok(&mut ws, req.id).await;
@@ -668,6 +671,7 @@ async fn an_apply_after_a_down_restarts_the_linked_agents() {
             &name,
             spec(),
             BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+            None,
         )
         .await
         .unwrap();
@@ -703,6 +707,7 @@ async fn a_late_status_on_a_live_link_is_mirrored_not_corrected() {
             &name,
             spec(),
             BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+            None,
         )
         .await
         .unwrap();
@@ -745,6 +750,7 @@ async fn a_plugin_sync_leaves_a_kubernetes_fleet_up() {
             &name,
             spec(),
             BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+            None,
         )
         .await
         .unwrap();
@@ -776,6 +782,7 @@ async fn a_dropped_agent_leaves_the_status_and_its_frames_are_ignored() {
                 ("f/c/a".to_string(), TOKEN.to_string()),
                 ("f/c/b".to_string(), TOKEN_B.to_string()),
             ]),
+            None,
         )
         .await
         .unwrap();
@@ -792,6 +799,7 @@ async fn a_dropped_agent_leaves_the_status_and_its_frames_are_ignored() {
             &name,
             spec(),
             BTreeMap::from([("f/c/a".to_string(), TOKEN.to_string())]),
+            None,
         )
         .await
         .unwrap();

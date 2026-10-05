@@ -253,6 +253,7 @@ fn run_kubernetes(
             existing,
             PluginSetup::Declared {
                 state_dir: layout.plugins_state_dir(),
+                managed_dir: layout.managed_dir(),
             },
             registry,
             client,

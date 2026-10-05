@@ -13,8 +13,12 @@ pub enum PluginSetup {
     /// One machine: `plugins.yaml` and the reserved fleet (today).
     Packages(PluginHostConfig),
     /// Kubernetes mode (Spec O §23.2): the operator's list; hellos persist
-    /// under `state_dir` (`<state>/plugins`).
-    Declared { state_dir: PathBuf },
+    /// under `state_dir` (`<state>/plugins`), managed fleet requests
+    /// under `managed_dir` (`<state>/managed`, §23.3).
+    Declared {
+        state_dir: PathBuf,
+        managed_dir: PathBuf,
+    },
 }
 
 /// What the Daemon holds. A closed enum, not a trait object: two

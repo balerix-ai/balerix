@@ -4,6 +4,7 @@
 pub mod declared;
 pub mod idle;
 pub mod link;
+pub mod managed;
 pub mod pty;
 pub mod tls;
 

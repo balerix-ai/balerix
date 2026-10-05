@@ -148,6 +148,7 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         )
         .route("/v1/plugins", get(list_plugins).put(declare_plugins))
         .route("/v1/plugins/sync", post(sync_plugins))
+        .route("/v1/managed-fleets", get(managed_fleets))
         .route("/v1/plugins/{name}", delete(purge_plugin))
         .route("/v1/sessions", post(create_session))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
@@ -311,9 +312,30 @@ async fn update_fleet(
 ) -> Result<Json<FleetRecord>, ApiError> {
     let req = body(b)?;
     let name = fleet_name(&path_name(name)?)?;
+    // Spec O §23.3: the plugin a managed fleet is applied for
+    let managed_by = req
+        .managed_by
+        .as_deref()
+        .map(|p| {
+            p.parse::<AgentName>().map_err(|e: NameError| {
+                ApiError::new(StatusCode::BAD_REQUEST, format!("managed_by: {e}"))
+            })
+        })
+        .transpose()?;
     let record = match req.agent_tokens {
         // Spec O §7.3: the operator's apply
-        Some(tokens) => state.daemon.apply_kube(&name, req.spec, tokens).await?,
+        Some(tokens) => {
+            state
+                .daemon
+                .apply_kube(&name, req.spec, tokens, managed_by)
+                .await?
+        }
+        None if managed_by.is_some() => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "managed_by is sent only with agent_tokens",
+            ));
+        }
         None => {
             state
                 .daemon
@@ -430,6 +452,14 @@ async fn declare_plugins(
     let Json(list) = b.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
     state.daemon.declare_plugins(list).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /v1/managed-fleets` (Spec O §23.3): what the operator writes as
+/// Fleets on the plugins' behalf.
+async fn managed_fleets(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<balerix_api::ManagedFleet>>, ApiError> {
+    Ok(Json(state.daemon.managed_fleets()?))
 }
 
 async fn sync_plugins(State(state): State<AppState>) -> Result<Json<SyncReport>, ApiError> {

@@ -205,7 +205,8 @@ impl Harness {
     }
 
     /// Kubernetes mode's plugin source (Spec O §23.2): the operator's list,
-    /// hellos persisted under `dir/plugins`, plugins called with `client`
+    /// hellos persisted under `dir/plugins`, managed fleet requests under
+    /// `dir/managed`, plugins called with `client`
     /// (with or without an authority).
     pub fn daemon_declared(
         &self,
@@ -222,6 +223,7 @@ impl Harness {
             ready_toolchain(),
             PluginSetup::Declared {
                 state_dir: dir.join("plugins"),
+                managed_dir: dir.join("managed"),
             },
             client,
         )

@@ -171,12 +171,13 @@ async fn delete_fleet(
         repos: q.keep_repos,
         sessions: q.keep_sessions,
     };
-    Ok(Json(
-        state
-            .daemon
-            .down_as(&name, keep, q.purge, &Caller::Plugin(plugin))
-            .await?,
-    ))
+    let record = state
+        .daemon
+        .down_as(&name, keep, q.purge, &Caller::Plugin(plugin))
+        .await?;
+    // Kubernetes mode: the operator downs it from the stored request (§23.3)
+    state.daemon.managed_down(&name, q);
+    Ok(Json(record))
 }
 
 /// `GET fleets/watch` (WS): every change, as the whole list (§18.4).

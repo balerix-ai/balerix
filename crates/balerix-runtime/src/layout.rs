@@ -259,6 +259,11 @@ impl StateLayout {
     pub fn fleets_dir(&self) -> PathBuf {
         self.state_root.join("fleets")
     }
+    /// `managed/`: a Kubernetes-mode Daemon's stored managed fleet
+    /// requests, one `<name>.json` each (Spec O §23.3).
+    pub fn managed_dir(&self) -> PathBuf {
+        self.state_root.join("managed")
+    }
     pub fn fleet_dir(&self, f: &FleetName) -> PathBuf {
         self.fleets_dir().join(f.as_str())
     }
@@ -532,6 +537,10 @@ mod tests {
         assert_eq!(
             l.fleets_dir(),
             PathBuf::from("/h/.local/state/balerix/fleets")
+        );
+        assert_eq!(
+            l.managed_dir(),
+            PathBuf::from("/h/.local/state/balerix/managed")
         );
     }
 

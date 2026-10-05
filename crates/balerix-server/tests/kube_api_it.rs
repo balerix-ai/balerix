@@ -316,6 +316,18 @@ async fn a_kubernetes_daemon_takes_no_fleet_but_the_operators() {
         .await
         .unwrap_err();
     assert_eq!(e.to_string(), "fleet u is not managed by kubernetes");
+    // nor on a plugin's behalf (§23.3): a CLI record is no plugin's
+    let e = daemon
+        .apply_kube(
+            &"u".parse().unwrap(),
+            named("u"),
+            tokens("u"),
+            Some("fake".parse().unwrap()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.to_string(), "fleet u is not managed by a plugin");
+    assert!(matches!(e, balerix_server::DaemonError::Managed(_)), "409");
     let e = daemon
         .apply_kube(&"p".parse().unwrap(), named("p"), tokens("p"), None)
         .await

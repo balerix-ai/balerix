@@ -714,11 +714,20 @@ impl Daemon {
                 },
                 Some(p),
             ) if p != me.as_str() => Err(managed(p)),
+            // nor adopts a record nobody manages, a CLI one (R7)
             (
                 Caller::Kubernetes {
                     managed_by: Some(_),
                 },
-                _,
+                None,
+            ) => Err(DaemonError::Managed(format!(
+                "fleet {name} is not managed by a plugin"
+            ))),
+            (
+                Caller::Kubernetes {
+                    managed_by: Some(_),
+                },
+                Some(_),
             ) => Ok(()),
             (Caller::Kubernetes { managed_by: None }, Some(p))
                 if p != crate::kube::KUBERNETES_OWNER =>

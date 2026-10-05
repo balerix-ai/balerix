@@ -395,26 +395,29 @@ where
 }
 
 /// The controllers, one set per watched namespace, until the future is
-/// dropped. Tasks 5–8 add a line per controller to `set`.
-pub async fn run(client: Client, cfg: RunConfig) {
+/// dropped. `client` serves the reconciles; `watches`, from
+/// `watch_client::watch_client`, every watch (hyper#4207, #129).
+pub async fn run(client: Client, watches: Client, cfg: RunConfig) {
     let ctx = Arc::new(Context::new(client, cfg));
     let namespaces: Vec<Option<String>> = match &ctx.run.watch_namespaces {
         Some(list) if !list.is_empty() => list.iter().cloned().map(Some).collect(),
         _ => vec![None],
     };
-    let sets = namespaces.into_iter().map(|ns| set(ctx.clone(), ns));
+    let sets = namespaces
+        .into_iter()
+        .map(|ns| set(ctx.clone(), &watches, ns));
     futures_util::future::join_all(sets).await;
 }
 
 /// The four controllers over one namespace (or all).
-async fn set(ctx: Arc<Context>, namespace: Option<String>) {
+async fn set(ctx: Arc<Context>, watches: &Client, namespace: Option<String>) {
     tracing::info!(namespace = namespace.as_deref().unwrap_or("*"), "watching");
     let ns = namespace.as_deref();
-    let controllers: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> = vec![
-        Box::pin(daemon::controller(ctx.clone(), ns)),
-        Box::pin(fleet::controller(ctx.clone(), ns)),
-        Box::pin(crew::controller(ctx.clone(), ns)),
-        Box::pin(agent::controller(ctx.clone(), ns)),
+    let controllers: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>> = vec![
+        Box::pin(daemon::controller(ctx.clone(), watches, ns)),
+        Box::pin(fleet::controller(ctx.clone(), watches, ns)),
+        Box::pin(crew::controller(ctx.clone(), watches, ns)),
+        Box::pin(agent::controller(ctx.clone(), watches, ns)),
     ];
     futures_util::future::join_all(controllers).await;
 }

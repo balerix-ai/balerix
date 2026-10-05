@@ -309,7 +309,12 @@ async fn the_phase_3_journey_on_kind() {
     // 5. drop bob: harvested into the crew cache. The harvest Job and its
     // pod are bob's Agent's and go with it, so their outcome is watched
     // as it happens, not read after
-    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    // on a client of their own (`watch_client`, #129): a watch on the pooled
+    // `client` could hold up the probes below for up to 290 s
+    let watch_client =
+        balerix_operator::watch_client::watch_client(kube::Config::infer().await.unwrap()).unwrap();
+    let jobs: Api<Job> = Api::namespaced(watch_client.clone(), &ns);
+    let watch_pods: Api<Pod> = Api::namespaced(watch_client, &ns);
     let succeeded = Arc::new(Mutex::new(None::<i32>));
     let message = Arc::new(Mutex::new(None::<String>));
     let job_watch = tokio::spawn({
@@ -326,7 +331,7 @@ async fn the_phase_3_journey_on_kind() {
         }
     });
     let pod_watch = tokio::spawn({
-        let (pods, message) = (pods.clone(), message.clone());
+        let (pods, message) = (watch_pods, message.clone());
         async move {
             let config = watcher::Config::default().labels("job-name=f-c-bob-harvest");
             let mut events =

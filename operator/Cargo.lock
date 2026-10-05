@@ -298,6 +298,9 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "hyper",
+ "hyper-timeout",
+ "hyper-util",
  "insta",
  "k8s-openapi",
  "kube",
@@ -315,6 +318,8 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]

@@ -29,8 +29,8 @@ use crate::desired::daemon::{
 use crate::desired::names;
 use crate::pki::{self, Issued};
 
-pub async fn controller(ctx: Arc<Context>, namespace: Option<&str>) {
-    let client = &ctx.client;
+pub async fn controller(ctx: Arc<Context>, watches: &kube::Client, namespace: Option<&str>) {
+    let client = watches;
     Controller::new(
         api_in::<Daemon>(client, namespace),
         watcher::Config::default(),

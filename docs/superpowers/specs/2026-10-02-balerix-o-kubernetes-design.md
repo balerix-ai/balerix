@@ -2104,3 +2104,65 @@ This refines §9.4.
   `manage` brings up a managed Fleet whose agents become Ready; removing
   it from `spec.plugins` deletes the Fleet. The operator runs out of
   cluster as in §21.4, so the missing Events RBAC does not bite here.
+
+### 23.7 Decided by the plan
+
+What 4a's plan decided beyond §23.1–§23.3, and the rulings made while
+building it, as built.
+
+- **`Plugin::manifest()` returns `Option<&'static str>` and defaults to
+  `None`.** This amends §23.1's `-> &'static str`. It is not a required
+  method, so the SDK's own test plugins and third-party plugins keep
+  compiling. Kubernetes mode refuses a `hello` without a manifest anyway.
+- **The SDK sends the manifest only when it was given an authority
+  (`BALERIX_CA_FILE`).** `HelloRequest` is `deny_unknown_fields`, so a
+  released one-machine Daemon (0.2.0) would answer 400 to a `hello`
+  carrying it. On one machine the manifest is ignored, so nothing is lost.
+- **`PluginSource` is a closed enum (`Packages`, `Declared`), not a trait
+  object.** There are two adapters and their methods are async; the enum
+  needs no boxing.
+- **`PUT /v1/plugins` registers every plugin at once,** with a placeholder
+  manifest (no needs, no hooks, not ready). A fleet that names the plugin
+  then applies with its pairs `pending`, as on one machine, where `sync`
+  registers before any `hello`. Without this, an apply answers `no plugin
+  "x" is installed` until the plugin's `hello`.
+- **`serve --tls-ca <file>` is optional in Kubernetes mode.** The Daemon
+  pods 3b ships do not mount it until 4b. Without it, `PUT /v1/plugins` is
+  409 `this daemon was started without --tls-ca; it cannot call plugins`.
+  The plugin client and the route proxy always use a preconfigured TLS
+  config; with no `--tls-ca` it trusts nothing (`kube::tls::no_roots`), and
+  `proxy::client` takes that config as an `Arc<ClientConfig>`.
+- **`PluginAddr.listen` may hold a URL.** `PluginAddr::base()` gives
+  `https://…` as-is and prefixes a bare `host:port` with `http://`. The
+  client and the proxy build their URLs from it.
+- **The proxy uses hyper-rustls's `https_or_http` connector.** reqwest's
+  rustls feature already brings it into the lock. Loopback `http://` keeps
+  working through the same client.
+- **In Kubernetes mode a plugin's `DELETE fleets/{name}` still downs the
+  fleet** through `down_as` (the mirror sends `stop`) and also marks the
+  stored request down. A down request is kept until the plugin applies that
+  name again, the plugin is dropped, or the record is purged.
+- **`Caller::Kubernetes` becomes `Caller::Kubernetes { managed_by:
+  Option<AgentName> }`.**
+- **`dev fake-plugin` uses `serve`.** `configure` writes the hello file and
+  spawns the manage step, so the fake gets TLS and the manifest with no code
+  of its own.
+- **A refused re-hello takes the plugin out of the chain and deletes its
+  `hello.json`,** so a restart cannot bring back a hello that no longer
+  holds. A restored hello lists as `starting` with its real version until
+  the first health poll, which comes 10 s after the Daemon starts.
+
+Rulings made while building it:
+
+- **The fake plugin's manifest** is the union of the e2e fake's two
+  packages: needs `[actions, fleets, kv, manage]`, `intercept: [PreToolUse,
+  Stop]` and `observe: [SessionStart, Notification, PreToolUse, Stop]`.
+  Task 8's grants and refusal text depend on those needs.
+- **`sync` and `purge` refuse when the plugin source is `Declared`,** not
+  on the mode, through `PluginError::Managed` (409). This keeps the
+  existing error statuses; production Kubernetes mode always uses
+  `Declared`.
+- **The operator acting for a plugin (`managed_by`) never adopts an
+  existing ownerless fleet:** 409 `fleet {name} is not managed by a
+  plugin`. This is §7.4's rule that the operator never adopts a record it
+  did not create, applied to §23.3's `check_owner`.

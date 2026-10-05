@@ -1,11 +1,13 @@
 //! Kubernetes mode (Spec O §7): the sidecar link and the two ports over
 //! it, the idle ports, and TLS serving.
 
+pub mod declared;
 pub mod idle;
 pub mod link;
 pub mod pty;
 pub mod tls;
 
+pub use declared::DeclaredPlugins;
 pub use idle::{NoFiles, NoPool};
 pub use link::{ATTACH_WAIT, LINK_CALL_TIMEOUT, LinkError, LinkHub};
 pub use tls::{TlsServer, client_config, no_roots, serve_tls};

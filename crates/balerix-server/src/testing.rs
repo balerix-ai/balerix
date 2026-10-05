@@ -2,7 +2,7 @@
 //! bundle over the `balerix-core` fakes.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -118,7 +118,7 @@ impl Harness {
             credentials,
             ports,
             registry: PluginRegistry::new(),
-            client: PluginClient::new().unwrap_or_else(|e| panic!("http client: {e}")),
+            client: PluginClient::new(None).unwrap_or_else(|e| panic!("http client: {e}")),
             kv_dir,
             kv,
             hub: None,
@@ -265,6 +265,8 @@ pub struct StubScript {
     pub health_ok: bool,
     pub metrics_body: String,
     pub expect_token: Option<String>,
+    /// (certificate, key) PEM: serve `https://` (Spec O §23.1).
+    pub tls: Option<(PathBuf, PathBuf)>,
 }
 
 #[derive(Clone)]
@@ -291,6 +293,7 @@ pub async fn stub_plugin(script: StubScript) -> StubPlugin {
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::{Value, json};
+    let script_tls = script.tls.clone();
     let calls = Arc::new(StdMutex::new(Vec::new()));
     #[derive(Clone)]
     struct S {
@@ -385,21 +388,57 @@ pub async fn stub_plugin(script: StubScript) -> StubPlugin {
             "/v1/metrics",
             get(move |State(s): State<S>| async move { s.script.metrics_body.clone() }),
         )
+        .route(
+            "/v1/routes/ws",
+            get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
+                ws.on_upgrade(|mut socket| async move {
+                    while let Some(Ok(msg)) = socket.recv().await {
+                        if matches!(msg, axum::extract::ws::Message::Text(_))
+                            && socket.send(msg).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            }),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             check_token,
         ))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap_or_else(|e| panic!("bind: {e}"));
-    let listen = listener
+    let tls = script_tls;
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("bind: {e}"));
+    listener
+        .set_nonblocking(true)
+        .unwrap_or_else(|e| panic!("nonblocking: {e}"));
+    let port = listener
         .local_addr()
         .unwrap_or_else(|e| panic!("addr: {e}"))
-        .to_string();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+        .port();
+    let listen = if tls.is_some() {
+        format!("https://127.0.0.1:{port}")
+    } else {
+        format!("127.0.0.1:{port}")
+    };
+    if let Some((cert, key)) = tls {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+            .await
+            .unwrap_or_else(|e| panic!("tls: {e}"));
+        let server = axum_server::from_tcp_rustls(listener, config)
+            .unwrap_or_else(|e| panic!("tls listener: {e}"));
+        tokio::spawn(async move {
+            let _ = server.serve(app.into_make_service()).await;
+        });
+    } else {
+        let listener =
+            tokio::net::TcpListener::from_std(listener).unwrap_or_else(|e| panic!("listener: {e}"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+    }
     StubPlugin { listen, calls }
 }
 
@@ -415,4 +454,32 @@ pub fn write_plugin_package(dir: &Path, name: &str, manifest_extra: &str) {
         dir.join("mise.toml"),
         "[tools]\n[tasks.serve]\nrun = \"true\"\n",
     );
+}
+
+/// (ca.crt, tls.crt, tls.key) for 127.0.0.1 in `dir`: a throwaway authority
+/// and the leaf it signs, for the TLS stub plugin (Spec O §23.1).
+pub fn test_authority(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let io = |what: &str, e: &dyn std::fmt::Display| -> ! { panic!("authority: {what}: {e}") };
+    let mut ca =
+        rcgen::CertificateParams::new(Vec::<String>::new()).unwrap_or_else(|e| io("ca params", &e));
+    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().unwrap_or_else(|e| io("ca key", &e));
+    let ca_cert = ca
+        .self_signed(&ca_key)
+        .unwrap_or_else(|e| io("ca cert", &e));
+    let issuer = rcgen::Issuer::new(ca, ca_key);
+    let key = rcgen::KeyPair::generate().unwrap_or_else(|e| io("key", &e));
+    let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .unwrap_or_else(|e| io("leaf params", &e))
+        .signed_by(&key, &issuer)
+        .unwrap_or_else(|e| io("leaf", &e));
+    let paths = (dir.join("ca.crt"), dir.join("tls.crt"), dir.join("tls.key"));
+    for (path, pem) in [
+        (&paths.0, ca_cert.pem()),
+        (&paths.1, leaf.pem()),
+        (&paths.2, key.serialize_pem()),
+    ] {
+        std::fs::write(path, pem).unwrap_or_else(|e| io("write", &e));
+    }
+    paths
 }

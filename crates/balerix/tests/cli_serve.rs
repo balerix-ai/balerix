@@ -374,10 +374,19 @@ fn kubernetes_mode_refuses_missing_tls_and_detach_and_tmux_mode_refuses_the_tls_
         .arg(&key)
         .output()
         .unwrap();
-    assert!(
-        String::from_utf8_lossy(&out.stderr)
-            .contains("--tls-cert, --tls-key and --admin-token-file are for --mode kubernetes")
-    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains(
+        "--tls-cert, --tls-key, --tls-ca and --admin-token-file are for --mode kubernetes"
+    ));
+    // --tls-ca alone is refused in tmux mode like the other kube flags
+    let out = balerix(home.path(), tools.path())
+        .args(["serve", "--bind", "127.0.0.1:0"])
+        .arg("--tls-ca")
+        .arg(&cert)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains(
+        "--tls-cert, --tls-key, --tls-ca and --admin-token-file are for --mode kubernetes"
+    ));
     fs::write(&token_file, "short\n").unwrap();
     let out = balerix(home.path(), tools.path())
         .args(["serve", "--mode", "kubernetes", "--bind", "127.0.0.1:0"])

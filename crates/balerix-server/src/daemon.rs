@@ -197,6 +197,7 @@ impl Daemon {
                 Err(e) => tracing::error!("skipping a stored fleet with an invalid name: {e}"),
             }
         }
+        let proxy_client = crate::proxy::client(client.tls());
         let daemon = Arc::new(Self {
             fleets: RwLock::new(fleets),
             ports,
@@ -206,7 +207,7 @@ impl Daemon {
             plugins,
             registry,
             client,
-            proxy_client: crate::proxy::client(),
+            proxy_client,
             kv,
             sessions: Sessions::new(),
             changes,

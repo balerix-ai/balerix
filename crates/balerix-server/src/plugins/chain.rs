@@ -345,7 +345,7 @@ mod tests {
     fn handler(r: &Arc<PluginRegistry>) -> (Arc<PluginEventHandler>, Metrics) {
         let m = Metrics::new().unwrap();
         (
-            PluginEventHandler::new(r.clone(), PluginClient::new().unwrap(), m.clone()),
+            PluginEventHandler::new(r.clone(), PluginClient::new(None).unwrap(), m.clone()),
             m,
         )
     }

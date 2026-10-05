@@ -19,6 +19,18 @@ pub struct PluginAddr {
     pub token: String,
 }
 
+impl PluginAddr {
+    /// Where to call the plugin: a URL as given (Kubernetes mode, Spec O
+    /// §23.2), or `http://` + a loopback `host:port` from `hello`.
+    pub fn base(&self) -> String {
+        if self.listen.starts_with("https://") || self.listen.starts_with("http://") {
+            self.listen.trim_end_matches('/').to_string()
+        } else {
+            format!("http://{}", self.listen)
+        }
+    }
+}
+
 impl fmt::Debug for PluginAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PluginAddr")

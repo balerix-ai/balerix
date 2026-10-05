@@ -57,9 +57,10 @@ async fn the_client_sends_the_documented_bodies() {
         }],
         health_ok: true,
         expect_token: Some("tok".into()),
+        tls: None,
     })
     .await;
-    let c = PluginClient::new().unwrap();
+    let c = PluginClient::new(None).unwrap();
     let addr = PluginAddr {
         listen: stub.listen.clone(),
         token: "tok".into(),

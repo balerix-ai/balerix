@@ -114,38 +114,39 @@ async fn ensure_material(
 ) -> Result<i64, Error> {
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
     let now = ctx.now();
-    let (authority, minted) = match read_issued(
+    let authority = match read_issued(
         secrets.get_opt(&names::authority(name)).await?.as_ref(),
         "ca.crt",
         "ca.key",
     ) {
-        Some(a) => (a, false),
+        Some(a) => a,
         None => {
             tracing::info!(daemon = %name, "minting the authority");
-            (pki::new_authority(namespace, name, now)?, true)
+            pki::new_authority(namespace, name, now)?
         }
     };
-    // a serving certificate its authority cannot verify is missing (§21.2)
-    let serving = match read_issued(
+    // a serving certificate its authority cannot verify is missing (§21.2):
+    // checked against the authority this reconcile holds, so one minted by
+    // a reconcile dropped before it applied the serving Secret is followed
+    let serving_names = pki::daemon_names(namespace, name);
+    let existing = read_issued(
         secrets.get_opt(&names::serving(name)).await?.as_ref(),
         "tls.crt",
         "tls.key",
-    ) {
-        Some(s) if !minted && !pki::needs_renewal(s.not_after, now) => s,
-        existing => {
-            let renewal = match (minted, existing.is_some()) {
-                (true, _) => "authority",
-                (false, true) => "expiring",
-                (false, false) => "absent",
-            };
+    );
+    let renewal = match &existing {
+        None => Some("absent"),
+        Some(s) if !pki::verifies(&authority.cert_pem, &s.cert_pem, &serving_names[0], now) => {
+            Some("unverified")
+        }
+        Some(s) if pki::needs_renewal(s.not_after, now) => Some("expiring"),
+        Some(_) => None,
+    };
+    let serving = match (existing, renewal) {
+        (Some(s), None) => s,
+        (_, renewal) => {
             tracing::info!(daemon = %name, renewal, "issuing the serving certificate");
-            pki::issue_serving(
-                &authority,
-                namespace,
-                name,
-                &pki::daemon_names(namespace, name),
-                now,
-            )?
+            pki::issue_serving(&authority, namespace, name, &serving_names, now)?
         }
     };
     let admin_token = match secrets

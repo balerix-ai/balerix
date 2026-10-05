@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use balerix_api::{AgentPhase, AgentStatus as DaemonAgentStatus};
 use balerix_operator::api::{Agent, Crew, Daemon, DaemonSpec, Fleet, FleetSpec};
+use balerix_operator::pki;
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, Secret, Service};
@@ -283,6 +284,94 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
     assert_eq!(
         secrets.get("balerix-default-admin").await.unwrap().data,
         admin.data
+    );
+    operator.abort();
+}
+
+/// A reconcile that applied a new authority and was dropped before the
+/// serving Secret leaves a certificate the authority cannot verify: the
+/// next reconcile counts it as missing and reissues it (§21.2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_serving_certificate_the_authority_cannot_verify_is_reissued() {
+    let Some(env) = envtest().await else { return };
+    let ns = namespace(&env.client, "daemon").await;
+    let client = env.client.clone();
+    Api::<Daemon>::namespaced(client.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Daemon::new("default", daemon_spec()),
+        )
+        .await
+        .unwrap();
+    let clock = TestClock::default();
+    let operator = spawn_operator(env, &ns, None, &clock);
+    let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), &ns);
+    wait_for("the StatefulSet", Duration::from_secs(60), || async {
+        statefulsets.get_opt("balerix-default").await.unwrap()
+    })
+    .await;
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), &ns);
+    let tls = secrets.get("balerix-default-tls").await.unwrap();
+    let old_crt = tls.data.as_ref().unwrap()["tls.crt"].clone();
+    let names = pki::daemon_names(&ns, "default");
+
+    // a day on, so the reissued certificate's expiry, and the template, differ
+    clock.advance(86_400);
+    let now = clock.clock()();
+    let other = pki::new_authority(&ns, "default", now).unwrap();
+    let replaced = Patch::Merge(serde_json::json!({
+        "metadata": { "annotations": { "balerix.ai/not-after": other.not_after.to_string() } },
+        "stringData": { "ca.crt": other.cert_pem, "ca.key": other.key_pem }
+    }));
+    let text =
+        |s: &Secret, key: &str| String::from_utf8(s.data.as_ref().unwrap()[key].0.clone()).unwrap();
+    // a reconcile that read the authority before the patch applies the
+    // old one back: patch again until the new one stays
+    let reissued = wait_for(
+        "a serving certificate from the new authority",
+        Duration::from_secs(60),
+        || async {
+            let ca = secrets.get("balerix-default-ca").await.unwrap();
+            if text(&ca, "ca.crt") != other.cert_pem {
+                secrets
+                    .patch("balerix-default-ca", &PatchParams::default(), &replaced)
+                    .await
+                    .unwrap();
+                return None;
+            }
+            let s = secrets.get("balerix-default-tls").await.unwrap();
+            (s.data.as_ref().unwrap()["tls.crt"] != old_crt
+                && pki::verifies(&other.cert_pem, &text(&s, "tls.crt"), &names[0], now))
+            .then_some(s)
+        },
+    )
+    .await;
+    let not_after = reissued.metadata.annotations.as_ref().unwrap()["balerix.ai/not-after"].clone();
+    assert_ne!(
+        not_after,
+        tls.metadata.annotations.as_ref().unwrap()["balerix.ai/not-after"]
+    );
+    wait_for(
+        "the pod template to roll",
+        Duration::from_secs(60),
+        || async {
+            let s = statefulsets.get("balerix-default").await.unwrap();
+            (s.spec
+                .unwrap()
+                .template
+                .metadata
+                .unwrap()
+                .annotations
+                .unwrap()["balerix.ai/not-after"]
+                == not_after)
+                .then_some(())
+        },
+    )
+    .await;
+    // the authority the dropped reconcile left is kept
+    assert_eq!(
+        text(&secrets.get("balerix-default-ca").await.unwrap(), "ca.crt"),
+        other.cert_pem
     );
     operator.abort();
 }

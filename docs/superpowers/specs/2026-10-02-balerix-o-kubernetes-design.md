@@ -1606,7 +1606,9 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
   otherwise each status patch would re-trigger a reconcile and a probe.
 - **A newly minted authority always re-issues the serving certificate.** A
   lost CA Secret would otherwise leave a certificate the new authority
-  cannot verify.
+  cannot verify. Amended: any serving certificate the authority read or
+  minted cannot verify (`pki::verifies`) is re-issued, which also covers a
+  reconcile dropped between applying the two Secrets.
 - **The test is the kubelet.** In envtest nothing runs pods. A test patches a
   Job's `status` and its pod's termination message, patches a Pod's
   `status`, and deletes a Pod once the operator has set its deletion

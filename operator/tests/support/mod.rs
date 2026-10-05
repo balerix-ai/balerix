@@ -57,8 +57,25 @@ pub async fn namespace(client: &Client, label: &str) -> String {
     name
 }
 
+/// How long one probe of `wait_for` or `hold_for` may take. A kube request
+/// is now and then lost on a pooled connection and never answered (the
+/// client has no read timeout); the probe is dropped and polled again.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One probe: `Some(answer)`, or `None` when it was lost.
+async fn probe_once<T, Fut>(probe: Fut) -> Option<Option<T>>
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let answer = tokio::time::timeout(PROBE_TIMEOUT, probe).await.ok();
+    if answer.is_none() {
+        eprintln!("a probe took over {PROBE_TIMEOUT:?}: dropped");
+    }
+    answer
+}
+
 /// Polls `probe` every 200 ms until it answers `Some`, or panics with
-/// `what` after `timeout`.
+/// `what` after `timeout`. A lost probe is "not yet".
 pub async fn wait_for<T, F, Fut>(what: &str, timeout: Duration, mut probe: F) -> T
 where
     F: FnMut() -> Fut,
@@ -66,7 +83,7 @@ where
 {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(t) = probe().await {
+        if let Some(Some(t)) = probe_once(probe()).await {
             return t;
         }
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -75,14 +92,29 @@ where
 }
 
 /// Holds `what` true for `hold`: panics the first time `probe` answers `Some`.
+/// A lost probe saw nothing, so it proves nothing: the hold ends only on a
+/// probe that answered after `hold`, and panics if none has answered
+/// `PROBE_TIMEOUT` × 6 past it.
 pub async fn hold_for<T, F, Fut>(what: &str, hold: Duration, mut probe: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
     let deadline = Instant::now() + hold;
-    while Instant::now() < deadline {
-        assert!(probe().await.is_none(), "{what} happened; it must not");
+    let give_up = deadline + PROBE_TIMEOUT * 6;
+    loop {
+        match probe_once(probe()).await {
+            Some(answer) => {
+                assert!(answer.is_none(), "{what} happened; it must not");
+                if Instant::now() >= deadline {
+                    return;
+                }
+            }
+            None => assert!(
+                Instant::now() < give_up,
+                "no probe of {what} answered after the hold"
+            ),
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }

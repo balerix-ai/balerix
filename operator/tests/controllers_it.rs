@@ -119,10 +119,12 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
         .get("balerix-default")
         .await
         .unwrap();
-    Api::<Job>::namespaced(client.clone(), &ns)
-        .get("balerix-default-pool")
-        .await
-        .unwrap();
+    // the reconcile applies the StatefulSet before it creates the pool Job
+    let pool_jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    wait_for("the pool Job", Duration::from_secs(60), || async {
+        pool_jobs.get_opt("balerix-default-pool").await.unwrap()
+    })
+    .await;
     let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
     claims.get("balerix-default-state").await.unwrap();
     claims.get("balerix-default-shared").await.unwrap();
@@ -232,9 +234,18 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
         .delete("balerix-default-ca", &Default::default())
         .await
         .unwrap();
+    // a reconcile that read the Secret before the delete applies the old
+    // authority back: delete again while the old one is there
     wait_for("a new authority", Duration::from_secs(60), || async {
         let s = secrets.get_opt("balerix-default-ca").await.unwrap()?;
-        (s.data.as_ref()?.get("ca.crt") != ca.data.as_ref().unwrap().get("ca.crt")).then_some(())
+        if s.data.as_ref()?.get("ca.crt") == ca.data.as_ref().unwrap().get("ca.crt") {
+            // gone already when the operator's own read raced this one
+            let _ = secrets
+                .delete("balerix-default-ca", &Default::default())
+                .await;
+            return None;
+        }
+        Some(())
     })
     .await;
     let reissued = wait_for(

@@ -1578,6 +1578,13 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
   stays listed, deleting, until its pods are gone, and `ensure_job` and the
   busy check treat a deleting Job as running, so a predecessor's pod holds
   the crew.
+- **A reconcile is bounded at 30 s** (`controllers::RECONCILE_TIMEOUT`,
+  through `bounded`). A kube request now and then is lost on a pooled
+  HTTP/1 connection and never answered, and kube-client 4.2 has no read
+  timeout; the runtime never starts a second reconcile of an object whose
+  first still runs, so the object would be stuck until a restart. On expiry
+  the future is dropped (a held crew lock with it), a warning names the
+  object, and `Error::TimedOut` requeues in 2 s with no back-off.
 - **A credentials or token Secret the user must fix is `Materialized=False`,
   reason `CredentialsInvalid`,** on the Agent: a missing Secret, a missing
   key, or a `credentials.json` that does not parse (serde's line and
@@ -1683,6 +1690,9 @@ Known in 3b and left open:
   instead of a Daemon watch.
 - The envtest suite has load-sensitive waits (60 s `wait_for`, an
   occasional 180 s hang under four API servers on one host).
+- A per-request client timeout for production (`Config::read_timeout` cuts
+  idle watches too, so a tower timeout layer on non-watch requests), and a
+  report to hyper-util of the lost requests, with the task-dump trace.
 - §8.5's "the Agent's branch changed" row is not built: a branch change is
   a spec change, so the Pod is replaced on the same claim, and the
   sidecar's `ensure_clone` then wants to recreate the clone, which

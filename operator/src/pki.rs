@@ -1,13 +1,19 @@
 //! One certificate authority per Daemon, and the serving certificates it
 //! signs (Spec O §10.3). The controller keeps each pair in a Secret with
-//! its expiry as an annotation, so nothing here or there parses X.509.
-//! Times are unix seconds, given by the caller.
+//! its expiry as an annotation; the one X.509 check is `verifies`, made
+//! the way a client of the Daemon makes it. Times are unix seconds, given
+//! by the caller.
+
+use std::sync::Arc;
 
 use rand::Rng;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
+use rustls::client::danger::ServerCertVerifier;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use time::OffsetDateTime;
 
 pub const AUTHORITY_DAYS: i64 = 3650;
@@ -108,6 +114,36 @@ pub fn issue_serving(
     })
 }
 
+/// Whether `serving_pem` chains to `authority_pem` and is valid for
+/// `name` at `now`, checked as a client of the Daemon checks it. Anything
+/// unparseable does not verify.
+pub fn verifies(authority_pem: &str, serving_pem: &str, name: &str, now: i64) -> bool {
+    check(authority_pem, serving_pem, name, now).is_ok()
+}
+
+fn check(authority_pem: &str, serving_pem: &str, name: &str, now: i64) -> Result<(), String> {
+    let mut roots = rustls::RootCertStore::empty();
+    let authority =
+        CertificateDer::from_pem_slice(authority_pem.as_bytes()).map_err(|e| format!("{e:?}"))?;
+    roots.add(authority).map_err(|e| format!("{e:?}"))?;
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .build()
+    .map_err(|e| format!("{e:?}"))?;
+    let leaf =
+        CertificateDer::from_pem_slice(serving_pem.as_bytes()).map_err(|e| format!("{e:?}"))?;
+    let name = ServerName::try_from(name.to_string()).map_err(|e| format!("{e:?}"))?;
+    let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+        u64::try_from(now).map_err(|_| format!("the time {now} is out of range"))?,
+    ));
+    verifier
+        .verify_server_cert(&leaf, &[], &name, &[], now)
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+}
+
 pub fn needs_renewal(not_after: i64, now: i64) -> bool {
     now >= not_after - RENEW_BEFORE_DAYS * DAY_SECS
 }
@@ -134,38 +170,13 @@ pub fn new_token() -> String {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
-    use std::sync::Arc;
-
-    use rustls::client::danger::ServerCertVerifier;
-    use rustls_pki_types::pem::PemObject;
-    use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
-
     use super::*;
 
     const NOW: i64 = 1_800_000_000;
     const DAY: i64 = 86_400;
 
     fn verify(authority: &Issued, leaf: &Issued, name: &str, at: i64) -> Result<(), String> {
-        let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(CertificateDer::from_pem_slice(authority.cert_pem.as_bytes()).unwrap())
-            .unwrap();
-        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
-            Arc::new(roots),
-            Arc::new(rustls::crypto::ring::default_provider()),
-        )
-        .build()
-        .unwrap();
-        verifier
-            .verify_server_cert(
-                &CertificateDer::from_pem_slice(leaf.cert_pem.as_bytes()).unwrap(),
-                &[],
-                &ServerName::try_from(name.to_string()).unwrap(),
-                &[],
-                UnixTime::since_unix_epoch(std::time::Duration::from_secs(at as u64)),
-            )
-            .map(|_| ())
-            .map_err(|e| format!("{e:?}"))
+        check(&authority.cert_pem, &leaf.cert_pem, name, at)
     }
 
     #[test]
@@ -211,6 +222,27 @@ mod tests {
         verify(&ca, &leaf, "127.0.0.1", NOW + 61 * DAY).unwrap();
         let other = new_authority("team-a", "default", NOW).unwrap();
         assert!(verify(&other, &leaf, "127.0.0.1", NOW + 61 * DAY).is_err());
+    }
+
+    /// A serving certificate its authority cannot verify counts as
+    /// missing (§21.2): the controller reissues it.
+    #[test]
+    fn a_serving_certificate_verifies_only_against_its_own_authority() {
+        let a = new_authority("team-a", "default", NOW).unwrap();
+        let b = new_authority("team-a", "default", NOW).unwrap();
+        let names = daemon_names("team-a", "default");
+        let leaf = issue_serving(&a, "team-a", "default", &names, NOW).unwrap();
+        assert!(verifies(&a.cert_pem, &leaf.cert_pem, &names[0], NOW + DAY));
+        // same name and key usage, another key: missing
+        assert!(!verifies(&b.cert_pem, &leaf.cert_pem, &names[0], NOW + DAY));
+        // garbage, or a key where a certificate belongs: missing
+        for garbage in ["", "not a certificate", leaf.key_pem.as_str()] {
+            assert!(!verifies(&a.cert_pem, garbage, &names[0], NOW + DAY));
+            assert!(!verifies(garbage, &leaf.cert_pem, &names[0], NOW + DAY));
+        }
+        let mangled = leaf.cert_pem.replacen("MII", "MIJ", 1);
+        assert_ne!(mangled, leaf.cert_pem);
+        assert!(!verifies(&a.cert_pem, &mangled, &names[0], NOW + DAY));
     }
 
     #[test]

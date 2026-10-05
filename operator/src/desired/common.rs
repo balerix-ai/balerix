@@ -63,10 +63,12 @@ impl Images {
 }
 
 /// `component` is `daemon`, `crew`, `agent`, `pool`, `sync` or `harvest`.
+/// `daemon` is the Daemon's name; its label value is
+/// `names::daemon_label`'s, bounded to 63 characters.
 pub fn labels(daemon: &str, component: &str, extra: &[(&str, &str)]) -> Value {
     let mut all = json!({
         "app.kubernetes.io/managed-by": MANAGER,
-        "balerix.ai/daemon": daemon,
+        "balerix.ai/daemon": super::names::daemon_label(daemon),
         "balerix.ai/component": component,
     });
     for (k, v) in extra {

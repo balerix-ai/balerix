@@ -6,7 +6,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   annotations:
-    balerix.ai/input-hash: 5e2a8938def9582addaa645179b7b3d6603319afddf641d48b40eb53fd3254c9
+    balerix.ai/input-hash: e6771e208acdcc260d7ee447437edde83aabd929ca66ba15fb209626c1d8b895
   labels:
     app.kubernetes.io/managed-by: balerix-operator
     balerix.ai/component: sync
@@ -22,6 +22,7 @@ metadata:
       name: payments-backend
       uid: crew-uid
 spec:
+  activeDeadlineSeconds: 3600
   backoffLimit: 0
   template:
     metadata:
@@ -81,6 +82,8 @@ spec:
               subPath: pools/daemon
             - mountPath: /balerix/scratch
               name: scratch
+            - mountPath: /tmp
+              name: tmp
             - mountPath: /balerix/secret
               name: gh
               readOnly: true
@@ -122,6 +125,8 @@ spec:
             claimName: balerix-default-shared
         - emptyDir: {}
           name: scratch
+        - emptyDir: {}
+          name: tmp
         - name: gh
           secret:
             defaultMode: 288

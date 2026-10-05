@@ -15,7 +15,7 @@ use super::common::{
     Cond, DesiredError, OperatorConfig, claim, conditions, container_security, labels, owner_of,
     pod_security, typed,
 };
-use super::jobs::SHARED;
+use super::jobs::{AGENT_DIR, SHARED};
 use super::names;
 use crate::api::{Agent, AgentStatus, ClaimSpec, Daemon};
 
@@ -134,9 +134,11 @@ pub fn agent_objects(inputs: &AgentInputs<'_>) -> Result<AgentObjects, DesiredEr
         shared(names::vol_daemon_pool(), "daemon"),
     ];
     let both = |extra: Vec<Value>| -> Vec<Value> {
-        let mut mounts = vec![json!({ "name": "agent", "mountPath": "/balerix/agent" })];
+        let mut mounts =
+            vec![json!({ "name": "agent", "mountPath": "/balerix/agent", "subPath": AGENT_DIR })];
         mounts.extend(slice.iter().cloned());
         mounts.push(json!({ "name": "run", "mountPath": "/balerix/run" }));
+        mounts.push(json!({ "name": "tmp", "mountPath": "/tmp" }));
         mounts.extend(extra);
         mounts
     };
@@ -180,8 +182,18 @@ pub fn agent_objects(inputs: &AgentInputs<'_>) -> Result<AgentObjects, DesiredEr
                 "securityContext": pod_security(),
                 "nodeSelector": node_selector,
                 "tolerations": tolerations,
-                // a native sidecar: an init container that keeps running
                 "initContainers": [{
+                    // the claim's directory, made by the pods' own user:
+                    // the kubelet would make a missing sub-path as root
+                    "name": "claim",
+                    "image": inputs.cfg.images.agent,
+                    "command": ["mkdir", "-p", format!("/balerix/claim/{AGENT_DIR}")],
+                    // a failed `mkdir` reports its stderr as the message
+                    "terminationMessagePolicy": "FallbackToLogsOnError",
+                    "securityContext": container_security(),
+                    "volumeMounts": [{ "name": "agent", "mountPath": "/balerix/claim" }],
+                }, {
+                    // a native sidecar: an init container that keeps running
                     "name": "sidecar",
                     "image": inputs.cfg.images.agent,
                     "restartPolicy": "Always",
@@ -211,6 +223,7 @@ pub fn agent_objects(inputs: &AgentInputs<'_>) -> Result<AgentObjects, DesiredEr
                     { "name": "shared", "persistentVolumeClaim": {
                         "claimName": names::shared_claim(&spec.daemon), "readOnly": true } },
                     { "name": "run", "emptyDir": {} },
+                    { "name": "tmp", "emptyDir": {} },
                     { "name": "bundle", "secret": { "secretName": names::bundle(name), "defaultMode": 0o440 } },
                     { "name": "authority", "configMap": { "name": names::authority(&spec.daemon) } },
                 ],
@@ -304,9 +317,12 @@ pub fn agent_status(
     let side = pod.and_then(sidecar);
     let past_materialize =
         reported.is_some_and(|r| matches!(r.phase, P::Starting | P::Ready | P::Dead | P::Stopped));
+    // §21.5: a termination message is read only while the sidecar is not
+    // running; a running sidecar's old crash in `lastState` is history.
+    let running = side.is_some_and(|s| s.state.as_ref().is_some_and(|st| st.running.is_some()));
     let materialized = if past_materialize {
         Cond::yes("Materialized", "Materialized", "")
-    } else if let Some(message) = side.and_then(termination_message) {
+    } else if let Some(message) = side.filter(|_| !running).and_then(termination_message) {
         let reason = if message.starts_with("SandboxUnavailable") {
             "SandboxUnavailable"
         } else {
@@ -662,5 +678,64 @@ mod tests {
         let s = agent_status(&a, Some(&fresh), None, &at(1));
         assert_eq!(cond(&s, "Materialized"), ("Unknown", "Materializing", ""));
         assert_eq!(cond(&s, "Ready"), ("False", "NotReady", ""));
+    }
+
+    #[test]
+    fn both_containers_mount_an_empty_dir_at_tmp() {
+        let spec = objects(json!({ "type": "pod" })).pod.spec.unwrap();
+        // the sidecar and the agent; the `claim` init container only runs `mkdir`
+        let both: Vec<_> = spec
+            .init_containers
+            .iter()
+            .flatten()
+            .chain(spec.containers.iter())
+            .filter(|c| c.name != "claim")
+            .collect();
+        assert_eq!(both.len(), 2);
+        for c in both {
+            assert!(
+                c.volume_mounts
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.mount_path == "/tmp"),
+                "{}",
+                c.name
+            );
+        }
+        assert!(
+            spec.volumes
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "tmp" && v.empty_dir.is_some())
+        );
+    }
+
+    #[test]
+    fn a_running_sidecars_old_crash_is_not_a_failure() {
+        let a = agent(json!({ "type": "pod" }));
+        let last =
+            json!({ "terminated": { "exitCode": 1, "message": "MaterializeFailed: git: boom" } });
+        let with = |state: Value| {
+            pod(json!({
+                "conditions": [{ "type": "PodScheduled", "status": "True" }],
+                "initContainerStatuses": [sidecar(false, state, last.clone())]
+            }))
+        };
+        let s = agent_status(&a, Some(&with(json!({ "running": {} }))), None, &at(1));
+        assert_eq!(cond(&s, "Materialized"), ("Unknown", "Materializing", ""));
+        // the same message on a sidecar that is not running is the failure
+        let s = agent_status(
+            &a,
+            Some(&with(
+                json!({ "waiting": { "reason": "CrashLoopBackOff" } }),
+            )),
+            None,
+            &at(1),
+        );
+        assert_eq!(
+            cond(&s, "Materialized"),
+            ("False", "MaterializeFailed", "MaterializeFailed: git: boom")
+        );
     }
 }

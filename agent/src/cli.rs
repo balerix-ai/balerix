@@ -29,6 +29,9 @@ pub enum Command {
     PoolSync(PoolSyncArgs),
     /// The harvest Job: the agent's branch into the crew cache (§8.4).
     Harvest(HarvestArgs),
+    /// The cleanup Job: empty a crew's cache and pool after its Fleet is
+    /// deleted with `retain: None` (§5.2, §8.5).
+    CrewRemove(CrewRemoveArgs),
 }
 
 #[derive(Debug, Args)]
@@ -149,6 +152,15 @@ pub struct HarvestArgs {
     /// The agent claim, mounted read-only.
     #[arg(long, default_value = "/balerix/agent")]
     pub agent_dir: PathBuf,
+    #[command(flatten)]
+    pub dirs: JobDirs,
+}
+
+#[derive(Debug, Args)]
+pub struct CrewRemoveArgs {
+    /// `<fleet>/<crew>`.
+    #[arg(long)]
+    pub crew: String,
     #[command(flatten)]
     pub dirs: JobDirs,
 }

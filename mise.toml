@@ -3,7 +3,7 @@
 [tools]
 rust = { version = "1.99.0", components = ["rustfmt", "clippy"] }
 "cargo:cargo-nextest" = "0.9.146"
-cargo-insta = "1.48.0"
+cargo-insta = "1.49.0"
 "cargo:cargo-audit" = "0.22.2"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
 "github:sourcefrog/cargo-mutants" = "27.1.0"
@@ -39,7 +39,7 @@ run = [
 ]
 
 [tasks.lint]
-description = "Static tier: rustfmt check + clippy with warnings denied, then the core dependency-isolation guard, and the published crates package cleanly"
+description = "Static tier: rustfmt check + clippy with warnings denied, then the core dependency-isolation guard, the published crates package cleanly, and the workflow, script and Dockerfile linters"
 run = [
   "cargo fmt --all --check",
   "cargo clippy --workspace --all-targets -- -D warnings",
@@ -53,6 +53,9 @@ run = [
   "actionlint",
   "zizmor --offline --min-severity medium .github",
   "shellcheck -x scripts/release/*.sh",
+  # every Dockerfile, the two images `build-image` never builds included
+  # (docker/operator, docker/agent: Spec O §21.6)
+  "hadolint docker/*/Dockerfile",
 ]
 
 [tasks.test]
@@ -84,7 +87,12 @@ description = "Lint and test the standalone agent project (balerix-agent, Spec O
 run = "scripts/agent.sh check"
 
 [tasks.operator]
-description = "Lint and test the standalone operator project (balerix-operator, Spec O §12): builds balerix first for its client test against a Kubernetes-mode daemon; fails when operator/crds differs from the Rust types. Its own tier; not part of `check`"
+description = "Lint and test the standalone operator project (balerix-operator, Spec O §12): builds balerix first for its client test against a Kubernetes-mode daemon; the controller tests run on the envtest binaries this task pins (a kube-apiserver and etcd, no cluster); fails when operator/crds differs from the Rust types. Its own tier; not part of `check`"
+# envtest (kube-apiserver, etcd, kubectl) is pinned here, not in [tools], so
+# only this task downloads the ~160 MB tarball. The tag is the spike's 1.34
+# line (§19); the binaries sit under controller-tools/envtest/ in it, and
+# mise strips the single top directory, so bin_path is envtest.
+tools = { "github:kubernetes-sigs/controller-tools" = { version = "envtest-v1.34.1", bin_path = "envtest" } }
 run = "scripts/operator.sh check"
 
 [tasks.crds]
@@ -137,6 +145,20 @@ description = "End-to-end journey against a real daemon, git, mise, nono and tmu
 depends = ["package-plugins flow web"]
 env = { BALERIX_REQUIRE_TOOLS = "1" }
 run = "cargo nextest run -p balerix --test e2e"
+
+[tasks.kind-up]
+description = "A kind cluster for e2e-k8s with the shared local-path class, the CRDs and the daemon and agent images built from this tree (needs docker; `-- down` deletes it)"
+# kind and kubectl are pinned here, not in [tools], so only this task and
+# e2e-k8s download them. kind 0.33.0 ships the node image the script pins.
+tools = { kind = "0.33.0", kubectl = "1.34.12" }
+usage = 'arg "[mode]" default="up" help="up or down"'
+run = 'scripts/kind-up.sh "$usage_mode"'
+
+[tasks.e2e-k8s]
+description = "The Phase 3 journey on the kind cluster kind-up made: operator out of cluster, fake claude in the pods; fails (not skips) without the cluster"
+tools = { kind = "0.33.0", kubectl = "1.34.12" }
+env = { BALERIX_REQUIRE_TOOLS = "1" }
+run = "scripts/operator.sh e2e"
 
 [tasks.serve]
 # HOME alone is not enough: StateLayout prefers XDG_STATE_HOME/XDG_DATA_HOME/

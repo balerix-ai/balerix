@@ -483,3 +483,30 @@ fn a_harvest_without_a_working_nono_fails() {
     assert!(e.starts_with("f/c/a: "), "{e}");
     assert!(e.contains("no-such-nono"), "{e}");
 }
+
+#[test]
+fn remove_crew_empties_the_slice_and_keeps_the_mount_points() {
+    let root = support::temp_root("remove-crew");
+    let slice = SharedSlice::new(root.join("shared"));
+    let crew = slice.crew();
+    // what a sync left behind: a cache, a pool, logs, and the fleet and
+    // daemon pools the crew only reads
+    std::fs::create_dir_all(crew.repo.join(".git/objects")).unwrap();
+    std::fs::write(crew.repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::create_dir_all(crew.root.join("mise/installs")).unwrap();
+    std::fs::create_dir_all(crew.root.join("no-hooks")).unwrap();
+    std::fs::create_dir_all(&crew.logs).unwrap();
+    std::fs::create_dir_all(slice.fleet().root.join("mise")).unwrap();
+    std::fs::create_dir_all(slice.daemon_pool()).unwrap();
+
+    balerix_runtime::jobs::remove_crew(&slice).unwrap();
+
+    // the mount points stay (a Job cannot remove a mount), empty
+    assert!(crew.repo.is_dir() && std::fs::read_dir(&crew.repo).unwrap().next().is_none());
+    assert!(crew.root.is_dir() && std::fs::read_dir(&crew.root).unwrap().next().is_none());
+    // what the crew only reads is untouched
+    assert!(slice.fleet().root.join("mise").is_dir());
+    assert!(slice.daemon_pool().is_dir());
+    // a second run over an empty slice is fine
+    balerix_runtime::jobs::remove_crew(&slice).unwrap();
+}

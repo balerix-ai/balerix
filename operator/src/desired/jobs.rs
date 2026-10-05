@@ -25,6 +25,16 @@ pub const VOLUME: &str = "/balerix/volume";
 pub const SHARED: &str = "/balerix/shared";
 /// A Job's emptyDir: the gh config, the git profile, nono's home, `HOME`.
 pub const SCRATCH: &str = "/balerix/scratch";
+/// The directory of an agent claim that is mounted at `/balerix/agent`.
+/// A volume's root belongs to root, and the sidecar narrows the agent
+/// root to 0700 (`write_home`), which only its owner may do: the agent
+/// pod's `claim` init container makes this directory as uid 10001.
+pub const AGENT_DIR: &str = "agent";
+/// Every Job's `activeDeadlineSeconds`: a pod that never starts (an image
+/// that cannot be pulled, a claim that is gone) fails the Job, with the
+/// Job's own message, under the Job rule, instead of leaving it running
+/// forever. An hour, for a slow pool install.
+pub const JOB_DEADLINE_SECONDS: i64 = 3600;
 
 pub struct JobContext<'a> {
     pub namespace: &'a str,
@@ -99,10 +109,12 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
         })
         .collect();
     mounts.push(json!({ "name": "scratch", "mountPath": SCRATCH }));
+    mounts.push(json!({ "name": "tmp", "mountPath": "/tmp" }));
     mounts.extend(parts.mounts);
     let mut volumes = vec![
         json!({ "name": "shared", "persistentVolumeClaim": { "claimName": names::shared_claim(ctx.daemon) } }),
         json!({ "name": "scratch", "emptyDir": {} }),
+        json!({ "name": "tmp", "emptyDir": {} }),
     ];
     volumes.extend(parts.volumes);
     let input = hash(&json!({
@@ -124,6 +136,7 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
         "spec": {
             // the operator retries with back-off (§8.3); the Job does not
             "backoffLimit": 0,
+            "activeDeadlineSeconds": JOB_DEADLINE_SECONDS,
             "template": {
                 "metadata": { "labels": labels },
                 "spec": {
@@ -154,6 +167,31 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
             },
         },
     }))
+}
+
+/// The cleanup Job (§21.2): `crew-remove` over the crew's cache and pool,
+/// read-write, after the Fleet's Agents are gone.
+pub fn remove_job(ctx: &JobContext<'_>, fleet: &str, crew: &str) -> Result<Job, DesiredError> {
+    let mut args = strings(&["crew-remove", "--crew"]);
+    args.push(format!("{fleet}/{crew}"));
+    job(
+        ctx,
+        Parts {
+            name: names::remove_job(fleet, crew),
+            component: "remove",
+            extra_labels: vec![
+                ("balerix.ai/fleet", fleet.to_string()),
+                ("balerix.ai/crew", crew.to_string()),
+            ],
+            args,
+            slices: vec![
+                slice(names::vol_crew_repo(fleet, crew), "repo", true),
+                slice(names::vol_crew_pool(fleet, crew), "crew", true),
+            ],
+            volumes: vec![],
+            mounts: vec![],
+        },
+    )
 }
 
 /// `pools/daemon`: the system table this image embeds (§20.3).
@@ -291,7 +329,7 @@ pub fn harvest_job(
                 "persistentVolumeClaim": { "claimName": agent_name, "readOnly": true },
             })],
             mounts: vec![
-                json!({ "name": "agent", "mountPath": "/balerix/agent", "readOnly": true }),
+                json!({ "name": "agent", "mountPath": "/balerix/agent", "subPath": AGENT_DIR, "readOnly": true }),
             ],
         },
     )
@@ -315,6 +353,26 @@ fn message(pods: &[Pod]) -> Option<String> {
     })
 }
 
+/// A failed Job with no pod message: its `Failed` condition's reason and
+/// message (`DeadlineExceeded: Job was active longer than specified
+/// deadline`) when the Job controller wrote them.
+fn failed_condition(job: &Job) -> String {
+    let condition = job
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|c| c.iter().find(|c| c.type_ == "Failed" && c.status == "True"))
+        .filter(|c| c.reason.as_deref().is_some_and(|r| !r.is_empty()));
+    match condition {
+        Some(c) => format!(
+            "the job failed: {}: {}",
+            c.reason.as_deref().unwrap_or_default(),
+            c.message.as_deref().unwrap_or_default()
+        ),
+        None => "the job failed and left no message".to_string(),
+    }
+}
+
 /// `existing` is the Job by `wanted`'s name, if there is one; `pods` are
 /// that Job's pods.
 pub fn job_outcome(existing: Option<&Job>, pods: &[Pod], wanted: &Job) -> JobOutcome {
@@ -330,9 +388,7 @@ pub fn job_outcome(existing: Option<&Job>, pods: &[Pod], wanted: &Job) -> JobOut
         return JobOutcome::Succeeded(message(pods).unwrap_or_default());
     }
     if status.and_then(|s| s.failed).unwrap_or(0) >= 1 {
-        return JobOutcome::Failed(
-            message(pods).unwrap_or_else(|| "the job failed and left no message".to_string()),
-        );
+        return JobOutcome::Failed(message(pods).unwrap_or_else(|| failed_condition(job)));
     }
     JobOutcome::Running
 }
@@ -562,6 +618,24 @@ mod tests {
             JobOutcome::Failed("the job failed and left no message".into())
         );
 
+        // past its deadline with no pod to speak: the Job's own condition
+        let expired = observed(
+            &wanted,
+            json!({ "failed": 1, "conditions": [{ "type": "Failed", "status": "True",
+                "reason": "DeadlineExceeded", "message": "Job was active longer than specified deadline" }] }),
+        );
+        assert_eq!(
+            job_outcome(Some(&expired), &[], &wanted),
+            JobOutcome::Failed(
+                "the job failed: DeadlineExceeded: Job was active longer than specified deadline"
+                    .into()
+            )
+        );
+        assert_eq!(
+            wanted.spec.as_ref().unwrap().active_deadline_seconds,
+            Some(JOB_DEADLINE_SECONDS)
+        );
+
         let newer = Images::for_version("0.3.0");
         let other = daemon_pool_job(&ctx(&newer)).unwrap();
         assert_eq!(job_outcome(Some(&done), &[], &other), JobOutcome::Stale);
@@ -693,6 +767,32 @@ mod tests {
         assert_eq!(
             crew_cond(&s, "ToolsReady"),
             ("False", "PoolSyncRunning", "")
+        );
+    }
+
+    #[test]
+    fn the_remove_job_runs_crew_remove_over_the_crews_writable_slice() {
+        let images = images();
+        let job = remove_job(&ctx(&images), "f", "c").unwrap();
+        insta::assert_yaml_snapshot!(job);
+    }
+
+    #[test]
+    fn every_job_mounts_an_empty_dir_at_tmp() {
+        let images = images();
+        let job = daemon_pool_job(&ctx(&images)).unwrap();
+        let spec = job.spec.unwrap().template.spec.unwrap();
+        let mounts = spec.containers[0].volume_mounts.clone().unwrap();
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.mount_path == "/tmp" && m.name == "tmp")
+        );
+        assert!(
+            spec.volumes
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "tmp" && v.empty_dir.is_some())
         );
     }
 }

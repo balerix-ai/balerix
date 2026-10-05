@@ -56,10 +56,14 @@ reconciles what exists against what was declared.
 - `balerix-operator` (`operator/`, standalone like `agent/`) — the Kubernetes
   operator (Spec O §5, §12). Its `desired` functions are pure, from observed
   objects to typed `k8s-openapi` objects and status conditions; the
-  controllers (sub-project 3b) are the only part that touches a cluster. The
-  Daemon holds no Kubernetes credentials, so the operator pushes resolved
-  fleets to it through `daemon_client`. The sync, pool and harvest Jobs are
-  `balerix-agent` commands over `balerix_runtime::jobs`.
+  controllers (`controllers/`, one `kube_runtime::Controller` per kind, one
+  set per watched namespace) are the only part that touches a cluster: they
+  observe, call `desired`, apply with server-side apply and patch status; the
+  Daemon is polled into a per-fleet record cache every 15 s and the Agents
+  mirror it. The Daemon holds no Kubernetes credentials, so the operator
+  pushes resolved fleets to it through `daemon_client`. The sync, pool,
+  harvest and cleanup (`crew-remove`) Jobs are `balerix-agent` commands over
+  `balerix_runtime::jobs`.
 - `balerix-plugin-sdk` — the plugin side of the host protocol; depends on
   `api` only. `Host` (async, one method per route, including
   `Host::attach`/`watch_fleets`), the `Plugin` trait (`Plugin::routes`) and

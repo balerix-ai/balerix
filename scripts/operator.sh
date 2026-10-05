@@ -8,7 +8,7 @@
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 
-usage() { echo "usage: $0 {build|fmt|check|crds}" >&2; exit 2; }
+usage() { echo "usage: $0 {build|fmt|check|crds|e2e}" >&2; exit 2; }
 [[ $# -eq 1 ]] || usage
 dir="$repo/operator"
 target="$dir/target"
@@ -28,9 +28,31 @@ case "$1" in
     export BALERIX_BIN="${CARGO_TARGET_DIR:-$repo/target}/debug/balerix"
     CARGO_TARGET_DIR="$target" cargo fmt --manifest-path "$dir/Cargo.toml" --all --check
     CARGO_TARGET_DIR="$target" cargo clippy --manifest-path "$dir/Cargo.toml" --all-targets -- -D warnings
+    # the envtest binaries the task pins; the harness skips (fails under
+    # BALERIX_REQUIRE_TOOLS=1) without them
+    if command -v kube-apiserver >/dev/null; then
+      ENVTEST_DIR="$(dirname "$(command -v kube-apiserver)")"
+      export ENVTEST_DIR
+    fi
+    # Every test but tests/e2e_k8s.rs, the journey, which needs the kind
+    # cluster and fails without it under BALERIX_REQUIRE_TOOLS=1 (the `e2e`
+    # mode runs it). A filter, not a list of targets, so a new tests/*.rs
+    # runs here without an edit; nextest rejects a binary() filter that
+    # matches no binary, so the journey's file must keep its name.
     CARGO_TARGET_DIR="$target" cargo nextest run \
-      --config-file "$repo/.config/nextest.toml" \
-      --manifest-path "$dir/Cargo.toml"
+      --config-file "$dir/.config/nextest.toml" \
+      --manifest-path "$dir/Cargo.toml" \
+      -E 'not binary(e2e_k8s)'
+    ;;
+  e2e)
+    root="${CARGO_TARGET_DIR:-$repo/target}/tmp/kind"
+    export KUBECONFIG="$root/kubeconfig"
+    export BALERIX_K8S_IMAGES="${BALERIX_K8S_IMAGES:-balerix:e2e,balerix-agent:e2e}"
+    # the e2e-k8s profile: the journey waits minutes per step, past the
+    # default profile's three-minute termination
+    CARGO_TARGET_DIR="$target" cargo nextest run \
+      --config-file "$dir/.config/nextest.toml" --profile e2e-k8s \
+      --manifest-path "$dir/Cargo.toml" --test e2e_k8s --no-capture
     ;;
   *)
     usage

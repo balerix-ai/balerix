@@ -201,6 +201,17 @@ impl PluginRegistry {
         }
     }
 
+    /// Back to the placeholder of `declare`: not ready, no needs, no hooks.
+    pub fn unhello(&self, name: &AgentName) {
+        if let Some(p) = self.write().plugins.get_mut(name) {
+            p.manifest = placeholder_manifest(name);
+            p.listen = None;
+            p.token = None;
+            p.ready = false;
+            p.degraded = None;
+        }
+    }
+
     pub fn set_ready(&self, name: &AgentName, ready: bool) {
         if let Some(p) = self.write().plugins.get_mut(name) {
             p.ready = ready;

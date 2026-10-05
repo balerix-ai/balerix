@@ -268,7 +268,12 @@ impl DeclaredPlugins {
         let manifest = match checked {
             Ok(m) => m,
             Err(text) => {
+                // The old hello no longer holds: out of the chain, and a
+                // restart must not bring it back.
                 e.hello = HelloState::Refused(text.clone());
+                e.misses = 0;
+                self.registry.unhello(name);
+                let _ = std::fs::remove_file(self.hello_path(name.as_str()));
                 return Err(DaemonError::Invalid(text));
             }
         };
@@ -611,5 +616,30 @@ mod tests {
         assert_eq!(d.replace(vec![]).unwrap(), vec![n("flow")]);
         assert!(!reg.is_installed("flow"));
         assert!(!dir.path().join("flow/hello.json").exists());
+    }
+
+    #[test]
+    fn a_refused_re_hello_leaves_the_chain_and_is_not_resurrected_by_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = PluginRegistry::new();
+        let d = DeclaredPlugins::new(dir.path().into(), reg.clone());
+        let e = entry("flow", &[Capability::Kv]);
+        d.replace(vec![e.clone()]).unwrap();
+        d.hello(&n("flow"), &hello("flow", "kv")).unwrap();
+        assert!(d.hello(&n("flow"), &hello("flow", "workspace")).is_err());
+        assert!(reg.ready_addr(&n("flow")).is_none(), "out of the chain");
+        assert!(
+            !reg.has(&n("flow"), Capability::Kv),
+            "the old needs are gone"
+        );
+        assert!(d.pollable().is_empty());
+        assert!(!dir.path().join("flow/hello.json").exists());
+
+        let d2 = DeclaredPlugins::new(dir.path().into(), PluginRegistry::new());
+        d2.replace(vec![e]).unwrap();
+        assert!(
+            d2.pollable().is_empty(),
+            "the refused hello is not restored"
+        );
     }
 }

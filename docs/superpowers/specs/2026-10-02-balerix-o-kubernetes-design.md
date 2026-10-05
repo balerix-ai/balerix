@@ -1759,11 +1759,13 @@ down-record purge path (#135); the runtime flakes #136 and #137.
   is the one other errors get: 5 s, doubling per attempt, at most 5 min.
   Attempts are counted from the first timeout, so the third waits 20 s.
 - **The third consecutive timeout publishes a Warning Event** on the object,
-  reason `ReconcileTimedOut`, message `the reconcile did not finish in 30s,
-  3 times in a row`, with the count updated on later timeouts. `within`
-  publishes it, since it runs async and `error_policy` does not. The Event
-  goes through kube-runtime's `Recorder` (events.k8s.io/v1, reporter
-  `balerix-operator`), which folds repeats into one Event's series.
+  reason `ReconcileTimedOut`, message `the reconcile did not finish in
+  30s, 3 or more times in a row: backing off`, and so does every later
+  consecutive timeout. The message is fixed, so kube-runtime's `Recorder`
+  (events.k8s.io/v1, reporter `balerix-operator`) folds the repeats into
+  one Event whose series count is the number of repeats. `within` counts
+  the timeout and publishes the Event, since it runs async and
+  `error_policy` does not; `error_policy` reads the count.
   Publishing is best effort: an Event that cannot be written is logged and
   dropped, and never fails the reconcile.
 - **The bound itself does not change.** A reconcile that needs more than

@@ -150,17 +150,24 @@ fn wait_until(mut f: impl FnMut() -> bool) {
     }
 }
 
-fn wait_for_phase(k: &Kube, phase: &str) -> Value {
+/// The usual bound for a phase to come; the post-restart wait has its own
+/// (the first health poll is 10 s after the Daemon starts).
+const PHASE_WAIT: Duration = Duration::from_secs(15);
+
+/// The fake's row in `GET /v1/plugins` (the only plugin listed).
+fn plugin_row(k: &Kube) -> Value {
+    let (_, rows) = tls_call(&k.addr, &k.ca, "GET", "/v1/plugins", Some(ADMIN), None);
+    rows[0].clone()
+}
+
+fn wait_for_phase(k: &Kube, phase: &str, within: Duration) -> Value {
     let start = Instant::now();
     loop {
         let (_, rows) = tls_call(&k.addr, &k.ca, "GET", "/v1/plugins", Some(ADMIN), None);
         if rows[0]["phase"] == phase {
             return rows[0].clone();
         }
-        assert!(
-            start.elapsed() < Duration::from_secs(15),
-            "phase {phase} never came: {rows}"
-        );
+        assert!(start.elapsed() < within, "phase {phase} never came: {rows}");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -193,7 +200,7 @@ fn a_fake_plugin_in_its_own_process_says_hello_over_tls_and_intercepts() {
     let scratch = tempfile::tempdir().unwrap();
     declare(&k, port, GRANT, json!({ "greeting": "hi" }));
     let _fake = fake_plugin(&k, port, scratch.path());
-    wait_for_phase(&k, "ready");
+    wait_for_phase(&k, "ready", PHASE_WAIT);
     assert!(
         wait_for_file(&scratch.path().join("fake-plugin.hello")).contains("\"greeting\": \"hi\"")
     );
@@ -240,7 +247,7 @@ fn a_grant_short_of_the_manifest_refuses_the_hello_and_the_row_says_which() {
     let scratch = tempfile::tempdir().unwrap();
     declare(&k, port, &["actions", "fleets", "kv"], json!({}));
     let _fake = fake_plugin(&k, port, scratch.path());
-    let row = wait_for_phase(&k, "failed");
+    let row = wait_for_phase(&k, "failed", PHASE_WAIT);
     assert_eq!(
         row["message"],
         "hello.manifest.needs: manage is not granted"
@@ -283,14 +290,33 @@ fn a_daemon_restart_keeps_a_running_plugin_ready_without_a_new_hello() {
     let scratch = tempfile::tempdir().unwrap();
     declare(&k, port, GRANT, json!({}));
     let _fake = fake_plugin(&k, port, scratch.path());
-    wait_for_phase(&k, "ready");
+    let before = wait_for_phase(&k, "ready", PHASE_WAIT);
+    let version = before["version"].as_str().unwrap().to_string();
+    assert!(!version.is_empty(), "{before}");
     let hello = scratch.path().join("fake-plugin.hello");
     let hello_at = std::fs::metadata(&hello).unwrap().modified().unwrap();
     // restart the Daemon on the same state (the fake keeps running), then
     // re-send the list as the operator does after a restart
     let k = restart(k);
     declare(&k, port, GRANT, json!({}));
-    wait_for_phase(&k, "ready"); // the first health poll, ≤ 10 s
+    // The restore itself: the persisted hello is back (the hello'd
+    // version, where an entry still waiting for a hello lists none) but
+    // not ready. The health loop sleeps HEALTH_INTERVAL before its first
+    // poll, so nothing can have made it ready this soon after the start.
+    let restored = plugin_row(&k);
+    assert_eq!(
+        (restored["phase"].as_str(), restored["version"].as_str()),
+        (Some("starting"), Some(version.as_str())),
+        "{restored}"
+    );
+    // Ready from the first health poll (10 s after the start). Only a
+    // hello'd entry is polled, so health alone could not have done this
+    // for an entry without one.
+    let after = wait_for_phase(&k, "ready", Duration::from_secs(30));
+    assert_eq!(after["version"], before["version"], "{after}");
+    // Secondary: the fake says hello only at start-up, so an unchanged
+    // file shows it was not restarted or re-configured; it cannot show the
+    // Daemon restored the hello (the assertions above do that).
     let again = std::fs::metadata(&hello).unwrap().modified().unwrap();
     assert_eq!(hello_at, again, "no second hello");
 }

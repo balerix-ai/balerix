@@ -17,8 +17,8 @@ use kube::api::{Patch, PatchParams, PostParams};
 use support::envtest::envtest;
 use support::stub_daemon::StubDaemon;
 use support::{
-    TestClock, finish_job, hold_for, namespace, reap_claim, reap_pod, reap_pod_uid, spawn_operator,
-    wait_for,
+    TestClock, expire_job, finish_job, hold_for, namespace, reap_claim, reap_pod, reap_pod_uid,
+    spawn_operator, wait_for,
 };
 
 fn daemon_spec() -> DaemonSpec {
@@ -469,6 +469,62 @@ async fn a_failed_pool_job_is_reported_and_retried_after_the_delay() {
         attempts.is_none() || attempts.as_deref() == Some("{}"),
         "{attempts:?}"
     );
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_whose_pod_was_never_created_fails_at_its_deadline_and_is_retried() {
+    let Some(env) = envtest().await else { return };
+    let ns = namespace(&env.client, "expired").await;
+    let client = env.client.clone();
+    let daemons: Api<Daemon> = Api::namespaced(client.clone(), &ns);
+    daemons
+        .create(
+            &PostParams::default(),
+            &Daemon::new("default", daemon_spec()),
+        )
+        .await
+        .unwrap();
+    let clock = TestClock::default();
+    let operator = spawn_operator(env, &ns, None, &clock);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let first = wait_for("the pool Job", Duration::from_secs(60), || async {
+        jobs.get_opt("balerix-default-pool").await.unwrap()
+    })
+    .await;
+
+    // a quota refused its pod; the deadline failed it with `failed: 0`
+    expire_job(&client, &ns, "balerix-default-pool").await;
+    let status = wait_for(
+        "SystemToolsReady=False for the expired Job",
+        Duration::from_secs(10),
+        || async {
+            let s = daemons.get("default").await.unwrap().status?;
+            let tools = condition(&s.conditions, "SystemToolsReady");
+            (tools.status == "False" && tools.reason == "PoolSyncFailed").then_some(s)
+        },
+    )
+    .await;
+    assert_eq!(
+        condition(&status.conditions, "SystemToolsReady").message,
+        "the job failed: DeadlineExceeded: Job was active longer than specified deadline"
+    );
+
+    clock.advance(31);
+    wait_for("the retry", Duration::from_secs(60), || async {
+        let j = jobs.get_opt("balerix-default-pool").await.unwrap()?;
+        (j.metadata.uid != first.metadata.uid).then_some(j)
+    })
+    .await;
+    let attempts = daemons
+        .get("default")
+        .await
+        .unwrap()
+        .metadata
+        .annotations
+        .unwrap()["balerix.ai/attempts"]
+        .clone();
+    assert_eq!(attempts, "{\"balerix-default-pool\":2}");
     operator.abort();
 }
 

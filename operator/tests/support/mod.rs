@@ -169,6 +169,25 @@ pub fn spawn_operator(
     .abort_handle()
 }
 
+/// The Job controller's part for a Job whose pod was never created (a
+/// quota or a webhook refused it) and whose deadline passed:
+/// `Failed=True/DeadlineExceeded` with `failed: 0` and no pod. 1.34 wants
+/// `startTime` and `FailureTarget=True` before `Failed=True`.
+pub async fn expire_job(client: &Client, namespace: &str, name: &str) {
+    use k8s_openapi::api::batch::v1::Job;
+    use kube::api::{Patch, PatchParams};
+    let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+    let now = k8s_openapi::jiff::Timestamp::now().to_string();
+    let why = "Job was active longer than specified deadline";
+    let status = serde_json::json!({ "status": { "startTime": now, "conditions": [
+        { "type": "FailureTarget", "status": "True", "reason": "DeadlineExceeded", "message": why, "lastTransitionTime": now },
+        { "type": "Failed", "status": "True", "reason": "DeadlineExceeded", "message": why, "lastTransitionTime": now }
+    ] } });
+    jobs.patch_status(name, &PatchParams::default(), &Patch::Merge(&status))
+        .await
+        .unwrap();
+}
+
 /// The kubelet's part for a Job in envtest: marks it succeeded or failed
 /// (with a `Failed` condition stamped now), and when `message` is given,
 /// leaves a pod labelled `job-name` whose container terminated with it.

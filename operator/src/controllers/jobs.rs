@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 
 use super::{Context, Error};
 use crate::desired::common::JobOutcome;
-use crate::desired::jobs::job_outcome;
+use crate::desired::jobs::{job_failed, job_outcome};
 
 /// On the owner: a JSON object from Job name to the attempt its next run
 /// is. Absent or missing the name means attempt 1.
@@ -86,9 +86,7 @@ fn failed_at(job: &Job) -> Option<i64> {
 
 /// Whether a Job is still running: created and not yet succeeded or failed.
 fn unfinished(job: &Job) -> bool {
-    let status = job.status.as_ref();
-    status.and_then(|s| s.succeeded).unwrap_or(0) == 0
-        && status.and_then(|s| s.failed).unwrap_or(0) == 0
+    job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0) == 0 && !job_failed(job)
 }
 
 /// Whether another Job of this crew is unfinished or still being deleted
@@ -267,6 +265,15 @@ where
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn a_job_failed_by_its_condition_alone_is_finished() {
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "apiVersion": "batch/v1", "kind": "Job", "metadata": { "name": "j" },
+            "status": { "conditions": [{ "type": "Failed", "status": "True", "reason": "DeadlineExceeded" }] }
+        })).unwrap();
+        assert!(!unfinished(&job));
+    }
 
     #[test]
     fn the_delay_doubles_from_thirty_seconds_to_a_ten_minute_cap() {

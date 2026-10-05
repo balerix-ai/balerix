@@ -373,6 +373,18 @@ fn failed_condition(job: &Job) -> String {
     }
 }
 
+/// Whether a Job failed: a pod counted as failed, or the Job controller's
+/// `Failed` condition. A Job whose pod was never created (a ResourceQuota,
+/// an admission webhook) reaches `Failed=True/DeadlineExceeded` under
+/// `activeDeadlineSeconds` with `failed: 0` (§22.3).
+pub fn job_failed(job: &Job) -> bool {
+    let status = job.status.as_ref();
+    status.and_then(|s| s.failed).unwrap_or(0) >= 1
+        || status
+            .and_then(|s| s.conditions.as_ref())
+            .is_some_and(|c| c.iter().any(|c| c.type_ == "Failed" && c.status == "True"))
+}
+
 /// `existing` is the Job by `wanted`'s name, if there is one; `pods` are
 /// that Job's pods.
 pub fn job_outcome(existing: Option<&Job>, pods: &[Pod], wanted: &Job) -> JobOutcome {
@@ -387,7 +399,7 @@ pub fn job_outcome(existing: Option<&Job>, pods: &[Pod], wanted: &Job) -> JobOut
         // a success whose pod is gone has no message to report; that is not a failure
         return JobOutcome::Succeeded(message(pods).unwrap_or_default());
     }
-    if status.and_then(|s| s.failed).unwrap_or(0) >= 1 {
+    if job_failed(job) {
         return JobOutcome::Failed(message(pods).unwrap_or_else(|| failed_condition(job)));
     }
     JobOutcome::Running
@@ -576,6 +588,36 @@ mod tests {
 
     fn pod(statuses: serde_json::Value) -> Pod {
         serde_json::from_value(json!({ "metadata": { "name": "p" }, "status": statuses })).unwrap()
+    }
+
+    #[test]
+    fn a_job_whose_pod_was_never_created_fails_by_its_condition() {
+        let images = images();
+        let wanted = daemon_pool_job(&ctx(&images)).unwrap();
+        // a quota refused the pod; the deadline failed the Job: `failed` is 0
+        let refused = observed(
+            &wanted,
+            json!({ "conditions": [{ "type": "Failed", "status": "True",
+                "reason": "DeadlineExceeded", "message": "Job was active longer than specified deadline" }] }),
+        );
+        assert!(job_failed(&refused));
+        assert_eq!(
+            job_outcome(Some(&refused), &[], &wanted),
+            JobOutcome::Failed(
+                "the job failed: DeadlineExceeded: Job was active longer than specified deadline"
+                    .into()
+            )
+        );
+        // a condition that is not True decides nothing
+        let not_yet = observed(
+            &wanted,
+            json!({ "conditions": [{ "type": "Failed", "status": "False" }] }),
+        );
+        assert!(!job_failed(&not_yet));
+        assert_eq!(
+            job_outcome(Some(&not_yet), &[], &wanted),
+            JobOutcome::Running
+        );
     }
 
     #[test]

@@ -3,7 +3,8 @@
 **Date:** 2026-10-02
 **Status:** Design approved in brainstorm 2026-10-02; written spec approved
 2026-10-02; the spike's findings recorded in §19; sub-project 2 decisions
-in §7.4; sub-project 3a decisions in §20
+in §7.4; sub-project 3a decisions in §20; sub-project 4 decisions in
+§23
 **Scope:** running balerix on Kubernetes. A `balerix-operator` reconciles
 five custom resources (Daemon, Fleet, Crew, Agent, Plugin) into pods,
 claims, Secrets and Jobs. Each Daemon object is a `balerix serve` instance
@@ -905,7 +906,8 @@ Each gets its own plan.
    plugins. Built as two plans, 3a without a cluster and 3b on one (§20,
    §21). 3a done 2026-10; 3b done 2026-10 (PR #127).
 4. **Plugins.** §9. Done when `e2e-k8s` passes with flow and web, and the
-   managed journey passes with `dev fake-plugin`.
+   managed journey passes with `dev fake-plugin`. Built as two plans, 4a
+   without a cluster and 4b on one (§23).
 5. **Release and charts.** §13, §14. Done when a fork rehearsal publishes
    images and both charts and `helm install` from the published index
    brings up a Ready fleet.
@@ -1864,3 +1866,241 @@ their status writers. An Event fits all four the same way and is where
   `CrewLocked` Event on the owner; a CA Secret rewritten with another
   authority's key is re-minted once, after which the pod template's
   annotation holds across reconciles.
+
+## 23. Decided in sub-project 4 (2026-10)
+
+Sub-project 4 is §9: plugins on Kubernetes. Brainstormed 2026-10-05. It
+refines §4.5, §5.5 and §9 where the code showed them to be incomplete,
+and it is built as two plans cut at the cluster, as 3 was:
+
+- **4a, without a cluster:** `balerix-api`, the plugin SDK and the
+  Daemon (§23.1–§23.3). Done when the two-process integration tests of
+  §23.6 pass.
+- **4b, on a cluster:** the Plugin controller, the Daemon controller's
+  plugin list, the managed-Fleet writer, the plugin images and the plugin
+  journey in `e2e-k8s` (§23.4–§23.6). Done when §17's condition holds:
+  `e2e-k8s` passes with flow and web, and the managed journey passes with
+  `dev fake-plugin`.
+
+Not in this item: the chart, its RBAC (Events included) and publishing
+(sub-project 5); github and matrix in `e2e-k8s` (they need no code change,
+§23.1, but external accounts); a hot reload of renewed certificates.
+
+### 23.1 Wire and SDK
+
+- **`hello` carries the manifest.** `HelloRequest` gains
+  `manifest: Option<PluginManifest>` (serde default, skipped when `None`);
+  the protocol stays 1. The SDK's `Plugin` trait gains
+  `fn manifest(&self) -> &'static str`, which each in-tree plugin
+  implements as `include_str!("../package/balerix-plugin.yaml")` and
+  `dev fake-plugin` builds inline; the SDK parses it and sends it. On one
+  machine the Daemon still reads the package's manifest and ignores
+  `hello`'s copy. In Kubernetes mode a `hello` without one is refused:
+  `hello.manifest: required in kubernetes mode`.
+- **Inputs stay environment variables; secrets are files they name.**
+  This amends §9.1. The four variables of today keep their meaning. New,
+  all optional, set by the Deployment (§23.4):
+
+  | Variable | Meaning |
+  |---|---|
+  | `BALERIX_PLUGIN_TOKEN_FILE` | the token, read from a file; wins over `BALERIX_PLUGIN_TOKEN` |
+  | `BALERIX_CA_FILE` | the only authority the host client trusts; `BALERIX_API_URL` must then be `https://` |
+  | `BALERIX_PLUGIN_TLS_CERT`, `BALERIX_PLUGIN_TLS_KEY` | serve TLS with this certificate and key (both or neither) |
+  | `BALERIX_PLUGIN_LISTEN` | the bind address; default `127.0.0.1:0`, a pod sets `0.0.0.0:7644` |
+
+  The plugin's config is not mounted. It arrives in the `hello` reply as
+  it does today, so it never lands on the pod's disk; §9.1's "its config
+  (secrets injected)" among the mounted files is withdrawn.
+- **TLS is always on in the core crates, and trusts one authority.** The
+  SDK serves with axum-server (`tls-rustls-no-provider`, the Daemon's
+  stack, §7.4); its host client is reqwest with `rustls-no-provider` and
+  `use_preconfigured_tls`, a root store holding only the CA; its
+  WebSockets use tokio-tungstenite's `Connector::Rustls` with the same
+  config. The Daemon's plugin client (`plugins/client.rs`) gets the same
+  client shape, trusting the authority the Daemon serves under. The ring
+  provider is installed explicitly; there are no webpki or native roots.
+  With no CA and no certificate given, both sides stay plain HTTP on
+  loopback, exactly as today. A renewed certificate is picked up by a
+  restart (the operator rolls the Deployment, §23.4), never reloaded.
+  `scripts/check-core-deps.sh` asserts the new exact feature sets. A cargo
+  feature was rejected: two SDK feature sets to test, and a plugin built
+  without it would fail only in a pod.
+- **`hello.listen` is ignored in Kubernetes mode.** The Daemon calls the
+  address the operator gives it (§23.2). Plugins still send it, and on
+  one machine it must still be loopback.
+- **github and matrix need no code change.** github's webhook `listen`
+  is set through `spec.config` to the `expose` port; it is plain HTTP
+  behind its Service, and TLS toward GitHub is an ingress's. matrix keeps
+  its store in `BALERIX_PLUGIN_SCRATCH`: the scratch claim when declared,
+  an `emptyDir` otherwise.
+
+### 23.2 The Daemon's plugins in Kubernetes mode
+
+- **A plugin-source port behind `PluginHost`.** Where the Daemon's
+  plugins come from becomes a seam with two adapters. `Packages` is
+  today's code, unchanged: `plugins.yaml`, the materializer and the
+  reserved `balerix` fleet's actor. `Declared` is Kubernetes mode's and
+  lives in `kube/`, beside `NoFiles`, `NoPool` and `LinkHub`. The
+  registry, the interceptor chain, the plugin client, the proxy and the
+  `plugin-host` routes sit above the port and do not change. Rejected: a
+  mirrored reserved fleet (mirroring assumes a sidecar link per agent,
+  and a plugin's lifecycle is its Deployment's), and a sidecar per plugin
+  (contradicts §9.1).
+- **`PUT /v1/plugins` (admin token)** replaces the whole list; its order
+  is interceptor order, the order of `Daemon.spec.plugins`. An entry is
+  `{name, grant, config, fleetDefaults, token, url}`: `grant` a list of
+  capabilities, `token` at least 32 characters, `url` `https://`. An
+  unknown capability, a duplicate name, a reserved name or a non-https
+  url is 400. `kubernetes` joins the reserved plugin names. A tmux-mode
+  Daemon answers 409 `this daemon reads plugins.yaml`. In Kubernetes
+  mode `POST /v1/plugins/sync` and `DELETE /v1/plugins/{name}` answer
+  409 `this daemon is in kubernetes mode; change its plugins through the
+  Daemon's spec.plugins`.
+- **`Declared` holds the list in memory** (§9.2) and matches a
+  presented token against it in constant time, as `plugin_for_token`
+  does. `hello` is checked in order: the name equals the token's plugin;
+  the protocol is 1; a manifest is present; its name equals the entry's;
+  its `needs` are within the grant. The refusal names the first failure
+  (`hello.manifest.needs: kv is not granted`) and is kept on the
+  plugin's row. Routes go on checking the manifest's `needs`, which the
+  grant now bounds.
+- **Readiness.** A plugin is ready from an accepted `hello` until three
+  consecutive missed health polls (the existing 10 s poll); a good poll
+  makes it ready again only if a `hello` was accepted for its current
+  entry. Activation is re-sent on `hello`, as today.
+- **A Daemon restart does not need a new `hello`.** An accepted hello's
+  manifest and version are written to
+  `<state>/plugins/<name>/hello.json` with the hash of the list entry
+  they were accepted under. When the operator re-sends the list after a
+  restart (§23.4), an entry whose hash matches is re-checked against its
+  grant and becomes ready on its first good health poll, with activation
+  re-sent then. Any change to an entry changes its hash; the operator's
+  Deployment hash covers the same fields, so the pod rolls and says
+  `hello` again.
+- **`GET /v1/plugins`** keeps its row, `PluginStatus`. In Kubernetes
+  mode `phase` is `Ready` when ready and `Starting` before a first
+  `hello`; a refused `hello` is `Failed` with the refusal in `message`;
+  a ready plugin that misses its polls is `Failed` with `health: …`.
+  `listen` is the entry's url. The operator reads these rows (§23.4).
+- **Dropping a plugin** from the list takes it out of the chain and
+  drops its stored managed requests (§23.3); the operator deletes its
+  Fleets. The Daemon itself downs nothing for a dropped plugin in
+  Kubernetes mode: the fleets are the operator's.
+
+### 23.3 Managed fleets
+
+This refines §9.4.
+
+- **The plugin's `PUT plugin-host/fleets/{name}` answers at once.** The
+  Daemon runs today's checks synchronously: reserved name, owner,
+  resolution beneath the plugin's `fleetDefaults` held to the restricted
+  surface (Spec M §12.1). A failure is the same 400 or 409 as on one
+  machine. On success it stores `{name, plugin, file}` in memory and under
+  `<state>/managed/<name>.json`, records the fleet with
+  `owner: <plugin>`, the resolved spec and no agents, and answers as
+  Spec M §12.2 says: the record if the plugin has `fleets`, 204
+  otherwise. This is the SDK's documented contract ("the call returns
+  before the fleet is ready"); `fleets/watch` and `GET fleets/{name}`
+  see the record at once and its agents when the operator's pods link.
+  Rejected: holding the PUT until the operator has applied (ties a
+  plugin to the operator's poll and fails while the operator is down).
+- **The plugin's `DELETE plugin-host/fleets/{name}`** marks the stored
+  request down with its query, and is answered with the record.
+- **`GET /v1/managed-fleets` (admin)** lists
+  `[{name, plugin, file, down}]`, `down` being the query or absent.
+- **Owner stays the plugin.** Mirroring is a property of the mode
+  (`actor.rs`), not of `owner: kubernetes`, so a managed fleet's record
+  keeps `owner: <plugin>`: the plugin downs it, watches it and gets the
+  usual 409 on others'. The operator applies it with `PUT
+  /v1/fleets/{name}` carrying `agent_tokens` and a new field
+  `managed_by: <plugin>`; `Caller::Kubernetes` gains the plugin it acts
+  for, and `check_owner` accepts the operator's apply or down of a record
+  whose owner is that plugin. Without `managed_by` the operator's rules
+  of §7.4 are unchanged. The CLI still gets 409.
+
+### 23.4 The operator
+
+- **The Plugin controller (§5.5)** acts only on a Plugin named in a
+  Daemon's `spec.plugins` in its namespace. Unlisted, the Plugin is
+  `Deployed=False/NotListed` and owns nothing; a name listed by two
+  Daemons makes both Daemons `PluginsReady=False/PluginListedTwice`.
+  Listed, it applies with server-side apply, owner-referenced to the
+  Plugin:
+  - a token Secret (`pki::new_token`);
+  - a serving Secret issued by the listing Daemon's authority for the
+    Service's names (`<plugin>`, `.<ns>`, `.<ns>.svc`,
+    `.<ns>.svc.cluster.local`), renewed as the Daemon's is, reissued when
+    `pki::verifies` fails;
+  - the optional scratch claim;
+  - a Deployment of one replica: §9.1's hardened pod (the agent pod's
+    security context, read-only root, an `emptyDir` at `/tmp`), the
+    variables of §23.1, the token, certificate, key and CA mounted under
+    `/balerix/{token,tls,ca}`, the scratch claim or an `emptyDir` at
+    `BALERIX_PLUGIN_SCRATCH`, `spec.resources`;
+  - a Service: port 7644, plus `expose.port` when set;
+  - a NetworkPolicy: ingress to 7644 from the Daemon's pod only, to the
+    `expose` port from anywhere; egress to the Daemon, DNS and 443.
+  A hash annotation on the pod template over the spec, the grant, the
+  resolved config, the referenced Secrets' data, the token and the
+  serving certificate rolls the Deployment (§5.5).
+- **`spec.secrets` are resolved by the operator**, injected into
+  `config` as `plugins.yaml`'s `secrets` are, and reach the Daemon only
+  through `PUT /v1/plugins`, never a file in the plugin's pod.
+- **The Daemon controller sends the list.** It builds it from
+  `spec.plugins` and their Plugins (url
+  `https://<plugin>.<ns>.svc:7644`) and sends `PUT /v1/plugins` on every
+  reconcile; the call is idempotent, and it is how the list returns after
+  a Daemon restart. A Plugin whose token or serving Secret is not yet
+  made is left out of that pass. `PluginsReady` replaces
+  `PluginsUnsupported` (§20.2): `True` when every listed plugin's row is
+  `Ready`, otherwise `False` with `PluginMissing` (no Plugin object),
+  `PluginRefused` (the row's message) or `PluginNotReady`.
+- **The Plugin's conditions** are `Deployed` (the Deployment is
+  available) and `Ready` (its row is `Ready`; the refusal as message
+  when `Failed`), polled with `GET /v1/plugins` on the 15 s requeue.
+- **The managed-Fleet writer** runs in the Daemon reconcile. For each
+  live request of `GET /v1/managed-fleets` it writes a Fleet `<name>`
+  with server-side apply: labelled `balerix.ai/managed-by: <plugin>`,
+  owner-referenced to the Plugin (deleting the Plugin deletes its
+  Fleets), `daemon` the listing Daemon, and the file's defaults and crews
+  merged beneath the Plugin's `fleetDefaults`, `runner: pod`. It never
+  writes a Fleet that lacks the label or carries another plugin's; that
+  request gets a `FleetConflict` Event on the Plugin. A request marked
+  down, a request no longer listed, or a plugin dropped from
+  `spec.plugins` deletes the Fleet, `retain` taken from the down query
+  (`keep-repos` → `Branches`, else `None`). The restricted surface is not
+  checked again: the Daemon resolved the file.
+- **The Fleet controller** sends `managed_by: <plugin>` when its Fleet
+  carries the label.
+
+### 23.5 Images
+
+- `kind-up` also builds and loads `balerix-plugin-flow:e2e` and
+  `balerix-plugin-web:e2e` from `docker/plugin/Dockerfile` with the musl
+  binaries, and `balerix-fake-plugin:e2e`: a stage `FROM balerix:e2e`
+  whose entrypoint is `balerix dev fake-plugin`.
+- The released plugin images (`IMAGE_UNITS`) already use
+  `docker/plugin/Dockerfile`; wiring them to a chart is sub-project 5's.
+
+### 23.6 Testing
+
+- **4a:** unit tests for `Declared` (token match, every `hello`
+  refusal, readiness over missed polls, the persisted hello across a
+  restart) and the managed-request store; SDK tests for the new
+  variables and TLS on both sides; two-process integration tests with
+  the Daemon in Kubernetes mode serving TLS and `dev fake-plugin` given
+  CA, certificate and token files: `hello` accepted, a grant refusal, an
+  interception over TLS, a managed PUT then `GET /v1/managed-fleets`
+  then an operator-style apply with `managed_by`, and a Daemon restart
+  that keeps the plugin ready without a new `hello`. The one-machine
+  plugin tests and `plugin_manage_journey` stay green unchanged.
+- **4b:** envtest tests for listed and unlisted Plugins, the objects and
+  the hash roll, a changed authority reissuing the serving certificate,
+  `PluginsReady` over a stub Daemon's rows, the managed writer's label
+  rules, and drop → delete. `e2e-k8s` gains the plugin journey: a Daemon
+  lists flow and web and both reach `Ready`; a flow rule acts on an
+  agent's Stop; web's review page is fetched through the Daemon's
+  `/v1/plugins/web/…` over the port-forward; `dev fake-plugin` with
+  `manage` brings up a managed Fleet whose agents become Ready; removing
+  it from `spec.plugins` deletes the Fleet. The operator runs out of
+  cluster as in §21.4, so the missing Events RBAC does not bite here.

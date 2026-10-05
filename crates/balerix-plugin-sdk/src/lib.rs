@@ -13,6 +13,7 @@ pub mod host;
 pub mod metrics;
 pub mod plugin;
 pub mod testing;
+pub mod tls;
 
 pub use host::{Attach, AttachRead, AttachWrite, CloseReason, FleetWatch, Host};
 pub use metrics::Metrics;
@@ -27,6 +28,15 @@ pub struct Env {
     pub name: String,
     pub token: String,
     pub scratch: PathBuf,
+    /// `BALERIX_CA_FILE` (Spec O §23.1): the one authority the client
+    /// trusts; `api_url` must then be `https://`.
+    pub ca: Option<PathBuf>,
+    /// `BALERIX_PLUGIN_TLS_CERT` / `_KEY` (Spec O §23.1): the certificate
+    /// and key a plugin in a pod serves with.
+    pub tls: Option<(PathBuf, PathBuf)>,
+    /// `BALERIX_PLUGIN_LISTEN` (Spec O §23.1): `127.0.0.1:0` on one machine,
+    /// `0.0.0.0:7644` in a pod.
+    pub listen: String,
 }
 
 impl fmt::Debug for Env {
@@ -36,6 +46,9 @@ impl fmt::Debug for Env {
             .field("name", &self.name)
             .field("token", &"<redacted>")
             .field("scratch", &self.scratch)
+            .field("ca", &self.ca)
+            .field("tls", &self.tls)
+            .field("listen", &self.listen)
             .finish()
     }
 }
@@ -44,6 +57,8 @@ impl fmt::Debug for Env {
 pub enum SdkError {
     #[error("environment: {0} is not set")]
     MissingEnv(&'static str),
+    #[error("environment: {0}")]
+    Env(&'static str),
     #[error("daemon: {0}")]
     Transport(String),
     #[error("daemon: HTTP {status}: {message}")]
@@ -58,19 +73,47 @@ pub enum SdkError {
 
 impl Env {
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, SdkError> {
-        let var = |k: &'static str| {
+        let opt = |k: &str| {
             get(k)
-                .filter(|v| !v.trim().is_empty())
-                .ok_or(SdkError::MissingEnv(k))
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let var = |k: &'static str| opt(k).ok_or(SdkError::MissingEnv(k));
+        // Spec O §23.1: a pod mounts the token; the file wins
+        let token = match opt("BALERIX_PLUGIN_TOKEN_FILE") {
+            Some(path) => std::fs::read_to_string(&path)
+                .map_err(|e| SdkError::Transport(format!("{path}: {e}")))?
+                .trim()
+                .to_string(),
+            None => var("BALERIX_PLUGIN_TOKEN")?,
+        };
+        let api_url = var("BALERIX_API_URL")?.trim_end_matches('/').to_string();
+        let ca = opt("BALERIX_CA_FILE").map(PathBuf::from);
+        if ca.is_some() && !api_url.starts_with("https://") {
+            return Err(SdkError::Env(
+                "BALERIX_CA_FILE is set, so BALERIX_API_URL must be https://",
+            ));
+        }
+        let tls = match (
+            opt("BALERIX_PLUGIN_TLS_CERT"),
+            opt("BALERIX_PLUGIN_TLS_KEY"),
+        ) {
+            (Some(c), Some(k)) => Some((PathBuf::from(c), PathBuf::from(k))),
+            (None, None) => None,
+            _ => {
+                return Err(SdkError::Env(
+                    "BALERIX_PLUGIN_TLS_CERT and BALERIX_PLUGIN_TLS_KEY go together",
+                ));
+            }
         };
         Ok(Self {
-            api_url: var("BALERIX_API_URL")?
-                .trim()
-                .trim_end_matches('/')
-                .to_string(),
+            api_url,
             name: var("BALERIX_PLUGIN_NAME")?,
-            token: var("BALERIX_PLUGIN_TOKEN")?,
+            token,
             scratch: PathBuf::from(var("BALERIX_PLUGIN_SCRATCH")?),
+            ca,
+            tls,
+            listen: opt("BALERIX_PLUGIN_LISTEN").unwrap_or_else(|| "127.0.0.1:0".into()),
         })
     }
 
@@ -131,5 +174,81 @@ mod tests {
         let host = Host::new(e).unwrap();
         let dbg = format!("{host:?}");
         assert!(!dbg.contains("tok-secret"), "{dbg}");
+    }
+
+    #[test]
+    fn env_reads_the_file_inputs_and_holds_their_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("token");
+        std::fs::write(&tok, "tok-from-file\n").unwrap();
+        let ca = dir.path().join("ca.crt");
+        let mut vars: Vec<(&'static str, String)> = vec![
+            ("BALERIX_API_URL", "https://balerix.ns.svc:7643".into()),
+            ("BALERIX_PLUGIN_NAME", "flow".into()),
+            ("BALERIX_PLUGIN_TOKEN_FILE", tok.display().to_string()),
+            ("BALERIX_PLUGIN_SCRATCH", "/scratch".into()),
+            ("BALERIX_CA_FILE", ca.display().to_string()),
+            ("BALERIX_PLUGIN_TLS_CERT", "/tls/tls.crt".into()),
+            ("BALERIX_PLUGIN_TLS_KEY", "/tls/tls.key".into()),
+            ("BALERIX_PLUGIN_LISTEN", "0.0.0.0:7644".into()),
+        ];
+        fn get(vars: &[(&'static str, String)]) -> impl Fn(&str) -> Option<String> + use<> {
+            let vars = vars.to_vec();
+            move |k: &str| vars.iter().find(|(kk, _)| *kk == k).map(|(_, v)| v.clone())
+        }
+        let e = Env::from_env(get(&vars)).unwrap();
+        assert_eq!(e.token, "tok-from-file", "file wins, trimmed");
+        assert_eq!(e.ca.as_deref(), Some(ca.as_path()));
+        assert_eq!(e.listen, "0.0.0.0:7644");
+        assert!(e.tls.is_some());
+        // a CA with a plain-http daemon url is refused
+        vars[0].1 = "http://balerix:7643".into();
+        assert_eq!(
+            Env::from_env(get(&vars)).unwrap_err().to_string(),
+            "environment: BALERIX_CA_FILE is set, so BALERIX_API_URL must be https://"
+        );
+        vars[0].1 = "https://balerix.ns.svc:7643".into();
+        // a certificate without its key is refused
+        vars.retain(|(k, _)| *k != "BALERIX_PLUGIN_TLS_KEY");
+        assert_eq!(
+            Env::from_env(get(&vars)).unwrap_err().to_string(),
+            "environment: BALERIX_PLUGIN_TLS_CERT and BALERIX_PLUGIN_TLS_KEY go together"
+        );
+    }
+
+    #[test]
+    fn env_without_the_new_variables_is_todays_env() {
+        let e = Env::from_env(env_of(FULL)).unwrap();
+        assert_eq!(
+            (e.ca, e.tls, e.listen.as_str()),
+            (None, None, "127.0.0.1:0")
+        );
+    }
+}
+
+/// A throwaway authority for TLS tests (Spec O §23.1); host.rs and the
+/// plugin tests share it.
+#[cfg(test)]
+pub(crate) mod test_tls {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use std::path::{Path, PathBuf};
+
+    /// (ca.crt, tls.crt, tls.key) for 127.0.0.1 in `dir`.
+    pub(crate) fn authority(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca, ca_key);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .unwrap()
+            .signed_by(&key, &issuer)
+            .unwrap();
+        let paths = (dir.join("ca.crt"), dir.join("tls.crt"), dir.join("tls.key"));
+        std::fs::write(&paths.0, ca_cert.pem()).unwrap();
+        std::fs::write(&paths.1, leaf.pem()).unwrap();
+        std::fs::write(&paths.2, key.serialize_pem()).unwrap();
+        paths
     }
 }

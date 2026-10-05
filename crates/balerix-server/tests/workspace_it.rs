@@ -36,6 +36,9 @@ async fn start_silent(w: &World, name: &str) -> Host {
         name: name.into(),
         token: token(w, name).await,
         scratch: w.dir.path().join("s"),
+        ca: None,
+        tls: None,
+        listen: "127.0.0.1:0".into(),
     };
     let (listener, listen) = bind().await.unwrap();
     let tok = env.token.clone();

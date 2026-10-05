@@ -280,6 +280,7 @@ mod tests {
     impl Plugin for Silent {}
 
     async fn post(url: &str, token: &str, body: Value) -> (u16, Value) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
         let r = c
             .post(url)
@@ -322,6 +323,7 @@ mod tests {
         )
         .await;
         assert_eq!((s, v), (200, json!({ "response": { "x": 2 } })));
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
         assert_eq!(
             c.get(format!("{base}/v1/health"))
@@ -366,6 +368,7 @@ mod tests {
         }
         // every route, not a sample: the middleware is one, but a route
         // registered outside it would pass unnoticed
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
         for (method, path) in [
             ("POST", "/v1/activate"),
@@ -411,6 +414,7 @@ mod tests {
         }
         let (listener, listen) = bind().await.unwrap();
         tokio::spawn(run(listener, Arc::new(Routed), "tok"));
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
         for (path, want) in [("/v1/routes", "root"), ("/v1/routes/x", "x")] {
             let r = c
@@ -458,6 +462,7 @@ mod tests {
         .unwrap();
         let listen = fake.hellos()[0].listen.clone();
         assert!(listen.starts_with("127.0.0.1:"));
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
         assert_eq!(
             c.get(format!("http://{listen}/v1/health"))

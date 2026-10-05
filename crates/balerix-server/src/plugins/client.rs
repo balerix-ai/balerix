@@ -84,6 +84,8 @@ impl fmt::Debug for PluginClient {
 
 impl PluginClient {
     pub fn new() -> Result<Self, PluginError> {
+        // reqwest's `rustls-no-provider` panics without one (Spec O §23.1)
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::builder()
             .no_proxy()
             .timeout(CALL_TIMEOUT)

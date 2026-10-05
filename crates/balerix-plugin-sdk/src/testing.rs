@@ -117,6 +117,9 @@ impl FakeHost {
             name: name.to_string(),
             token: self.inner.token.clone(),
             scratch: scratch.into(),
+            ca: None,
+            tls: None,
+            listen: "127.0.0.1:0".into(),
         }
     }
 

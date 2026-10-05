@@ -116,6 +116,9 @@ async fn start_flow(w: &World) -> (Arc<FlowLike>, Host) {
         name: "flow".into(),
         token: token(w, "flow").await,
         scratch: w.dir.path().join("scratch"),
+        ca: None,
+        tls: None,
+        listen: "127.0.0.1:0".into(),
     };
     tokio::spawn({
         let plugin = plugin.clone();
@@ -495,6 +498,9 @@ async fn plugin_metrics_are_re_exported_under_the_prefix_rule() {
             name: name.into(),
             token: token(&w, name).await,
             scratch: w.dir.path().join("s"),
+            ca: None,
+            tls: None,
+            listen: "127.0.0.1:0".into(),
         };
         Host::new(env)
             .unwrap()

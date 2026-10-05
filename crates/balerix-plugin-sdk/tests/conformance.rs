@@ -111,6 +111,7 @@ impl Plugin for Reference {
 async fn the_router_answers_every_daemon_to_plugin_fixture() {
     let (listener, listen) = bind().await.unwrap();
     tokio::spawn(run(listener, Arc::new(Reference::new()), "tok"));
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let c = reqwest::Client::builder().no_proxy().build().unwrap();
     for (name, f) in fixtures()
         .iter()
@@ -157,6 +158,7 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
     // beyond what the typed `Host` API surfaces (e.g. `Result<(), _>` calls
     // collapse a 200 and its `{}` body to `Ok(())`; `SdkError::Status` keeps
     // only the message, not the numeric code as read from the fixture).
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let c = reqwest::Client::builder().no_proxy().build().unwrap();
 
     let r = host.hello("0.1.0", "127.0.0.1:4000").await.unwrap();

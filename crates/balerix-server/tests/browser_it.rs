@@ -235,6 +235,9 @@ async fn a_101_to_a_plain_request_is_a_502_not_a_parked_task() {
         name: "web".into(),
         token: web,
         scratch: w.dir.path().join("s"),
+        ca: None,
+        tls: None,
+        listen: "127.0.0.1:0".into(),
     })
     .unwrap()
     .hello("0.1.0", &listen)
@@ -281,6 +284,9 @@ async fn the_mount_proxies_plain_requests_and_websockets_and_filters_headers() {
         name: "web".into(),
         token: web.clone(),
         scratch: w.dir.path().join("s"),
+        ca: None,
+        tls: None,
+        listen: "127.0.0.1:0".into(),
     })
     .unwrap()
     .hello("0.1.0", &listen)

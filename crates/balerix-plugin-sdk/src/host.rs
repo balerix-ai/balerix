@@ -1,5 +1,6 @@
 //! The plugin → daemon half (plugins spec §4.1): one method per route,
-//! bearer from `Env`, loopback only.
+//! bearer from `Env`. Loopback `http://` on one machine; `https://` only
+//! with the authority from `BALERIX_CA_FILE` (Spec O §23.1).
 
 use std::fmt;
 use std::sync::Arc;
@@ -78,6 +79,8 @@ fn path_encode(s: &str) -> String {
 
 impl Host {
     pub fn new(env: Env) -> Result<Self, SdkError> {
+        // Env's fields are public, so its own check may have been skipped
+        crate::refuse_https_without_ca(&env.api_url, env.ca.as_deref())?;
         crate::tls::install_provider();
         let tls = env
             .ca
@@ -984,6 +987,12 @@ mod tls_tests {
             tls: None,
             listen: "127.0.0.1:0".into(),
         };
+        // Env's fields are public: Host refuses https:// without an
+        // authority itself rather than fall back to the system's roots
+        assert_eq!(
+            Host::new(env(None)).unwrap_err(),
+            SdkError::Env("BALERIX_API_URL is https://, so BALERIX_CA_FILE must be set")
+        );
         let host = Host::new(env(Some(ca))).unwrap();
         assert_eq!(
             host.hello("0.1.0", "x", None).await.unwrap().config["ok"],

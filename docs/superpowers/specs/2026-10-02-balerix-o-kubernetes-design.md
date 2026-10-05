@@ -2166,3 +2166,8 @@ Rulings made while building it:
   existing ownerless fleet:** 409 `fleet {name} is not managed by a
   plugin`. This is §7.4's rule that the operator never adopts a record it
   did not create, applied to §23.3's `check_owner`.
+- **An `https://` `BALERIX_API_URL` without `BALERIX_CA_FILE` is
+  refused** (`BALERIX_API_URL is https://, so BALERIX_CA_FILE must be
+  set`), by `Env::from_env` and again by `Host::new`, since `Env`'s fields
+  are public. Without an authority, reqwest would verify against the
+  system's roots and tungstenite against webpki's bundle.

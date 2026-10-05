@@ -94,6 +94,7 @@ impl Env {
                 "BALERIX_CA_FILE is set, so BALERIX_API_URL must be https://",
             ));
         }
+        refuse_https_without_ca(&api_url, ca.as_deref())?;
         let tls = match (
             opt("BALERIX_PLUGIN_TLS_CERT"),
             opt("BALERIX_PLUGIN_TLS_KEY"),
@@ -121,6 +122,21 @@ impl Env {
     pub fn from_process() -> Result<Self, SdkError> {
         Self::from_env(|k| std::env::var(k).ok())
     }
+}
+
+/// Spec O §23.1: without the authority file, reqwest would verify
+/// `https://` against the system's roots and tungstenite `wss://` against
+/// webpki's bundle; the daemon's one authority is the only trust allowed.
+pub(crate) fn refuse_https_without_ca(
+    api_url: &str,
+    ca: Option<&std::path::Path>,
+) -> Result<(), SdkError> {
+    if ca.is_none() && api_url.starts_with("https://") {
+        return Err(SdkError::Env(
+            "BALERIX_API_URL is https://, so BALERIX_CA_FILE must be set",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -208,6 +224,17 @@ mod tests {
             "environment: BALERIX_CA_FILE is set, so BALERIX_API_URL must be https://"
         );
         vars[0].1 = "https://balerix.ns.svc:7643".into();
+        // an https daemon url without the authority is refused: no public
+        // roots stand in for it (Spec O §23.1)
+        let without_ca: Vec<_> = vars
+            .iter()
+            .filter(|(k, _)| *k != "BALERIX_CA_FILE")
+            .cloned()
+            .collect();
+        assert_eq!(
+            Env::from_env(get(&without_ca)).unwrap_err(),
+            SdkError::Env("BALERIX_API_URL is https://, so BALERIX_CA_FILE must be set")
+        );
         // a certificate without its key is refused
         vars.retain(|(k, _)| *k != "BALERIX_PLUGIN_TLS_KEY");
         assert_eq!(

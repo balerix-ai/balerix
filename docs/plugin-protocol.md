@@ -46,7 +46,7 @@ The Deployment sets these, all optional; a plugin on one machine sets none.
 | Variable | Meaning |
 |---|---|
 | `BALERIX_PLUGIN_TOKEN_FILE` | The token, read from a file; wins over `BALERIX_PLUGIN_TOKEN`. |
-| `BALERIX_CA_FILE` | The only authority the plugin's host client trusts; `BALERIX_API_URL` must then be `https://`. |
+| `BALERIX_CA_FILE` | The only authority the plugin's host client trusts; `BALERIX_API_URL` must then be `https://`, and an `https://` `BALERIX_API_URL` without it is refused at start-up. |
 | `BALERIX_PLUGIN_TLS_CERT`, `BALERIX_PLUGIN_TLS_KEY` | Serve TLS with this certificate and key; both or neither. |
 | `BALERIX_PLUGIN_LISTEN` | The bind address; default `127.0.0.1:0`, a pod sets `0.0.0.0:7644`. |
 

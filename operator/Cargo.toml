@@ -44,7 +44,7 @@ hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"
 hyper-timeout = "0.5.2"
 hyper = { version = "1.11.1", default-features = false }
 tower-http = { version = "0.6.11", default-features = false, features = ["trace"] }
-tower = { version = "0.5.3", default-features = false, features = ["retry", "util"] }
+tower = { version = "0.5.3", default-features = false, features = ["retry", "timeout", "util"] }
 # The controllers' streams: `for_each` over a Controller's results.
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 # The controllers' logs: namespace, name, reason; never a token.

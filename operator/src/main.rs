@@ -82,7 +82,8 @@ async fn run(args: RunArgs) -> Result<()> {
         .context("cannot connect to the cluster (KUBECONFIG, or in-cluster)")?;
     let watches = balerix_operator::watch_client::watch_client(config.clone())
         .context("cannot build the watch client")?;
-    let client = kube::Client::try_from(config).context("cannot build the client")?;
+    let client = balerix_operator::request_client::request_client(config)
+        .context("cannot build the client")?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("cannot listen for SIGTERM")?;
     tokio::select! {

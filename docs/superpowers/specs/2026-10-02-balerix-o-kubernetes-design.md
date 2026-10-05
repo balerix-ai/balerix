@@ -1690,12 +1690,12 @@ Known in 3b and left open:
   somewhere (an Event) if anything needs it.
 - A Fleet naming a Daemon that does not exist yet waits a period (15 s)
   instead of a Daemon watch.
-- The envtest suite has load-sensitive waits (60 s `wait_for`, an
-  occasional 180 s hang under four API servers on one host).
-- A per-request client timeout for production (`Config::read_timeout` cuts
-  idle watches too, so a tower timeout layer on non-watch requests). The lost
-  requests are hyper#4207 (a stale HTTP/1 want pools a connection mid-watch);
-  until a fixed hyper ships, the watches run on an unpooled client (#129).
+- The envtest suite has load-sensitive waits (60 s `wait_for`). A lost
+  request no longer hangs a test: probes are bounded at 5 s and every
+  other request at 10 s (§22.1).
+- The lost requests are hyper#4207 (a stale HTTP/1 want pools a connection
+  mid-watch); until a fixed hyper ships, the watches run on an unpooled
+  client (#129). The per-request timeout is §22.1.
 - §8.5's "the Agent's branch changed" row is not built: a branch change is
   a spec change, so the Pod is replaced on the same claim, and the
   sidecar's `ensure_clone` then wants to recreate the clone, which
@@ -1709,3 +1709,158 @@ Known in 3b and left open:
   journey one to two minutes.
 - The operator's RBAC, Deployment and metrics, and `verify-k8s`, are
   sub-project 5; the Plugin controller is sub-project 4.
+
+## 22. Operator hardening (2026-10)
+
+The follow-ups 3b left in the operator's request handling, its Jobs and
+its authority, fixed together: #129, #130, #131, #132, #133, #134 and
+#138. Each fix touches a flow that §21 built. What they add between them is
+the operator writing Kubernetes Events, which the chart's RBAC must allow
+(§22.5). Not in this item: running the Fleet reconcile's requests in
+parallel, which is the real cure for a very large Fleet's slow reconcile
+(§22.2 only stops it from looping); §8.5's branch-changed row (#128); the
+down-record purge path (#135); the runtime flakes #136 and #137.
+
+### 22.1 A bound on every kube request (#129, #138)
+
+- **The reconcile client times out each request at 10 s.** Since #139 the
+  controllers' watches run on their own unpooled client
+  (`watch_client`), so the pooled client carries no watch, and a bound on
+  every request it sends cuts nothing long-lived. The bound is tower's
+  `TimeoutLayer` (tower's `timeout` feature; no new crate), added through
+  kube's `ClientBuilder::with_layer` in one function,
+  `request_client(config)`, which `main` uses in place of
+  `Client::try_from`. 10 s sits well inside `RECONCILE_TIMEOUT` (30 s), so
+  a lost request fails its reconcile with an ordinary error (`Error::Kube`,
+  the usual back-off) before the reconcile bound has to cut it.
+- **The bound covers the response head only.** The timeout wraps the
+  service call, which resolves when the head arrives; kube then reads the
+  body outside it. A lost request (hyper#4207) never gets a head, so it is
+  covered. A body that stalls after its head is not, and stays under the
+  reconcile bound. The layer sits outside kube's default stack, so the
+  bound also covers kube's own 429/503/504 retries and a credential
+  refresh: a throttled or restarting API server surfaces as `Error::Kube`
+  and the usual back-off rather than a long wait.
+- **The test harness builds its client through `request_client` too,** so
+  no direct API call in a test can wait past 10 s, inside `wait_for` and
+  `hold_for` or outside them (#138). The operator under test keeps sharing
+  the test's client: with every request bounded, a lost one costs a retry,
+  not the test.
+- **`watch_client` stays** until a hyper with the fix for hyperium/hyper#4207
+  (hyperium/hyper#4208 and seanmonstar/want#6) ships. #129 closes with this
+  item; the upstream report is hyper#4207 itself.
+- **This amends §21.6.** Its "per-request client timeout for production"
+  item is done, and its "occasional 180 s hang" item no longer holds: a
+  probe is bounded at 5 s and every other test request at 10 s.
+
+### 22.2 Repeated reconcile timeouts back off (#130)
+
+- **`error_policy` counts consecutive `TimedOut`s per object** in the same
+  per-object map as other errors, which a reconcile that ends well clears
+  (`reconciled`). The first two timeouts still requeue in 2 s, because one
+  timeout most likely means one lost request. From the third on, the delay
+  is the one other errors get: 5 s, doubling per attempt, at most 5 min.
+  Attempts are counted from the first timeout, so the third waits 20 s.
+- **The third consecutive timeout publishes a Warning Event** on the object,
+  reason `ReconcileTimedOut`, message `the reconcile did not finish in
+  30s, 3 or more times in a row: backing off`, and so does every later
+  consecutive timeout. The message is fixed, so kube-runtime's `Recorder`
+  (events.k8s.io/v1, reporter `balerix-operator`) folds the repeats into
+  one Event whose series count is the number of repeats. `within` counts
+  the timeout and publishes the Event, since it runs async and
+  `error_policy` does not; `error_policy` reads the count.
+  Publishing is best effort: an Event that cannot be written is logged and
+  dropped, and never fails the reconcile.
+- **The bound itself does not change.** A reconcile that needs more than
+  30 s still never finishes; this only stops it from running nearly all the
+  time and loading a slow API server, and makes the object say why.
+
+### 22.3 Jobs and the crew lock (#131, #132, #133)
+
+- **A Job is failed when `status.failed ≥ 1` or its `Failed` condition is
+  `True`** (#131). One predicate serves `job_outcome`, `unfinished` and so
+  `crew_holders`. A Job whose pod was never created, refused by a ResourceQuota
+  or an admission webhook, reaches `Failed=True/DeadlineExceeded` under
+  `activeDeadlineSeconds` with `failed: 0`. It is now retried under
+  §21.6's Job rule like any failure, and reports its condition through
+  `failed_condition`. This amends §21.6's deadline bullet, whose claim was
+  broader than the code.
+- **The crew lock also counts pods** (#132, gap 1). `crew_holders` lists pods
+  labelled `balerix.ai/fleet=<fleet>,balerix.ai/crew=<crew>` that carry a
+  `batch.kubernetes.io/job-name` label, so an agent pod never matches. A pod
+  holds the crew while its phase is neither `Succeeded` nor `Failed`, or
+  while it is being deleted. A dropped crew's sync pod, whose Job the
+  garbage collector took when the Crew was deleted in the background, then
+  keeps a harvest of that crew's agents from starting until the pod is gone.
+  `crew_holders` leaves the wanted Job out of the Job list by name only, so
+  pods labelled `job-name=<wanted>` that a same-named predecessor left
+  (collected in the background) are counted while unfinished or deleting,
+  which is the intended conservative behaviour.
+- **A crew held by something being deleted for too long says so** (#132,
+  gap 2). `crew_holders` returns what holds the crew, not a bare `bool`. When
+  that is a Job or a pod whose deletion timestamp is older than
+  `RunConfig::stuck_after` (5 min; tests set it lower), the owner of the
+  wanted Job gets a Warning Event, reason `CrewLocked`, naming the object
+  and its deletion time: the Crew for a sync Job, the Agent for a harvest
+  Job, the Fleet for a cleanup Job. The lock still holds. Forcing the
+  object out (a lost node's pod) is the user's call. The Event names the
+  object so they can.
+- **The busy check and the create outlive a dropped reconcile** (#132,
+  gap 3). `ensure_job` takes the crew lock as an owned guard
+  (`Mutex::lock_owned`) and runs the check and the create in a spawned task
+  holding it, then awaits the task. When `RECONCILE_TIMEOUT` drops the
+  reconcile, the task runs on to the create's answer, each of its requests
+  (the Job list, the pod list and the create) bounded at 10 s under §22.1,
+  and only then releases the lock. A second reconcile therefore
+  either waits for the lock or lists the created Job. **Accepted:** a
+  create the client gave up on at 10 s that the API server still commits
+  later. Its write has passed the client's bound, and the API server's own
+  request timeout (60 s) bounds it.
+- **The lock map is pruned** (#133). On release, under the map's mutex, a
+  crew's entry is removed when the releaser's `Arc` and the map's are the
+  only two (`Arc::strong_count == 2`). A caller that cloned it in between
+  keeps it. A caller that comes after the removal makes a new entry, and
+  nothing holds the old one. The map then holds only the crews that are
+  locked or awaited.
+
+### 22.4 An authority whose key does not match its certificate (#134)
+
+- **An authority is read back only if it works.** `read_issued`'s
+  authority half also checks that the CA Secret's `ca.key` signs leaves
+  that verify against its `ca.crt`. It issues a throwaway leaf and runs
+  `pki::verifies` on it (`pki::authority_works`), so no x509 parser is
+  added. An authority that fails this, or does not parse, is missing: it
+  is re-minted, which re-issues the serving certificate (§21.6), and the
+  Daemon pod rolls once. Before, the leaf never verified, so it was
+  re-issued every reconcile and the pod rolled on each one.
+
+### 22.5 Events and the chart's RBAC
+
+The operator now writes Events (`events.k8s.io/v1`, verbs `create` and
+`patch`) in every namespace it watches. Sub-project 5's chart grants this
+in the operator's ClusterRole, or in each watched namespace's Role
+(§5.6, §14.1). The events are `ReconcileTimedOut` (§22.2) and `CrewLocked`
+(§22.3), both of type Warning. An Event lives about an hour, so a held
+crew's Event is re-published while the hold lasts (the `Recorder` adds to
+its series). A condition would have needed a new type on four kinds and
+their status writers. An Event fits all four the same way and is where
+`kubectl describe` looks for "why is this stuck".
+
+### 22.6 Testing
+
+- **Unit:** a client aimed at a socket that accepts and never answers
+  fails within the bound; `error_policy` keeps 2 s for two timeouts, then
+  backs off, and resets after a success; `job_outcome` and `unfinished` read
+  a `Failed=True`, `failed: 0` Job as failed with the condition's message;
+  the crew lock stays held until a spawned create finishes after its caller
+  is dropped; the lock map drops a released entry and keeps one still
+  cloned; `pki::authority_works` refuses a key paired with another
+  authority's certificate.
+- **envtest:** a Job patched to `FailureTarget=True` then
+  `Failed=True/DeadlineExceeded`, with `failed: 0`, is retried and its
+  owner's condition carries the message; a Pending pod with a crew's Job
+  labels and no Job keeps a harvest Job from being created until it is
+  deleted; a crew pod held by a finalizer past `stuck_after` puts a
+  `CrewLocked` Event on the owner; a CA Secret rewritten with another
+  authority's key is re-minted once, after which the pod template's
+  annotation holds across reconciles.

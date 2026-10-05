@@ -13,12 +13,12 @@ use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::Api;
-use kube::api::{Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use support::envtest::envtest;
 use support::stub_daemon::StubDaemon;
 use support::{
-    TestClock, finish_job, hold_for, namespace, reap_claim, reap_pod, reap_pod_uid, spawn_operator,
-    wait_for,
+    TestClock, expire_job, finish_job, hold_for, namespace, reap_claim, reap_pod, reap_pod_uid,
+    spawn_operator, wait_for,
 };
 
 fn daemon_spec() -> DaemonSpec {
@@ -377,6 +377,102 @@ async fn a_serving_certificate_the_authority_cannot_verify_is_reissued() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_ca_secret_whose_key_is_not_its_certificates_is_reminted_once() {
+    let Some(env) = envtest().await else { return };
+    let ns = namespace(&env.client, "camismatch").await;
+    let client = env.client.clone();
+    Api::<Daemon>::namespaced(client.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Daemon::new("default", daemon_spec()),
+        )
+        .await
+        .unwrap();
+    let clock = TestClock::default();
+    let operator = spawn_operator(env, &ns, None, &clock);
+    let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), &ns);
+    wait_for("the StatefulSet", Duration::from_secs(60), || async {
+        statefulsets.get_opt("balerix-default").await.unwrap()
+    })
+    .await;
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), &ns);
+    let text =
+        |s: &Secret, key: &str| String::from_utf8(s.data.as_ref().unwrap()[key].0.clone()).unwrap();
+    let ca = secrets.get("balerix-default-ca").await.unwrap();
+    let (old_crt, old_key) = (text(&ca, "ca.crt"), text(&ca, "ca.key"));
+
+    // a day on, so a reissued serving certificate's expiry differs
+    clock.advance(86_400);
+    let other = pki::new_authority(&ns, "default", clock.clock()()).unwrap();
+    // the certificate kept, the key another authority's
+    let broken = Patch::Merge(serde_json::json!({ "stringData": { "ca.key": other.key_pem } }));
+    // a reconcile that read the old pair before the patch applies it back:
+    // patch again while the old key is there
+    let reminted = wait_for("a new authority", Duration::from_secs(60), || async {
+        let ca = secrets.get("balerix-default-ca").await.unwrap();
+        if text(&ca, "ca.crt") != old_crt {
+            return Some(ca);
+        }
+        if text(&ca, "ca.key") == old_key {
+            secrets
+                .patch("balerix-default-ca", &PatchParams::default(), &broken)
+                .await
+                .unwrap();
+        }
+        None
+    })
+    .await;
+    let new_crt = text(&reminted, "ca.crt");
+    assert_ne!(new_crt, other.cert_pem);
+    let now = clock.clock()();
+    let names = pki::daemon_names(&ns, "default");
+    let not_after = wait_for(
+        "a serving certificate from the new authority in the pod template",
+        Duration::from_secs(60),
+        || async {
+            let tls = secrets.get("balerix-default-tls").await.unwrap();
+            if !pki::verifies(&new_crt, &text(&tls, "tls.crt"), &names[0], now) {
+                return None;
+            }
+            let not_after = tls.metadata.annotations.unwrap()["balerix.ai/not-after"].clone();
+            let template = statefulsets.get("balerix-default").await.unwrap();
+            (template
+                .spec
+                .unwrap()
+                .template
+                .metadata
+                .unwrap()
+                .annotations
+                .unwrap()["balerix.ai/not-after"]
+                == not_after)
+                .then_some(not_after)
+        },
+    )
+    .await;
+    // once: the authority and the pod template hold across reconciles (period 1 s)
+    hold_for(
+        "a second re-mint or roll",
+        Duration::from_secs(5),
+        || async {
+            let ca = secrets.get("balerix-default-ca").await.unwrap();
+            let template = statefulsets.get("balerix-default").await.unwrap();
+            let rolled = template
+                .spec
+                .unwrap()
+                .template
+                .metadata
+                .unwrap()
+                .annotations
+                .unwrap()["balerix.ai/not-after"]
+                != not_after;
+            (text(&ca, "ca.crt") != new_crt || rolled).then_some(())
+        },
+    )
+    .await;
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_failed_pool_job_is_reported_and_retried_after_the_delay() {
     let Some(env) = envtest().await else { return };
     let ns = namespace(&env.client, "pooljob").await;
@@ -469,6 +565,62 @@ async fn a_failed_pool_job_is_reported_and_retried_after_the_delay() {
         attempts.is_none() || attempts.as_deref() == Some("{}"),
         "{attempts:?}"
     );
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_whose_pod_was_never_created_fails_at_its_deadline_and_is_retried() {
+    let Some(env) = envtest().await else { return };
+    let ns = namespace(&env.client, "expired").await;
+    let client = env.client.clone();
+    let daemons: Api<Daemon> = Api::namespaced(client.clone(), &ns);
+    daemons
+        .create(
+            &PostParams::default(),
+            &Daemon::new("default", daemon_spec()),
+        )
+        .await
+        .unwrap();
+    let clock = TestClock::default();
+    let operator = spawn_operator(env, &ns, None, &clock);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let first = wait_for("the pool Job", Duration::from_secs(60), || async {
+        jobs.get_opt("balerix-default-pool").await.unwrap()
+    })
+    .await;
+
+    // a quota refused its pod; the deadline failed it with `failed: 0`
+    expire_job(&client, &ns, "balerix-default-pool").await;
+    let status = wait_for(
+        "SystemToolsReady=False for the expired Job",
+        Duration::from_secs(10),
+        || async {
+            let s = daemons.get("default").await.unwrap().status?;
+            let tools = condition(&s.conditions, "SystemToolsReady");
+            (tools.status == "False" && tools.reason == "PoolSyncFailed").then_some(s)
+        },
+    )
+    .await;
+    assert_eq!(
+        condition(&status.conditions, "SystemToolsReady").message,
+        "the job failed: DeadlineExceeded: Job was active longer than specified deadline"
+    );
+
+    clock.advance(31);
+    wait_for("the retry", Duration::from_secs(60), || async {
+        let j = jobs.get_opt("balerix-default-pool").await.unwrap()?;
+        (j.metadata.uid != first.metadata.uid).then_some(j)
+    })
+    .await;
+    let attempts = daemons
+        .get("default")
+        .await
+        .unwrap()
+        .metadata
+        .annotations
+        .unwrap()["balerix.ai/attempts"]
+        .clone();
+    assert_eq!(attempts, "{\"balerix-default-pool\":2}");
     operator.abort();
 }
 
@@ -1534,6 +1686,7 @@ async fn job_rule(
         &ns,
     );
     cfg.period = Duration::from_secs(1);
+    cfg.stuck_after = Duration::from_secs(1);
     let ctx = balerix_operator::controllers::Context::new(env.client.clone(), cfg);
     (env, ns, ctx, owner)
 }
@@ -1593,6 +1746,22 @@ async fn the_crew_lock_lets_one_of_two_racing_jobs_start() {
         jobs.list(&Default::default()).await.unwrap().items.len(),
         20
     );
+}
+
+/// A pod of crew `f/c` with `extra` labels; nothing runs it. A
+/// `finalizer` keeps it, deleting, until the test takes it off.
+fn crew_pod(ns: &str, name: &str, extra: &[(&str, &str)], finalizer: Option<&str>) -> Pod {
+    let mut labels = serde_json::json!({ "balerix.ai/fleet": "f", "balerix.ai/crew": "c" });
+    for (k, v) in extra {
+        labels[*k] = serde_json::json!(v);
+    }
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": { "name": name, "namespace": ns, "labels": labels,
+            "finalizers": finalizer.into_iter().collect::<Vec<_>>() },
+        "spec": { "restartPolicy": "Never", "containers": [{ "name": "job", "image": "x" }] }
+    }))
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1679,6 +1848,147 @@ async fn a_stale_job_is_deleted_in_the_foreground_and_holds_the_crew_until_gone(
         new.metadata.annotations.unwrap()["balerix.ai/input-hash"],
         "new"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crews_job_pod_without_its_job_holds_the_crew() {
+    use balerix_operator::controllers::jobs::ensure_job;
+    use balerix_operator::desired::common::JobOutcome;
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, ctx, owner) = job_rule("podhold").await;
+    let client = env.client.clone();
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let job_name = [("batch.kubernetes.io/job-name", "f-c-sync")];
+    // a dropped crew's sync pod: its Job collected in the background, the pod still running
+    pods.create(
+        &PostParams::default(),
+        &crew_pod(&ns, "f-c-sync-x1", &job_name, None),
+    )
+    .await
+    .unwrap();
+    // an agent's own pod, and a finished pod of an old Job, hold nothing
+    pods.create(&PostParams::default(), &crew_pod(&ns, "f-c-a", &[], None))
+        .await
+        .unwrap();
+    let old = [("batch.kubernetes.io/job-name", "f-c-old")];
+    pods.create(
+        &PostParams::default(),
+        &crew_pod(&ns, "f-c-old-x1", &old, None),
+    )
+    .await
+    .unwrap();
+    pods.patch_status(
+        "f-c-old-x1",
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({ "status": { "phase": "Succeeded" } })),
+    )
+    .await
+    .unwrap();
+
+    let harvest = || crew_job(&ns, "f-c-a-harvest", "h");
+    let held = ensure_job(&ctx, &owner, harvest(), Some(("f", "c")))
+        .await
+        .unwrap();
+    assert_eq!(held.outcome, JobOutcome::Absent);
+    assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_none());
+
+    // no node: the pod is deleted at once, and the harvest starts
+    pods.delete("f-c-sync-x1", &DeleteParams::default())
+        .await
+        .unwrap();
+    wait_for("the sync pod gone", Duration::from_secs(30), || async {
+        pods.get_opt("f-c-sync-x1")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    let made = ensure_job(&ctx, &owner, harvest(), Some(("f", "c")))
+        .await
+        .unwrap();
+    assert_eq!(made.outcome, JobOutcome::Running);
+    assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crew_held_by_a_pod_deleting_past_the_bound_puts_crew_locked_on_the_owner() {
+    use balerix_operator::controllers::jobs::ensure_job;
+    use balerix_operator::desired::common::JobOutcome;
+    use k8s_openapi::api::events::v1::Event;
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, ctx, owner) = job_rule("stuck").await;
+    let client = env.client.clone();
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let events: Api<Event> = Api::namespaced(client.clone(), &ns);
+    let job_name = [("batch.kubernetes.io/job-name", "f-c-sync")];
+    // a pod on a lost node: deleting, and never gone
+    pods.create(
+        &PostParams::default(),
+        &crew_pod(&ns, "f-c-sync-x1", &job_name, Some("balerix.ai/test-hold")),
+    )
+    .await
+    .unwrap();
+    pods.delete("f-c-sync-x1", &DeleteParams::default())
+        .await
+        .unwrap();
+
+    let harvest = || crew_job(&ns, "f-c-a-harvest", "h");
+    let event = wait_for(
+        "a CrewLocked Event on the owner",
+        Duration::from_secs(30),
+        || async {
+            let ensured = ensure_job(&ctx, &owner, harvest(), Some(("f", "c")))
+                .await
+                .unwrap();
+            assert_eq!(ensured.outcome, JobOutcome::Absent, "the lock holds");
+            events
+                .list(&Default::default())
+                .await
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|e| {
+                    e.reason.as_deref() == Some("CrewLocked")
+                        && e.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some("owner")
+                })
+        },
+    )
+    .await;
+    assert_eq!(event.type_.as_deref(), Some("Warning"));
+    let note = event.note.unwrap();
+    assert!(
+        note.starts_with("crew f/c waits on Pod f-c-sync-x1, being deleted since "),
+        "{note}"
+    );
+    assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_none());
+
+    // the user forces it out: the harvest starts
+    pods.patch(
+        "f-c-sync-x1",
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({ "metadata": { "finalizers": null } })),
+    )
+    .await
+    .unwrap();
+    wait_for("the pod gone", Duration::from_secs(30), || async {
+        pods.get_opt("f-c-sync-x1")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    let made = ensure_job(&ctx, &owner, harvest(), Some(("f", "c")))
+        .await
+        .unwrap();
+    assert_eq!(made.outcome, JobOutcome::Running);
 }
 
 #[tokio::test(flavor = "multi_thread")]

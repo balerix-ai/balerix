@@ -3,21 +3,23 @@
 //! after a doubling delay carried on its owner's `balerix.ai/attempts`
 //! annotation, and a crew's sync, harvest and cleanup Jobs never run at
 //! once (§5.3): the crew's lock in the `Context` is held across the
-//! check and the create, and a stale Job is deleted in the foreground,
-//! so it stays listed, and keeps the crew busy, until its pods are gone.
+//! check and the create, by a task that outlives a dropped reconcile, and
+//! a stale Job is deleted in the foreground, so it stays listed, and keeps
+//! the crew busy, until its pods are gone.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
-use kube::{Api, Resource, ResourceExt};
+use kube::{Api, Client, Resource, ResourceExt};
 use serde::de::DeserializeOwned;
 
 use super::{Context, Error};
 use crate::desired::common::JobOutcome;
-use crate::desired::jobs::job_outcome;
+use crate::desired::jobs::{job_failed, job_outcome};
 
 /// On the owner: a JSON object from Job name to the attempt its next run
 /// is. Absent or missing the name means attempt 1.
@@ -86,31 +88,85 @@ fn failed_at(job: &Job) -> Option<i64> {
 
 /// Whether a Job is still running: created and not yet succeeded or failed.
 fn unfinished(job: &Job) -> bool {
-    let status = job.status.as_ref();
-    status.and_then(|s| s.succeeded).unwrap_or(0) == 0
-        && status.and_then(|s| s.failed).unwrap_or(0) == 0
+    job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0) == 0 && !job_failed(job)
 }
 
-/// Whether another Job of this crew is unfinished or still being deleted
-/// (§5.3's lock): a stale Job deleted in the foreground is listed until
-/// its pods are gone.
-pub async fn crew_busy(
-    ctx: &Context,
+/// What holds a crew (§5.3): one of its Jobs unfinished or being deleted,
+/// or one of its Jobs' pods not yet finished or being deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holder {
+    /// `Job` or `Pod`.
+    pub kind: &'static str,
+    pub name: String,
+    /// Unix seconds of its deletion timestamp, while it is being deleted.
+    pub deleting_since: Option<i64>,
+}
+
+fn deleting_since(meta: &ObjectMeta) -> Option<i64> {
+    meta.deletion_timestamp.as_ref().map(|t| t.0.as_second())
+}
+
+/// What holds the crew, other than the Job `except`. A stale Job deleted
+/// in the foreground is listed until its pods are gone. A pod outlives its
+/// Job when the Job is collected in the background, as a dropped crew's
+/// sync is (§22.3); `job-name` keeps the agents' own pods out.
+pub async fn crew_holders(
+    client: &Client,
     namespace: &str,
     fleet: &str,
     crew: &str,
     except: &str,
-) -> Result<bool, Error> {
-    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
-    let list = jobs
-        .list(
-            &ListParams::default()
-                .labels(&format!("balerix.ai/fleet={fleet},balerix.ai/crew={crew}")),
+) -> Result<Vec<Holder>, Error> {
+    let selector = format!("balerix.ai/fleet={fleet},balerix.ai/crew={crew}");
+    let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+    let mut holders: Vec<Holder> = jobs
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items
+        .iter()
+        .filter(|j| {
+            j.name_any() != except && (unfinished(j) || j.metadata.deletion_timestamp.is_some())
+        })
+        .map(|j| Holder {
+            kind: "Job",
+            name: j.name_any(),
+            deleting_since: deleting_since(&j.metadata),
+        })
+        .collect();
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let finished = |p: &Pod| {
+        matches!(
+            p.status.as_ref().and_then(|s| s.phase.as_deref()),
+            Some("Succeeded" | "Failed")
         )
-        .await?;
-    Ok(list.items.iter().any(|j| {
-        j.name_any() != except && (unfinished(j) || j.metadata.deletion_timestamp.is_some())
-    }))
+    };
+    holders.extend(
+        pods.list(
+            &ListParams::default().labels(&format!("{selector},batch.kubernetes.io/job-name")),
+        )
+        .await?
+        .items
+        .iter()
+        .filter(|p| p.metadata.deletion_timestamp.is_some() || !finished(p))
+        .map(|p| Holder {
+            kind: "Pod",
+            name: p.name_any(),
+            deleting_since: deleting_since(&p.metadata),
+        }),
+    );
+    Ok(holders)
+}
+
+/// The holder deleting longest, once that is `after` or more: a pod on a
+/// lost node never finishes its deletion (§22.3).
+fn stuck(holders: &[Holder], now: i64, after: Duration) -> Option<&Holder> {
+    holders
+        .iter()
+        .filter(|h| {
+            h.deleting_since
+                .is_some_and(|t| now - t >= after.as_secs() as i64)
+        })
+        .min_by_key(|h| h.deleting_since)
 }
 
 async fn set_attempts<K>(
@@ -155,6 +211,38 @@ pub async fn pods_of(pods: &Api<Pod>, job: Option<&Job>) -> Result<Vec<Pod>, Err
     }
 }
 
+/// What the busy check and the create came to.
+enum Created {
+    Made,
+    /// Made by a reconcile that raced this one: it is running.
+    Raced,
+    Busy(Vec<Holder>),
+    NamespaceTerminating,
+}
+
+/// The crew's busy check and the create, under the crew's lock when
+/// `crew` is given. Owns everything, so it can run in a task of its own.
+async fn check_and_create(
+    client: Client,
+    namespace: String,
+    crew: Option<(String, String)>,
+    wanted: Job,
+) -> Result<Created, Error> {
+    if let Some((fleet, crew)) = &crew {
+        let holders = crew_holders(&client, &namespace, fleet, crew, &wanted.name_any()).await?;
+        if !holders.is_empty() {
+            return Ok(Created::Busy(holders));
+        }
+    }
+    let jobs: Api<Job> = Api::namespaced(client, &namespace);
+    match jobs.create(&PostParams::default(), &wanted).await {
+        Ok(_) => Ok(Created::Made),
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(Created::Raced),
+        Err(kube::Error::Api(e)) if namespace_terminating(&e) => Ok(Created::NamespaceTerminating),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// `wanted` exists and is current, or is on its way: creates an absent
 /// one, replaces a stale one, leaves a running one, retries a failed one
 /// after its delay. `crew_lock` is the `(fleet, crew)` whose other Jobs
@@ -192,34 +280,55 @@ where
     let mut attempts = attempts_of(owner);
     match &outcome {
         JobOutcome::Absent => {
-            // the crew's lock across the check and the create (§5.3)
-            let lock = crew_lock.map(|(fleet, crew)| ctx.crew_lock(&namespace, fleet, crew));
-            let _held = match &lock {
-                Some(lock) => Some(lock.lock().await),
-                None => None,
-            };
-            if let Some((fleet, crew)) = crew_lock
-                && crew_busy(ctx, &namespace, fleet, crew, &name).await?
-            {
-                tracing::debug!(job = %name, "waiting: another Job of the crew runs");
-                return Ok(Ensured::new(outcome, soon));
-            }
-            match jobs.create(&PostParams::default(), &wanted).await {
-                Ok(_) => {
-                    tracing::info!(job = %name, attempt = attempts.get(&name).copied().unwrap_or(1), "created")
+            // the crew's lock across the check and the create (§5.3), kept
+            // by a task of its own until the create is answered (§22.3)
+            let work = check_and_create(
+                ctx.client.clone(),
+                namespace.clone(),
+                crew_lock.map(|(fleet, crew)| (fleet.to_string(), crew.to_string())),
+                wanted,
+            );
+            let created = match crew_lock {
+                Some((fleet, crew)) => {
+                    ctx.lock_crew(&namespace, fleet, crew)
+                        .await
+                        .hold_through(work)
+                        .await??
                 }
-                // made by a reconcile that raced this one: it is running
-                Err(kube::Error::Api(e)) if e.code == 409 => {}
-                Err(kube::Error::Api(e)) if namespace_terminating(&e) => {
+                None => work.await?,
+            };
+            match created {
+                Created::Busy(holders) => {
+                    tracing::debug!(job = %name, ?holders, "waiting: the crew is held");
+                    if let (Some((fleet, crew)), Some(h)) =
+                        (crew_lock, stuck(&holders, ctx.now(), ctx.run.stuck_after))
+                    {
+                        let since = h
+                            .deleting_since
+                            .and_then(|t| k8s_openapi::jiff::Timestamp::from_second(t).ok())
+                            .map(|t| t.to_string())
+                            .unwrap_or_default();
+                        let note = format!(
+                            "crew {fleet}/{crew} waits on {} {}, being deleted since {since}: the crew stays locked until it is gone",
+                            h.kind, h.name
+                        );
+                        ctx.warn(owner, "CrewLocked", note).await;
+                    }
+                    Ok(Ensured::new(outcome, soon))
+                }
+                Created::NamespaceTerminating => {
                     tracing::warn!(namespace = %namespace, job = %name, "not created: the namespace is being deleted");
-                    return Ok(Ensured {
+                    Ok(Ensured {
                         namespace_terminating: true,
                         ..Ensured::new(outcome, ctx.run.period)
-                    });
+                    })
                 }
-                Err(e) => return Err(e.into()),
+                Created::Made => {
+                    tracing::info!(job = %name, attempt = attempts.get(&name).copied().unwrap_or(1), "created");
+                    Ok(Ensured::new(JobOutcome::Running, soon))
+                }
+                Created::Raced => Ok(Ensured::new(JobOutcome::Running, soon)),
             }
-            Ok(Ensured::new(JobOutcome::Running, soon))
         }
         JobOutcome::Stale => {
             // foreground: the Job stays, deleting, until its pods are gone,
@@ -267,6 +376,34 @@ where
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn the_stuck_holder_is_the_one_deleting_longest_past_the_bound() {
+        let holder = |kind, name: &str, since| Holder {
+            kind,
+            name: name.to_string(),
+            deleting_since: since,
+        };
+        let after = Duration::from_secs(300);
+        let holders = vec![
+            holder("Job", "f-c-sync", None),
+            holder("Pod", "young", Some(1_000)),
+            holder("Pod", "old", Some(500)),
+        ];
+        assert_eq!(stuck(&holders, 1_200, after), Some(&holders[2]));
+        // nothing has been deleting for 300 s yet
+        assert_eq!(stuck(&holders, 700, after), None);
+        assert_eq!(stuck(&holders[..1], 10_000, after), None);
+    }
+
+    #[test]
+    fn a_job_failed_by_its_condition_alone_is_finished() {
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "apiVersion": "batch/v1", "kind": "Job", "metadata": { "name": "j" },
+            "status": { "conditions": [{ "type": "Failed", "status": "True", "reason": "DeadlineExceeded" }] }
+        })).unwrap();
+        assert!(!unfinished(&job));
+    }
 
     #[test]
     fn the_delay_doubles_from_thirty_seconds_to_a_ten_minute_cap() {

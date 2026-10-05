@@ -284,7 +284,8 @@ async fn attempt_start(bin: &Path, root: &Path, attempt: u32) -> Result<EnvTest,
         .await
         .unwrap();
     let watches = balerix_operator::watch_client::watch_client(config.clone()).unwrap();
-    let client = Client::try_from(config).unwrap();
+    // every request bounded (§22.1): a lost one costs the test a retry, not 180 s
+    let client = balerix_operator::request_client::request_client(config).unwrap();
 
     // `/readyz`, not `/version`: the version answers before the post-start
     // hooks (apiextensions, the system namespaces) are done

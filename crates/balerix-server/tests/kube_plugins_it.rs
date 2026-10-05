@@ -33,7 +33,7 @@ fn spec() -> FleetSpec {
 }
 
 struct World {
-    _daemon: Arc<Daemon>,
+    daemon: Arc<Daemon>,
     base: String,
     _dir: tempfile::TempDir,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -99,7 +99,7 @@ async fn serve_world(daemon: Arc<Daemon>, dir: tempfile::TempDir) -> World {
         let _ = rx.await;
     }));
     World {
-        _daemon: daemon,
+        daemon,
         base: format!("http://127.0.0.1:{port}"),
         _dir: dir,
         stop: Some(stop),
@@ -319,6 +319,75 @@ async fn a_fleet_naming_a_declared_plugin_applies_with_its_pair_pending() {
         rec["status"]["agents"]["f/c/a"]["plugins"]["flow"]["state"],
         "pending"
     );
+}
+
+/// Review Focus 3: three missed polls take a declared plugin out of the
+/// chain; the poll that finds it back re-sends its pairs' activations,
+/// since the plugin may have restarted and forgotten them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plugin_back_after_three_missed_polls_has_its_pairs_activated_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ca, cert, key) = balerix_server::testing::test_authority(dir.path());
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stub = stub_plugin(StubScript {
+        health_ok: true,
+        tls: Some((cert, key)),
+        health_down: Some(down.clone()),
+        ..Default::default()
+    })
+    .await;
+    let h = Harness::kube(Duration::from_secs(3600));
+    let tls = balerix_server::kube::tls::client_config(&ca).unwrap();
+    let w = world_with(&h, PluginClient::new(Some(tls)).unwrap()).await;
+    let (s, _) = w
+        .call(
+            "PUT",
+            "/v1/plugins",
+            Some(ADMIN),
+            Some(json!({ "plugins": [entry("flow", &stub.listen, &["kv"])] })),
+        )
+        .await;
+    assert_eq!(s, 204);
+    let token = entry("flow", "", &[])["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hello = json!({ "name": "flow", "version": "1.0.0", "protocol": 1,
+        "listen": "0.0.0.0:7644", "manifest": { "apiVersion": "balerix/v1", "kind": "Plugin",
+        "name": "flow", "version": "1.0.0", "protocol": 1, "start": "serve", "needs": ["kv"] } });
+    let (s, v) = w
+        .call("POST", "/v1/plugin-host/hello", Some(&token), Some(hello))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let mut req = request(Some(json!({ "f/c/a": "a".repeat(32) })));
+    req["spec"]["crews"]["c"]["agents"]["a"]["plugins"] = json!({ "flow": {} });
+    let (s, rec) = w.call("PUT", "/v1/fleets/f", Some(ADMIN), Some(req)).await;
+    assert_eq!(s, 200, "{rec}");
+    assert_eq!(
+        rec["status"]["agents"]["f/c/a"]["plugins"]["flow"]["state"], "active",
+        "{rec}"
+    );
+    let activated = stub.calls_named("activate").len();
+    assert!(activated >= 1);
+
+    down.store(true, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..2 {
+        w.daemon.poll_health().await;
+    }
+    let (_, rows) = w.call("GET", "/v1/plugins", Some(ADMIN), None).await;
+    assert_eq!(rows[0]["phase"], "ready", "two misses keep it: {rows}");
+    w.daemon.poll_health().await;
+    let (_, rows) = w.call("GET", "/v1/plugins", Some(ADMIN), None).await;
+    assert_eq!(rows[0]["phase"], "failed", "{rows}");
+    assert_eq!(stub.calls_named("activate").len(), activated);
+
+    down.store(false, std::sync::atomic::Ordering::SeqCst);
+    w.daemon.poll_health().await;
+    let (_, rows) = w.call("GET", "/v1/plugins", Some(ADMIN), None).await;
+    assert_eq!(rows[0]["phase"], "ready", "{rows}");
+    let again = stub.calls_named("activate");
+    assert_eq!(again.len(), activated + 1, "re-sent on recovery");
+    assert_eq!(again[activated]["agent"], "f/c/a");
 }
 
 /// A TLS stub plugin `fake` declared with `fleets` and `manage`, hello'd

@@ -314,6 +314,9 @@ pub struct StubScript {
     pub expect_token: Option<String>,
     /// (certificate, key) PEM: serve `https://` (Spec O §23.1).
     pub tls: Option<(PathBuf, PathBuf)>,
+    /// While it holds `true`, `/v1/health` answers 503 whatever
+    /// `health_ok` says: missed polls, then a recovery (§23.2).
+    pub health_down: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Clone)]
@@ -424,7 +427,12 @@ pub async fn stub_plugin(script: StubScript) -> StubPlugin {
             "/v1/health",
             get(move |State(s): State<S>| async move {
                 record(&s, "health", json!({}));
-                if s.script.health_ok {
+                let down = s
+                    .script
+                    .health_down
+                    .as_ref()
+                    .is_some_and(|d| d.load(std::sync::atomic::Ordering::SeqCst));
+                if s.script.health_ok && !down {
                     axum::http::StatusCode::OK
                 } else {
                     axum::http::StatusCode::SERVICE_UNAVAILABLE

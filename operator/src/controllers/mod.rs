@@ -20,6 +20,7 @@ use futures_util::future::BoxFuture;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::Action;
+use kube::runtime::events::{Event, EventType, Recorder, Reporter};
 use kube::{Api, Client, Resource, ResourceExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -98,8 +99,7 @@ pub enum Error {
     /// A cleanup that is not finished: requeued in 2 s, not an error.
     #[error("waiting: {0}")]
     Waiting(String),
-    /// The reconcile ran past `RECONCILE_TIMEOUT` and was dropped:
-    /// requeued in 2 s, like `Waiting`, but not a cleanup to report.
+    /// The reconcile ran past `RECONCILE_TIMEOUT` and was dropped: requeued in 2 s twice in a row, then backed off with an Event (§22.2).
     #[error("the reconcile did not finish in {0:?}")]
     TimedOut(Duration),
 }
@@ -116,36 +116,58 @@ impl From<kube::runtime::finalizer::Error<Error>> for Error {
 /// reconcile that never ends would hold its object for good.
 pub const RECONCILE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Timeouts in a row that still requeue in 2 s: one most likely means one
+/// lost request (§22.2).
+pub const QUICK_TIMEOUTS: u32 = 2;
+
 /// A controller's reconcile under `RECONCILE_TIMEOUT`, for `.run(...)`.
 pub fn bounded<K, F, Fut>(
     reconcile: F,
 ) -> impl FnMut(Arc<K>, Arc<Context>) -> BoxFuture<'static, Result<Action, Error>>
 where
     K: Resource + Send + Sync + 'static,
+    K::DynamicType: Default,
     F: Fn(Arc<K>, Arc<Context>) -> Fut,
     Fut: Future<Output = Result<Action, Error>> + Send + 'static,
 {
     move |object, ctx| {
-        let reconcile = reconcile(object.clone(), ctx);
-        Box::pin(within(RECONCILE_TIMEOUT, object, reconcile))
+        let reconcile = reconcile(object.clone(), ctx.clone());
+        Box::pin(async move { within(RECONCILE_TIMEOUT, object, &ctx, reconcile).await })
     }
 }
 
 /// `reconcile`, or `TimedOut` once it has run for `limit`: the future is
-/// dropped, and whatever it held with it.
-pub async fn within<K: Resource>(
+/// dropped, and whatever it held with it. Counts the timeout, which
+/// `error_policy` reads, and from the third in a row says so on the
+/// object (§22.2).
+pub async fn within<K>(
     limit: Duration,
     object: Arc<K>,
+    ctx: &Context,
     reconcile: impl Future<Output = Result<Action, Error>>,
-) -> Result<Action, Error> {
+) -> Result<Action, Error>
+where
+    K: Resource,
+    K::DynamicType: Default,
+{
     match tokio::time::timeout(limit, reconcile).await {
         Ok(result) => result,
         Err(_) => {
+            let n = ctx.count_error(&object_key(object.as_ref()));
             tracing::warn!(
                 namespace = %object.namespace().unwrap_or_default(),
                 name = %object.name_any(),
+                timeouts = n,
                 "the reconcile did not finish in {limit:?}: dropped and requeued"
             );
+            if n > QUICK_TIMEOUTS {
+                // fixed, so the Recorder folds the repeats into one series
+                let note = format!(
+                    "the reconcile did not finish in {limit:?}, {} or more times in a row: backing off",
+                    QUICK_TIMEOUTS + 1
+                );
+                ctx.warn(object.as_ref(), "ReconcileTimedOut", note).await;
+            }
             Err(Error::TimedOut(limit))
         }
     }
@@ -178,6 +200,8 @@ pub struct Context {
     crew_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Consecutive reconcile errors per object, for `error_policy`.
     errors: Mutex<BTreeMap<String, u32>>,
+    /// Warning Events on the objects (§22.5).
+    recorder: Recorder,
 }
 
 impl Context {
@@ -187,6 +211,13 @@ impl Context {
             images: run.images.clone(),
             namespace: run.namespace.clone(),
         };
+        let recorder = Recorder::new(
+            client.clone(),
+            Reporter {
+                controller: "balerix-operator".into(),
+                instance: None,
+            },
+        );
         Self {
             client,
             cfg,
@@ -197,7 +228,50 @@ impl Context {
             clients: Mutex::new(BTreeMap::new()),
             crew_locks: Mutex::new(BTreeMap::new()),
             errors: Mutex::new(BTreeMap::new()),
+            recorder,
         }
+    }
+
+    /// A Warning Event on `object` (§22.5). Best effort: an Event the API
+    /// server refuses (no RBAC, a lost request) is logged and dropped.
+    pub async fn warn<K>(&self, object: &K, reason: &str, note: String)
+    where
+        K: Resource,
+        K::DynamicType: Default,
+    {
+        let event = Event {
+            type_: EventType::Warning,
+            reason: reason.into(),
+            note: Some(note),
+            action: "Reconcile".into(),
+            secondary: None,
+        };
+        let reference = object.object_ref(&Default::default());
+        if let Err(e) = self.recorder.publish(&event, &reference).await {
+            tracing::warn!(
+                namespace = %object.namespace().unwrap_or_default(),
+                name = %object.name_any(),
+                reason,
+                "cannot publish the Event: {e}"
+            );
+        }
+    }
+
+    /// One more consecutive failure of the object; the count.
+    fn count_error(&self, key: &str) -> u32 {
+        let mut errors = self.errors.lock().unwrap_or_else(|e| e.into_inner());
+        let n = errors.entry(key.to_string()).or_insert(0);
+        *n = n.saturating_add(1);
+        *n
+    }
+
+    fn errors_of(&self, key: &str) -> u32 {
+        self.errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn now(&self) -> i64 {
@@ -343,7 +417,7 @@ pub fn reconciled<K: Resource>(ctx: &Context, object: &K) {
         .remove(&object_key(object));
 }
 
-/// 5 s, doubling per consecutive failure of the same object, at most 5 min.
+/// The requeue after a failed reconcile: `Waiting` in 2 s, `TimedOut` per §22.2, anything else by `backoff`.
 pub fn error_policy<K: Resource>(object: Arc<K>, error: &Error, ctx: Arc<Context>) -> Action {
     let key = object_key(object.as_ref());
     let (namespace, name) = (object.namespace().unwrap_or_default(), object.name_any());
@@ -351,19 +425,24 @@ pub fn error_policy<K: Resource>(object: Arc<K>, error: &Error, ctx: Arc<Context
         tracing::debug!(namespace = %namespace, name = %name, "{why}");
         return Action::requeue(Duration::from_secs(2));
     }
-    // a lost request, not a failure of the object: `within` logged it
+    // `within` counted it: the first ones are lost requests, not the object
     if let Error::TimedOut(_) = error {
-        return Action::requeue(Duration::from_secs(2));
+        let n = ctx.errors_of(&key);
+        return Action::requeue(if n <= QUICK_TIMEOUTS {
+            Duration::from_secs(2)
+        } else {
+            backoff(n)
+        });
     }
-    let attempt = {
-        let mut errors = ctx.errors.lock().unwrap_or_else(|e| e.into_inner());
-        let n = errors.entry(key.clone()).or_insert(0);
-        *n = n.saturating_add(1);
-        *n
-    };
-    let delay = Duration::from_secs((5u64 << attempt.saturating_sub(1).min(6)).min(300));
+    let attempt = ctx.count_error(&key);
+    let delay = backoff(attempt);
     tracing::warn!(namespace = %namespace, name = %name, attempt, "reconcile failed: {error}");
     Action::requeue(delay)
+}
+
+/// 5 s, doubling per consecutive failure of the same object, at most 5 min.
+fn backoff(attempt: u32) -> Duration {
+    Duration::from_secs((5u64 << attempt.saturating_sub(1).min(6)).min(300))
 }
 
 /// What a controller's stream yields, as a log line.
@@ -435,9 +514,24 @@ mod tests {
         Arc::new(c)
     }
 
+    /// Nothing listens on port 9: building the client opens no connection,
+    /// and an Event published through it fails at once.
+    fn context() -> Arc<Context> {
+        let client =
+            Client::try_from(kube::Config::new("http://127.0.0.1:9".parse().unwrap())).unwrap();
+        Arc::new(Context::new(
+            client,
+            RunConfig::new(
+                "0.2.0",
+                crate::desired::common::Images::for_version("0.2.0"),
+                "ns",
+            ),
+        ))
+    }
+
     #[tokio::test]
     async fn a_reconcile_inside_the_bound_keeps_its_result() {
-        let done = within(Duration::from_secs(30), object(), async {
+        let done = within(Duration::from_secs(30), object(), &context(), async {
             Ok(Action::requeue(Duration::from_secs(7)))
         })
         .await;
@@ -445,30 +539,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reconcile_past_the_bound_is_dropped_and_requeued_in_two_seconds() {
-        // a request that is never answered
-        let lost = std::future::pending::<Result<Action, Error>>();
+    async fn two_timeouts_requeue_in_two_seconds_and_the_third_backs_off() {
+        let ctx = context();
         let limit = Duration::from_millis(20);
-        let error = within(limit, object(), lost).await.unwrap_err();
-        assert!(matches!(error, Error::TimedOut(d) if d == limit), "{error}");
-        // building a client opens no connection
-        let client =
-            Client::try_from(kube::Config::new("http://127.0.0.1:9".parse().unwrap())).unwrap();
-        let ctx = Arc::new(Context::new(
-            client,
-            RunConfig::new(
-                "0.2.0",
-                crate::desired::common::Images::for_version("0.2.0"),
-                "ns",
-            ),
-        ));
-        // not a failure of the object: no backoff, however often it happens
-        for _ in 0..3 {
-            assert_eq!(
-                error_policy(object(), &error, ctx.clone()),
-                Action::requeue(Duration::from_secs(2))
-            );
+        let mut delays = Vec::new();
+        for _ in 0..4 {
+            // a request that is never answered
+            let lost = std::future::pending::<Result<Action, Error>>();
+            let error = within(limit, object(), &ctx, lost).await.unwrap_err();
+            assert!(matches!(error, Error::TimedOut(d) if d == limit), "{error}");
+            delays.push(error_policy(object(), &error, ctx.clone()));
         }
-        assert!(ctx.errors.lock().unwrap().is_empty());
+        // the third and fourth also published the Event; that it could not
+        // be written cost nothing
+        let secs = |s| Action::requeue(Duration::from_secs(s));
+        assert_eq!(delays, vec![secs(2), secs(2), secs(20), secs(40)]);
+        // a reconcile that ends well starts the count again
+        reconciled(&ctx, object().as_ref());
+        let lost = std::future::pending::<Result<Action, Error>>();
+        let error = within(limit, object(), &ctx, lost).await.unwrap_err();
+        assert_eq!(error_policy(object(), &error, ctx), secs(2));
+    }
+
+    #[test]
+    fn the_backoff_doubles_from_five_seconds_to_five_minutes() {
+        assert_eq!(backoff(1), Duration::from_secs(5));
+        assert_eq!(backoff(3), Duration::from_secs(20));
+        assert_eq!(backoff(7), Duration::from_secs(300));
+        assert_eq!(backoff(60), Duration::from_secs(300));
     }
 }

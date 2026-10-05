@@ -1,5 +1,7 @@
 //! Every daemon → plugin call (plugins spec §4.2) on one `reqwest` client:
-//! loopback, plain HTTP/1.1, no proxy, 5 s unless the caller says otherwise.
+//! HTTP/1.1, no proxy, plain on loopback and TLS under the Daemon's
+//! authority alone for a plugin URL (Spec O §23.1), 5 s unless the caller
+//! says otherwise.
 //! Failures are classified into the four `reason` labels of §4.3.
 //!
 //! Every call carries the plugin's own token as the bearer (§18.3): the
@@ -75,9 +77,10 @@ impl From<reqwest::Error> for CallFailure {
 #[derive(Clone)]
 pub struct PluginClient {
     http: reqwest::Client,
-    /// Spec O §23.1: the Daemon's authority, trusted alone; `None` on one
-    /// machine, where every plugin is loopback HTTP.
-    tls: Option<Arc<rustls::ClientConfig>>,
+    /// Spec O §23.1: the Daemon's authority, trusted alone; trusts nothing
+    /// on one machine, where every plugin is loopback HTTP.
+    tls: Arc<rustls::ClientConfig>,
+    trusts: bool,
 }
 
 impl fmt::Debug for PluginClient {
@@ -87,25 +90,33 @@ impl fmt::Debug for PluginClient {
 }
 
 impl PluginClient {
-    pub fn new(tls: Option<Arc<rustls::ClientConfig>>) -> Result<Self, PluginError> {
+    pub fn new(authority: Option<Arc<rustls::ClientConfig>>) -> Result<Self, PluginError> {
         // reqwest's `rustls-no-provider` panics without one (Spec O §23.1)
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut builder = reqwest::Client::builder().no_proxy().timeout(CALL_TIMEOUT);
-        if let Some(tls) = &tls {
-            builder = builder.use_preconfigured_tls((**tls).clone());
-        }
-        let http = builder
+        let trusts = authority.is_some();
+        let tls = match authority {
+            Some(t) => t,
+            None => crate::kube::tls::no_roots()
+                .map_err(|e| PluginError::Internal(format!("tls config: {e}")))?,
+        };
+        // always preconfigured: reqwest's own default is the system's roots
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(CALL_TIMEOUT)
+            .use_preconfigured_tls((*tls).clone())
             .build()
             .map_err(|e| PluginError::Internal(format!("http client: {e}")))?;
-        Ok(Self { http, tls })
+        Ok(Self { http, tls, trusts })
     }
 
-    /// Whether this client can call an `https://` plugin.
+    /// Whether this client was given an authority, so can call an
+    /// `https://` plugin.
     pub fn trusts(&self) -> bool {
-        self.tls.is_some()
+        self.trusts
     }
 
-    pub fn tls(&self) -> Option<Arc<rustls::ClientConfig>> {
+    /// The config the proxy's client shares: the authority, or no roots.
+    pub fn tls(&self) -> Arc<rustls::ClientConfig> {
         self.tls.clone()
     }
 

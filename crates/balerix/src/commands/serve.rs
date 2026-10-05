@@ -178,11 +178,6 @@ fn init_tracing(paths: &ServerPaths, level: &str, to_file: bool) -> Result<()> {
     Ok(())
 }
 
-/// Spec O §7.3: TLS on the pod address, the operator's admin token, the
-/// link hub as the runner and the workspace reader, no files to
-/// materialise, a pool that is a Job's, and no `plugins.yaml` (§9 brings
-/// `PUT /v1/plugins`): the startup plugin sync is not run. One process per
-/// pod, so there is no `already_running` check and no detach.
 /// The files `--mode kubernetes` reads; `ca` is optional (Spec O §23.1).
 struct KubeFiles<'a> {
     cert: &'a Path,
@@ -191,6 +186,11 @@ struct KubeFiles<'a> {
     ca: Option<&'a Path>,
 }
 
+/// Spec O §7.3: TLS on the pod address, the operator's admin token, the
+/// link hub as the runner and the workspace reader, no files to
+/// materialise, a pool that is a Job's, and no `plugins.yaml` (§9 brings
+/// `PUT /v1/plugins`): the startup plugin sync is not run. One process per
+/// pod, so there is no `already_running` check and no detach.
 fn run_kubernetes(
     layout: &StateLayout,
     paths: &ServerPaths,

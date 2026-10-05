@@ -8,7 +8,7 @@ pub mod tls;
 
 pub use idle::{NoFiles, NoPool};
 pub use link::{ATTACH_WAIT, LINK_CALL_TIMEOUT, LinkError, LinkHub};
-pub use tls::{TlsServer, client_config, serve_tls};
+pub use tls::{TlsServer, client_config, no_roots, serve_tls};
 
 /// `FleetRecord.owner` of a fleet the operator applied (§7.3).
 pub const KUBERNETES_OWNER: &str = "kubernetes";

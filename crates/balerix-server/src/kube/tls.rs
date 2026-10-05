@@ -57,6 +57,17 @@ impl TlsServer {
     }
 }
 
+fn build(roots: rustls::RootCertStore) -> Result<Arc<rustls::ClientConfig>, rustls::Error> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
 /// The Daemon's trust for a plugin (Spec O §23.1): the authority file's
 /// certificates and nothing else, no webpki or native roots. Its body is the
 /// SDK's `client_config`; this crate does not depend on the SDK.
@@ -72,12 +83,12 @@ pub fn client_config(ca: &Path) -> std::io::Result<Arc<rustls::ClientConfig>> {
     if roots.is_empty() {
         return Err(fail(&"no certificate in the authority file"));
     }
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|e| fail(&e))?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    Ok(Arc::new(config))
+    build(roots).map_err(|e| fail(&e))
+}
+
+/// A config that trusts nothing: with no authority an `https://` plugin
+/// fails its handshake rather than falling back to the system's roots, which
+/// reqwest's rustls feature would otherwise use (§23.1).
+pub fn no_roots() -> std::io::Result<Arc<rustls::ClientConfig>> {
+    build(rustls::RootCertStore::empty()).map_err(std::io::Error::other)
 }

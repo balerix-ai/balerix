@@ -53,36 +53,22 @@ const DROPPED_RESPONSE: [&str; 6] = [
     "transfer-encoding",
 ];
 
-/// Negligible on loopback; bounds a plugin whose listener has gone away
-/// without closing its port.
+/// Negligible on loopback; bounds a plugin whose listener or pod has gone
+/// away without closing its port.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-pub fn client(tls: Option<Arc<rustls::ClientConfig>>) -> HttpClient {
+pub fn client(tls: Arc<rustls::ClientConfig>) -> HttpClient {
     let mut http = HttpConnector::new();
     http.set_connect_timeout(Some(CONNECT_TIMEOUT));
     // https_or_http: loopback plugins stay plain; an https plugin is
     // verified against the Daemon's authority alone (Spec O §23.1)
     http.enforce_http(false);
-    let tls = tls.map_or_else(no_roots, |t| (*t).clone());
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls)
+        .with_tls_config((*tls).clone())
         .https_or_http()
         .enable_http1()
         .wrap_connector(http);
     Client::builder(TokioExecutor::new()).build(connector)
-}
-
-/// A config that trusts nothing: an `https://` plugin on a daemon given
-/// no authority fails its handshake rather than trusting a default store.
-fn no_roots() -> rustls::ClientConfig {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .map(|b| {
-            b.with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth()
-        })
-        .unwrap_or_else(|_| unreachable!("ring supports the safe default versions"))
 }
 
 /// An upgrade request is `Upgrade` together with a `Connection` that
@@ -405,7 +391,7 @@ mod tests {
         .await;
         let tls = crate::kube::tls::client_config(&ca).unwrap();
         let base = stub.listen.clone();
-        let proxy = client(Some(tls));
+        let proxy = client(tls);
         // a one-route front door that forwards through `forward`
         let app = axum::Router::new().route(
             "/v1/plugins/stub/ws",

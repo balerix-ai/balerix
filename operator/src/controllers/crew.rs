@@ -13,7 +13,7 @@ use kube::{Api, ResourceExt};
 
 use super::fleet::daemon_of;
 use super::jobs::{ensure_job, pods_of};
-use super::{Context, Error, api_in, error_policy, patch_status, reconciled, report};
+use super::{Context, Error, api_in, bounded, error_policy, patch_status, reconciled, report};
 use crate::api::Crew;
 use crate::desired::common::{JobOutcome, owner_of};
 use crate::desired::jobs::{JobContext, crew_status, crew_sync_job, job_outcome};
@@ -26,7 +26,7 @@ pub async fn controller(ctx: Arc<Context>, namespace: Option<&str>) {
         watcher::Config::default(),
     )
     .owns(api_in::<Job>(client, namespace), watcher::Config::default())
-    .run(reconcile, error_policy, ctx.clone())
+    .run(bounded(reconcile), error_policy, ctx.clone())
     .for_each(|r| async move { report("crew", r) })
     .await;
 }

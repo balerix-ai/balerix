@@ -11,10 +11,12 @@ pub mod fleet;
 pub mod jobs;
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use balerix_api::FleetRecord;
+use futures_util::future::BoxFuture;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::Action;
@@ -96,11 +98,56 @@ pub enum Error {
     /// A cleanup that is not finished: requeued in 2 s, not an error.
     #[error("waiting: {0}")]
     Waiting(String),
+    /// The reconcile ran past `RECONCILE_TIMEOUT` and was dropped:
+    /// requeued in 2 s, like `Waiting`, but not a cleanup to report.
+    #[error("the reconcile did not finish in {0:?}")]
+    TimedOut(Duration),
 }
 
 impl From<kube::runtime::finalizer::Error<Error>> for Error {
     fn from(e: kube::runtime::finalizer::Error<Error>) -> Self {
         Error::Finalizer(Box::new(e))
+    }
+}
+
+/// How long one reconcile may run. A kube request can be lost on a pooled
+/// connection and never answered, and the client has no read timeout; a
+/// reconcile awaiting it would hold its object for good, since the runtime
+/// never starts a second reconcile of an object whose first still runs.
+pub const RECONCILE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A controller's reconcile under `RECONCILE_TIMEOUT`, for `.run(...)`.
+pub fn bounded<K, F, Fut>(
+    reconcile: F,
+) -> impl FnMut(Arc<K>, Arc<Context>) -> BoxFuture<'static, Result<Action, Error>>
+where
+    K: Resource + Send + Sync + 'static,
+    F: Fn(Arc<K>, Arc<Context>) -> Fut,
+    Fut: Future<Output = Result<Action, Error>> + Send + 'static,
+{
+    move |object, ctx| {
+        let reconcile = reconcile(object.clone(), ctx);
+        Box::pin(within(RECONCILE_TIMEOUT, object, reconcile))
+    }
+}
+
+/// `reconcile`, or `TimedOut` once it has run for `limit`: the future is
+/// dropped, and whatever it held with it.
+pub async fn within<K: Resource>(
+    limit: Duration,
+    object: Arc<K>,
+    reconcile: impl Future<Output = Result<Action, Error>>,
+) -> Result<Action, Error> {
+    match tokio::time::timeout(limit, reconcile).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                namespace = %object.namespace().unwrap_or_default(),
+                name = %object.name_any(),
+                "the reconcile did not finish in {limit:?}: dropped and requeued"
+            );
+            Err(Error::TimedOut(limit))
+        }
     }
 }
 
@@ -304,6 +351,10 @@ pub fn error_policy<K: Resource>(object: Arc<K>, error: &Error, ctx: Arc<Context
         tracing::debug!(namespace = %namespace, name = %name, "{why}");
         return Action::requeue(Duration::from_secs(2));
     }
+    // a lost request, not a failure of the object: `within` logged it
+    if let Error::TimedOut(_) = error {
+        return Action::requeue(Duration::from_secs(2));
+    }
     let attempt = {
         let mut errors = ctx.errors.lock().unwrap_or_else(|e| e.into_inner());
         let n = errors.entry(key.clone()).or_insert(0);
@@ -366,4 +417,55 @@ async fn set(ctx: Arc<Context>, namespace: Option<String>) {
         Box::pin(agent::controller(ctx.clone(), ns)),
     ];
     futures_util::future::join_all(controllers).await;
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use k8s_openapi::api::core::v1::ConfigMap;
+
+    fn object() -> Arc<ConfigMap> {
+        let mut c = ConfigMap::default();
+        c.metadata.name = Some("o".into());
+        c.metadata.namespace = Some("ns".into());
+        Arc::new(c)
+    }
+
+    #[tokio::test]
+    async fn a_reconcile_inside_the_bound_keeps_its_result() {
+        let done = within(Duration::from_secs(30), object(), async {
+            Ok(Action::requeue(Duration::from_secs(7)))
+        })
+        .await;
+        assert_eq!(done.unwrap(), Action::requeue(Duration::from_secs(7)));
+    }
+
+    #[tokio::test]
+    async fn a_reconcile_past_the_bound_is_dropped_and_requeued_in_two_seconds() {
+        // a request that is never answered
+        let lost = std::future::pending::<Result<Action, Error>>();
+        let limit = Duration::from_millis(20);
+        let error = within(limit, object(), lost).await.unwrap_err();
+        assert!(matches!(error, Error::TimedOut(d) if d == limit), "{error}");
+        // building a client opens no connection
+        let client =
+            Client::try_from(kube::Config::new("http://127.0.0.1:9".parse().unwrap())).unwrap();
+        let ctx = Arc::new(Context::new(
+            client,
+            RunConfig::new(
+                "0.2.0",
+                crate::desired::common::Images::for_version("0.2.0"),
+                "ns",
+            ),
+        ));
+        // not a failure of the object: no backoff, however often it happens
+        for _ in 0..3 {
+            assert_eq!(
+                error_policy(object(), &error, ctx.clone()),
+                Action::requeue(Duration::from_secs(2))
+            );
+        }
+        assert!(ctx.errors.lock().unwrap().is_empty());
+    }
 }

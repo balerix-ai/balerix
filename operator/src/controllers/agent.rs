@@ -23,7 +23,9 @@ use super::crew::crew_ready;
 use super::daemon::read_secret_string;
 use super::fleet::daemon_of;
 use super::jobs::ensure_job;
-use super::{Context, Error, api_in, apply, error_policy, patch_status, reconciled, report};
+use super::{
+    Context, Error, api_in, apply, bounded, error_policy, patch_status, reconciled, report,
+};
 use crate::api::{Agent, AgentStatus, Crew, Daemon, Fleet, Retain};
 use crate::desired::agent::{AgentInputs, SPEC_HASH_ANNOTATION, agent_objects, agent_status};
 use crate::desired::common::{Cond, JobOutcome, conditions, owner_of};
@@ -73,7 +75,7 @@ pub async fn controller(ctx: Arc<Context>, namespace: Option<&str>) {
                 .collect::<Vec<_>>()
         },
     )
-    .run(reconcile, error_policy, ctx.clone())
+    .run(bounded(reconcile), error_policy, ctx.clone())
     .for_each(|r| async move { report("agent", r) })
     .await;
 }

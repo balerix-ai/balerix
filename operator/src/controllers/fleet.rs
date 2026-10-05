@@ -21,8 +21,8 @@ use super::agent::PURGE_ANNOTATION;
 use super::daemon::{authority_and_token, read_secret_string};
 use super::jobs::ensure_job;
 use super::{
-    Context, Error, api_in, apply, error_policy, patch_status, reconciled, replace_condition,
-    report,
+    Context, Error, api_in, apply, bounded, error_policy, patch_status, reconciled,
+    replace_condition, report,
 };
 use crate::api::{Agent, Crew, Daemon, Fleet, FleetStatus, Retain};
 use crate::daemon_client::{ClientError, DaemonClient};
@@ -66,7 +66,7 @@ pub async fn controller(ctx: Arc<Context>, namespace: Option<&str>) {
                 .collect::<Vec<_>>()
         },
     )
-    .run(reconcile, error_policy, ctx.clone())
+    .run(bounded(reconcile), error_policy, ctx.clone())
     .for_each(|r| async move { report("fleet", r) })
     .await;
 }

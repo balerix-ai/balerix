@@ -17,7 +17,9 @@ use kube::runtime::watcher;
 use kube::{Api, ResourceExt};
 
 use super::jobs::ensure_job;
-use super::{Context, Error, api_in, apply, error_policy, patch_status, reconciled, report};
+use super::{
+    Context, Error, api_in, apply, bounded, error_policy, patch_status, reconciled, report,
+};
 use crate::api::Daemon;
 use crate::desired::common::{Cond, conditions};
 use crate::desired::daemon::{
@@ -54,7 +56,7 @@ pub async fn controller(ctx: Arc<Context>, namespace: Option<&str>) {
         api_in::<NetworkPolicy>(client, namespace),
         watcher::Config::default(),
     )
-    .run(reconcile, error_policy, ctx.clone())
+    .run(bounded(reconcile), error_policy, ctx.clone())
     .for_each(|r| async move { report("daemon", r) })
     .await;
 }

@@ -3,13 +3,12 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use balerix_config::{HostPaths, ResolveOptions, host, read, resolve};
 use balerix_core::{Fleet, HookTarget, ResolvedAgent};
-use balerix_plugin_sdk::Host;
+use balerix_plugin_sdk::{Host, SdkError};
 use balerix_runtime::{RenderOptions, Runtime, StateLayout};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -297,34 +296,25 @@ fn hooks_of(settings: &Value, event: &str) -> Vec<Value> {
 /// Binding a loopback listener under nono is plugins spec §11.1 row 1: if
 /// it is refused, the verdict is left in scratch instead of hanging.
 pub fn fake_plugin_command() -> Result<String> {
-    use balerix_plugin_sdk::{Env, bind, run};
+    use balerix_plugin_sdk::Env;
     let env = Env::from_process()?;
     let scratch = env.scratch.clone();
     std::fs::create_dir_all(&scratch)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let token = env.token.clone();
         let host = Host::new(env)?;
-        let (listener, listen) = match bind().await {
-            Ok(b) => b,
-            Err(e) => {
-                std::fs::write(scratch.join("fake-plugin.bind-failed"), e.to_string())?;
-                bail!("fake-plugin: cannot bind a loopback listener: {e}");
-            }
-        };
-        let plugin = Arc::new(FakePlugin {
+        let plugin = FakePlugin {
             scratch: scratch.clone(),
-        });
-        let server = tokio::spawn(async move { run(listener, plugin, &token).await });
-        let resp = host.hello(env!("CARGO_PKG_VERSION"), &listen).await?;
-        std::fs::write(
-            scratch.join("fake-plugin.hello"),
-            serde_json::to_string_pretty(&resp.config)?,
-        )?;
-        eprintln!("fake-plugin: hello acknowledged; listening on {listen}");
-        manage_from_config(&host, &resp.config, &scratch).await?;
-        server.await??;
-        Ok::<String, anyhow::Error>(String::new())
+            host: host.clone(),
+        };
+        match balerix_plugin_sdk::serve(&host, env!("CARGO_PKG_VERSION"), plugin).await {
+            Ok(()) => Ok(String::new()),
+            Err(SdkError::Bind(e)) => {
+                std::fs::write(scratch.join("fake-plugin.bind-failed"), &e)?;
+                bail!("fake-plugin: cannot bind its listener: {e}");
+            }
+            Err(e) => Err(e.into()),
+        }
     })
 }
 
@@ -353,8 +343,13 @@ async fn manage_from_config(host: &Host, config: &Value, scratch: &Path) -> Resu
     Ok(())
 }
 
+/// What the fake would ship as `balerix-plugin.yaml`: the hooks and the
+/// capabilities the e2e and the Kubernetes tests exercise.
+const FAKE_PLUGIN_MANIFEST: &str = "apiVersion: balerix/v1\nkind: Plugin\nname: fake\nversion: 0.0.0\nprotocol: 1\nstart: serve\nhooks:\n  observe: [SessionStart, Notification, PreToolUse, Stop]\n  intercept: [PreToolUse, Stop]\nneeds: [actions, fleets, kv, manage]\n";
+
 struct FakePlugin {
     scratch: PathBuf,
+    host: Host,
 }
 
 impl FakePlugin {
@@ -372,6 +367,28 @@ impl FakePlugin {
 }
 
 impl balerix_plugin_sdk::Plugin for FakePlugin {
+    fn manifest(&self) -> Option<&'static str> {
+        Some(FAKE_PLUGIN_MANIFEST)
+    }
+
+    /// The `hello` reply: written to scratch, then `config.manage` applied
+    /// off the serving path (an apply may take the SDK's 120 s).
+    async fn configure(&self, config: Value) -> Result<(), String> {
+        std::fs::write(
+            self.scratch.join("fake-plugin.hello"),
+            serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        eprintln!("fake-plugin: hello acknowledged");
+        let (host, scratch) = (self.host.clone(), self.scratch.clone());
+        tokio::spawn(async move {
+            if let Err(e) = manage_from_config(&host, &config, &scratch).await {
+                eprintln!("fake-plugin: manage: {e}");
+            }
+        });
+        Ok(())
+    }
+
     async fn activate(&self, agent: &str, config: Value) -> Result<(), String> {
         if config.get("reject").is_some() {
             return Err(format!("fake-plugin: rejected by config for {agent}"));

@@ -152,9 +152,9 @@ async fn start_plugin<P: Plugin + 'static>(w: &World, name: &str, plugin: Arc<P>
     };
     let (listener, listen) = bind().await.unwrap();
     let tok = env.token.clone();
-    tokio::spawn(async move { run(listener, plugin, &tok).await });
+    tokio::spawn(async move { run(listener, plugin, &tok, None).await });
     let host = Host::new(env).unwrap();
-    host.hello("0.1.0", &listen).await.unwrap();
+    host.hello("0.1.0", &listen, None).await.unwrap();
     host
 }
 

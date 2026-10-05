@@ -17,7 +17,7 @@ pub mod tls;
 
 pub use host::{Attach, AttachRead, AttachWrite, CloseReason, FleetWatch, Host};
 pub use metrics::Metrics;
-pub use plugin::{Plugin, bind, router, run, serve};
+pub use plugin::{Plugin, bind, bind_to, parse_manifest, router, run, serve};
 
 /// The four `BALERIX_*` variables the daemon sets through the nono profile
 /// (plugins spec §5.1).

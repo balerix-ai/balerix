@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::http::HeaderValue;
 use balerix_api::{
     DownQuery, ErrorBody, FleetRecord, HelloRequest, HelloResponse, KvKeys, PLUGIN_PROTOCOL,
-    PluginAction, ResizeFrame, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
+    PluginAction, PluginManifest, ResizeFrame, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -137,13 +137,18 @@ impl Host {
     /// `POST /v1/plugin-host/hello` (plugins spec §4.1): announces the
     /// plugin's version and listen address; the daemon marks it `Ready`
     /// and answers with the daemon-level config.
-    pub async fn hello(&self, version: &str, listen: &str) -> Result<HelloResponse, SdkError> {
+    pub async fn hello(
+        &self,
+        version: &str,
+        listen: &str,
+        manifest: Option<&PluginManifest>,
+    ) -> Result<HelloResponse, SdkError> {
         let req = HelloRequest {
             name: self.env.name.clone(),
             version: version.to_string(),
             protocol: PLUGIN_PROTOCOL,
             listen: listen.to_string(),
-            manifest: None,
+            manifest: manifest.cloned(),
         };
         self.json(self.http.post(self.url("hello")).json(&req))
             .await
@@ -660,7 +665,7 @@ mod tests {
         let fake =
             FakeHost::start("tok", json!({ "greeting": "hi" }), vec![record("payments")]).await;
         let host = Host::new(fake.env("flow", std::path::Path::new("/s"))).unwrap();
-        let hello = host.hello("0.1.0", "127.0.0.1:4321").await.unwrap();
+        let hello = host.hello("0.1.0", "127.0.0.1:4321", None).await.unwrap();
         assert_eq!(hello.config["greeting"], "hi");
         let seen = fake.hellos();
         assert_eq!(seen.len(), 1);
@@ -916,7 +921,7 @@ mod tests {
         env.token = "wrong".into();
         let e = Host::new(env)
             .unwrap()
-            .hello("0.1.0", "127.0.0.1:1")
+            .hello("0.1.0", "127.0.0.1:1", None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -927,7 +932,7 @@ mod tests {
         env.api_url = "http://127.0.0.1:1".into();
         let e = Host::new(env)
             .unwrap()
-            .hello("0.1.0", "127.0.0.1:1")
+            .hello("0.1.0", "127.0.0.1:1", None)
             .await
             .unwrap_err();
         assert!(matches!(e, SdkError::Transport(_)), "{e}");
@@ -980,13 +985,16 @@ mod tls_tests {
             listen: "127.0.0.1:0".into(),
         };
         let host = Host::new(env(Some(ca))).unwrap();
-        assert_eq!(host.hello("0.1.0", "x").await.unwrap().config["ok"], true);
+        assert_eq!(
+            host.hello("0.1.0", "x", None).await.unwrap().config["ok"],
+            true
+        );
         // another authority's file: the handshake fails
         let other = tempfile::tempdir().unwrap();
         let (other_ca, _, _) = authority(other.path());
         let host = Host::new(env(Some(other_ca))).unwrap();
         assert!(matches!(
-            host.hello("0.1.0", "x").await,
+            host.hello("0.1.0", "x", None).await,
             Err(SdkError::Transport(_))
         ));
     }

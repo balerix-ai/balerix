@@ -98,6 +98,10 @@ impl WebPlugin {
 }
 
 impl Plugin for WebPlugin {
+    fn manifest(&self) -> Option<&'static str> {
+        Some(include_str!("../package/balerix-plugin.yaml"))
+    }
+
     async fn activate(&self, agent: &str, config: Value) -> Result<(), String> {
         let cfg = parse(&config).map_err(|e| e.to_string())?;
         self.shared.cache.set_enabled(agent, cfg.enabled);

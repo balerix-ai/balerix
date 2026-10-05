@@ -123,10 +123,10 @@ async fn start_flow(w: &World) -> (Arc<FlowLike>, Host) {
     tokio::spawn({
         let plugin = plugin.clone();
         let token = env.token.clone();
-        async move { run(listener, plugin, &token).await }
+        async move { run(listener, plugin, &token, None).await }
     });
     let host = Host::new(env).unwrap();
-    host.hello("0.1.0", &listen).await.unwrap();
+    host.hello("0.1.0", &listen, None).await.unwrap();
     (plugin, host)
 }
 
@@ -481,7 +481,7 @@ async fn plugin_metrics_are_re_exported_under_the_prefix_rule() {
         .set(1);
     let (l1, listen1) = bind().await.unwrap();
     let flow_token = token(&w, "flow").await;
-    tokio::spawn(async move { run(l1, Arc::new(Good(good)), &flow_token).await });
+    tokio::spawn(async move { run(l1, Arc::new(Good(good)), &flow_token, None).await });
     // A plugin outside the SDK answering an unprefixed family: the daemon
     // must drop the body whole.
     let bad = axum::Router::new().route(
@@ -504,7 +504,7 @@ async fn plugin_metrics_are_re_exported_under_the_prefix_rule() {
         };
         Host::new(env)
             .unwrap()
-            .hello("0.1.0", &listen)
+            .hello("0.1.0", &listen, None)
             .await
             .unwrap();
     }

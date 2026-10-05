@@ -25,6 +25,7 @@ hex = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 axum-server = { workspace = true }
+serde_norway = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

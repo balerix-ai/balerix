@@ -47,6 +47,9 @@ pub struct RunConfig {
     pub fleet_period: Duration,
     /// The Daemon's and the Crew's requeue: renewal and drift.
     pub period: Duration,
+    /// How long something holding a crew may take to be deleted before the
+    /// waiting Job's owner gets a `CrewLocked` Event (§22.3).
+    pub stuck_after: Duration,
     pub clock: Clock,
     /// Tests only: every Daemon is this plain-HTTP stub. A pod's Daemon is
     /// `https` and the client refuses anything else.
@@ -66,6 +69,7 @@ impl RunConfig {
             watch_namespaces: None,
             fleet_period: Duration::from_secs(15),
             period: Duration::from_secs(60),
+            stuck_after: Duration::from_secs(300),
             clock: Arc::new(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

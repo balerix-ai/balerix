@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client, Resource, ResourceExt};
 use serde::de::DeserializeOwned;
@@ -89,26 +90,82 @@ fn unfinished(job: &Job) -> bool {
     job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0) == 0 && !job_failed(job)
 }
 
-/// Whether another Job of this crew is unfinished or still being deleted
-/// (§5.3's lock): a stale Job deleted in the foreground is listed until
-/// its pods are gone.
-pub async fn crew_busy(
+/// What holds a crew (§5.3): one of its Jobs unfinished or being deleted,
+/// or one of its Jobs' pods not yet finished or being deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holder {
+    /// `Job` or `Pod`.
+    pub kind: &'static str,
+    pub name: String,
+    /// Unix seconds of its deletion timestamp, while it is being deleted.
+    pub deleting_since: Option<i64>,
+}
+
+fn deleting_since(meta: &ObjectMeta) -> Option<i64> {
+    meta.deletion_timestamp.as_ref().map(|t| t.0.as_second())
+}
+
+/// What holds the crew, other than the Job `except`. A stale Job deleted
+/// in the foreground is listed until its pods are gone. A pod outlives its
+/// Job when the Job is collected in the background, as a dropped crew's
+/// sync is (§22.3); `job-name` keeps the agents' own pods out.
+pub async fn crew_holders(
     client: &Client,
     namespace: &str,
     fleet: &str,
     crew: &str,
     except: &str,
-) -> Result<bool, Error> {
+) -> Result<Vec<Holder>, Error> {
+    let selector = format!("balerix.ai/fleet={fleet},balerix.ai/crew={crew}");
     let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
-    let list = jobs
-        .list(
-            &ListParams::default()
-                .labels(&format!("balerix.ai/fleet={fleet},balerix.ai/crew={crew}")),
+    let mut holders: Vec<Holder> = jobs
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items
+        .iter()
+        .filter(|j| {
+            j.name_any() != except && (unfinished(j) || j.metadata.deletion_timestamp.is_some())
+        })
+        .map(|j| Holder {
+            kind: "Job",
+            name: j.name_any(),
+            deleting_since: deleting_since(&j.metadata),
+        })
+        .collect();
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let finished = |p: &Pod| {
+        matches!(
+            p.status.as_ref().and_then(|s| s.phase.as_deref()),
+            Some("Succeeded" | "Failed")
         )
-        .await?;
-    Ok(list.items.iter().any(|j| {
-        j.name_any() != except && (unfinished(j) || j.metadata.deletion_timestamp.is_some())
-    }))
+    };
+    holders.extend(
+        pods.list(
+            &ListParams::default().labels(&format!("{selector},batch.kubernetes.io/job-name")),
+        )
+        .await?
+        .items
+        .iter()
+        .filter(|p| p.metadata.deletion_timestamp.is_some() || !finished(p))
+        .map(|p| Holder {
+            kind: "Pod",
+            name: p.name_any(),
+            deleting_since: deleting_since(&p.metadata),
+        }),
+    );
+    Ok(holders)
+}
+
+/// The holder deleting longest, once that is `after` or more: a pod on a
+/// lost node never finishes its deletion (§22.3).
+fn stuck(holders: &[Holder], now: i64, after: Duration) -> Option<&Holder> {
+    holders
+        .iter()
+        .filter(|h| {
+            h.deleting_since
+                .is_some_and(|t| now - t >= after.as_secs() as i64)
+        })
+        .min_by_key(|h| h.deleting_since)
 }
 
 async fn set_attempts<K>(
@@ -158,7 +215,7 @@ enum Created {
     Made,
     /// Made by a reconcile that raced this one: it is running.
     Raced,
-    Busy,
+    Busy(Vec<Holder>),
     NamespaceTerminating,
 }
 
@@ -170,10 +227,11 @@ async fn check_and_create(
     crew: Option<(String, String)>,
     wanted: Job,
 ) -> Result<Created, Error> {
-    if let Some((fleet, crew)) = &crew
-        && crew_busy(&client, &namespace, fleet, crew, &wanted.name_any()).await?
-    {
-        return Ok(Created::Busy);
+    if let Some((fleet, crew)) = &crew {
+        let holders = crew_holders(&client, &namespace, fleet, crew, &wanted.name_any()).await?;
+        if !holders.is_empty() {
+            return Ok(Created::Busy(holders));
+        }
     }
     let jobs: Api<Job> = Api::namespaced(client, &namespace);
     match jobs.create(&PostParams::default(), &wanted).await {
@@ -239,8 +297,22 @@ where
                 None => work.await?,
             };
             match created {
-                Created::Busy => {
-                    tracing::debug!(job = %name, "waiting: another Job of the crew runs");
+                Created::Busy(holders) => {
+                    tracing::debug!(job = %name, ?holders, "waiting: the crew is held");
+                    if let (Some((fleet, crew)), Some(h)) =
+                        (crew_lock, stuck(&holders, ctx.now(), ctx.run.stuck_after))
+                    {
+                        let since = h
+                            .deleting_since
+                            .and_then(|t| k8s_openapi::jiff::Timestamp::from_second(t).ok())
+                            .map(|t| t.to_string())
+                            .unwrap_or_default();
+                        let note = format!(
+                            "crew {fleet}/{crew} waits on {} {}, being deleted since {since}: the crew stays locked until it is gone",
+                            h.kind, h.name
+                        );
+                        ctx.warn(owner, "CrewLocked", note).await;
+                    }
                     Ok(Ensured::new(outcome, soon))
                 }
                 Created::NamespaceTerminating => {
@@ -303,6 +375,25 @@ where
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn the_stuck_holder_is_the_one_deleting_longest_past_the_bound() {
+        let holder = |kind, name: &str, since| Holder {
+            kind,
+            name: name.to_string(),
+            deleting_since: since,
+        };
+        let after = Duration::from_secs(300);
+        let holders = vec![
+            holder("Job", "f-c-sync", None),
+            holder("Pod", "young", Some(1_000)),
+            holder("Pod", "old", Some(500)),
+        ];
+        assert_eq!(stuck(&holders, 1_200, after), Some(&holders[2]));
+        // nothing has been deleting for 300 s yet
+        assert_eq!(stuck(&holders, 700, after), None);
+        assert_eq!(stuck(&holders[..1], 10_000, after), None);
+    }
 
     #[test]
     fn a_job_failed_by_its_condition_alone_is_finished() {

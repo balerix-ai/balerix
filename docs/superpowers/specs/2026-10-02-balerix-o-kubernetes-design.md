@@ -1776,13 +1776,13 @@ down-record purge path (#135); the runtime flakes #136 and #137.
 
 - **A Job is failed when `status.failed ≥ 1` or its `Failed` condition is
   `True`** (#131). One predicate serves `job_outcome`, `unfinished` and so
-  `crew_busy`. A Job whose pod was never created, refused by a ResourceQuota
+  `crew_holders`. A Job whose pod was never created, refused by a ResourceQuota
   or an admission webhook, reaches `Failed=True/DeadlineExceeded` under
   `activeDeadlineSeconds` with `failed: 0`. It is now retried under
   §21.6's Job rule like any failure, and reports its condition through
   `failed_condition`. This amends §21.6's deadline bullet, whose claim was
   broader than the code.
-- **The crew lock also counts pods** (#132, gap 1). `crew_busy` lists pods
+- **The crew lock also counts pods** (#132, gap 1). `crew_holders` lists pods
   labelled `balerix.ai/fleet=<fleet>,balerix.ai/crew=<crew>` that carry a
   `batch.kubernetes.io/job-name` label, so an agent pod never matches. A pod
   holds the crew while its phase is neither `Succeeded` nor `Failed`, or
@@ -1792,7 +1792,7 @@ down-record purge path (#135); the runtime flakes #136 and #137.
   The busy check runs only when the wanted Job is absent, so the wanted
   Job's own pods are never counted.
 - **A crew held by something being deleted for too long says so** (#132,
-  gap 2). `crew_busy` returns what holds the crew, not a bare `bool`. When
+  gap 2). `crew_holders` returns what holds the crew, not a bare `bool`. When
   that is a Job or a pod whose deletion timestamp is older than
   `RunConfig::stuck_after` (5 min; tests set it lower), the owner of the
   wanted Job gets a Warning Event, reason `CrewLocked`, naming the object
@@ -1804,8 +1804,9 @@ down-record purge path (#135); the runtime flakes #136 and #137.
   gap 3). `ensure_job` takes the crew lock as an owned guard
   (`Mutex::lock_owned`) and runs the check and the create in a spawned task
   holding it, then awaits the task. When `RECONCILE_TIMEOUT` drops the
-  reconcile, the task runs on to the create's answer, at most 10 s under
-  §22.1, and only then releases the lock. A second reconcile therefore
+  reconcile, the task runs on to the create's answer, each of its requests
+  (the Job list, the pod list and the create) bounded at 10 s under §22.1,
+  and only then releases the lock. A second reconcile therefore
   either waits for the lock or lists the created Job. **Accepted:** a
   create the client gave up on at 10 s that the API server still commits
   later. Its write has passed the client's bound, and the API server's own

@@ -13,7 +13,7 @@ use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::Api;
-use kube::api::{Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use support::envtest::envtest;
 use support::stub_daemon::StubDaemon;
 use support::{
@@ -1590,6 +1590,7 @@ async fn job_rule(
         &ns,
     );
     cfg.period = Duration::from_secs(1);
+    cfg.stuck_after = Duration::from_secs(1);
     let ctx = balerix_operator::controllers::Context::new(env.client.clone(), cfg);
     (env, ns, ctx, owner)
 }
@@ -1649,6 +1650,22 @@ async fn the_crew_lock_lets_one_of_two_racing_jobs_start() {
         jobs.list(&Default::default()).await.unwrap().items.len(),
         20
     );
+}
+
+/// A pod of crew `f/c` with `extra` labels; nothing runs it. A
+/// `finalizer` keeps it, deleting, until the test takes it off.
+fn crew_pod(ns: &str, name: &str, extra: &[(&str, &str)], finalizer: Option<&str>) -> Pod {
+    let mut labels = serde_json::json!({ "balerix.ai/fleet": "f", "balerix.ai/crew": "c" });
+    for (k, v) in extra {
+        labels[*k] = serde_json::json!(v);
+    }
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": { "name": name, "namespace": ns, "labels": labels,
+            "finalizers": finalizer.into_iter().collect::<Vec<_>>() },
+        "spec": { "restartPolicy": "Never", "containers": [{ "name": "job", "image": "x" }] }
+    }))
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1735,6 +1752,147 @@ async fn a_stale_job_is_deleted_in_the_foreground_and_holds_the_crew_until_gone(
         new.metadata.annotations.unwrap()["balerix.ai/input-hash"],
         "new"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crews_job_pod_without_its_job_holds_the_crew() {
+    use balerix_operator::controllers::jobs::ensure_job;
+    use balerix_operator::desired::common::JobOutcome;
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, ctx, owner) = job_rule("podhold").await;
+    let client = env.client.clone();
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let job_name = [("batch.kubernetes.io/job-name", "f-c-sync")];
+    // a dropped crew's sync pod: its Job collected in the background, the pod still running
+    pods.create(
+        &PostParams::default(),
+        &crew_pod(&ns, "f-c-sync-x1", &job_name, None),
+    )
+    .await
+    .unwrap();
+    // an agent's own pod, and a finished pod of an old Job, hold nothing
+    pods.create(&PostParams::default(), &crew_pod(&ns, "f-c-a", &[], None))
+        .await
+        .unwrap();
+    let old = [("batch.kubernetes.io/job-name", "f-c-old")];
+    pods.create(
+        &PostParams::default(),
+        &crew_pod(&ns, "f-c-old-x1", &old, None),
+    )
+    .await
+    .unwrap();
+    pods.patch_status(
+        "f-c-old-x1",
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({ "status": { "phase": "Succeeded" } })),
+    )
+    .await
+    .unwrap();
+
+    let harvest = || crew_job(&ns, "f-c-a-harvest", "h");
+    let held = ensure_job(&ctx, &owner, harvest(), Some(("f", "c")))
+        .await
+        .unwrap();
+    assert_eq!(held.outcome, JobOutcome::Absent);
+    assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_none());
+
+    // no node: the pod is deleted at once, and the harvest starts
+    pods.delete("f-c-sync-x1", &DeleteParams::default())
+        .await
+        .unwrap();
+    wait_for("the sync pod gone", Duration::from_secs(30), || async {
+        pods.get_opt("f-c-sync-x1")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    let made = ensure_job(&ctx, &owner, harvest(), Some(("f", "c")))
+        .await
+        .unwrap();
+    assert_eq!(made.outcome, JobOutcome::Running);
+    assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crew_held_by_a_pod_deleting_past_the_bound_puts_crew_locked_on_the_owner() {
+    use balerix_operator::controllers::jobs::ensure_job;
+    use balerix_operator::desired::common::JobOutcome;
+    use k8s_openapi::api::events::v1::Event;
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, ctx, owner) = job_rule("stuck").await;
+    let client = env.client.clone();
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let events: Api<Event> = Api::namespaced(client.clone(), &ns);
+    let job_name = [("batch.kubernetes.io/job-name", "f-c-sync")];
+    // a pod on a lost node: deleting, and never gone
+    pods.create(
+        &PostParams::default(),
+        &crew_pod(&ns, "f-c-sync-x1", &job_name, Some("balerix.ai/test-hold")),
+    )
+    .await
+    .unwrap();
+    pods.delete("f-c-sync-x1", &DeleteParams::default())
+        .await
+        .unwrap();
+
+    let harvest = || crew_job(&ns, "f-c-a-harvest", "h");
+    let event = wait_for(
+        "a CrewLocked Event on the owner",
+        Duration::from_secs(30),
+        || async {
+            let ensured = ensure_job(&ctx, &owner, harvest(), Some(("f", "c")))
+                .await
+                .unwrap();
+            assert_eq!(ensured.outcome, JobOutcome::Absent, "the lock holds");
+            events
+                .list(&Default::default())
+                .await
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|e| {
+                    e.reason.as_deref() == Some("CrewLocked")
+                        && e.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some("owner")
+                })
+        },
+    )
+    .await;
+    assert_eq!(event.type_.as_deref(), Some("Warning"));
+    let note = event.note.unwrap();
+    assert!(
+        note.starts_with("crew f/c waits on Pod f-c-sync-x1, being deleted since "),
+        "{note}"
+    );
+    assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_none());
+
+    // the user forces it out: the harvest starts
+    pods.patch(
+        "f-c-sync-x1",
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({ "metadata": { "finalizers": null } })),
+    )
+    .await
+    .unwrap();
+    wait_for("the pod gone", Duration::from_secs(30), || async {
+        pods.get_opt("f-c-sync-x1")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    let made = ensure_job(&ctx, &owner, harvest(), Some(("f", "c")))
+        .await
+        .unwrap();
+    assert_eq!(made.outcome, JobOutcome::Running);
 }
 
 #[tokio::test(flavor = "multi_thread")]

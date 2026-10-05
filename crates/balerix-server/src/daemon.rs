@@ -325,10 +325,6 @@ impl Daemon {
         self.plugins.packages()
     }
 
-    pub fn is_kubernetes(&self) -> bool {
-        self.ports.kube.is_some()
-    }
-
     pub fn registry(&self) -> &Arc<PluginRegistry> {
         &self.registry
     }

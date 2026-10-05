@@ -36,8 +36,8 @@ use crate::desired::names;
 /// On an Agent or its Fleet: skip the harvest, as `--purge` does (§8.5).
 pub const PURGE_ANNOTATION: &str = "balerix.ai/purge";
 
-pub async fn controller(ctx: Arc<Context>, namespace: Option<&str>) {
-    let client = &ctx.client;
+pub async fn controller(ctx: Arc<Context>, watches: &kube::Client, namespace: Option<&str>) {
+    let client = watches;
     let mapper_ctx = ctx.clone();
     Controller::new(
         api_in::<Agent>(client, namespace),

@@ -161,7 +161,12 @@ pub fn spawn_operator(
     cfg.period = Duration::from_secs(1);
     cfg.clock = clock.clock();
     cfg.insecure_daemon_url = daemon_url;
-    tokio::spawn(balerix_operator::controllers::run(env.client.clone(), cfg)).abort_handle()
+    tokio::spawn(balerix_operator::controllers::run(
+        env.client.clone(),
+        env.watches.clone(),
+        cfg,
+    ))
+    .abort_handle()
 }
 
 /// The kubelet's part for a Job in envtest: marks it succeeded or failed

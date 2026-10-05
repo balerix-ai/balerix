@@ -22,6 +22,8 @@ use tokio::sync::OnceCell;
 
 pub struct EnvTest {
     pub client: Client,
+    /// The operator's watch client (`watch_client`), on the same server.
+    pub watches: Client,
     pub kubeconfig: PathBuf,
     /// The two watched shells; they end the servers with this process.
     _shells: Vec<Child>,
@@ -281,6 +283,7 @@ async fn attempt_start(bin: &Path, root: &Path, attempt: u32) -> Result<EnvTest,
     let config = Config::from_custom_kubeconfig(kc, &KubeConfigOptions::default())
         .await
         .unwrap();
+    let watches = balerix_operator::watch_client::watch_client(config.clone()).unwrap();
     let client = Client::try_from(config).unwrap();
 
     // `/readyz`, not `/version`: the version answers before the post-start
@@ -350,6 +353,7 @@ async fn attempt_start(bin: &Path, root: &Path, attempt: u32) -> Result<EnvTest,
     }
     Ok(EnvTest {
         client,
+        watches,
         kubeconfig,
         _shells: vec![etcd, api],
     })

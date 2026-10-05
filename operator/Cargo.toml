@@ -37,6 +37,12 @@ clap = { version = "4.6.6", features = ["derive", "env"] }
 # The client, the controller runtime and the derive. `rustls-tls` + `ring`
 # is kube 4.2's default TLS stack, on the provider the Daemon client uses.
 kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ring"] }
+# The controllers' watch client (`watch_client`, hyper#4207): kube's own
+# connector stack over a hyper-util client that pools nothing. The versions
+# kube 4.2 already locks.
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
+hyper-timeout = "0.5.2"
+tower = { version = "0.5.3", default-features = false, features = ["retry", "util"] }
 # The controllers' streams: `for_each` over a Controller's results.
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 # The controllers' logs: namespace, name, reason; never a token.

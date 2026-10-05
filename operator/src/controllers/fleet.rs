@@ -32,8 +32,8 @@ use crate::desired::jobs::{JobContext, fleet_pool_job, remove_job};
 use crate::desired::names;
 use crate::pki::new_token;
 
-pub async fn controller(ctx: Arc<Context>, namespace: Option<&str>) {
-    let client = &ctx.client;
+pub async fn controller(ctx: Arc<Context>, watches: &kube::Client, namespace: Option<&str>) {
+    let client = watches;
     let mapper_ctx = ctx.clone();
     Controller::new(
         api_in::<Fleet>(client, namespace),

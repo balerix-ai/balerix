@@ -77,13 +77,16 @@ async fn run(args: RunArgs) -> Result<()> {
     cfg.watch_namespaces = args.watch_namespaces;
     cfg.insecure_daemon_url = args.insecure_daemon_url;
     cfg.resolve = args.resolve;
-    let client = kube::Client::try_default()
+    let config = kube::Config::infer()
         .await
         .context("cannot connect to the cluster (KUBECONFIG, or in-cluster)")?;
+    let watches = balerix_operator::watch_client::watch_client(config.clone())
+        .context("cannot build the watch client")?;
+    let client = kube::Client::try_from(config).context("cannot build the client")?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("cannot listen for SIGTERM")?;
     tokio::select! {
-        () = balerix_operator::controllers::run(client, cfg) => {}
+        () = balerix_operator::controllers::run(client, watches, cfg) => {}
         _ = sigterm.recv() => tracing::info!("SIGTERM: stopping"),
         _ = tokio::signal::ctrl_c() => tracing::info!("interrupted: stopping"),
     }

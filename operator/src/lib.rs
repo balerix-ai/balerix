@@ -8,3 +8,4 @@ pub mod controllers;
 pub mod daemon_client;
 pub mod desired;
 pub mod pki;
+pub mod watch_client;

@@ -19,8 +19,8 @@ use crate::desired::common::{JobOutcome, owner_of};
 use crate::desired::jobs::{JobContext, crew_status, crew_sync_job, job_outcome};
 use crate::desired::names;
 
-pub async fn controller(ctx: Arc<Context>, namespace: Option<&str>) {
-    let client = &ctx.client;
+pub async fn controller(ctx: Arc<Context>, watches: &kube::Client, namespace: Option<&str>) {
+    let client = watches;
     Controller::new(
         api_in::<Crew>(client, namespace),
         watcher::Config::default(),

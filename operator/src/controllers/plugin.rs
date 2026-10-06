@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use kube::api::{DeleteParams, ListParams, PostParams};
+use kube::api::{DeleteParams, ListParams, PostParams, Preconditions};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Api, ResourceExt};
@@ -117,43 +117,75 @@ pub async fn read_serving(
     ))
 }
 
-/// Unlisted: the objects a listing made are deleted (§23.4).
-async fn remove_owned(ctx: &Context, namespace: &str, plugin: &str) -> Result<(), Error> {
-    async fn gone<K>(api: Api<K>, name: &str) -> Result<(), Error>
+/// Unlisted: the objects a listing made are deleted (§23.4). Only those
+/// this Plugin owns: an object of the same name that someone else made is
+/// left alone.
+async fn remove_owned(
+    ctx: &Context,
+    namespace: &str,
+    plugin: &str,
+    uid: &str,
+) -> Result<(), Error> {
+    async fn release<K>(api: Api<K>, name: &str, owner: &str) -> Result<(), Error>
     where
         K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
     {
-        match api.delete(name, &DeleteParams::default()).await {
+        let Some(object) = api.get_opt(name).await? else {
+            return Ok(());
+        };
+        if !object.owner_references().iter().any(|o| o.uid == owner) {
+            return Ok(());
+        }
+        // the object read, not one made under its name since
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: object.uid(),
+                resource_version: None,
+            }),
+            ..DeleteParams::default()
+        };
+        match api.delete(name, &params).await {
             Ok(_) => Ok(()),
-            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+            // gone, or replaced by one that is not ours
+            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
     let c = &ctx.client;
-    gone(
+    release(
         Api::<Deployment>::namespaced(c.clone(), namespace),
         &names::plugin(plugin),
+        uid,
     )
     .await?;
-    gone(Api::<Service>::namespaced(c.clone(), namespace), plugin).await?;
-    gone(
+    release(
+        Api::<Service>::namespaced(c.clone(), namespace),
+        plugin,
+        uid,
+    )
+    .await?;
+    release(
         Api::<NetworkPolicy>::namespaced(c.clone(), namespace),
         &names::plugin(plugin),
+        uid,
     )
     .await?;
-    gone(
+    release(
         Api::<Secret>::namespaced(c.clone(), namespace),
         &names::plugin_token(plugin),
+        uid,
     )
     .await?;
-    gone(
+    release(
         Api::<Secret>::namespaced(c.clone(), namespace),
         &names::plugin_serving(plugin),
+        uid,
     )
     .await?;
-    gone(
+    release(
         Api::<PersistentVolumeClaim>::namespaced(c.clone(), namespace),
         &names::plugin_scratch(plugin),
+        uid,
     )
     .await?;
     Ok(())
@@ -169,7 +201,10 @@ pub async fn reconcile(plugin: Arc<Plugin>, ctx: Arc<Context>) -> Result<Action,
     let rows;
     let state = match listing(&name, &daemons) {
         Listing::None => {
-            remove_owned(&ctx, &namespace, &name).await?;
+            let uid = plugin
+                .uid()
+                .ok_or_else(|| Error::Missing(format!("Plugin {name} has no metadata.uid")))?;
+            remove_owned(&ctx, &namespace, &name, &uid).await?;
             PluginState::NotListed
         }
         Listing::Many(ds) => PluginState::ListedTwice(ds),

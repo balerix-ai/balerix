@@ -86,6 +86,15 @@ async fn world(
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unlisted_plugin_owns_nothing() {
     let (env, ns, _stub, _clock, operator) = world("unlisted", &[]).await;
+    // a Service of the plugin's name that someone else made
+    let services: Api<Service> = Api::namespaced(env.client.clone(), &ns);
+    let theirs: Service = serde_json::from_value(serde_json::json!({
+        "metadata": { "name": "web" }, "spec": { "ports": [{ "port": 80 }] } }))
+    .unwrap();
+    services
+        .create(&PostParams::default(), &theirs)
+        .await
+        .unwrap();
     let plugins: Api<Plugin> = Api::namespaced(env.client.clone(), &ns);
     plugins
         .create(
@@ -114,6 +123,11 @@ async fn an_unlisted_plugin_owns_nothing() {
             .await
             .unwrap()
             .is_none()
+    );
+    // the reconcile that said NotListed released what it owns first: not this
+    assert!(
+        services.get_opt("web").await.unwrap().is_some(),
+        "their Service survives"
     );
     operator.abort();
 }
@@ -337,9 +351,10 @@ async fn a_missing_secret_blocks_the_plugin_and_names_the_key() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plugin_unlisted_owns_nothing_and_relisted_comes_back() {
-    let (env, ns, _stub, _clock, operator) = world("relist", &["web"]).await;
+    let (env, ns, stub, _clock, operator) = world("relist", &["web"]).await;
     let c = env.client.clone();
-    Api::<Plugin>::namespaced(c.clone(), &ns)
+    let plugins: Api<Plugin> = Api::namespaced(c.clone(), &ns);
+    plugins
         .create(
             &PostParams::default(),
             &Plugin::new("web", plugin_spec(serde_json::json!({}))),
@@ -362,6 +377,8 @@ async fn a_plugin_unlisted_owns_nothing_and_relisted_comes_back() {
         .await
         .unwrap();
     let deployments: Api<Deployment> = Api::namespaced(c.clone(), &ns);
+    let services: Api<Service> = Api::namespaced(c.clone(), &ns);
+    let policies: Api<NetworkPolicy> = Api::namespaced(c.clone(), &ns);
     wait_for("objects gone", Duration::from_secs(30), || async {
         (deployments
             .get_opt("balerix-plugin-web")
@@ -370,6 +387,17 @@ async fn a_plugin_unlisted_owns_nothing_and_relisted_comes_back() {
             .is_none()
             && secrets
                 .get_opt("balerix-plugin-web-token")
+                .await
+                .unwrap()
+                .is_none()
+            && secrets
+                .get_opt("balerix-plugin-web-tls")
+                .await
+                .unwrap()
+                .is_none()
+            && services.get_opt("web").await.unwrap().is_none()
+            && policies
+                .get_opt("balerix-plugin-web")
                 .await
                 .unwrap()
                 .is_none())
@@ -389,6 +417,28 @@ async fn a_plugin_unlisted_owns_nothing_and_relisted_comes_back() {
     })
     .await;
     assert_ne!(token(again), token(first));
+
+    // relisted, it runs again: no operator restart
+    wait_for("the Deployment again", Duration::from_secs(30), || async {
+        deployments.get_opt("balerix-plugin-web").await.unwrap()
+    })
+    .await;
+    deployments
+        .patch_status(
+            "balerix-plugin-web",
+            &PatchParams::default(),
+            &Patch::Merge(
+                serde_json::json!({ "status": { "replicas": 1, "readyReplicas": 1, "availableReplicas": 1 } }),
+            ),
+        )
+        .await
+        .unwrap();
+    stub.set_plugin_rows(vec![ready_row("web")]);
+    wait_for("Ready again", Duration::from_secs(30), || async {
+        let p = plugins.get("web").await.unwrap();
+        (condition(&p, "Ready")?.0 == "True").then_some(())
+    })
+    .await;
     operator.abort();
 }
 

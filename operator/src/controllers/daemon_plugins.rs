@@ -16,13 +16,13 @@ use crate::desired::plugin::{
 
 /// Builds and sends `PUT /v1/plugins` from `spec.plugins` in order, then
 /// judges `PluginsReady` from `GET /v1/plugins`. A plugin with no Plugin,
-/// listed by another Daemon too, or whose token or serving Secret is not
-/// made yet is left out of this pass: none of these has managed requests
-/// to lose. A plugin that has both but whose grant or config cannot be
-/// built holds the whole list back: the Daemon drops the requests of any
-/// plugin a list leaves out (§23.7), so sending without it would delete
-/// its Fleets over a deleted Secret. Returns the names sent, `None` when
-/// nothing was.
+/// or whose token or serving Secret is not made yet, is left out of this
+/// pass: neither has managed requests to lose (deleting a Plugin collects
+/// its Fleets with it). A plugin listed by another Daemon too, or whose
+/// grant or config cannot be built, holds the whole list back: the Daemon
+/// drops the requests of any plugin a list leaves out (§23.7), so sending
+/// without it would delete its Fleets over a second listing or a deleted
+/// Secret. Returns the names sent, `None` when nothing was.
 pub async fn send_list(
     ctx: &Context,
     daemon: &Daemon,
@@ -38,11 +38,14 @@ pub async fn send_list(
         .into_iter()
         .filter(|d| d.name_any() != name)
         .collect();
-    let (mut missing, mut twice, mut entries) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut missing, mut entries) = (Vec::new(), Vec::new());
     for p in &daemon.spec.plugins {
         if others.iter().any(|d| d.spec.plugins.contains(p)) {
-            twice.push(p.clone());
-            continue;
+            let message = format!("Plugin {p} is listed by another Daemon too");
+            return Ok((
+                Cond::no("PluginsReady", "PluginListedTwice", &message),
+                None,
+            ));
         }
         let Some(plugin) = plugins.get_opt(p).await? else {
             missing.push(p.clone());
@@ -54,12 +57,9 @@ pub async fn send_list(
         ) else {
             continue;
         };
-        let config = match (
-            grant(&plugin.spec),
-            read_config(ctx, namespace, &plugin).await?,
-        ) {
-            (Err(e), _) => Err(("InvalidSpec", e)),
-            (Ok(_), c) => c,
+        let config = match grant(&plugin.spec) {
+            Err(e) => Err(("InvalidSpec", e)),
+            Ok(_) => read_config(ctx, namespace, &plugin).await?,
         };
         let config = match config {
             Ok(c) => c,
@@ -86,7 +86,7 @@ pub async fn send_list(
         .await?;
     let rows = client.plugins().await?;
     Ok((
-        plugins_ready(&daemon.spec.plugins, &missing, &twice, &rows),
+        plugins_ready(&daemon.spec.plugins, &missing, &[], &rows),
         Some(sent),
     ))
 }
@@ -96,7 +96,9 @@ pub async fn send_list(
 /// deletes the Fleet; so does a plugin dropped from `spec.plugins`. A
 /// plugin still listed but left out of this pass (its Secrets not made)
 /// keeps its Fleets. A Fleet without the label, or with another plugin's,
-/// is never written: a `FleetConflict` Event instead.
+/// is never written: a `FleetConflict` Event instead. A request that
+/// cannot be made a Fleet, or that the API server refuses, is a
+/// `ManagedFleetRefused` Event on its Plugin and the rest go on.
 pub async fn write_managed(
     ctx: &Context,
     daemon: &Daemon,
@@ -112,29 +114,8 @@ pub async fn write_managed(
         let Some(plugin) = plugins.get_opt(&row.plugin).await? else {
             continue;
         };
-        let current = fleets.get_opt(&row.name).await?;
-        if let Some(f) = &current
-            && f.labels().get(MANAGED_BY_LABEL) != Some(&row.plugin)
-        {
-            let note = format!(
-                "Fleet {} exists and is not managed by plugin {}: left as it is",
-                row.name, row.plugin
-            );
-            ctx.warn(&plugin, "FleetConflict", note).await;
-            continue;
-        }
-        let mut desired = managed_fleet(row, &plugin, &name)?;
-        match &row.down {
-            None => {
-                apply(&ctx.client, &desired).await?;
-            }
-            Some(down) if current.is_some() => {
-                desired.spec.retain = retain_of(down);
-                apply(&ctx.client, &desired).await?;
-                delete_fleet(&fleets, &row.name).await?;
-            }
-            Some(_) => {}
-        }
+        let written = write_one(ctx, &fleets, row, &plugin, &name).await;
+        refused(ctx, Some(&plugin), &row.name, written).await?;
     }
     let ours = fleets
         .list(&ListParams::default().labels(MANAGED_BY_LABEL))
@@ -151,8 +132,67 @@ pub async fn write_managed(
             .iter()
             .any(|r| r.name == f.name_any() && r.plugin == plugin && r.down.is_none());
         if dropped || (sent.contains(&plugin) && !live) {
-            delete_fleet(&fleets, &f.name_any()).await?;
+            let deleted = delete_fleet(&fleets, &f.name_any()).await;
+            let owner = plugins.get_opt(&plugin).await?;
+            refused(ctx, owner.as_ref(), &f.name_any(), deleted).await?;
         }
+    }
+    Ok(())
+}
+
+/// One managed request written: applied, or downed and deleted.
+async fn write_one(
+    ctx: &Context,
+    fleets: &Api<Fleet>,
+    row: &balerix_api::ManagedFleet,
+    plugin: &Plugin,
+    daemon: &str,
+) -> Result<(), Error> {
+    let current = fleets.get_opt(&row.name).await?;
+    if let Some(f) = &current
+        && f.labels().get(MANAGED_BY_LABEL) != Some(&row.plugin)
+    {
+        let note = format!(
+            "Fleet {} exists and is not managed by plugin {}: left as it is",
+            row.name, row.plugin
+        );
+        ctx.warn(plugin, "FleetConflict", note).await;
+        return Ok(());
+    }
+    let mut desired = managed_fleet(row, plugin, daemon)?;
+    match &row.down {
+        None => {
+            apply(&ctx.client, &desired).await?;
+        }
+        Some(down) if current.is_some() => {
+            desired.spec.retain = retain_of(down);
+            apply(&ctx.client, &desired).await?;
+            delete_fleet(fleets, &row.name).await?;
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+/// A request's own failure (one `managed_fleet` cannot build, or a 4xx
+/// from the API server) is a Warning on its Plugin and the pass goes on;
+/// anything else (transport, 5xx) fails the reconcile.
+async fn refused(
+    ctx: &Context,
+    plugin: Option<&Plugin>,
+    fleet: &str,
+    result: Result<(), Error>,
+) -> Result<(), Error> {
+    let why = match result {
+        Ok(()) => return Ok(()),
+        Err(Error::Desired(e)) => e.to_string(),
+        Err(Error::Kube(kube::Error::Api(e))) if (400..500).contains(&e.code) => e.to_string(),
+        Err(e) => return Err(e),
+    };
+    let note = format!("managed Fleet {fleet}: {why}");
+    match plugin {
+        Some(p) => ctx.warn(p, "ManagedFleetRefused", note).await,
+        None => tracing::warn!(fleet, "{note}"),
     }
     Ok(())
 }

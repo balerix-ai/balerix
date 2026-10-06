@@ -596,15 +596,24 @@ async fn a_plugin_whose_config_cannot_be_built_holds_the_list_back() {
     plugins
         .create(
             &PostParams::default(),
-            &Plugin::new("web", plugin_spec(serde_json::json!({}))),
+            &Plugin::new(
+                "web",
+                plugin_spec(serde_json::json!({ "needs": ["actions", "fleets", "manage"] })),
+            ),
         )
         .await
         .unwrap();
+    stub.set_managed(vec![managed("m", "web", None)]);
     wait_for("a list of both", Duration::from_secs(60), || async {
         made(&stub)
             .iter()
             .any(|l| l == &["flow", "web"])
             .then_some(())
+    })
+    .await;
+    let fleets: Api<balerix_operator::api::Fleet> = Api::namespaced(env.client.clone(), &ns);
+    wait_for("web's Fleet m", Duration::from_secs(60), || async {
+        fleets.get_opt("m").await.unwrap()
     })
     .await;
     // web's config now names a Secret that does not exist
@@ -646,6 +655,9 @@ async fn a_plugin_whose_config_cannot_be_built_holds_the_list_back() {
         lists[both..].iter().all(|l| l == &["flow", "web"]),
         "{lists:?}"
     );
+    // and nothing touched web's Fleet
+    let m = fleets.get("m").await.unwrap();
+    assert!(m.metadata.deletion_timestamp.is_none());
     operator.abort();
 }
 
@@ -818,6 +830,126 @@ async fn dropping_the_plugin_deletes_its_fleets() {
     support::finish_job(&c, &ns, "m-c-remove", true, None).await;
     wait_for("Fleet m gone", Duration::from_secs(120), || async {
         fleets.get_opt("m").await.unwrap().is_none().then_some(())
+    })
+    .await;
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_listed_twice_holds_the_list_back_and_keeps_its_fleets() {
+    let (env, ns, stub, _clock, operator) = world("twicefleets", &["fake"]).await;
+    let c = env.client.clone();
+    Api::<Plugin>::namespaced(c.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Plugin::new(
+                "fake",
+                plugin_spec(serde_json::json!({ "needs": ["fleets", "manage"] })),
+            ),
+        )
+        .await
+        .unwrap();
+    stub.set_managed(vec![managed("m", "fake", None)]);
+    let fleets: Api<balerix_operator::api::Fleet> = Api::namespaced(c.clone(), &ns);
+    wait_for("Fleet m", Duration::from_secs(60), || async {
+        fleets.get_opt("m").await.unwrap()
+    })
+    .await;
+    // a second Daemon lists it too (it never becomes ready: only the first talks to the stub)
+    Api::<Daemon>::namespaced(c.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Daemon::new("other", daemon_spec(&["fake"])),
+        )
+        .await
+        .unwrap();
+    let daemons: Api<Daemon> = Api::namespaced(c.clone(), &ns);
+    wait_for("PluginListedTwice", Duration::from_secs(60), || async {
+        let s = daemons.get("default").await.unwrap().status?;
+        s.conditions
+            .iter()
+            .find(|c| {
+                c.type_ == "PluginsReady"
+                    && c.reason == "PluginListedTwice"
+                    && c.message == "Plugin fake is listed by another Daemon too"
+            })
+            .cloned()
+    })
+    .await;
+    // no list without fake went out, so the Daemon keeps its managed requests
+    let sent = stub.lists().len();
+    support::hold_for(
+        "a list sent while fake is listed twice",
+        Duration::from_secs(3),
+        || async { (stub.lists().len() > sent).then_some(()) },
+    )
+    .await;
+    let m = fleets.get("m").await.unwrap();
+    assert!(m.metadata.deletion_timestamp.is_none());
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_managed_request_is_an_event_and_the_rest_go_on() {
+    let (env, ns, stub, _clock, operator) = world("refused", &["fake"]).await;
+    let c = env.client.clone();
+    Api::<Plugin>::namespaced(c.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Plugin::new(
+                "fake",
+                plugin_spec(serde_json::json!({ "needs": ["fleets", "manage"] })),
+            ),
+        )
+        .await
+        .unwrap();
+    // the API server refuses the first (not a valid object name); the second is fine
+    stub.set_managed(vec![
+        managed("Bad_Name", "fake", None),
+        managed("good", "fake", None),
+    ]);
+    stub.set_plugin_rows(vec![ready_row("fake")]);
+    let events: Api<k8s_openapi::api::events::v1::Event> = Api::namespaced(c.clone(), &ns);
+    let event = wait_for(
+        "ManagedFleetRefused on the Plugin",
+        Duration::from_secs(60),
+        || async {
+            events
+                .list(&Default::default())
+                .await
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|e| {
+                    e.reason.as_deref() == Some("ManagedFleetRefused")
+                        && e.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some("fake")
+                })
+        },
+    )
+    .await;
+    assert!(
+        event
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("managed Fleet Bad_Name: "),
+        "{:?}",
+        event.note
+    );
+    let fleets: Api<balerix_operator::api::Fleet> = Api::namespaced(c.clone(), &ns);
+    let good = wait_for("Fleet good", Duration::from_secs(60), || async {
+        fleets.get_opt("good").await.unwrap()
+    })
+    .await;
+    assert_eq!(good.labels()["balerix.ai/managed-by"], "fake");
+    // the reconcile went on to write the Daemon's status
+    let daemons: Api<Daemon> = Api::namespaced(c.clone(), &ns);
+    wait_for("PluginsReady=AllReady", Duration::from_secs(60), || async {
+        let s = daemons.get("default").await.unwrap().status?;
+        s.conditions
+            .iter()
+            .any(|c| c.type_ == "PluginsReady" && c.reason == "AllReady")
+            .then_some(())
     })
     .await;
     operator.abort();

@@ -43,8 +43,9 @@ credentials, hook input, or sandbox rules.
   local-path class (§19.3), and the daemon, agent, operator and plugin
   images built from this tree and loaded (`balerix:e2e`,
   `balerix-agent:e2e`, `balerix-operator:e2e`, …); no CRDs. Needs
-  docker; `mise run kind-up -- down` deletes it. This host has no docker:
-  CI only.
+  docker; `mise run kind-up -- down` deletes it. `mise run kind-up cluster`
+  makes the cluster and class only, no images (what the charts release
+  check uses). This host has no docker: CI only.
 - `e2e-k8s` — the Phase 3 and plugin journeys on that cluster
   (`operator/tests/e2e_k8s.rs`): `scripts/operator.sh e2e` installs the
   operator chart (with `--take-ownership`, so definitions an earlier `kubectl apply` made are adopted; the CRDs, and the operator in the cluster under its own
@@ -85,6 +86,13 @@ credentials, hook input, or sandbox rules.
   scratch repository (`scripts/verify-github.sh`); needs `GITHUB_APP_ID`,
   `GITHUB_APP_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_REPO` and a listener
   GitHub can reach. Not part of any CI tier.
+- `verify-k8s` — Spec O §24.6's manual check with the real `claude` on the
+  cluster `KUBECONFIG` names (`scripts/verify-k8s.sh`): both charts from
+  the tree (`-- --from tree`, the default) or the published index
+  (`-- --from index`, with `BALERIX_VERIFY_OWNER` for a fork), a
+  payments-shaped Fleet on pod runners, the e2e journey's checks; prints a
+  report. Needs a ReadWriteMany class (`BALERIX_VERIFY_SHARED_CLASS`) and a
+  logged-in `claude`; `-- down` removes it. Not part of any CI tier.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 - `vendor-xterm` is a script, not a task: `scripts/vendor-xterm.sh` re-fetches
   and verifies the web plugin's assets against
@@ -92,10 +100,12 @@ credentials, hook input, or sandbox rules.
   every digest matches); `--check` verifies the committed files offline.
 - `release-prepare <unit> [version]` — what `release-pr.yml` runs: works
   out one release unit's next version (core, common, flow, web, matrix,
-  github) and writes it into the manifests, lockfiles, plugin manifest and
+  github, charts) and writes it into the manifests, lockfiles, plugin manifest and
   changelog. Commits nothing. `docs/RELEASING.md` is the release process.
 - `release-test` — scenario tests for `scripts/release/` against throwaway
-  clones under `target/tmp`; CI runs it when the scripts change.
+  clones under `target/tmp`; CI runs it when the scripts change. It covers
+  the charts unit's gates (`appVersion`, plugin tags, a pin-only change,
+  a core minor), staging and the fork rewrite.
 
 ## Conventions
 - Ports (`Materializer`, `AgentRunner`, `Clock`, `FleetStore`, `EventHandler`)

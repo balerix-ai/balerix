@@ -7,14 +7,16 @@ Design: `docs/superpowers/specs/2026-09-11-release-pipeline-design.md`
 
 | Unit | Tag | Ships |
 |---|---|---|
-| core | `balerix-v<ver>` | `balerix` binaries, `ghcr.io/balerix-ai/balerix`, `balerix-api` and `balerix-plugin-sdk` on crates.io |
+| core | `balerix-v<ver>` | `balerix`, `balerix-operator` and `balerix-agent` binaries; `ghcr.io/balerix-ai/balerix`, `…/balerix-agent` and `…/balerix-operator`; `balerix-api` and `balerix-plugin-sdk` on crates.io |
 | common | `balerix-plugin-common-v<ver>` | `balerix-plugin-common` on crates.io |
 | flow | `balerix-plugin-flow-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-flow`, release package |
 | web | `balerix-plugin-web-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-web`, release package |
 | matrix | `balerix-plugin-matrix-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-matrix`, release package |
 | github | `balerix-plugin-github-v<ver>` | binaries, `ghcr.io/balerix-ai/balerix-plugin-github`, release package |
+| charts | `balerix-charts-v<ver>` | both charts at one version: `oci://ghcr.io/balerix-ai/charts/balerix-operator` and `…/balerix-daemon`, and the index at `https://balerix-ai.github.io/helm-charts` |
 
-Binaries are static musl builds for Linux x86_64 and aarch64.
+Binaries are static musl builds for Linux x86_64 and aarch64. Core's
+archive holds all three binaries.
 
 A library unit ships crates only: no binary, image or package. `common`
 names the SDK and API by version, and crates.io builds it against exactly
@@ -33,6 +35,31 @@ after `balerix-v0.1.0`; publishing it against 0.1.0 would fail. The
 refusal above keeps the bot from proposing it; if a bot-opened common
 release PR is open anyway, do not merge it before the core release that
 moves those versions has landed (its tag exists).
+
+### The charts unit
+
+The charts name core's version (`appVersion`, which core's release PR
+moves) and each plugin's (`plugins.<plugin>.image.tag` in
+`charts/balerix-daemon/values.yaml`, which that plugin's release PR
+moves). `prepare.sh charts` proposes nothing until all of them are
+tagged, and names the missing tag. A moved pin counts as a change even with
+no commit under `charts/`, and the larger bump wins (a core minor is a
+chart minor). The changelog lists the moved images under `### Images`.
+
+The release runs in this order:
+
+1. package the charts (a fork's archives name the fork's images);
+2. `mise run charts` on the archives, then install them on kind with the
+   published images (the Daemon, flow and web Ready);
+3. push to OCI and sign;
+4. the GitHub Release, with the archives;
+5. the index commit to `helm-charts`;
+6. verify through the index, waiting up to 10 minutes for Pages. A failure
+   here flags the release as a prerelease.
+
+The first charts release must follow a core release that ships the
+operator image. `balerix-v0.2.0` predates it, and the check job would fail
+on it.
 
 ## Cutting a release
 
@@ -86,7 +113,9 @@ head): it already carries the prepared version and changelog section.
 
 For whatever it plans, a dry run audits, builds, smoke-tests, packages,
 builds and scans images, and runs `cargo publish --dry-run`, then uploads
-every artifact to the run. Nothing is pushed, published or tagged.
+every artifact to the run. Nothing is pushed, published or tagged. For the
+charts unit, that is packaging, the check on kind and uploading the
+archives.
 
 ## Recovery
 
@@ -101,6 +130,10 @@ release.
 | after an image push | an unannounced `<ver>` image tag | Re-run; the tag is overwritten and `latest` has not moved. |
 | one unit's GitHub Release, after other units in the same run published | those units are tagged, but their packages are not verified and their images not promoted | Use *Re-run failed jobs* on that run: it retries the failed release, then runs `verify-package` and `promote-images` for every unit. A new run or push skips units that already have tags, so their `latest` stays on the previous release until they release again. |
 | `verify-package` | the release is published and flagged as a prerelease; no image's moving tags move in that run | Fix it; the next patch release follows the normal flow. |
+| charts check | nothing public | Fix through a normal PR. |
+| after `charts-publish` | the OCI charts exist, no tag | Re-run. |
+| `charts-index` | tagged, not indexed | Re-run; it skips an index that already lists the version. |
+| `charts-verify` | the release is flagged as a prerelease | Fix the index or Pages; the next release follows the normal flow. |
 | a bad release shipped | — | Roll forward with a patch release. `cargo yank` a harmful crate version. Never delete or move a tag. |
 
 A release is built and tagged at the commit of the `release.yml` run that
@@ -160,7 +193,35 @@ Nothing releases until all of this is done.
    x -- cargo publish --locked --manifest-path plugins/common/Cargo.toml`,
    plus its trusted publisher.
 8. **ghcr visibility:** after each image's first push, set its package to
-   public (ghcr creates packages private).
+   public (ghcr creates packages private). That covers `balerix`,
+   `balerix-agent`, `balerix-operator`, the plugin images and, after the
+   first charts release, `charts/*`. The charts check pulls the images
+   anonymously, so the images the charts install (`balerix`,
+   `balerix-agent`, `balerix-operator`, flow and web) must be public
+   before the first charts release, on a fork too.
+9. **The charts repository:** `balerix-ai/helm-charts` must exist with a
+   `main` branch before the first charts release (`charts-index` checks it
+   out and pushes to `main`). Enable GitHub Pages on it, served from
+   `main`, and install the `balerix-release` App on it too with *Contents:
+   read and write*.
+10. **Branch protection:** add `charts` to `main`'s required checks.
+11. **First releases of the Kubernetes pieces**, in order: core (the first
+    with the operator), github, then charts.
+
+## Rehearsing Kubernetes on forks
+
+The first charts release is rehearsed before it is real (Spec O §24.6).
+
+1. Fork `balerix` and `helm-charts` under one account and do the one-time
+   setup above there.
+2. Make the fork's ghcr packages public as each first appears.
+3. Merge the release PRs for core, then github, then charts, watching
+   `release.yml` each time.
+4. Run `mise run verify-k8s -- --from index` with
+   `BALERIX_VERIFY_OWNER=<account>` against a cluster with a ReadWriteMany
+   storage class. It installs both charts from the fork's index and walks
+   the journey with a real `claude`, then prints a report.
+5. Paste the report into the rehearsal record.
 
 ## Pins that move together
 

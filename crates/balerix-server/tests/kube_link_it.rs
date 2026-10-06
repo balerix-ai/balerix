@@ -114,7 +114,10 @@ async fn a_sidecar_links_sends_status_and_answers_calls() {
     let h = Harness::kube(Duration::from_secs(3600));
     let w = world(&h).await;
     let name = "f".parse().unwrap();
-    w.daemon.apply_kube(&name, spec(), tokens()).await.unwrap();
+    w.daemon
+        .apply_kube(&name, spec(), tokens(), None)
+        .await
+        .unwrap();
     let id: AgentId = "f/c/a".parse().unwrap();
     let token = w.daemon.hook_secret(&id).await.unwrap();
     let hub = w.daemon.kube().unwrap().clone();
@@ -234,7 +237,10 @@ async fn the_link_route_refuses_a_bad_token_a_wrong_protocol_and_a_tmux_daemon()
     let h = Harness::kube(Duration::from_secs(3600));
     let w = world(&h).await;
     let name = "f".parse().unwrap();
-    w.daemon.apply_kube(&name, spec(), tokens()).await.unwrap();
+    w.daemon
+        .apply_kube(&name, spec(), tokens(), None)
+        .await
+        .unwrap();
     let id: AgentId = "f/c/a".parse().unwrap();
     let token = w.daemon.hook_secret(&id).await.unwrap();
     let status = |e: tokio_tungstenite::tungstenite::Error| match e {
@@ -266,7 +272,10 @@ async fn a_call_in_flight_fails_link_down_when_its_link_closes_or_is_replaced() 
     let h = Harness::kube(Duration::from_secs(3600));
     let w = world(&h).await;
     let name = "f".parse().unwrap();
-    w.daemon.apply_kube(&name, spec(), tokens()).await.unwrap();
+    w.daemon
+        .apply_kube(&name, spec(), tokens(), None)
+        .await
+        .unwrap();
     let id: AgentId = "f/c/a".parse().unwrap();
     let token = w.daemon.hook_secret(&id).await.unwrap();
     let hub = w.daemon.kube().unwrap().clone();

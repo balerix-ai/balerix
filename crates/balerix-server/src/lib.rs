@@ -41,7 +41,7 @@ pub use lifecycle::{
 pub use metrics::Metrics;
 pub use plugins::{
     ActivationRow, ObserverQueue, PluginAddr, PluginClient, PluginError, PluginEventHandler,
-    PluginHost, PluginHostConfig, PluginInfo, PluginKv, PluginRegistry,
+    PluginHost, PluginHostConfig, PluginInfo, PluginKv, PluginRegistry, PluginSetup, PluginSource,
 };
 pub use store::FileFleetStore;
 pub use system_pool::{SystemPoolConfig, SystemPoolState};

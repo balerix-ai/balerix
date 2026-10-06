@@ -11,7 +11,8 @@ the conformance tests so the three cannot drift apart (§6).
 
 Host protocol major **1**. A plugin's `hello` (§3) sends `protocol`; the
 daemon refuses any value it does not speak. Both directions are JSON over
-plain HTTP/1.1 on loopback — no TLS, no proxies. Every request and response
+HTTP/1.1, no proxies: plain HTTP on loopback on one machine, TLS under the
+Daemon's authority in a pod (§2.1). Every request and response
 body is a JSON object, except the routes stated to carry a raw byte body
 (`GET`/`PUT /v1/plugin-host/kv/{key}`, `GET /v1/health`, `GET /v1/metrics`).
 Every non-2xx response is `{ "error": "<message>" }`
@@ -38,6 +39,25 @@ profile environment (plugins spec §5.1):
 | `BALERIX_PLUGIN_TOKEN` | The bearer for every plugin → daemon call: `Authorization: Bearer <token>`. A wrong or missing token is 401 `{ "error": "unknown plugin or bad token" }` on every route under `/v1/plugin-host/`, `hello` included (`hello-bad-token.json`). It is also the bearer the daemon presents on every daemon → plugin call (§4); a plugin must check it and answer 401 `{ "error": "bad daemon token" }` to anything else (`activate-bad-token.json`), since its listener is a loopback port any local process can reach. |
 | `BALERIX_PLUGIN_SCRATCH` | A read-write scratch directory; no API call needed. |
 
+### 2.1 In a pod (Spec O §23.1)
+
+The Deployment sets these, all optional; a plugin on one machine sets none.
+
+| Variable | Meaning |
+|---|---|
+| `BALERIX_PLUGIN_TOKEN_FILE` | The token, read from a file; wins over `BALERIX_PLUGIN_TOKEN`. |
+| `BALERIX_CA_FILE` | The only authority the plugin's host client trusts; `BALERIX_API_URL` must then be `https://`, and an `https://` `BALERIX_API_URL` without it is refused at start-up. |
+| `BALERIX_PLUGIN_TLS_CERT`, `BALERIX_PLUGIN_TLS_KEY` | Serve TLS with this certificate and key; both or neither. |
+| `BALERIX_PLUGIN_LISTEN` | The bind address; default `127.0.0.1:0`, a pod sets `0.0.0.0:7644`. |
+
+Both directions are then HTTPS, each side trusting the one authority the
+Daemon serves under (no webpki or native roots; the Daemon's own client
+trusts nothing when started without `--tls-ca`). A renewed certificate is
+picked up by a restart. The plugin's config is not mounted: it arrives in
+the `hello` reply. In Kubernetes mode the Daemon ignores `hello`'s `listen`
+and calls the `url` the operator's list gave (§3.1); on one machine
+`listen` must still be loopback.
+
 ## 3. Plugin → daemon
 
 Base `BALERIX_API_URL`, path prefix `/v1/plugin-host/`, bearer
@@ -52,7 +72,8 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 
 | Route | Capability | Request | Response | Status | Fixture |
 |---|---|---|---|---|---|
-| `POST hello` | always | `{ name, version, protocol, listen }` | `{ config }` | 200 | `hello.json` |
+| `POST hello` | always | `{ name, version, protocol, listen, manifest? }` | `{ config }` | 200 | `hello.json` |
+| `POST hello`, Kubernetes mode, no manifest or one outside the grant | always | same | `{ error }`: `hello.manifest: required in kubernetes mode`, `hello.manifest.name: "<m>" does not match the plugin "<p>"` or `hello.manifest.needs: <cap> is not granted` | 400 | (asserted by `crates/balerix-server/tests/kube_plugins_it.rs`, §6) |
 | `POST hello`, bad/missing token | always | same | `{ error }` | 401 | `hello-bad-token.json` |
 | `GET fleets` | `fleets` | — | `[FleetRecord]` | 200 | `fleets.json` |
 | `GET fleets/{name}` | `fleets` | — | `FleetRecord` | 200 | (shape as in `fleets.json`'s `response[0]`) |
@@ -79,6 +100,18 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 | `GET kv/{key}`, unknown key | `kv` | — | `{ "error": "no such key" }` | 404 | (same status as `fleet-missing.json`) |
 | `PUT kv/{key}?secret=<bool>` | `kv` | raw bytes | `{}` | 200 | `kv-put.json` |
 | `DELETE kv/{key}` | `kv` | — | `{}` | 200 | (same success shape as `PUT`) |
+
+`manifest` is the plugin's `balerix-plugin.yaml` as JSON. The SDK sends it
+only when it was given an authority (`BALERIX_CA_FILE`): `hello` rejects
+unknown fields, so a one-machine Daemon of the 0.2.0 release would answer
+400 to it. On one machine the Daemon reads the package's manifest and
+ignores `hello`'s copy. In Kubernetes mode the manifest is required and
+held to the package rules that need no package (`apiVersion`, `kind`,
+`name`, a non-empty `version`, `protocol` 1, `start`, known hook events,
+`sandbox` a mapping), refused as `hello.manifest.<field>: <reason>`; then
+its `name` must be the plugin's and its `needs` within the grant. A
+refused `hello` takes the plugin out of the interceptor chain and deletes
+its stored `hello.json`.
 
 A `FleetRecord` is `{ spec: { name, crews }, owner?, generation, desired: { state },
 stopped, status: { generation, observed_generation, phase, agents } }`
@@ -164,10 +197,39 @@ agent's `branch` setting names an existing remote branch to work on
 (`crews.<c>.agents.<a>.branch`, validated as `git check-ref-format
 --branch` would); the diff base stays the crew's `ref`.
 
+### 3.1 Admin side in Kubernetes mode (Spec O §23.2, §23.3)
+
+| Route | Request | Response | Status |
+|---|---|---|---|
+| `PUT /v1/plugins` | `{ "plugins": [{ name, grant, config?, fleetDefaults?, token, url }] }`, the whole list in interceptor order; a plugin not on it loses its stored managed requests, also after a Daemon restart | — | 204 |
+| `PUT /v1/plugins`, bad entry | same | `{ error }`: `plugins[<i>].url: must be https://`, `plugins[<i>].token: a token is at least 32 characters`, `plugins[<i>].token: listed twice`, `plugins[<i>].name: <reason>` or `plugins[<i>].name: listed twice`; an unknown capability in `grant` | 400 |
+| `PUT /v1/plugins`, tmux mode | same | `this daemon reads plugins.yaml` | 409 |
+| `PUT /v1/plugins`, no `--tls-ca` | same | `this daemon was started without --tls-ca; it cannot call plugins` | 409 |
+| `POST /v1/plugins/sync`, `DELETE /v1/plugins/{name}` | — | `this daemon is in kubernetes mode; change its plugins through the Daemon's spec.plugins` | 409 |
+| `GET /v1/managed-fleets` | — | `[{ name, plugin, file, down? }]`; `down` is the delete's query, absent while the request is live | 200 |
+| `PUT /v1/fleets/{name}` with `managed_by: <plugin>` | the operator's apply, with `agent_tokens` | — | 200 |
+| `PUT /v1/fleets/{name}` with `managed_by`, the existing record has no owner | same | `fleet <name> is not managed by a plugin` | 409 |
+
+All take the admin token. The list replaces the previous one and is
+idempotent; `kubernetes` is a reserved plugin name. A plugin is registered
+at once with a placeholder manifest, ready from an accepted `hello` until
+three consecutive missed health polls; a good poll makes it ready again
+only if a `hello` was accepted for its current entry. An accepted hello is
+kept in `<state>/plugins/<name>/hello.json` with the hash of the entry;
+after a restart an unchanged entry lists as `starting` with its real
+version and is ready on its first good health poll (10 s after the Daemon
+starts), when activation is re-sent. A changed entry is not restored.
+`token` and `url` are the Daemon's to use: it calls `url` over TLS,
+whatever `hello.listen` said. A plugin's `PUT fleets/{name}` (§3) is
+checked and answered at once and stored for the operator, who applies it
+with `managed_by`; the record keeps `owner: <plugin>`. `DELETE
+fleets/{name}` marks the stored request down.
+
 ## 4. Daemon → plugin
 
-At the `listen` address the plugin's `hello` gave (§3), plain HTTP, 5 s
-timeout unless stated otherwise.
+At the `listen` address the plugin's `hello` gave (§3) — in Kubernetes mode
+the `url` of the operator's list (§3.1), over TLS (§2.1) — 5 s timeout
+unless stated otherwise.
 
 Every request carries `Authorization: Bearer <BALERIX_PLUGIN_TOKEN>` — the
 plugin's own token (§2). The fixtures' `headers` object is what the daemon
@@ -233,7 +295,7 @@ itself and must apply the prefix.
 A manifest with `routes: true` mounts the plugin's own HTTP surface at
 `/v1/plugins/<name>/…` on the daemon's listener, authenticated by the
 admin bearer or a browser session cookie (plugins spec §18.2). The daemon
-forwards `/v1/plugins/<name>/` to `GET|POST|… http://<listen>/v1/routes`
+forwards `/v1/plugins/<name>/` to `GET|POST|… http://<listen>/v1/routes` (`https://<url>` in Kubernetes mode)
 and `/v1/plugins/<name>/<rest>?<query>` to `/v1/routes/<rest>?<query>`
 — `<rest>` crosses percent-encoded exactly as the client wrote it, and a
 `.` or `..` segment (its `%2e` spellings included) is refused with 400

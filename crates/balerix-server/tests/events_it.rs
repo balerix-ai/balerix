@@ -116,14 +116,17 @@ async fn start_flow(w: &World) -> (Arc<FlowLike>, Host) {
         name: "flow".into(),
         token: token(w, "flow").await,
         scratch: w.dir.path().join("scratch"),
+        ca: None,
+        tls: None,
+        listen: "127.0.0.1:0".into(),
     };
     tokio::spawn({
         let plugin = plugin.clone();
         let token = env.token.clone();
-        async move { run(listener, plugin, &token).await }
+        async move { run(listener, plugin, &token, None).await }
     });
     let host = Host::new(env).unwrap();
-    host.hello("0.1.0", &listen).await.unwrap();
+    host.hello("0.1.0", &listen, None).await.unwrap();
     (plugin, host)
 }
 
@@ -153,6 +156,7 @@ async fn activation_pending_then_active_rejection_fails_up_and_down_deactivates(
         spec: spec(&[("a", json!({ "v": 1 }))]),
         credentials: Default::default(),
         agent_tokens: None,
+        managed_by: None,
     });
     let (s, v) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(s, 200, "{v}");
@@ -182,6 +186,7 @@ async fn activation_pending_then_active_rejection_fails_up_and_down_deactivates(
         spec: spec(&[("a", json!({ "v": 1 })), ("b", json!({ "reject": true }))]),
         credentials: Default::default(),
         agent_tokens: None,
+        managed_by: None,
     });
     let (s, v) = w.api.admin("PUT", "/v1/fleets/f", Some(&bad));
     assert_eq!(s, 400);
@@ -216,6 +221,7 @@ async fn activation_pending_then_active_rejection_fails_up_and_down_deactivates(
             spec: s2,
             credentials: Default::default(),
             agent_tokens: None,
+            managed_by: None,
         })),
     );
     assert_eq!(
@@ -251,6 +257,7 @@ async fn the_chain_blocks_observers_see_and_actions_reach_the_runner() {
         spec: spec(&[("a", json!({}))]),
         credentials: Default::default(),
         agent_tokens: None,
+        managed_by: None,
     });
     let (s, _) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(s, 200);
@@ -365,6 +372,7 @@ async fn host_routes_are_gated_by_needs_and_kv_and_actions_work() {
             spec: spec(&[("a", json!({}))]),
             credentials: Default::default(),
             agent_tokens: None,
+            managed_by: None,
         })),
     );
     assert_eq!(s, 200);
@@ -473,7 +481,7 @@ async fn plugin_metrics_are_re_exported_under_the_prefix_rule() {
         .set(1);
     let (l1, listen1) = bind().await.unwrap();
     let flow_token = token(&w, "flow").await;
-    tokio::spawn(async move { run(l1, Arc::new(Good(good)), &flow_token).await });
+    tokio::spawn(async move { run(l1, Arc::new(Good(good)), &flow_token, None).await });
     // A plugin outside the SDK answering an unprefixed family: the daemon
     // must drop the body whole.
     let bad = axum::Router::new().route(
@@ -490,10 +498,13 @@ async fn plugin_metrics_are_re_exported_under_the_prefix_rule() {
             name: name.into(),
             token: token(&w, name).await,
             scratch: w.dir.path().join("s"),
+            ca: None,
+            tls: None,
+            listen: "127.0.0.1:0".into(),
         };
         Host::new(env)
             .unwrap()
-            .hello("0.1.0", &listen)
+            .hello("0.1.0", &listen, None)
             .await
             .unwrap();
     }

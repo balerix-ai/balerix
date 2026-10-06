@@ -36,12 +36,15 @@ async fn start_silent(w: &World, name: &str) -> Host {
         name: name.into(),
         token: token(w, name).await,
         scratch: w.dir.path().join("s"),
+        ca: None,
+        tls: None,
+        listen: "127.0.0.1:0".into(),
     };
     let (listener, listen) = bind().await.unwrap();
     let tok = env.token.clone();
-    tokio::spawn(async move { run(listener, Arc::new(Silent), &tok).await });
+    tokio::spawn(async move { run(listener, Arc::new(Silent), &tok, None).await });
     let host = Host::new(env).unwrap();
-    host.hello("0.1.0", &listen).await.unwrap();
+    host.hello("0.1.0", &listen, None).await.unwrap();
     host
 }
 
@@ -123,6 +126,7 @@ async fn workspace_routes_are_gated_by_capability_activation_and_the_path_rule()
             spec: spec(&["a", "b"]),
             credentials: Default::default(),
             agent_tokens: None,
+            managed_by: None,
         })),
     );
     assert_eq!(s, 200, "{v}");

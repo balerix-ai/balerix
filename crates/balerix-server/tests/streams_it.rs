@@ -146,12 +146,15 @@ async fn start_plugin<P: Plugin + 'static>(w: &World, name: &str, plugin: Arc<P>
         name: name.into(),
         token: token(w, name).await,
         scratch: w.dir.path().join("s"),
+        ca: None,
+        tls: None,
+        listen: "127.0.0.1:0".into(),
     };
     let (listener, listen) = bind().await.unwrap();
     let tok = env.token.clone();
-    tokio::spawn(async move { run(listener, plugin, &tok).await });
+    tokio::spawn(async move { run(listener, plugin, &tok, None).await });
     let host = Host::new(env).unwrap();
-    host.hello("0.1.0", &listen).await.unwrap();
+    host.hello("0.1.0", &listen, None).await.unwrap();
     host
 }
 
@@ -190,6 +193,7 @@ async fn fleets_watch_sends_the_full_list_on_every_change() {
         spec: spec(&[("a", &[("flow", json!({ "v": 1 }))])]),
         credentials: Default::default(),
         agent_tokens: None,
+        managed_by: None,
     });
     let (st, _) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(st, 200);
@@ -233,6 +237,7 @@ async fn a_rejected_activation_is_a_watch_frame() {
         ]),
         credentials: Default::default(),
         agent_tokens: None,
+        managed_by: None,
     });
     let (st, v) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(st, 200, "{v}");
@@ -257,6 +262,7 @@ async fn a_rejected_activation_is_a_watch_frame() {
         ]),
         credentials: Default::default(),
         agent_tokens: None,
+        managed_by: None,
     });
     let (st, v) = w.api.admin("PUT", "/v1/fleets/f", Some(&bad));
     assert_eq!(st, 400, "{v}");
@@ -283,6 +289,7 @@ async fn removing_a_plugin_is_a_watch_frame() {
         spec: spec(&[("a", &[("flow", json!({ "v": 1 }))])]),
         credentials: Default::default(),
         agent_tokens: None,
+        managed_by: None,
     });
     let (st, v) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(st, 200, "{v}");
@@ -329,6 +336,7 @@ async fn world_with_web_active() -> (World, String, Host) {
         spec: spec(&[("a", &[("web", json!({}))]), ("b", &[])]),
         credentials: Default::default(),
         agent_tokens: None,
+        managed_by: None,
     });
     let (st, _) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(st, 200);

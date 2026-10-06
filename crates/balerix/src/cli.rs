@@ -212,6 +212,11 @@ pub struct ServeArgs {
     /// A file holding the admin token (--mode kubernetes).
     #[arg(long)]
     pub admin_token_file: Option<PathBuf>,
+    /// The Daemon's authority, PEM (--mode kubernetes, Spec O §23.1): the
+    /// one root it trusts when calling plugins. Without it the Daemon
+    /// refuses a plugin list.
+    #[arg(long)]
+    pub tls_ca: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

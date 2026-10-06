@@ -18,7 +18,8 @@ pub use fleet::{Crew, Fleet, FleetError, RESERVED_AGENT_NAME};
 pub use name::{AgentId, AgentName, CrewName, FleetName, NameError};
 pub use plugin::{
     ManifestError, PLUGIN_CREW, RESERVED_FLEET, ResolvedPlugin, is_reserved_fleet, plugin_fleet,
-    plugin_id, reserved_fleet_reason, validate_manifest,
+    plugin_id, reserved_fleet_reason, reserved_plugin_reason, validate_manifest,
+    validate_manifest_fields,
 };
 pub use ports::{
     AgentRunner, Clock, CredentialSource, CrewTools, FleetResolver, HookTarget, Keep, LaunchPlan,

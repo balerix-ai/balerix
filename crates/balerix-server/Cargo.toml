@@ -30,10 +30,15 @@ ureq = { workspace = true }
 reqwest = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+hyper-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 tracing = { workspace = true }
 # `testing.rs` is a library module (integration tests and the daemon's own
 # tests share it) and its harness owns temporary directories.
 tempfile = { workspace = true }
+# Likewise the harness's: `testing::test_authority` issues a throwaway
+# authority and leaf for the TLS stub plugin (Spec O §23.1).
+rcgen = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

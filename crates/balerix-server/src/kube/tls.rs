@@ -4,11 +4,13 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
+use rustls_pki_types::pem::PemObject;
 
 pub struct TlsServer {
     handle: Handle<SocketAddr>,
@@ -53,4 +55,40 @@ impl TlsServer {
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?
     }
+}
+
+fn build(roots: rustls::RootCertStore) -> Result<Arc<rustls::ClientConfig>, rustls::Error> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+/// The Daemon's trust for a plugin (Spec O §23.1): the authority file's
+/// certificates and nothing else, no webpki or native roots. Its body is the
+/// SDK's `client_config`; this crate does not depend on the SDK.
+pub fn client_config(ca: &Path) -> std::io::Result<Arc<rustls::ClientConfig>> {
+    let fail = |e: &dyn std::fmt::Display| std::io::Error::other(format!("{}: {e}", ca.display()));
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pki_types::CertificateDer::pem_file_iter(ca).map_err(|e| fail(&e))? {
+        roots
+            .add(cert.map_err(|e| fail(&e))?)
+            .map_err(|e| fail(&e))?;
+    }
+    if roots.is_empty() {
+        return Err(fail(&"no certificate in the authority file"));
+    }
+    build(roots).map_err(|e| fail(&e))
+}
+
+/// A config that trusts nothing: with no authority an `https://` plugin
+/// fails its handshake rather than falling back to the system's roots, which
+/// reqwest's rustls feature would otherwise use (§23.1).
+pub fn no_roots() -> std::io::Result<Arc<rustls::ClientConfig>> {
+    build(rustls::RootCertStore::empty()).map_err(std::io::Error::other)
 }

@@ -207,6 +207,10 @@ impl FlowPlugin {
 }
 
 impl Plugin for FlowPlugin {
+    fn manifest(&self) -> Option<&'static str> {
+        Some(include_str!("../package/balerix-plugin.yaml"))
+    }
+
     /// Compile, then resume the stored state when it belongs to this very
     /// config and is still declared; otherwise start at `initial` and
     /// store that. A KV fault rejects: the operator's `up` should fail

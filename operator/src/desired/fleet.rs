@@ -237,6 +237,7 @@ pub fn plan_fleet(
                 .filter_map(|key| tokens.get(key).map(|t| (key.clone(), t.clone())))
                 .collect(),
         ),
+        managed_by: None,
     });
     Ok(FleetPlan {
         spec,

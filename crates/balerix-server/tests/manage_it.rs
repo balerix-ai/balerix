@@ -34,12 +34,15 @@ async fn start_silent(w: &World, name: &str) -> Host {
         name: name.into(),
         token: token(w, name).await,
         scratch: w.dir.path().join("s"),
+        ca: None,
+        tls: None,
+        listen: "127.0.0.1:0".into(),
     };
     let (listener, listen) = bind().await.unwrap();
     let tok = env.token.clone();
-    tokio::spawn(async move { run(listener, Arc::new(Silent), &tok).await });
+    tokio::spawn(async move { run(listener, Arc::new(Silent), &tok, None).await });
     let host = Host::new(env).unwrap();
-    host.hello("0.1.0", &listen).await.unwrap();
+    host.hello("0.1.0", &listen, None).await.unwrap();
     host
 }
 
@@ -157,6 +160,7 @@ async fn a_plugin_with_manage_applies_and_downs_a_fleet_it_owns() {
         spec: spec("f"),
         credentials: Default::default(),
         agent_tokens: None,
+        managed_by: None,
     });
     let (s, v) = w.api.admin("POST", "/v1/fleets", Some(&req));
     assert_eq!(
@@ -205,6 +209,7 @@ async fn a_plugin_with_manage_applies_and_downs_a_fleet_it_owns() {
         spec: spec("g"),
         credentials: Default::default(),
         agent_tokens: None,
+        managed_by: None,
     });
     let (s, _) = w.api.admin("POST", "/v1/fleets", Some(&g));
     assert_eq!(s, 200);

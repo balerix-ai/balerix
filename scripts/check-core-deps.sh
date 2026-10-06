@@ -3,7 +3,8 @@
 # tree (Spec H §1, §3, §4):
 #
 #   1. The workspace is the seven core crates and nothing else.
-#   2. `reqwest` in that workspace carries `json` and nothing else.
+#   2. `reqwest` in that workspace carries `__rustls,__tls,json,rustls-no-provider`
+#      and nothing else (Spec O §23.1).
 #
 # The second is the symptom the split was made to cure; the first is the cause,
 # and catches a readmitted plugin whose tree never touches `reqwest` at all.
@@ -37,11 +38,13 @@ if ! tree=$(cargo tree --workspace --edges features --invert reqwest) \
 fi
 
 # Assert the whole feature set rather than denying a list of known-bad
-# features: the set after the split is `json` alone (Spec H §10.1), so any
+# features: the set is TLS on one authority (Spec O §23.1; it was `json` alone
+# after Spec H §10.1), so any
 # future leak is covered without extending a denylist.
-have=$(sed -n 's/^[^A-Za-z]*reqwest feature "\([^"]*\)".*/\1/p' <<<"$tree" | sort -u | paste -sd, -)
-if [[ $have != "json" ]]; then
-  echo "core reqwest features are '$have', expected 'json' (a plugin leaked into the core resolution)" >&2
+have=$(sed -n 's/^[^A-Za-z]*reqwest feature "\([^"]*\)".*/\1/p' <<<"$tree" | LC_ALL=C sort -u | paste -sd, -)
+want="__rustls,__tls,json,rustls-no-provider"
+if [[ $have != "$want" ]]; then
+  echo "core reqwest features are '$have', expected '$want' (Spec O §23.1; a plugin leaked into the core resolution)" >&2
   exit 1
 fi
-echo "core workspace clean: members match Spec H §3, reqwest features are 'json'"
+echo "core workspace clean: members match Spec H §3, reqwest features are '$want'"

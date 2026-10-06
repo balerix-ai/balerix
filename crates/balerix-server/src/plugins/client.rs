@@ -1,5 +1,7 @@
 //! Every daemon → plugin call (plugins spec §4.2) on one `reqwest` client:
-//! loopback, plain HTTP/1.1, no proxy, 5 s unless the caller says otherwise.
+//! HTTP/1.1, no proxy, plain on loopback and TLS under the Daemon's
+//! authority alone for a plugin URL (Spec O §23.1), 5 s unless the caller
+//! says otherwise.
 //! Failures are classified into the four `reason` labels of §4.3.
 //!
 //! Every call carries the plugin's own token as the bearer (§18.3): the
@@ -7,6 +9,7 @@
 //! this is how it tells the daemon from the rest.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use balerix_api::{
@@ -74,6 +77,10 @@ impl From<reqwest::Error> for CallFailure {
 #[derive(Clone)]
 pub struct PluginClient {
     http: reqwest::Client,
+    /// Spec O §23.1: the Daemon's authority, trusted alone; trusts nothing
+    /// on one machine, where every plugin is loopback HTTP.
+    tls: Arc<rustls::ClientConfig>,
+    trusts: bool,
 }
 
 impl fmt::Debug for PluginClient {
@@ -83,17 +90,38 @@ impl fmt::Debug for PluginClient {
 }
 
 impl PluginClient {
-    pub fn new() -> Result<Self, PluginError> {
+    pub fn new(authority: Option<Arc<rustls::ClientConfig>>) -> Result<Self, PluginError> {
+        // reqwest's `rustls-no-provider` panics without one (Spec O §23.1)
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let trusts = authority.is_some();
+        let tls = match authority {
+            Some(t) => t,
+            None => crate::kube::tls::no_roots()
+                .map_err(|e| PluginError::Internal(format!("tls config: {e}")))?,
+        };
+        // always preconfigured: reqwest's own default is the system's roots
         let http = reqwest::Client::builder()
             .no_proxy()
             .timeout(CALL_TIMEOUT)
+            .use_preconfigured_tls((*tls).clone())
             .build()
             .map_err(|e| PluginError::Internal(format!("http client: {e}")))?;
-        Ok(Self { http })
+        Ok(Self { http, tls, trusts })
+    }
+
+    /// Whether this client was given an authority, so can call an
+    /// `https://` plugin.
+    pub fn trusts(&self) -> bool {
+        self.trusts
+    }
+
+    /// The config the proxy's client shares: the authority, or no roots.
+    pub fn tls(&self) -> Arc<rustls::ClientConfig> {
+        self.tls.clone()
     }
 
     fn url(addr: &PluginAddr, path: &str) -> String {
-        format!("http://{}{path}", addr.listen)
+        format!("{}{path}", addr.base())
     }
 
     /// Reads at most `MAX_BODY` bytes off the wire, chunk by chunk, so an
@@ -219,6 +247,51 @@ mod tests {
     use balerix_api::{HookEvent, Timestamp};
     use serde_json::{Value, json};
 
+    #[test]
+    fn a_url_is_used_as_given_and_a_bare_address_is_loopback_http() {
+        let bare = PluginAddr {
+            listen: "127.0.0.1:9".into(),
+            token: "t".into(),
+        };
+        assert_eq!(bare.base(), "http://127.0.0.1:9");
+        let url = PluginAddr {
+            listen: "https://flow.ns.svc:7644".into(),
+            token: "t".into(),
+        };
+        assert_eq!(url.base(), "https://flow.ns.svc:7644");
+        assert_eq!(
+            PluginClient::url(&url, "/v1/health"),
+            "https://flow.ns.svc:7644/v1/health"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_client_calls_a_tls_plugin_under_the_given_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = crate::testing::test_authority(dir.path());
+        let stub = crate::testing::stub_plugin(crate::testing::StubScript {
+            health_ok: true,
+            tls: Some((cert, key)),
+            ..Default::default()
+        })
+        .await;
+        assert!(
+            stub.listen.starts_with("https://127.0.0.1:"),
+            "{}",
+            stub.listen
+        );
+        let tls = crate::kube::tls::client_config(&ca).unwrap();
+        let client = PluginClient::new(Some(tls)).unwrap();
+        let addr = PluginAddr {
+            listen: stub.listen.clone(),
+            token: "t".into(),
+        };
+        client.health(&addr).await.unwrap();
+        // without the authority the handshake fails as a connect failure
+        let plain = PluginClient::new(None).unwrap();
+        assert_eq!(plain.health(&addr).await.unwrap_err(), CallFailure::Connect);
+    }
+
     /// A plugin stub: activate rejects agent "bad", intercept echoes the
     /// event name (or returns a non-object for "PreCompact", or sleeps 3 s
     /// past any short caller timeout for "Stop"), health is fine, metrics
@@ -294,7 +367,7 @@ mod tests {
             listen: stub().await,
             token: "t".into(),
         };
-        let c = PluginClient::new().unwrap();
+        let c = PluginClient::new(None).unwrap();
         c.activate(
             &addr,
             &ActivateRequest {
@@ -411,7 +484,7 @@ mod tests {
             listen: oversized_stub().await,
             token: "t".into(),
         };
-        let c = PluginClient::new().unwrap();
+        let c = PluginClient::new(None).unwrap();
         let e = c.metrics(&addr, Duration::from_secs(5)).await.unwrap_err();
         assert_eq!(e.reason(), "body");
         assert!(matches!(e, CallFailure::Body(_)), "{e}");

@@ -174,8 +174,9 @@ credentials, hook input, or sandbox rules.
   rustls, HTTP/2, gzip and stream that it never asked for, and tripled the
   gate's cold build. `scripts/check-core-deps.sh` fails if that ever comes
   back: it asserts both the seven-crate member list and that the core
-  `reqwest` carries `json` alone, so a readmitted plugin is caught whether or
-  not its tree pulls a `reqwest` feature. A plugin change is caught by
+  `reqwest` carries exactly `__rustls,__tls,json,rustls-no-provider` (TLS on
+  one authority, no webpki or native roots, Spec O §23.1), so a readmitted
+  plugin is caught whether or not its tree pulls a `reqwest` feature. A plugin change is caught by
   `mise run plugins`, not by `check`.
 - insta snapshots: read the `.snap.new`, compare against the plan's expected
   values, then `mise x -- cargo insta accept`. Never blind-accept.

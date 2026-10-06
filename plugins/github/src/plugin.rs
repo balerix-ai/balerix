@@ -59,6 +59,10 @@ impl<L: Launcher> GitHubPlugin<L> {
 }
 
 impl<L: Launcher> Plugin for GitHubPlugin<L> {
+    fn manifest(&self) -> Option<&'static str> {
+        Some(include_str!("../package/balerix-plugin.yaml"))
+    }
+
     /// Parse, prove the App, start the actor, then hand it the
     /// config. Nothing is queued unless all three succeed.
     async fn configure(&self, config: Value) -> Result<(), String> {

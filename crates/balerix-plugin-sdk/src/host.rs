@@ -1,13 +1,15 @@
 //! The plugin → daemon half (plugins spec §4.1): one method per route,
-//! bearer from `Env`, loopback only.
+//! bearer from `Env`. Loopback `http://` on one machine; `https://` only
+//! with the authority from `BALERIX_CA_FILE` (Spec O §23.1).
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::HeaderValue;
 use balerix_api::{
     DownQuery, ErrorBody, FleetRecord, HelloRequest, HelloResponse, KvKeys, PLUGIN_PROTOCOL,
-    PluginAction, ResizeFrame, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
+    PluginAction, PluginManifest, ResizeFrame, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -15,7 +17,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::{Env, SdkError};
 
@@ -32,6 +34,8 @@ const APPLY_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct Host {
     env: Env,
     http: reqwest::Client,
+    /// Spec O §23.1: the authority-only config, for `wss://` too.
+    tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl fmt::Debug for Host {
@@ -75,12 +79,22 @@ fn path_encode(s: &str) -> String {
 
 impl Host {
     pub fn new(env: Env) -> Result<Self, SdkError> {
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(TIMEOUT)
+        // Env's fields are public, so its own check may have been skipped
+        crate::refuse_https_without_ca(&env.api_url, env.ca.as_deref())?;
+        crate::tls::install_provider();
+        let tls = env
+            .ca
+            .as_deref()
+            .map(crate::tls::client_config)
+            .transpose()?;
+        let mut builder = reqwest::Client::builder().no_proxy().timeout(TIMEOUT);
+        if let Some(tls) = &tls {
+            builder = builder.use_preconfigured_tls((**tls).clone());
+        }
+        let http = builder
             .build()
             .map_err(|e| SdkError::Transport(e.to_string()))?;
-        Ok(Self { env, http })
+        Ok(Self { env, http, tls })
     }
 
     pub fn env(&self) -> &Env {
@@ -126,12 +140,18 @@ impl Host {
     /// `POST /v1/plugin-host/hello` (plugins spec §4.1): announces the
     /// plugin's version and listen address; the daemon marks it `Ready`
     /// and answers with the daemon-level config.
-    pub async fn hello(&self, version: &str, listen: &str) -> Result<HelloResponse, SdkError> {
+    pub async fn hello(
+        &self,
+        version: &str,
+        listen: &str,
+        manifest: Option<&PluginManifest>,
+    ) -> Result<HelloResponse, SdkError> {
         let req = HelloRequest {
             name: self.env.name.clone(),
             version: version.to_string(),
             protocol: PLUGIN_PROTOCOL,
             listen: listen.to_string(),
+            manifest: manifest.cloned(),
         };
         self.json(self.http.post(self.url("hello")).json(&req))
             .await
@@ -308,7 +328,12 @@ impl Host {
 
     /// `ws://` twin of `url`: the streams of §18.4.
     fn ws_url(&self, path: &str) -> String {
-        self.url(path).replacen("http://", "ws://", 1)
+        let url = self.url(path);
+        if let Some(rest) = url.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else {
+            url.replacen("http://", "ws://", 1)
+        }
     }
 
     /// Opens one of the daemon's WebSocket routes with the bearer; a
@@ -321,7 +346,8 @@ impl Host {
         let bearer = HeaderValue::from_str(&format!("Bearer {}", self.env.token))
             .map_err(|e| SdkError::Transport(e.to_string()))?;
         req.headers_mut().insert("authorization", bearer);
-        match connect_async(req).await {
+        let connector = self.tls.clone().map(tokio_tungstenite::Connector::Rustls);
+        match tokio_tungstenite::connect_async_tls_with_config(req, None, false, connector).await {
             Ok((socket, _)) => Ok(socket),
             Err(tungstenite::Error::Http(resp)) => {
                 let status = resp.status().as_u16();
@@ -642,7 +668,7 @@ mod tests {
         let fake =
             FakeHost::start("tok", json!({ "greeting": "hi" }), vec![record("payments")]).await;
         let host = Host::new(fake.env("flow", std::path::Path::new("/s"))).unwrap();
-        let hello = host.hello("0.1.0", "127.0.0.1:4321").await.unwrap();
+        let hello = host.hello("0.1.0", "127.0.0.1:4321", None).await.unwrap();
         assert_eq!(hello.config["greeting"], "hi");
         let seen = fake.hellos();
         assert_eq!(seen.len(), 1);
@@ -898,7 +924,7 @@ mod tests {
         env.token = "wrong".into();
         let e = Host::new(env)
             .unwrap()
-            .hello("0.1.0", "127.0.0.1:1")
+            .hello("0.1.0", "127.0.0.1:1", None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -909,7 +935,7 @@ mod tests {
         env.api_url = "http://127.0.0.1:1".into();
         let e = Host::new(env)
             .unwrap()
-            .hello("0.1.0", "127.0.0.1:1")
+            .hello("0.1.0", "127.0.0.1:1", None)
             .await
             .unwrap_err();
         assert!(matches!(e, SdkError::Transport(_)), "{e}");
@@ -920,5 +946,65 @@ mod tests {
             !dbg.contains("s3cret-value") && dbg.contains("<redacted>"),
             "{dbg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::test_tls::authority;
+    use axum::Router;
+    use axum::routing::post;
+
+    #[tokio::test]
+    async fn the_host_client_trusts_the_given_authority_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = authority(dir.path());
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+            .await
+            .unwrap();
+        let handle: axum_server::Handle<std::net::SocketAddr> = axum_server::Handle::new();
+        let app = Router::new().route(
+            "/v1/plugin-host/hello",
+            post(|| async { axum::Json(serde_json::json!({ "config": { "ok": true } })) }),
+        );
+        let h = handle.clone();
+        tokio::spawn(async move {
+            axum_server::bind_rustls("127.0.0.1:0".parse().unwrap(), config)
+                .handle(h)
+                .serve(app.into_make_service())
+                .await
+        });
+        let addr = handle.listening().await.unwrap();
+        let env = |ca: Option<std::path::PathBuf>| crate::Env {
+            api_url: format!("https://{addr}"),
+            name: "flow".into(),
+            token: "t".into(),
+            scratch: dir.path().into(),
+            ca,
+            tls: None,
+            listen: "127.0.0.1:0".into(),
+        };
+        // Env's fields are public: Host refuses https:// without an
+        // authority itself rather than fall back to the system's roots
+        assert_eq!(
+            Host::new(env(None)).unwrap_err(),
+            SdkError::Env("BALERIX_API_URL is https://, so BALERIX_CA_FILE must be set")
+        );
+        let host = Host::new(env(Some(ca))).unwrap();
+        assert_eq!(
+            host.hello("0.1.0", "x", None).await.unwrap().config["ok"],
+            true
+        );
+        // another authority's file: the handshake fails
+        let other = tempfile::tempdir().unwrap();
+        let (other_ca, _, _) = authority(other.path());
+        let host = Host::new(env(Some(other_ca))).unwrap();
+        assert!(matches!(
+            host.hello("0.1.0", "x", None).await,
+            Err(SdkError::Transport(_))
+        ));
     }
 }

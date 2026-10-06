@@ -19,6 +19,18 @@ pub struct PluginAddr {
     pub token: String,
 }
 
+impl PluginAddr {
+    /// Where to call the plugin: a URL as given (Kubernetes mode, Spec O
+    /// §23.2), or `http://` + a loopback `host:port` from `hello`.
+    pub fn base(&self) -> String {
+        if self.listen.starts_with("https://") || self.listen.starts_with("http://") {
+            self.listen.trim_end_matches('/').to_string()
+        } else {
+            format!("http://{}", self.listen)
+        }
+    }
+}
+
 impl fmt::Debug for PluginAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PluginAddr")
@@ -55,6 +67,23 @@ impl fmt::Debug for PluginInfo {
             .field("degraded", &self.degraded)
             .field("fleet_defaults", &self.fleet_defaults)
             .finish()
+    }
+}
+
+/// Spec O §23.2: what a declared plugin is before its first hello: it
+/// subscribes to nothing and may call nothing.
+fn placeholder_manifest(name: &AgentName) -> PluginManifest {
+    PluginManifest {
+        api_version: "balerix/v1".into(),
+        kind: balerix_api::PLUGIN_KIND.into(),
+        name: name.to_string(),
+        version: String::new(),
+        protocol: balerix_api::PLUGIN_PROTOCOL,
+        start: String::new(),
+        hooks: Default::default(),
+        needs: Default::default(),
+        routes: false,
+        sandbox: Value::Object(Default::default()),
     }
 }
 
@@ -120,6 +149,65 @@ impl PluginRegistry {
             p.listen = Some(listen);
             p.token = Some(token);
             p.ready = true;
+            p.degraded = None;
+        }
+    }
+
+    /// Spec O §23.2: the operator's list. Every entry is registered at once
+    /// with a placeholder manifest (no needs, no hooks) and not ready, so a
+    /// fleet naming it applies with its pairs pending; `keep` names the
+    /// entries whose accepted hello still holds (their manifest and readiness
+    /// are kept). Rows of plugins no longer listed are dropped.
+    pub fn declare(&self, entries: &[(AgentName, Value)], keep: &[AgentName]) {
+        let mut w = self.write();
+        let old = std::mem::take(&mut w.plugins);
+        w.order = entries.iter().map(|(n, _)| n.clone()).collect();
+        for (name, fleet_defaults) in entries {
+            let prev = old.get(name).filter(|_| keep.contains(name));
+            let info = match prev {
+                Some(p) => PluginInfo {
+                    fleet_defaults: fleet_defaults.clone(),
+                    ..p.clone()
+                },
+                None => PluginInfo {
+                    manifest: placeholder_manifest(name),
+                    listen: None,
+                    token: None,
+                    ready: false,
+                    degraded: None,
+                    fleet_defaults: fleet_defaults.clone(),
+                },
+            };
+            w.plugins.insert(name.clone(), info);
+        }
+        let names: Vec<AgentName> = w.plugins.keys().cloned().collect();
+        w.rows.retain(|(_, p), _| names.contains(p));
+    }
+
+    /// An accepted hello: the real manifest, the url and token, ready.
+    pub fn accept_hello(
+        &self,
+        name: &AgentName,
+        manifest: PluginManifest,
+        url: String,
+        token: String,
+    ) {
+        if let Some(p) = self.write().plugins.get_mut(name) {
+            p.manifest = manifest;
+            p.listen = Some(url);
+            p.token = Some(token);
+            p.ready = true;
+            p.degraded = None;
+        }
+    }
+
+    /// Back to the placeholder of `declare`: not ready, no needs, no hooks.
+    pub fn unhello(&self, name: &AgentName) {
+        if let Some(p) = self.write().plugins.get_mut(name) {
+            p.manifest = placeholder_manifest(name);
+            p.listen = None;
+            p.token = None;
+            p.ready = false;
             p.degraded = None;
         }
     }

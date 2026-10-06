@@ -101,19 +101,85 @@ pub struct PluginEntry {
 }
 
 /// Body of `POST /v1/plugin-host/hello`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HelloRequest {
     pub name: String,
     pub version: String,
     pub protocol: u32,
-    /// `127.0.0.1:<port>` the plugin listens on.
+    /// `127.0.0.1:<port>` the plugin listens on. Ignored in Kubernetes
+    /// mode, where the Daemon calls the address the operator gave (Spec O
+    /// §23.1).
     pub listen: String,
+    /// The plugin's own `balerix-plugin.yaml` (Spec O §23.1). Required by a
+    /// Daemon in Kubernetes mode, which checks its `needs` against the
+    /// grant; ignored on one machine, which reads the package. Sent only
+    /// when the plugin has an authority to trust: a 0.2.0 daemon refuses
+    /// unknown fields here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<PluginManifest>,
+}
+
+/// One entry of `PUT /v1/plugins` (Spec O §23.2): what the operator knows
+/// of a plugin it runs. Order in the list is interceptor order.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredPlugin {
+    pub name: String,
+    /// The capabilities the manifest's `needs` must stay within.
+    pub grant: BTreeSet<Capability>,
+    /// Daemon-level config with secrets injected, handed back in `hello`.
+    #[serde(default = "empty_object")]
+    pub config: Value,
+    #[serde(
+        default = "empty_object",
+        rename = "fleetDefaults",
+        skip_serializing_if = "is_empty_object"
+    )]
+    pub fleet_defaults: Value,
+    /// The plugin's token: its bearer to the Daemon and the Daemon's to it.
+    pub token: String,
+    /// `https://<plugin>.<namespace>.svc:7644`.
+    pub url: String,
+}
+
+/// Hand-written: `token` and `config` hold secrets.
+impl std::fmt::Debug for DeclaredPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeclaredPlugin")
+            .field("name", &self.name)
+            .field("grant", &self.grant)
+            .field("config", &"<redacted>")
+            .field("fleet_defaults", &self.fleet_defaults)
+            .field("token", &"<redacted>")
+            .field("url", &self.url)
+            .finish()
+    }
+}
+
+/// Body of `PUT /v1/plugins`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredPlugins {
+    pub plugins: Vec<DeclaredPlugin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HelloResponse {
     pub config: Value,
+}
+
+/// One row of `GET /v1/managed-fleets` (Spec O §23.3): a plugin's
+/// unresolved fleet file, for the operator to write as a Fleet. `down` is
+/// the plugin's down query once it downed the fleet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedFleet {
+    pub name: String,
+    pub plugin: String,
+    pub file: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub down: Option<crate::DownQuery>,
 }
 
 /// One row of `GET /v1/plugins`.
@@ -274,6 +340,7 @@ mod tests {
             version: "0.1.0".into(),
             protocol: PLUGIN_PROTOCOL,
             listen: "127.0.0.1:4321".into(),
+            manifest: None,
         };
         let back: HelloRequest = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
         assert_eq!(back, h);
@@ -372,5 +439,70 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("unknown field `fleet_defaults`"), "{err}");
+    }
+
+    #[test]
+    fn a_hello_without_a_manifest_still_parses_and_serialises_without_the_key() {
+        let old = r#"{"name":"web","version":"0.2.1","protocol":1,"listen":"127.0.0.1:9"}"#;
+        let h: HelloRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(h.manifest, None);
+        let back = serde_json::to_value(&h).unwrap();
+        assert!(back.get("manifest").is_none(), "{back}");
+    }
+
+    #[test]
+    fn a_hello_carries_the_manifest_when_given() {
+        let m: PluginManifest = serde_norway::from_str(
+            "apiVersion: balerix/v1\nkind: Plugin\nname: flow\nversion: 0.1.1\nprotocol: 1\nstart: serve\nneeds: [actions, kv]\n",
+        )
+        .unwrap();
+        let h = HelloRequest {
+            name: "flow".into(),
+            version: "0.1.1".into(),
+            protocol: PLUGIN_PROTOCOL,
+            listen: "0.0.0.0:7644".into(),
+            manifest: Some(m.clone()),
+        };
+        let v = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["manifest"]["needs"], serde_json::json!(["actions", "kv"]));
+        let back: HelloRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.manifest, Some(m));
+    }
+
+    #[test]
+    fn a_declared_plugin_parses_redacts_and_refuses_an_unknown_capability() {
+        let body = serde_json::json!({ "plugins": [{
+            "name": "flow", "grant": ["actions", "kv"], "config": { "secret": "s3cret" },
+            "fleetDefaults": { "claude": { "binary": "fake-claude" } },
+            "token": "t0123456789abcdef0123456789abcdef", "url": "https://flow.ns.svc:7644"
+        }]});
+        let d: DeclaredPlugins = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(
+            d.plugins[0].grant,
+            BTreeSet::from([Capability::Actions, Capability::Kv])
+        );
+        let dbg = format!("{:?}", d.plugins[0]);
+        assert!(
+            !dbg.contains("s3cret") && !dbg.contains("t0123456789"),
+            "{dbg}"
+        );
+        let mut bad = body;
+        bad["plugins"][0]["grant"] = serde_json::json!(["root"]);
+        let err = serde_json::from_value::<DeclaredPlugins>(bad)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown variant `root`"), "{err}");
+    }
+
+    #[test]
+    fn a_managed_fleet_row_omits_down_while_live() {
+        let row = ManagedFleet {
+            name: "gh-1".into(),
+            plugin: "github".into(),
+            file: serde_json::json!({ "crews": {} }),
+            down: None,
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        assert!(v.get("down").is_none(), "{v}");
     }
 }

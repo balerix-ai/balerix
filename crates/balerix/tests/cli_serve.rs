@@ -1,44 +1,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod support;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Fake tools on PATH: `serve` discovers them but calls none without a fleet.
-fn fake_tools(dir: &Path) {
-    for t in ["git", "gh", "mise", "nono", "tmux"] {
-        fs::write(dir.join(t), "#!/bin/sh\nexit 0\n").unwrap();
-    }
-}
-
-fn balerix(home: &Path, tools: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_balerix"));
-    cmd.env("HOME", home)
-        .env("PATH", tools)
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_STATE_HOME")
-        .env_remove("XDG_DATA_HOME")
-        .env_remove("BALERIX_API_URL");
-    cmd
-}
-
-fn wait_for_file(path: &Path) -> String {
-    let start = Instant::now();
-    loop {
-        if let Ok(s) = fs::read_to_string(path)
-            && !s.trim().is_empty()
-        {
-            return s.trim().to_string();
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "{} never appeared",
-            path.display()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
+use support::{Kill, balerix, fake_tools, tls_files, tls_get, wait_for_file};
 
 fn get(url: &str, token: Option<&str>) -> (u16, String) {
     let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -55,14 +23,6 @@ fn get(url: &str, token: Option<&str>) -> (u16, String) {
         resp.status().as_u16(),
         resp.body_mut().read_to_string().unwrap(),
     )
-}
-
-struct Kill(Child);
-impl Drop for Kill {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 #[test]
@@ -192,74 +152,6 @@ fn serve_rejects_a_non_loopback_bind_and_writes_no_endpoint() {
     assert!(!server_dir.join("endpoint").exists());
 }
 
-/// A throwaway authority and a leaf for 127.0.0.1, as PEM files in `dir`:
-/// (ca.crt, tls.crt, tls.key).
-fn tls_files(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
-    let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca.distinguished_name
-        .push(rcgen::DnType::CommonName, "balerix test authority");
-    let ca_key = rcgen::KeyPair::generate().unwrap();
-    let ca_cert = ca.self_signed(&ca_key).unwrap();
-    let ca_pem = dir.join("ca.crt");
-    fs::write(&ca_pem, ca_cert.pem()).unwrap();
-    let issuer = rcgen::Issuer::new(ca, ca_key);
-    let leaf =
-        rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
-            .unwrap();
-    let key = rcgen::KeyPair::generate().unwrap();
-    let cert = leaf.signed_by(&key, &issuer).unwrap();
-    let cert_pem = dir.join("tls.crt");
-    let key_pem = dir.join("tls.key");
-    fs::write(&cert_pem, cert.pem()).unwrap();
-    fs::write(&key_pem, key.serialize_pem()).unwrap();
-    (ca_pem, cert_pem, key_pem)
-}
-
-/// One HTTPS GET over rustls on a plain TcpStream: the core workspace has
-/// no TLS client (P3-1 holds for ureq and reqwest), and the test needs
-/// none beyond rustls itself.
-fn tls_get(addr: &str, ca: &Path, path: &str, token: Option<&str>) -> (u16, String) {
-    use rustls_pki_types::pem::PemObject;
-    use std::io::{Read, Write};
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pki_types::CertificateDer::pem_file_iter(ca).unwrap() {
-        roots.add(cert.unwrap()).unwrap();
-    }
-    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    let name = rustls_pki_types::ServerName::try_from("127.0.0.1").unwrap();
-    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), name).unwrap();
-    let mut tcp = std::net::TcpStream::connect(addr).unwrap();
-    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
-    let auth = token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
-    tls.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{auth}\r\n")
-            .as_bytes(),
-    )
-    .unwrap();
-    let mut raw = Vec::new();
-    let _ = tls.read_to_end(&mut raw);
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let status: u16 = text
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let body = text
-        .split_once("\r\n\r\n")
-        .map_or(String::new(), |(_, b)| b.to_string());
-    (status, body)
-}
-
 #[test]
 fn kubernetes_mode_serves_tls_with_the_mounted_token_and_reads_no_plugins_file() {
     let home = tempfile::tempdir().unwrap();
@@ -374,10 +266,19 @@ fn kubernetes_mode_refuses_missing_tls_and_detach_and_tmux_mode_refuses_the_tls_
         .arg(&key)
         .output()
         .unwrap();
-    assert!(
-        String::from_utf8_lossy(&out.stderr)
-            .contains("--tls-cert, --tls-key and --admin-token-file are for --mode kubernetes")
-    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains(
+        "--tls-cert, --tls-key, --tls-ca and --admin-token-file are for --mode kubernetes"
+    ));
+    // --tls-ca alone is refused in tmux mode like the other kube flags
+    let out = balerix(home.path(), tools.path())
+        .args(["serve", "--bind", "127.0.0.1:0"])
+        .arg("--tls-ca")
+        .arg(&cert)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains(
+        "--tls-cert, --tls-key, --tls-ca and --admin-token-file are for --mode kubernetes"
+    ));
     fs::write(&token_file, "short\n").unwrap();
     let out = balerix(home.path(), tools.path())
         .args(["serve", "--mode", "kubernetes", "--bind", "127.0.0.1:0"])

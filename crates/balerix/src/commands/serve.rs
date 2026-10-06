@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use balerix_core::{FleetStore, ReconcilePolicy};
 use balerix_runtime::{Runtime, StateLayout, TmuxRunner};
-use balerix_server::kube::{LinkHub, NoFiles, NoPool, serve_tls};
+use balerix_server::kube::{self, LinkHub, NoFiles, NoPool, serve_tls};
 use balerix_server::{
     Daemon, FileFleetStore, Metrics, PluginClient, PluginEventHandler, PluginHostConfig, PluginKv,
-    PluginRegistry, Ports, ServerPaths, Vault, load_or_create_token, read_endpoint,
+    PluginRegistry, PluginSetup, Ports, ServerPaths, Vault, load_or_create_token, read_endpoint,
     remove_if_exists, router, serve, write_endpoint, write_pid,
 };
 use serde::Deserialize;
@@ -89,9 +89,14 @@ pub fn serve_command(args: &ServeArgs) -> Result<String> {
     let bind = args.bind.clone().unwrap_or(config.bind);
     match args.mode {
         ServeMode::Tmux => {
-            if args.tls_cert.is_some() || args.tls_key.is_some() || args.admin_token_file.is_some()
+            if args.tls_cert.is_some()
+                || args.tls_key.is_some()
+                || args.tls_ca.is_some()
+                || args.admin_token_file.is_some()
             {
-                bail!("--tls-cert, --tls-key and --admin-token-file are for --mode kubernetes");
+                bail!(
+                    "--tls-cert, --tls-key, --tls-ca and --admin-token-file are for --mode kubernetes"
+                );
             }
             require_loopback(&bind)?;
             if args.detach {
@@ -122,7 +127,18 @@ pub fn serve_command(args: &ServeArgs) -> Result<String> {
             let addr: SocketAddr = bind
                 .parse()
                 .with_context(|| format!("bind address {bind:?} is not a valid host:port"))?;
-            run_kubernetes(&layout, &paths, addr, &config.log, cert, key, token_file)
+            run_kubernetes(
+                &layout,
+                &paths,
+                addr,
+                &config.log,
+                &KubeFiles {
+                    cert,
+                    key,
+                    token_file,
+                    ca: args.tls_ca.as_deref(),
+                },
+            )
         }
     }
 }
@@ -162,21 +178,38 @@ fn init_tracing(paths: &ServerPaths, level: &str, to_file: bool) -> Result<()> {
     Ok(())
 }
 
+/// The files `--mode kubernetes` reads; `ca` is optional (Spec O §23.1).
+struct KubeFiles<'a> {
+    cert: &'a Path,
+    key: &'a Path,
+    token_file: &'a Path,
+    ca: Option<&'a Path>,
+}
+
 /// Spec O §7.3: TLS on the pod address, the operator's admin token, the
 /// link hub as the runner and the workspace reader, no files to
-/// materialise, a pool that is a Job's, and no `plugins.yaml` (§9 brings
-/// `PUT /v1/plugins`): the startup plugin sync is not run. One process per
-/// pod, so there is no `already_running` check and no detach.
+/// materialise, a pool that is a Job's, and no `plugins.yaml`: the
+/// plugins are the operator's list, sent with `PUT /v1/plugins` (§23.2),
+/// so there is no startup plugin sync. One process per pod, so there is
+/// no `already_running` check and no detach.
 fn run_kubernetes(
     layout: &StateLayout,
     paths: &ServerPaths,
     addr: SocketAddr,
     log: &str,
-    cert: &Path,
-    key: &Path,
-    token_file: &Path,
+    files: &KubeFiles<'_>,
 ) -> Result<String> {
+    let KubeFiles {
+        cert,
+        key,
+        token_file,
+        ca,
+    } = *files;
     init_tracing(paths, log, false)?;
+    let tls = ca
+        .map(kube::tls::client_config)
+        .transpose()
+        .with_context(|| "--tls-ca")?;
     let token = std::fs::read_to_string(token_file)
         .with_context(|| format!("cannot read {}", token_file.display()))?
         .trim()
@@ -209,7 +242,7 @@ fn run_kubernetes(
         let fleets = existing.len();
         let metrics = Metrics::new()?;
         let registry = PluginRegistry::new();
-        let client = PluginClient::new().map_err(|e| anyhow!("plugins: {e}"))?;
+        let client = PluginClient::new(tls).map_err(|e| anyhow!("plugins: {e}"))?;
         let kv = Arc::new(PluginKv::new(layout.plugins_state_dir(), vault.clone()));
         let handler = PluginEventHandler::new(registry.clone(), client.clone(), metrics.clone());
         let daemon = Daemon::start(
@@ -218,9 +251,9 @@ fn run_kubernetes(
             metrics,
             token,
             existing,
-            PluginHostConfig {
-                plugins_file: layout.config_root.join("plugins.yaml"),
-                install_root: layout.plugins_data_dir(),
+            PluginSetup::Declared {
+                state_dir: layout.plugins_state_dir(),
+                managed_dir: layout.managed_dir(),
             },
             registry,
             client,
@@ -289,7 +322,7 @@ fn run(
         // are the ones `/metrics` encodes (plugins spec §12).
         let metrics = Metrics::new()?;
         let registry = PluginRegistry::new();
-        let client = PluginClient::new().map_err(|e| anyhow!("plugins: {e}"))?;
+        let client = PluginClient::new(None).map_err(|e| anyhow!("plugins: {e}"))?;
         let kv = Arc::new(PluginKv::new(layout.plugins_state_dir(), vault.clone()));
         let handler = PluginEventHandler::new(registry.clone(), client.clone(), metrics.clone());
         let daemon = Daemon::start(
@@ -298,10 +331,10 @@ fn run(
             metrics,
             token,
             existing,
-            PluginHostConfig {
+            PluginSetup::Packages(PluginHostConfig {
                 plugins_file: layout.config_root.join("plugins.yaml"),
                 install_root: layout.plugins_data_dir(),
-            },
+            }),
             registry,
             client,
             kv,

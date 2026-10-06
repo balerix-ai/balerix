@@ -2,7 +2,7 @@
 //! bundle over the `balerix-core` fakes.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use crate::actor::Ports;
 use crate::daemon::{Daemon, DaemonHandler};
 use crate::kube::LinkHub;
 use crate::metrics::Metrics;
-use crate::plugins::{PluginClient, PluginKv, PluginRegistry};
+use crate::plugins::{PluginClient, PluginKv, PluginRegistry, PluginSetup};
 use crate::vault::Vault;
 
 #[derive(Default)]
@@ -118,7 +118,7 @@ impl Harness {
             credentials,
             ports,
             registry: PluginRegistry::new(),
-            client: PluginClient::new().unwrap_or_else(|e| panic!("http client: {e}")),
+            client: PluginClient::new(None).unwrap_or_else(|e| panic!("http client: {e}")),
             kv_dir,
             kv,
             hub: None,
@@ -204,6 +204,31 @@ impl Harness {
         )
     }
 
+    /// Kubernetes mode's plugin source (Spec O §23.2): the operator's list,
+    /// hellos persisted under `dir/plugins`, managed fleet requests under
+    /// `dir/managed`, plugins called with `client`
+    /// (with or without an authority).
+    pub fn daemon_declared(
+        &self,
+        handler: Arc<dyn DaemonHandler>,
+        dir: &Path,
+        token: &str,
+        client: PluginClient,
+    ) -> Arc<Daemon> {
+        self.start(
+            handler,
+            token,
+            Metrics::new().unwrap_or_else(|e| panic!("metrics: {e}")),
+            Vec::new(),
+            ready_toolchain(),
+            PluginSetup::Declared {
+                state_dir: dir.join("plugins"),
+                managed_dir: dir.join("managed"),
+            },
+            client,
+        )
+    }
+
     fn daemon_full(
         &self,
         handler: Arc<dyn DaemonHandler>,
@@ -212,6 +237,28 @@ impl Harness {
         metrics: Metrics,
         existing: Vec<(FleetRecord, FleetSecrets)>,
         toolchain: Arc<dyn SystemToolchain>,
+    ) -> Arc<Daemon> {
+        self.start(
+            handler,
+            token,
+            metrics,
+            existing,
+            toolchain,
+            PluginSetup::Packages(plugin_config_in(plugin_dir)),
+            self.client.clone(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        &self,
+        handler: Arc<dyn DaemonHandler>,
+        token: &str,
+        metrics: Metrics,
+        existing: Vec<(FleetRecord, FleetSecrets)>,
+        toolchain: Arc<dyn SystemToolchain>,
+        plugins: PluginSetup,
+        client: PluginClient,
     ) -> Arc<Daemon> {
         // The runner, the workspace reader and `kube` come from `self.ports`:
         // `Harness::kube` swaps those three for the link hub.
@@ -229,9 +276,9 @@ impl Harness {
             metrics,
             token.to_string(),
             existing,
-            plugin_config_in(plugin_dir),
+            plugins,
             self.registry.clone(),
-            self.client.clone(),
+            client,
             self.kv.clone(),
             toolchain,
         )
@@ -265,6 +312,11 @@ pub struct StubScript {
     pub health_ok: bool,
     pub metrics_body: String,
     pub expect_token: Option<String>,
+    /// (certificate, key) PEM: serve `https://` (Spec O §23.1).
+    pub tls: Option<(PathBuf, PathBuf)>,
+    /// While it holds `true`, `/v1/health` answers 503 whatever
+    /// `health_ok` says: missed polls, then a recovery (§23.2).
+    pub health_down: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Clone)]
@@ -291,6 +343,7 @@ pub async fn stub_plugin(script: StubScript) -> StubPlugin {
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::{Value, json};
+    let script_tls = script.tls.clone();
     let calls = Arc::new(StdMutex::new(Vec::new()));
     #[derive(Clone)]
     struct S {
@@ -374,7 +427,12 @@ pub async fn stub_plugin(script: StubScript) -> StubPlugin {
             "/v1/health",
             get(move |State(s): State<S>| async move {
                 record(&s, "health", json!({}));
-                if s.script.health_ok {
+                let down = s
+                    .script
+                    .health_down
+                    .as_ref()
+                    .is_some_and(|d| d.load(std::sync::atomic::Ordering::SeqCst));
+                if s.script.health_ok && !down {
                     axum::http::StatusCode::OK
                 } else {
                     axum::http::StatusCode::SERVICE_UNAVAILABLE
@@ -385,21 +443,57 @@ pub async fn stub_plugin(script: StubScript) -> StubPlugin {
             "/v1/metrics",
             get(move |State(s): State<S>| async move { s.script.metrics_body.clone() }),
         )
+        .route(
+            "/v1/routes/ws",
+            get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
+                ws.on_upgrade(|mut socket| async move {
+                    while let Some(Ok(msg)) = socket.recv().await {
+                        if matches!(msg, axum::extract::ws::Message::Text(_))
+                            && socket.send(msg).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            }),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             check_token,
         ))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap_or_else(|e| panic!("bind: {e}"));
-    let listen = listener
+    let tls = script_tls;
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("bind: {e}"));
+    listener
+        .set_nonblocking(true)
+        .unwrap_or_else(|e| panic!("nonblocking: {e}"));
+    let port = listener
         .local_addr()
         .unwrap_or_else(|e| panic!("addr: {e}"))
-        .to_string();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+        .port();
+    let listen = if tls.is_some() {
+        format!("https://127.0.0.1:{port}")
+    } else {
+        format!("127.0.0.1:{port}")
+    };
+    if let Some((cert, key)) = tls {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+            .await
+            .unwrap_or_else(|e| panic!("tls: {e}"));
+        let server = axum_server::from_tcp_rustls(listener, config)
+            .unwrap_or_else(|e| panic!("tls listener: {e}"));
+        tokio::spawn(async move {
+            let _ = server.serve(app.into_make_service()).await;
+        });
+    } else {
+        let listener =
+            tokio::net::TcpListener::from_std(listener).unwrap_or_else(|e| panic!("listener: {e}"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+    }
     StubPlugin { listen, calls }
 }
 
@@ -415,4 +509,32 @@ pub fn write_plugin_package(dir: &Path, name: &str, manifest_extra: &str) {
         dir.join("mise.toml"),
         "[tools]\n[tasks.serve]\nrun = \"true\"\n",
     );
+}
+
+/// (ca.crt, tls.crt, tls.key) for 127.0.0.1 in `dir`: a throwaway authority
+/// and the leaf it signs, for the TLS stub plugin (Spec O §23.1).
+pub fn test_authority(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let io = |what: &str, e: &dyn std::fmt::Display| -> ! { panic!("authority: {what}: {e}") };
+    let mut ca =
+        rcgen::CertificateParams::new(Vec::<String>::new()).unwrap_or_else(|e| io("ca params", &e));
+    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().unwrap_or_else(|e| io("ca key", &e));
+    let ca_cert = ca
+        .self_signed(&ca_key)
+        .unwrap_or_else(|e| io("ca cert", &e));
+    let issuer = rcgen::Issuer::new(ca, ca_key);
+    let key = rcgen::KeyPair::generate().unwrap_or_else(|e| io("key", &e));
+    let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .unwrap_or_else(|e| io("leaf params", &e))
+        .signed_by(&key, &issuer)
+        .unwrap_or_else(|e| io("leaf", &e));
+    let paths = (dir.join("ca.crt"), dir.join("tls.crt"), dir.join("tls.key"));
+    for (path, pem) in [
+        (&paths.0, ca_cert.pem()),
+        (&paths.1, leaf.pem()),
+        (&paths.2, key.serialize_pem()),
+    ] {
+        std::fs::write(path, pem).unwrap_or_else(|e| io("write", &e));
+    }
+    paths
 }

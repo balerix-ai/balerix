@@ -13,7 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use balerix_api::{
     ActivateRequest, DeactivateRequest, ErrorBody, EventBatch, HookEvent, InterceptRequest,
-    InterceptResponse,
+    InterceptResponse, PluginManifest,
 };
 use serde_json::{Value, json};
 
@@ -86,6 +86,25 @@ pub trait Plugin: Send + Sync + 'static {
     fn routes(&self) -> Option<Router> {
         None
     }
+    /// The plugin's own `balerix-plugin.yaml`, usually
+    /// `include_str!("../package/balerix-plugin.yaml")` (Spec O §23.1). A
+    /// Daemon in Kubernetes mode refuses a `hello` without it and checks its
+    /// `needs` against the plugin's grant; one machine reads the package.
+    fn manifest(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// The manifest `plugin` returns, parsed; `Err` when it does not parse,
+/// which `serve` reports before saying hello.
+pub fn parse_manifest<P: Plugin>(plugin: &P) -> Result<Option<PluginManifest>, SdkError> {
+    plugin
+        .manifest()
+        .map(|text| {
+            serde_norway::from_str(text)
+                .map_err(|e| SdkError::Configure(format!("balerix-plugin.yaml: {e}")))
+        })
+        .transpose()
 }
 
 /// The §4.2 router for `plugin`. Every route, the plugin's own under
@@ -204,11 +223,12 @@ async fn metrics<P: Plugin>(State(p): State<Arc<P>>) -> Response {
     ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
-/// A loopback listener on an ephemeral port and its `host:port`.
-pub async fn bind() -> Result<(tokio::net::TcpListener, String), SdkError> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+/// A listener on `addr` (`127.0.0.1:0` on one machine, `0.0.0.0:7644` in
+/// a pod) and its `host:port`.
+pub async fn bind_to(addr: &str) -> Result<(tokio::net::TcpListener, String), SdkError> {
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|e| SdkError::Bind(e.to_string()))?;
+        .map_err(|e| SdkError::Bind(format!("{addr}: {e}")))?;
     let listen = listener
         .local_addr()
         .map_err(|e| SdkError::Bind(e.to_string()))?
@@ -216,14 +236,37 @@ pub async fn bind() -> Result<(tokio::net::TcpListener, String), SdkError> {
     Ok((listener, listen))
 }
 
-/// Serves the router until the future is dropped.
+/// A loopback listener on an ephemeral port and its `host:port`.
+pub async fn bind() -> Result<(tokio::net::TcpListener, String), SdkError> {
+    bind_to("127.0.0.1:0").await
+}
+
+/// Serves the router until the future is dropped: plain HTTP, or TLS with
+/// `tls = (certificate, key)` (Spec O §23.1). A renewed certificate is a
+/// restart's, never reloaded.
 pub async fn run<P: Plugin>(
     listener: tokio::net::TcpListener,
     plugin: Arc<P>,
     token: &str,
+    tls: Option<&(std::path::PathBuf, std::path::PathBuf)>,
 ) -> Result<(), SdkError> {
-    axum::serve(listener, router(plugin, token))
-        .into_future()
+    let app = router(plugin, token);
+    let Some((cert, key)) = tls else {
+        return axum::serve(listener, app)
+            .into_future()
+            .await
+            .map_err(|e| SdkError::Bind(e.to_string()));
+    };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+        .await
+        .map_err(|e| SdkError::Bind(format!("{}: {e}", cert.display())))?;
+    let std = listener
+        .into_std()
+        .map_err(|e| SdkError::Bind(e.to_string()))?;
+    axum_server::from_tcp_rustls(std, config)
+        .map_err(|e| SdkError::Bind(e.to_string()))?
+        .serve(app.into_make_service())
         .await
         .map_err(|e| SdkError::Bind(e.to_string()))
 }
@@ -231,7 +274,7 @@ pub async fn run<P: Plugin>(
 /// Bind, say hello, serve. Returns only on a bind or hello failure, or
 /// when the server stops.
 pub async fn serve<P: Plugin>(host: &Host, version: &str, plugin: P) -> Result<(), SdkError> {
-    let (listener, listen) = bind().await?;
+    let (listener, listen) = bind_to(&host.env().listen).await?;
     serve_on(host, version, plugin, listener, listen).await
 }
 
@@ -247,15 +290,23 @@ async fn serve_on<P: Plugin>(
     listener: tokio::net::TcpListener,
     listen: String,
 ) -> Result<(), SdkError> {
+    // Spec O §23.1: only with an authority, so a released one-machine
+    // daemon (which refuses unknown fields in hello) never sees it
+    let manifest = match host.env().ca {
+        Some(_) => parse_manifest(&plugin)?,
+        None => None,
+    };
     let plugin = Arc::new(plugin);
     let token = host.env().token.clone();
+    let tls = host.env().tls.clone();
     let listener_plugin = plugin.clone();
-    let server = tokio::spawn(async move { run(listener, listener_plugin, &token).await });
+    let server =
+        tokio::spawn(async move { run(listener, listener_plugin, &token, tls.as_ref()).await });
     let stop = |server: tokio::task::JoinHandle<Result<(), SdkError>>| async move {
         server.abort();
         let _ = server.await;
     };
-    let reply = match host.hello(version, &listen).await {
+    let reply = match host.hello(version, &listen, manifest.as_ref()).await {
         Ok(reply) => reply,
         Err(e) => {
             stop(server).await;
@@ -279,7 +330,80 @@ mod tests {
     struct Silent;
     impl Plugin for Silent {}
 
+    struct WithManifest;
+    impl Plugin for WithManifest {
+        fn manifest(&self) -> Option<&'static str> {
+            Some(
+                "apiVersion: balerix/v1\nkind: Plugin\nname: t\nversion: 0.1.0\nprotocol: 1\nstart: serve\nneeds: [kv]\n",
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_carries_the_manifest_only_with_an_authority() {
+        // the SDK's fake host over plain http: the CA-less case
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let fake = crate::testing::FakeHost::start("tok", serde_json::json!({}), vec![]).await;
+        let host = Host::new(fake.env("t", std::path::Path::new("scratch"))).unwrap();
+        let (listener, listen) = bind().await.unwrap();
+        let h = host.clone();
+        let server =
+            tokio::spawn(
+                async move { serve_on(&h, "0.1.0", WithManifest, listener, listen).await },
+            );
+        let start = std::time::Instant::now();
+        while fake.hellos().is_empty() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "no hello"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // `manifest` is skipped when `None`, so `None` here is the key absent
+        // on the wire: what a 0.2.0 daemon's deny_unknown_fields needs
+        assert_eq!(fake.hellos()[0].manifest, None);
+        server.abort();
+    }
+
+    #[test]
+    fn the_manifest_a_plugin_returns_is_parsed_before_hello() {
+        let m = parse_manifest(&WithManifest).unwrap().unwrap();
+        assert_eq!(m.name, "t");
+        struct Broken;
+        impl Plugin for Broken {
+            fn manifest(&self) -> Option<&'static str> {
+                Some("not: [a manifest")
+            }
+        }
+        let err = parse_manifest(&Broken).unwrap_err().to_string();
+        assert!(err.starts_with("configure: balerix-plugin.yaml:"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_serves_tls_with_the_given_certificate() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = crate::test_tls::authority(dir.path());
+        let (listener, listen) = bind().await.unwrap();
+        let tls = (cert, key);
+        let server =
+            tokio::spawn(async move { run(listener, Arc::new(Silent), "tok", Some(&tls)).await });
+        let client = reqwest::Client::builder()
+            .use_preconfigured_tls((*crate::tls::client_config(&ca).unwrap()).clone())
+            .build()
+            .unwrap();
+        let r = client
+            .get(format!("https://{listen}/v1/health"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        server.abort();
+    }
+
     async fn post(url: &str, token: &str, body: Value) -> (u16, Value) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
         let r = c
             .post(url)
@@ -299,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn defaults_accept_everything_and_pass_the_response_through() {
         let (listener, listen) = bind().await.unwrap();
-        tokio::spawn(run(listener, Arc::new(Silent), "tok"));
+        tokio::spawn(run(listener, Arc::new(Silent), "tok", None));
         let base = format!("http://{listen}");
         let (s, _) = post(
             &format!("{base}/v1/activate"),
@@ -322,6 +446,7 @@ mod tests {
         )
         .await;
         assert_eq!((s, v), (200, json!({ "response": { "x": 2 } })));
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
         assert_eq!(
             c.get(format!("{base}/v1/health"))
@@ -349,7 +474,7 @@ mod tests {
     #[tokio::test]
     async fn every_route_refuses_a_call_without_the_daemon_bearer() {
         let (listener, listen) = bind().await.unwrap();
-        tokio::spawn(run(listener, Arc::new(Silent), "tok"));
+        tokio::spawn(run(listener, Arc::new(Silent), "tok", None));
         let base = format!("http://{listen}");
         for token in ["", "nope"] {
             let (s, v) = post(
@@ -366,6 +491,7 @@ mod tests {
         }
         // every route, not a sample: the middleware is one, but a route
         // registered outside it would pass unnoticed
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
         for (method, path) in [
             ("POST", "/v1/activate"),
@@ -410,7 +536,8 @@ mod tests {
             }
         }
         let (listener, listen) = bind().await.unwrap();
-        tokio::spawn(run(listener, Arc::new(Routed), "tok"));
+        tokio::spawn(run(listener, Arc::new(Routed), "tok", None));
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
         for (path, want) in [("/v1/routes", "root"), ("/v1/routes/x", "x")] {
             let r = c
@@ -458,6 +585,7 @@ mod tests {
         .unwrap();
         let listen = fake.hellos()[0].listen.clone();
         assert!(listen.starts_with("127.0.0.1:"));
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
         assert_eq!(
             c.get(format!("http://{listen}/v1/health"))

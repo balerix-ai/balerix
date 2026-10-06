@@ -117,6 +117,9 @@ impl FakeHost {
             name: name.to_string(),
             token: self.inner.token.clone(),
             scratch: scratch.into(),
+            ca: None,
+            tls: None,
+            listen: "127.0.0.1:0".into(),
         }
     }
 
@@ -974,9 +977,9 @@ impl Harness {
         let plugin = Arc::new(plugin);
         let served = plugin.clone();
         let token = token.to_string();
-        let server = tokio::spawn(async move { run(listener, served, &token).await });
+        let server = tokio::spawn(async move { run(listener, served, &token, None).await });
         let reply = host
-            .hello("test", &listen)
+            .hello("test", &listen, None)
             .await
             .unwrap_or_else(|e| panic!("Harness hello: {e}"));
         plugin

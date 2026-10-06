@@ -5,6 +5,8 @@
 //! upgraded on both sides and copied byte for byte — the proxy never
 //! parses a WebSocket frame.
 
+use std::sync::Arc;
+
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
@@ -17,7 +19,7 @@ use crate::api::ApiError;
 use crate::plugins::PluginAddr;
 use crate::sessions::MOUNT_PREFIX;
 
-pub type HttpClient = Client<HttpConnector, Body>;
+pub type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 
 /// Proxied request bodies are capped like every other body.
 pub const MAX_BODY: usize = 1 << 20;
@@ -51,13 +53,21 @@ const DROPPED_RESPONSE: [&str; 6] = [
     "transfer-encoding",
 ];
 
-/// Negligible on loopback; bounds a plugin whose listener has gone away
-/// without closing its port.
+/// Negligible on loopback; bounds a plugin whose listener or pod has gone
+/// away without closing its port.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-pub fn client() -> HttpClient {
-    let mut connector = HttpConnector::new();
-    connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
+pub fn client(tls: Arc<rustls::ClientConfig>) -> HttpClient {
+    let mut http = HttpConnector::new();
+    http.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    // https_or_http: loopback plugins stay plain; an https plugin is
+    // verified against the Daemon's authority alone (Spec O §23.1)
+    http.enforce_http(false);
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config((*tls).clone())
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http);
     Client::builder(TokioExecutor::new()).build(connector)
 }
 
@@ -173,11 +183,11 @@ fn dot_segment(segment: &str) -> bool {
     )
 }
 
-/// `http://<listen>/v1/routes` for an empty `rest` (axum answers a nested
+/// `<base>/v1/routes` for an empty `rest` (axum answers a nested
 /// router's `/` there, not at `/v1/routes/`), else `/v1/routes/<rest>`
 /// with `rest` as the client encoded it, and the query string as it came.
 /// A `.` or `..` segment is refused rather than forwarded.
-pub fn upstream_uri(listen: &str, rest: &str, query: Option<&str>) -> Result<Uri, String> {
+pub fn upstream_uri(base: &str, rest: &str, query: Option<&str>) -> Result<Uri, String> {
     if rest.split('/').any(dot_segment) {
         return Err("path: . and .. segments are not forwarded".to_string());
     }
@@ -187,7 +197,7 @@ pub fn upstream_uri(listen: &str, rest: &str, query: Option<&str>) -> Result<Uri
         format!("/v1/routes/{rest}")
     };
     let query = query.map(|q| format!("?{q}")).unwrap_or_default();
-    format!("http://{listen}{path}{query}")
+    format!("{base}{path}{query}")
         .parse()
         .map_err(|e: axum::http::uri::InvalidUri| e.to_string())
 }
@@ -216,7 +226,7 @@ pub async fn forward(
         }
     };
     let rest = forwarded_rest(parts.uri.path());
-    let uri = match upstream_uri(&addr.listen, rest, parts.uri.query()) {
+    let uri = match upstream_uri(&addr.base(), rest, parts.uri.query()) {
         Ok(u) => u,
         Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, e).into_response(),
     };
@@ -369,16 +379,66 @@ mod tests {
         assert_eq!(resp.len(), 3, "a 101 keeps its upgrade headers");
     }
 
+    #[tokio::test]
+    async fn a_websocket_upgrades_through_the_proxy_to_a_tls_plugin() {
+        use futures_util::{SinkExt, StreamExt};
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = crate::testing::test_authority(dir.path());
+        let stub = crate::testing::stub_plugin(crate::testing::StubScript {
+            tls: Some((cert, key)),
+            ..Default::default()
+        })
+        .await;
+        let tls = crate::kube::tls::client_config(&ca).unwrap();
+        let base = stub.listen.clone();
+        let proxy = client(tls);
+        // a one-route front door that forwards through `forward`
+        let app = axum::Router::new().route(
+            "/v1/plugins/stub/ws",
+            axum::routing::any(move |req: axum::extract::Request| {
+                let (proxy, base) = (proxy.clone(), base.clone());
+                async move {
+                    let addr = PluginAddr {
+                        listen: base,
+                        token: "t".into(),
+                    };
+                    forward(&proxy, &addr, "stub", req).await
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        // a hung 101 must fail the test, not stall it
+        let t = std::time::Duration::from_secs(5);
+        let (mut ws, _) = tokio::time::timeout(
+            t,
+            tokio_tungstenite::connect_async(format!("ws://{front}/v1/plugins/stub/ws")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::text("ping"))
+            .await
+            .unwrap();
+        let echoed = tokio::time::timeout(t, ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed.into_text().unwrap().as_str(), "ping");
+    }
+
     #[test]
     fn the_upstream_uri_lands_under_v1_routes() {
         assert_eq!(
-            upstream_uri("127.0.0.1:4000", "", None)
+            upstream_uri("http://127.0.0.1:4000", "", None)
                 .unwrap()
                 .to_string(),
             "http://127.0.0.1:4000/v1/routes"
         );
         assert_eq!(
-            upstream_uri("127.0.0.1:4000", "agents/f/c/a/ws", Some("cols=80"))
+            upstream_uri("http://127.0.0.1:4000", "agents/f/c/a/ws", Some("cols=80"))
                 .unwrap()
                 .to_string(),
             "http://127.0.0.1:4000/v1/routes/agents/f/c/a/ws?cols=80"
@@ -387,12 +447,12 @@ mod tests {
         // stays one path byte instead of starting a query, and a `%20`
         // parses where a decoded space would not
         assert_eq!(
-            upstream_uri("127.0.0.1:4000", "a%20b%3Fx=1%2Fy", None)
+            upstream_uri("http://127.0.0.1:4000", "a%20b%3Fx=1%2Fy", None)
                 .unwrap()
                 .to_string(),
             "http://127.0.0.1:4000/v1/routes/a%20b%3Fx=1%2Fy"
         );
-        assert!(upstream_uri("127.0.0.1:4000", "a b", None).is_err());
+        assert!(upstream_uri("http://127.0.0.1:4000", "a b", None).is_err());
         for rest in [
             "..",
             "../hook",
@@ -403,13 +463,13 @@ mod tests {
             "a/./b",
         ] {
             assert_eq!(
-                upstream_uri("127.0.0.1:4000", rest, None),
+                upstream_uri("http://127.0.0.1:4000", rest, None),
                 Err("path: . and .. segments are not forwarded".to_string()),
                 "{rest}"
             );
         }
         // only a whole segment is a dot segment
-        assert!(upstream_uri("127.0.0.1:4000", "..a/b..", None).is_ok());
+        assert!(upstream_uri("http://127.0.0.1:4000", "..a/b..", None).is_ok());
     }
 
     #[test]

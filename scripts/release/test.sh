@@ -84,6 +84,14 @@ chart_pin_of() {
     chart_pin "$2"
   )
 }
+set_chart_pin_of() {
+  (
+    cd "$1"
+    # shellcheck source=scripts/release/lib.sh
+    source scripts/release/lib.sh
+    set_chart_pin "$2" "$3"
+  )
+}
 
 # Releases every version the charts name, as they name them: what the
 # charts gate waits for (Spec O §24.5).
@@ -651,6 +659,48 @@ scenario_charts_gate() {
   expect_grep "charts after all: changelog section" "## $(charts_field_of "$dir" version) - " "$dir/charts/CHANGELOG.md"
 }
 
+# At release time every pin is tagged or released by this same run, at the
+# version the run releases: the charts job waits for merge-images, so the
+# run's image tags exist by then (Spec O §24.5).
+scenario_charts_pins_at_release() {
+  local dir err pin
+  dir=$(fixture charts-pins)
+  err="$root/charts-pins.err"
+  release "$dir" core "$(charts_field_of "$dir" appVersion)"
+  release "$dir" flow "$(chart_pin_of "$dir" flow)"
+  release "$dir" web "$(chart_pin_of "$dir" web)"
+  release "$dir" matrix "$(chart_pin_of "$dir" matrix)"
+  pin=$(chart_pin_of "$dir" github)
+  expect_eq "pins: github's pin is its manifest version" "$pin" "$(manifest_version "$dir" github)"
+  if "$dir/scripts/release/check-pins.sh" charts 2>"$err"; then
+    fail "pins: github untagged and not in the run: passed"
+  else
+    pass "pins: github untagged and not in the run: fails"
+  fi
+  cat "$err" >>"$log"
+  expect_grep "pins: names the missing tag" "balerix-plugin-github-v$pin (plugins.github.image.tag)" "$err"
+  if "$dir/scripts/release/check-pins.sh" charts github 2>>"$log"; then
+    pass "pins: github untagged but in the run: ok"
+  else
+    fail "pins: github untagged but in the run: failed"
+  fi
+  set_chart_pin_of "$dir" github 9.9.9
+  if "$dir/scripts/release/check-pins.sh" charts github 2>"$err"; then
+    fail "pins: in the run at another version: passed"
+  else
+    pass "pins: in the run at another version: fails"
+  fi
+  cat "$err" >>"$log"
+  expect_grep "pins: names the pinned tag" "balerix-plugin-github-v9.9.9 (plugins.github.image.tag)" "$err"
+  discard "$dir"
+  release "$dir" github "$pin"
+  if "$dir/scripts/release/check-pins.sh" charts 2>>"$log"; then
+    pass "pins: all tagged: ok"
+  else
+    fail "pins: all tagged: failed"
+  fi
+}
+
 # A plugin release moves its pin and nothing else in the daemon values;
 # plugins.github is not credentials.github.
 scenario_plugin_moves_pin() {
@@ -785,6 +835,7 @@ scenario_core_bump_moves_common
 scenario_common_change_releases_dependents
 scenario_plan_crates
 scenario_charts_gate
+scenario_charts_pins_at_release
 scenario_plugin_moves_pin
 scenario_core_moves_app_version
 scenario_charts_pin_only

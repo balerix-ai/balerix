@@ -65,15 +65,11 @@ library_blocked() {
 # tag): until every one is tagged, a release would install images that do
 # not exist (Spec O §24.5). A status, not a failure, as for a library.
 charts_blocked() {
-  local app plugin pin missing=()
-  app=$(charts_field appVersion)
-  tag_exists "$(unit_tag core "$app")" || missing+=("$(unit_tag core "$app") (appVersion)")
-  for plugin in "${PLUGIN_UNITS[@]}"; do
-    pin=$(chart_pin "$plugin")
-    [[ -n $pin ]] || die "charts: $DAEMON_VALUES has no plugins.$plugin.image.tag"
-    tag_exists "$(unit_tag "$plugin" "$pin")" ||
-      missing+=("$(unit_tag "$plugin" "$pin") (plugins.$plugin.image.tag)")
-  done
+  local pins pinned version field missing=()
+  pins=$(charts_pins)
+  while read -r pinned version field; do
+    tag_exists "$(unit_tag "$pinned" "$version")" || missing+=("$(unit_tag "$pinned" "$version") ($field)")
+  done <<<"$pins"
   ((${#missing[@]})) || return 1
   echo "charts: they name versions with no release tag yet: ${missing[*]}; release those first, then charts" >&2
 }

@@ -56,6 +56,9 @@ EOF
 fi
 
 if [[ $kind == charts ]]; then
+  for chart in "${CHARTS[@]}"; do
+    [[ -f $assets/$chart-$version.tgz ]] || die "$unit: no $chart-$version.tgz in $assets"
+  done
   owner=${GITHUB_REPOSITORY%%/*}
   owner=${owner,,}
   cat >>"$notes" <<EOF

@@ -267,6 +267,18 @@ chart_pin() {
   ' "${2:-$DAEMON_VALUES}"
 }
 
+# Every version the charts name, one `<unit> <version> <field>` line each:
+# core's (appVersion) and each plugin's (its image tag).
+charts_pins() {
+  local plugin pin
+  echo "core $(charts_field appVersion) appVersion"
+  for plugin in "${PLUGIN_UNITS[@]}"; do
+    pin=$(chart_pin "$plugin")
+    [[ -n $pin ]] || die "charts: $DAEMON_VALUES has no plugins.$plugin.image.tag"
+    echo "$plugin $pin plugins.$plugin.image.tag"
+  done
+}
+
 set_chart_pin() {
   local tmp="$DAEMON_VALUES.new"
   awk -v want="  $1:" -v v="$2" '

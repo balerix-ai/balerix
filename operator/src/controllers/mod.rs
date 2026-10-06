@@ -259,6 +259,10 @@ pub struct Context {
     errors: Mutex<BTreeMap<String, u32>>,
     /// Warning Events on the objects (§22.5).
     recorder: Recorder,
+    /// `<ns>/<fleet>/<crew>` to when its `CrewLocked` was last published:
+    /// once per `stuck_after` per crew (§24.1), not on every waiter's
+    /// wait. Removed when the crew's Job is made.
+    crew_locked: Mutex<BTreeMap<String, i64>>,
 }
 
 impl Context {
@@ -286,7 +290,30 @@ impl Context {
             crew_locks: Arc::default(),
             errors: Mutex::new(BTreeMap::new()),
             recorder,
+            crew_locked: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Whether this crew's `CrewLocked` is due; when it is, its time is
+    /// recorded.
+    pub fn crew_locked_due(&self, key: &str) -> bool {
+        let now = self.now();
+        let mut last = self.crew_locked.lock().unwrap_or_else(|e| e.into_inner());
+        match last.get(key) {
+            Some(t) if now - t < self.run.stuck_after.as_secs() as i64 => false,
+            _ => {
+                last.insert(key.to_string(), now);
+                true
+            }
+        }
+    }
+
+    /// The crew is no longer locked: its next stuck spell is reported at once.
+    pub fn crew_unlocked(&self, key: &str) {
+        self.crew_locked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
     }
 
     /// A Warning Event on `object` (§22.5). Best effort: an Event the API

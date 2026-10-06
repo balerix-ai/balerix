@@ -11,8 +11,8 @@ use balerix_operator::pki;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use kube::Api;
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
+use kube::{Api, ResourceExt};
 use support::envtest::envtest;
 use support::stub_daemon::StubDaemon;
 use support::{TestClock, make_daemon_ready, namespace, spawn_operator, wait_for};
@@ -467,5 +467,358 @@ async fn a_plugin_listed_by_two_daemons_is_neither_ones() {
     })
     .await;
     assert_eq!(got.2, "listed by Daemons default, other");
+    operator.abort();
+}
+
+fn made(stub: &StubDaemon) -> Vec<Vec<String>> {
+    stub.lists()
+        .iter()
+        .map(|l| l.plugins.iter().map(|p| p.name.clone()).collect())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_list_is_sent_on_every_reconcile_in_spec_order() {
+    let (env, ns, stub, _clock, operator) = world("list", &["web", "flow"]).await;
+    let plugins: Api<Plugin> = Api::namespaced(env.client.clone(), &ns);
+    for name in ["flow", "web"] {
+        plugins
+            .create(
+                &PostParams::default(),
+                &Plugin::new(name, plugin_spec(serde_json::json!({}))),
+            )
+            .await
+            .unwrap();
+    }
+    wait_for(
+        "three lists naming web then flow",
+        Duration::from_secs(60),
+        || async {
+            (made(&stub)
+                .iter()
+                .filter(|l| *l == &["web", "flow"])
+                .count()
+                >= 3)
+                .then_some(())
+        },
+    )
+    .await;
+    let list = stub.lists().last().unwrap().clone();
+    assert_eq!(list.plugins[0].url, format!("https://web.{ns}.svc:7644"));
+    // the entry's revision is the pod's
+    let d = Api::<Deployment>::namespaced(env.client.clone(), &ns)
+        .get("balerix-plugin-web")
+        .await
+        .unwrap();
+    let env_rev = d.spec.unwrap().template.spec.unwrap().containers[0]
+        .env
+        .clone()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "BALERIX_PLUGIN_REVISION")
+        .unwrap()
+        .value
+        .unwrap();
+    assert_eq!(list.plugins[0].revision, env_rev);
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugins_ready_follows_the_daemons_rows() {
+    let (env, ns, stub, _clock, operator) = world("rows", &["web"]).await;
+    let daemons: Api<Daemon> = Api::namespaced(env.client.clone(), &ns);
+    let reason = || async {
+        let d = daemons.get("default").await.unwrap();
+        let s = d.status?;
+        let c = s.conditions.iter().find(|c| c.type_ == "PluginsReady")?;
+        Some((c.status.clone(), c.reason.clone(), c.message.clone()))
+    };
+    wait_for("PluginMissing", Duration::from_secs(60), || async {
+        reason()
+            .await
+            .filter(|r| r.1 == "PluginMissing" && r.2 == "Plugin web does not exist")
+    })
+    .await;
+    Api::<Plugin>::namespaced(env.client.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Plugin::new("web", plugin_spec(serde_json::json!({}))),
+        )
+        .await
+        .unwrap();
+    stub.set_plugin_rows(vec![PluginStatus {
+        phase: AgentPhase::Failed,
+        message: "hello.manifest.needs: kv is not granted".into(),
+        ..ready_row("web")
+    }]);
+    wait_for("PluginRefused", Duration::from_secs(60), || async {
+        reason().await.filter(|r| {
+            r.1 == "PluginRefused" && r.2 == "web: hello.manifest.needs: kv is not granted"
+        })
+    })
+    .await;
+    // Ready says why too
+    let d = daemons.get("default").await.unwrap();
+    assert!(
+        d.status
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|c| c.type_ == "Ready" && c.reason == "PluginRefused")
+    );
+    stub.set_plugin_rows(vec![ready_row("web")]);
+    wait_for("AllReady and Ready", Duration::from_secs(60), || async {
+        let d = daemons.get("default").await.unwrap();
+        let s = d.status?;
+        (s.conditions
+            .iter()
+            .any(|c| c.type_ == "PluginsReady" && c.reason == "AllReady")
+            && s.conditions
+                .iter()
+                .any(|c| c.type_ == "Ready" && c.status == "True"))
+        .then_some(())
+    })
+    .await;
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_whose_config_cannot_be_built_holds_the_list_back() {
+    let (env, ns, stub, _clock, operator) = world("heldback", &["flow", "web"]).await;
+    let plugins: Api<Plugin> = Api::namespaced(env.client.clone(), &ns);
+    plugins
+        .create(
+            &PostParams::default(),
+            &Plugin::new("flow", plugin_spec(serde_json::json!({}))),
+        )
+        .await
+        .unwrap();
+    plugins
+        .create(
+            &PostParams::default(),
+            &Plugin::new("web", plugin_spec(serde_json::json!({}))),
+        )
+        .await
+        .unwrap();
+    wait_for("a list of both", Duration::from_secs(60), || async {
+        made(&stub)
+            .iter()
+            .any(|l| l == &["flow", "web"])
+            .then_some(())
+    })
+    .await;
+    // web's config now names a Secret that does not exist
+    plugins
+        .patch(
+            "web",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": {
+        "secrets": { "password": { "secretName": "absent", "key": "pw" } } } })),
+        )
+        .await
+        .unwrap();
+    let daemons: Api<Daemon> = Api::namespaced(env.client.clone(), &ns);
+    wait_for("PluginsReady says why", Duration::from_secs(60), || async {
+        let s = daemons.get("default").await.unwrap().status?;
+        s.conditions
+            .iter()
+            .find(|c| {
+                c.type_ == "PluginsReady"
+                    && c.reason == "SecretMissing"
+                    && c.message == "web: spec.secrets.password: Secret absent does not exist"
+            })
+            .cloned()
+    })
+    .await;
+    // no list without web went out: the Daemon keeps the last one, and with it web's managed requests
+    let sent = stub.lists().len();
+    support::hold_for(
+        "a list sent while web is blocked",
+        Duration::from_secs(3),
+        || async { (stub.lists().len() > sent).then_some(()) },
+    )
+    .await;
+    // from the first list of both on: one sent before flow's token and
+    // certificate were made leaves flow out, as it should
+    let lists = made(&stub);
+    let both = lists.iter().position(|l| l == &["flow", "web"]).unwrap();
+    assert!(
+        lists[both..].iter().all(|l| l == &["flow", "web"]),
+        "{lists:?}"
+    );
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_whose_secrets_are_not_made_is_left_out_of_the_list() {
+    // §23.4: a plugin that cannot be sent yet and has no managed requests
+    // to lose is left out, and the rest go. The Plugin controller makes a
+    // token and certificate at once, so envtest cannot hold one back; a
+    // listed name with no Plugin object takes the same `continue`.
+    let (env, ns, stub, _clock, operator) = world("leftout", &["flow", "ghost"]).await;
+    Api::<Plugin>::namespaced(env.client.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Plugin::new("flow", plugin_spec(serde_json::json!({}))),
+        )
+        .await
+        .unwrap();
+    wait_for(
+        "a list with flow alone",
+        Duration::from_secs(60),
+        || async { made(&stub).iter().any(|l| l == &["flow"]).then_some(()) },
+    )
+    .await;
+    operator.abort();
+}
+
+fn managed(
+    name: &str,
+    plugin: &str,
+    down: Option<balerix_api::DownQuery>,
+) -> balerix_api::ManagedFleet {
+    serde_json::from_value(serde_json::json!({ "name": name, "plugin": plugin, "file": {
+        "apiVersion": "balerix/v1", "kind": "Fleet", "name": name,
+        "crews": { "c": { "repo": "acme/api", "git": { "auth": "none" }, "agents": { "carol": {} } } } },
+        "down": down })).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_managed_request_becomes_a_labelled_fleet_and_its_down_deletes_it() {
+    let (env, ns, stub, _clock, operator) = world("managed", &["fake"]).await;
+    let c = env.client.clone();
+    Api::<Plugin>::namespaced(c.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Plugin::new(
+                "fake",
+                plugin_spec(serde_json::json!({ "needs": ["actions", "fleets", "kv", "manage"] })),
+            ),
+        )
+        .await
+        .unwrap();
+    stub.set_managed(vec![managed("m", "fake", None)]);
+    let fleets: Api<balerix_operator::api::Fleet> = Api::namespaced(c.clone(), &ns);
+    let f = wait_for("Fleet m", Duration::from_secs(60), || async {
+        fleets.get_opt("m").await.unwrap()
+    })
+    .await;
+    assert_eq!(f.labels()["balerix.ai/managed-by"], "fake");
+    assert_eq!(f.spec.daemon, "default");
+    // the Fleet controller applies it for the plugin
+    wait_for("a PUT managed by fake", Duration::from_secs(60), || async {
+        stub.puts()
+            .iter()
+            .any(|p| p.spec.name == "m" && p.managed_by.as_deref() == Some("fake"))
+            .then_some(())
+    })
+    .await;
+    // the plugin downs it with keep-repos: Branches, then gone
+    stub.set_managed(vec![managed(
+        "m",
+        "fake",
+        Some(balerix_api::DownQuery {
+            keep_repos: true,
+            ..Default::default()
+        }),
+    )]);
+    wait_for("Fleet m gone", Duration::from_secs(120), || async {
+        fleets.get_opt("m").await.unwrap().is_none().then_some(())
+    })
+    .await;
+    assert!(stub.deletes().contains(&"m".to_string()));
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_managed_request_never_overwrites_a_fleet_it_does_not_manage() {
+    let (env, ns, stub, _clock, operator) = world("conflict", &["fake"]).await;
+    let c = env.client.clone();
+    Api::<Plugin>::namespaced(c.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Plugin::new(
+                "fake",
+                plugin_spec(serde_json::json!({ "needs": ["fleets", "manage"] })),
+            ),
+        )
+        .await
+        .unwrap();
+    let fleets: Api<balerix_operator::api::Fleet> = Api::namespaced(c.clone(), &ns);
+    let mine: balerix_operator::api::Fleet = serde_json::from_value(serde_json::json!({
+        "apiVersion": "balerix.ai/v1alpha1", "kind": "Fleet", "metadata": { "name": "m" },
+        "spec": { "daemon": "default", "crews": { "c": { "repo": "acme/mine", "git": { "auth": "none" }, "agents": { "me": {} } } } } })).unwrap();
+    fleets.create(&PostParams::default(), &mine).await.unwrap();
+    stub.set_managed(vec![managed("m", "fake", None)]);
+    let events: Api<k8s_openapi::api::events::v1::Event> = Api::namespaced(c.clone(), &ns);
+    wait_for(
+        "FleetConflict on the Plugin",
+        Duration::from_secs(60),
+        || async {
+            events
+                .list(&Default::default())
+                .await
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|e| {
+                    e.reason.as_deref() == Some("FleetConflict")
+                        && e.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some("fake")
+                })
+        },
+    )
+    .await;
+    let still = fleets.get("m").await.unwrap();
+    assert_eq!(still.spec.crews["c"].repo, "acme/mine");
+    assert!(still.labels().get("balerix.ai/managed-by").is_none());
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_plugin_deletes_its_fleets() {
+    let (env, ns, stub, _clock, operator) = world("drop", &["fake"]).await;
+    let c = env.client.clone();
+    Api::<Plugin>::namespaced(c.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Plugin::new(
+                "fake",
+                plugin_spec(serde_json::json!({ "needs": ["fleets", "manage"] })),
+            ),
+        )
+        .await
+        .unwrap();
+    stub.set_managed(vec![managed("m", "fake", None)]);
+    let fleets: Api<balerix_operator::api::Fleet> = Api::namespaced(c.clone(), &ns);
+    wait_for("Fleet m", Duration::from_secs(60), || async {
+        fleets.get_opt("m").await.unwrap()
+    })
+    .await;
+    Api::<Daemon>::namespaced(c.clone(), &ns)
+        .patch(
+            "default",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": { "plugins": [] } })),
+        )
+        .await
+        .unwrap();
+    // the Fleet's finalizer runs its crew's remove Job (`retain: None`)
+    // once the crew's sync no longer holds it (§22.3); play the kubelet
+    // for both
+    let jobs: Api<k8s_openapi::api::batch::v1::Job> = Api::namespaced(c.clone(), &ns);
+    wait_for("Job m-c-sync", Duration::from_secs(60), || async {
+        jobs.get_opt("m-c-sync").await.unwrap()
+    })
+    .await;
+    support::finish_job(&c, &ns, "m-c-sync", true, Some("0123abcd")).await;
+    wait_for("Job m-c-remove", Duration::from_secs(60), || async {
+        jobs.get_opt("m-c-remove").await.unwrap()
+    })
+    .await;
+    support::finish_job(&c, &ns, "m-c-remove", true, None).await;
+    wait_for("Fleet m gone", Duration::from_secs(120), || async {
+        fleets.get_opt("m").await.unwrap().is_none().then_some(())
+    })
+    .await;
     operator.abort();
 }

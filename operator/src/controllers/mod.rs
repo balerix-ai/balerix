@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod crew;
 pub mod daemon;
+mod daemon_plugins;
 pub mod fleet;
 pub mod jobs;
 pub mod plugin;

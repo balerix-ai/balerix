@@ -1,13 +1,16 @@
 //! The Daemon's admin API, as the operator uses it (Spec O §5.2, §7.4):
 //! `PUT /v1/fleets/{name}` with one token per agent, the forced `DELETE`,
-//! the fleet's record, and `/readyz`. It trusts one authority, the
+//! the fleet's record, `/readyz`, and the plugins' `PUT`/`GET /v1/plugins`
+//! and `GET /v1/managed-fleets` (§23). It trusts one authority, the
 //! Daemon's own (§10.3), and nothing else; the Daemon holds no Kubernetes
 //! credentials, so everything between the two goes through here (O-8).
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use balerix_api::{DownQuery, ErrorBody, FleetRecord, FleetRequest};
+use balerix_api::{
+    DeclaredPlugins, DownQuery, ErrorBody, FleetRecord, FleetRequest, ManagedFleet, PluginStatus,
+};
 use reqwest::StatusCode;
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
@@ -277,5 +280,52 @@ impl DaemonClient {
             s if s == StatusCode::NOT_FOUND || s.is_success() => Ok(()),
             _ => Err(Self::refused(response).await),
         }
+    }
+
+    /// `PUT /v1/plugins` (§23.2, §23.4): the whole list, in interceptor
+    /// order. Idempotent; re-sent on every reconcile.
+    pub async fn declare_plugins(&self, list: &DeclaredPlugins) -> Result<(), ClientError> {
+        let response = self
+            .http
+            .put(self.url("/v1/plugins"))
+            .bearer_auth(&self.token)
+            .json(list)
+            .send()
+            .await
+            .map_err(unavailable)?;
+        if !response.status().is_success() {
+            return Err(Self::refused(response).await);
+        }
+        Ok(())
+    }
+
+    /// `GET /v1/plugins`: one row per declared plugin.
+    pub async fn plugins(&self) -> Result<Vec<PluginStatus>, ClientError> {
+        let response = self
+            .http
+            .get(self.url("/v1/plugins"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(unavailable)?;
+        if !response.status().is_success() {
+            return Err(Self::refused(response).await);
+        }
+        decoded(response).await
+    }
+
+    /// `GET /v1/managed-fleets` (§23.3): the plugins' fleet files.
+    pub async fn managed_fleets(&self) -> Result<Vec<ManagedFleet>, ClientError> {
+        let response = self
+            .http
+            .get(self.url("/v1/managed-fleets"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(unavailable)?;
+        if !response.status().is_success() {
+            return Err(Self::refused(response).await);
+        }
+        decoded(response).await
     }
 }

@@ -21,14 +21,7 @@ tag=$(unit_tag "$unit" "$version")
 package="$crate-v$version-package.tar.gz"
 
 if [[ ${2:-} == --flag ]]; then
-  marker="> **Package verification failed**"
-  body=$(gh release view "$tag" --json body --jq .body)
-  if ! grep -qF "$marker" <<<"$body"; then
-    run="${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-}"
-    printf '%s on %s ([run](%s)); do not install this release.\n\n%s\n' \
-      "$marker" "$(uname -m)" "$run" "$body" >"${RUNNER_TEMP:-/tmp}/notes-$unit.md"
-    gh release edit "$tag" --prerelease --notes-file "${RUNNER_TEMP:-/tmp}/notes-$unit.md"
-  fi
+  flag_prerelease "$tag" "> **Package verification failed**" "do not install this release."
   exit 0
 fi
 [[ $# -eq 1 ]] || die "usage: $0 <plugin> [--flag]"

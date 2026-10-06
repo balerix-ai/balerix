@@ -157,7 +157,7 @@ description = "A kind cluster for e2e-k8s with the shared local-path class and t
 # kind and kubectl are pinned here, not in [tools], so only this task and
 # e2e-k8s download them. kind 0.33.0 ships the node image the script pins.
 tools = { kind = "0.33.0", kubectl = "1.34.12" }
-usage = 'arg "[mode]" default="up" help="up or down"'
+usage = 'arg "[mode]" default="up" help="up, cluster (no images) or down"'
 run = 'scripts/kind-up.sh "$usage_mode"'
 
 [tasks.e2e-k8s]

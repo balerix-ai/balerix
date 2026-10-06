@@ -716,6 +716,35 @@ scenario_charts_core_minor() {
   expect_grep "charts after core 0.3.0: the image listed" '`balerix` 0.2.0 → 0.3.0' "$dir/$(field notes "$out")"
 }
 
+# Staged as published: upstream's charts are the tree's, byte for byte.
+scenario_stage_charts() {
+  local dir="$root/stage-upstream" chart
+  GITHUB_REPOSITORY_OWNER=balerix-ai "$repo/scripts/release/stage-charts.sh" "$dir" >/dev/null 2>>"$log"
+  for chart in balerix-operator balerix-daemon; do
+    if diff -r "$repo/charts/$chart" "$dir/$chart" >>"$log" 2>&1; then
+      pass "stage, upstream: $chart is the tree's"
+    else
+      fail "stage, upstream: $chart differs from the tree"
+    fi
+  done
+}
+
+# A fork's charts install the fork's images, lowercased (Spec O §24.5).
+scenario_stage_charts_fork() {
+  local dir="$root/stage-fork" app
+  app=$(charts_field_of "$repo" appVersion)
+  GITHUB_REPOSITORY_OWNER=Example "$repo/scripts/release/stage-charts.sh" "$dir" >/dev/null 2>>"$log"
+  expect_grep "stage, fork: operator repository" 'repository: ghcr.io/example/balerix-operator' "$dir/balerix-operator/values.yaml"
+  expect_grep "stage, fork: daemon image" "daemon: \"ghcr.io/example/balerix:$app\"" "$dir/balerix-operator/values.yaml"
+  expect_grep "stage, fork: agent image" "agent: \"ghcr.io/example/balerix-agent:$app\"" "$dir/balerix-operator/values.yaml"
+  expect_grep "stage, fork: a plugin repository" 'repository: ghcr.io/example/balerix-plugin-github' "$dir/balerix-daemon/values.yaml"
+  if grep -rq 'ghcr.io/balerix-ai/' "$dir"/*/values.yaml; then
+    fail "stage, fork: a balerix-ai image is left"
+  else
+    pass "stage, fork: no balerix-ai image left"
+  fi
+}
+
 scenario_plan_charts() {
   local dir out
   dir=$(fixture plan-charts)
@@ -761,6 +790,8 @@ scenario_core_moves_app_version
 scenario_charts_pin_only
 scenario_charts_core_minor
 scenario_plan_charts
+scenario_stage_charts
+scenario_stage_charts_fork
 
 if ((failures)); then
   echo "$failures check(s) failed; fixtures and $log kept" >&2

@@ -10,7 +10,10 @@
 # Nothing here is a production class: the shared directory is one host
 # path, not a network filesystem.
 #
-# usage: kind-up.sh [up|down]
+# `cluster` makes the cluster and the shared class only, with no images: the
+# charts release check installs the published ones (Spec O §24.5).
+#
+# usage: kind-up.sh [up|cluster|down]
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo"
@@ -22,18 +25,21 @@ export KUBECONFIG="$root/kubeconfig"
 # kind 0.33.0's node image for the spike's Kubernetes line (§19)
 node_image="kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d"
 
-for tool in kind kubectl docker cargo rustup jq; do
+mode=${1:-up}
+tools=(kind kubectl docker)
+[[ $mode != up ]] || tools+=(cargo rustup jq)
+for tool in "${tools[@]}"; do
   command -v "$tool" >/dev/null || { echo "kind-up: $tool is not on PATH" >&2; exit 2; }
 done
 
-case "${1:-up}" in
+case "$mode" in
   down)
     kind delete cluster --name "$name" 2>/dev/null || true
     rm -rf "$root"
     exit 0
     ;;
-  up) ;;
-  *) echo "usage: $0 [up|down]" >&2; exit 2 ;;
+  up | cluster) ;;
+  *) echo "usage: $0 [up|cluster|down]" >&2; exit 2 ;;
 esac
 
 mkdir -p "$root" "$shared"
@@ -59,6 +65,11 @@ kubectl -n local-path-storage patch configmap local-path-config --type merge \
   -p '{"data":{"config.json":"{\"nodePathMap\":[],\"sharedFileSystemPath\":\"/var/local-path-shared\"}"}}'
 kubectl -n local-path-storage rollout restart deployment local-path-provisioner
 kubectl -n local-path-storage rollout status deployment local-path-provisioner --timeout=120s
+
+if [[ $mode == cluster ]]; then
+  echo "kind-up: cluster $name ready, no images loaded; KUBECONFIG=$KUBECONFIG"
+  exit 0
+fi
 
 # the musl target the images' static binaries build for
 case "$(uname -m)" in

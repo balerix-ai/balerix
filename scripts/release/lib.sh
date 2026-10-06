@@ -313,3 +313,16 @@ level_rank() {
     *) echo 0 ;;
   esac
 }
+
+# Flags <tag>'s GitHub Release as a prerelease, putting <marker>, this
+# runner's architecture, a link to this run and <advice> at the top of its
+# notes; once (Spec I §7.3).
+flag_prerelease() {
+  local tag=$1 marker=$2 advice=$3 body run file
+  body=$(gh release view "$tag" --json body --jq .body)
+  if grep -qF "$marker" <<<"$body"; then return 0; fi
+  run="${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-}"
+  file="${RUNNER_TEMP:-/tmp}/notes-$tag.md"
+  printf '%s on %s ([run](%s)); %s\n\n%s\n' "$marker" "$(uname -m)" "$run" "$advice" "$body" >"$file"
+  gh release edit "$tag" --prerelease --notes-file "$file"
+}

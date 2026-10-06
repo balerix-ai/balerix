@@ -55,7 +55,35 @@ cargo add $crate@$version
 EOF
 fi
 
-if [[ $kind != library ]]; then
+if [[ $kind == charts ]]; then
+  owner=${GITHUB_REPOSITORY%%/*}
+  owner=${owner,,}
+  cat >>"$notes" <<EOF
+
+### Install
+
+\`\`\`sh
+helm repo add balerix https://$owner.github.io/helm-charts
+helm install balerix-operator balerix/balerix-operator --version $version \\
+  --namespace balerix-system --create-namespace
+helm install balerix balerix/balerix-daemon --version $version --namespace <namespace>
+\`\`\`
+
+Or from \`oci://ghcr.io/$owner/charts/balerix-operator\` and \`oci://ghcr.io/$owner/charts/balerix-daemon\`.
+
+### Verify
+
+\`\`\`sh
+gh attestation verify balerix-operator-$version.tgz --repo $GITHUB_REPOSITORY
+sha256sum --check --ignore-missing SHA256SUMS
+cosign verify ghcr.io/$owner/charts/balerix-operator:$version \\
+  --certificate-identity https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/heads/main \\
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+\`\`\`
+EOF
+fi
+
+if [[ $kind == core || $kind == plugin ]]; then
   {
     printf '\n### Verify\n\n```sh\n'
     printf 'gh attestation verify %s --repo %s\n' "$crate-v$version-x86_64-unknown-linux-musl.tar.gz" "$GITHUB_REPOSITORY"

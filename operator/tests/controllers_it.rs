@@ -1975,6 +1975,10 @@ async fn crew_locked_is_published_once_per_stuck_after() {
         return;
     }
     let (env, ns, mut ctx, owner) = job_rule("throttle").await;
+    // A 60 s bound, not job_rule's 1 s: the clock counts whole wall-clock
+    // seconds, so five calls straddling a second boundary would otherwise
+    // look like a full stuck_after elapsed and publish twice.
+    ctx.run.stuck_after = Duration::from_secs(60);
     let clock = TestClock::default();
     ctx.run.clock = clock.clock();
     let client = env.client.clone();
@@ -1990,7 +1994,7 @@ async fn crew_locked_is_published_once_per_stuck_after() {
     pods.delete("f-c-sync-x1", &DeleteParams::default())
         .await
         .unwrap();
-    clock.advance(2); // past job_rule's stuck_after of 1 s
+    clock.advance(120); // well past the 60 s stuck_after
     let locked = || async {
         events
             .list(&Default::default())
@@ -2024,7 +2028,7 @@ async fn crew_locked_is_published_once_per_stuck_after() {
         once[0].series
     );
     // past stuck_after again: a second publish, folded into a series
-    clock.advance(2);
+    clock.advance(120);
     ensure_job(
         &ctx,
         &owner,

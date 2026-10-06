@@ -8,21 +8,25 @@ use kube::{Api, ResourceExt};
 use super::plugin::{read_config, read_serving, read_token};
 use super::{Context, Error, apply};
 use crate::api::{Daemon, Fleet, Plugin};
-use crate::daemon_client::DaemonClient;
+use crate::daemon_client::{ClientError, DaemonClient};
 use crate::desired::common::Cond;
 use crate::desired::plugin::{
-    MANAGED_BY_LABEL, PluginInputs, declared, grant, managed_fleet, plugins_ready, retain_of,
+    MANAGED_BY_LABEL, PluginInputs, check_name, declared, grant, managed_fleet, plugins_ready,
+    retain_of,
 };
 
 /// Builds and sends `PUT /v1/plugins` from `spec.plugins` in order, then
 /// judges `PluginsReady` from `GET /v1/plugins`. A plugin with no Plugin,
-/// or whose token or serving Secret is not made yet, is left out of this
-/// pass: neither has managed requests to lose (deleting a Plugin collects
-/// its Fleets with it). A plugin listed by another Daemon too, or whose
-/// grant or config cannot be built, holds the whole list back: the Daemon
-/// drops the requests of any plugin a list leaves out (§23.7), so sending
-/// without it would delete its Fleets over a second listing or a deleted
-/// Secret. Returns the names sent, `None` when nothing was.
+/// or whose token or serving Secret is not made yet and that the Daemon
+/// has no row for, is left out of this pass: neither has managed requests
+/// to lose (deleting a Plugin collects its Fleets with it). A plugin
+/// listed by another Daemon too, whose name or grant or config cannot be
+/// built, or whose token or serving Secret is being remade while the
+/// Daemon runs it, holds the whole list back: the Daemon drops the
+/// requests of any plugin a list leaves out (§23.7), so sending without it
+/// would delete its Fleets over a second listing or a deleted Secret. A
+/// list the Daemon refuses is `ListRefused`. Returns the names sent,
+/// `None` when nothing was.
 pub async fn send_list(
     ctx: &Context,
     daemon: &Daemon,
@@ -39,6 +43,8 @@ pub async fn send_list(
         .filter(|d| d.name_any() != name)
         .collect();
     let (mut missing, mut entries) = (Vec::new(), Vec::new());
+    // the Daemon's rows before this list, asked for at most once
+    let mut running: Option<Vec<balerix_api::PluginStatus>> = None;
     for p in &daemon.spec.plugins {
         if others.iter().any(|d| d.spec.plugins.contains(p)) {
             let message = format!("Plugin {p} is listed by another Daemon too");
@@ -51,10 +57,23 @@ pub async fn send_list(
             missing.push(p.clone());
             continue;
         };
+        if let Err(message) = check_name(p) {
+            return Ok((
+                Cond::no("PluginsReady", "InvalidSpec", &format!("{p}: {message}")),
+                None,
+            ));
+        }
         let (Some(token), Some(serving)) = (
             read_token(ctx, namespace, p).await?,
             read_serving(ctx, namespace, p).await?,
         ) else {
+            if running.is_none() {
+                running = Some(client.plugins().await?);
+            }
+            if running.iter().flatten().any(|r| &r.name == p) {
+                let message = format!("{p}: its token or serving Secret is being remade");
+                return Ok((Cond::no("PluginsReady", "PluginNotReady", &message), None));
+            }
             continue;
         };
         let config = match grant(&plugin.spec) {
@@ -81,9 +100,16 @@ pub async fn send_list(
         )?);
     }
     let sent: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
-    client
+    match client
         .declare_plugins(&balerix_api::DeclaredPlugins { plugins: entries })
-        .await?;
+        .await
+    {
+        Ok(()) => {}
+        Err(ClientError::Rejected(message)) => {
+            return Ok((Cond::no("PluginsReady", "ListRefused", &message), None));
+        }
+        Err(e) => return Err(e.into()),
+    }
     let rows = client.plugins().await?;
     Ok((
         plugins_ready(&daemon.spec.plugins, &missing, &[], &rows),
@@ -95,10 +121,10 @@ pub async fn send_list(
 /// for it. A down request, or a sent plugin's Fleet with no live request,
 /// deletes the Fleet; so does a plugin dropped from `spec.plugins`. A
 /// plugin still listed but left out of this pass (its Secrets not made)
-/// keeps its Fleets. A Fleet without the label, or with another plugin's,
-/// is never written: a `FleetConflict` Event instead. A request that
-/// cannot be made a Fleet, or that the API server refuses, is a
-/// `ManagedFleetRefused` Event on its Plugin and the rest go on.
+/// keeps its Fleets. A Fleet without the label, with another plugin's, or
+/// of another Daemon is never written: a `FleetConflict` Event instead. A
+/// request that cannot be made a Fleet, or that the API server refuses,
+/// is a `ManagedFleetRefused` Event on its Plugin and the rest go on.
 pub async fn write_managed(
     ctx: &Context,
     daemon: &Daemon,
@@ -149,13 +175,18 @@ async fn write_one(
     daemon: &str,
 ) -> Result<(), Error> {
     let current = fleets.get_opt(&row.name).await?;
-    if let Some(f) = &current
-        && f.labels().get(MANAGED_BY_LABEL) != Some(&row.plugin)
-    {
-        let note = format!(
+    let conflict = match &current {
+        Some(f) if f.labels().get(MANAGED_BY_LABEL) != Some(&row.plugin) => Some(format!(
             "Fleet {} exists and is not managed by plugin {}: left as it is",
             row.name, row.plugin
-        );
+        )),
+        Some(f) if f.spec.daemon != daemon => Some(format!(
+            "Fleet {} belongs to Daemon {}, not {daemon}: left as it is",
+            row.name, f.spec.daemon
+        )),
+        _ => None,
+    };
+    if let Some(note) = conflict {
         ctx.warn(plugin, "FleetConflict", note).await;
         return Ok(());
     }

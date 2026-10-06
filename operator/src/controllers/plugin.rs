@@ -21,11 +21,11 @@ use super::{
     Context, Error, api_in, apply, bounded, error_policy, patch_status, reconciled, report,
 };
 use crate::api::{Daemon, Plugin, PluginStatus as PluginObjectStatus};
-use crate::desired::common::conditions;
+use crate::desired::common::{MANAGER, conditions};
 use crate::desired::names;
 use crate::desired::plugin::{
-    Listing, PluginInputs, PluginState, grant, inject_secrets, listing, plugin_conditions,
-    plugin_objects,
+    Listing, PluginInputs, PluginState, check_name, grant, inject_secrets, listing,
+    plugin_conditions, plugin_objects,
 };
 use crate::pki::{self, Issued};
 
@@ -56,7 +56,10 @@ pub async fn controller(ctx: Arc<Context>, watches: &kube::Client, namespace: Op
     .await;
 }
 
-/// `spec.config` with `spec.secrets` injected, or why it cannot be.
+/// `spec.config` with `spec.secrets` injected, or why it cannot be. A
+/// Secret the operator manages (a Daemon's authority, its admin token, a
+/// plugin's token) is never one: whoever may edit a Plugin could ship it
+/// to any image.
 pub async fn read_config(
     ctx: &Context,
     namespace: &str,
@@ -74,6 +77,20 @@ pub async fn read_config(
                 ),
             )));
         };
+        if secret
+            .labels()
+            .get("app.kubernetes.io/managed-by")
+            .map(String::as_str)
+            == Some(MANAGER)
+        {
+            return Ok(Err((
+                "InvalidSpec",
+                format!(
+                    "spec.secrets.{key}: Secret {} is managed by the operator",
+                    r.secret_name
+                ),
+            )));
+        }
         let Some(value) = read_secret_string(&secret, &r.key) else {
             return Ok(Err((
                 "SecretMissing",
@@ -248,6 +265,11 @@ async fn listed(
     name: &str,
     daemon: &str,
 ) -> Result<Result<bool, (&'static str, String)>, Error> {
+    // before anything is made: a name the Service or the Daemon refuses
+    // would fail part-way through
+    if let Err(e) = check_name(name) {
+        return Ok(Err(("InvalidSpec", e)));
+    }
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
     let Some(authority) = read_issued(
         secrets.get_opt(&names::authority(daemon)).await?.as_ref(),

@@ -807,6 +807,59 @@ async fn a_managed_request_never_overwrites_a_fleet_it_does_not_manage() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_managed_request_never_repoints_another_daemons_fleet() {
+    let (env, ns, stub, _clock, operator) = world("otherdaemon", &["fake"]).await;
+    let c = env.client.clone();
+    Api::<Plugin>::namespaced(c.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Plugin::new(
+                "fake",
+                plugin_spec(serde_json::json!({ "needs": ["fleets", "manage"] })),
+            ),
+        )
+        .await
+        .unwrap();
+    // labelled for this plugin, but another Daemon's
+    let fleets: Api<balerix_operator::api::Fleet> = Api::namespaced(c.clone(), &ns);
+    let theirs: balerix_operator::api::Fleet = serde_json::from_value(serde_json::json!({
+        "apiVersion": "balerix.ai/v1alpha1", "kind": "Fleet",
+        "metadata": { "name": "m", "labels": { "balerix.ai/managed-by": "fake" } },
+        "spec": { "daemon": "other", "crews": { "c": { "repo": "acme/theirs", "git": { "auth": "none" }, "agents": { "them": {} } } } } })).unwrap();
+    fleets
+        .create(&PostParams::default(), &theirs)
+        .await
+        .unwrap();
+    stub.set_managed(vec![managed("m", "fake", None)]);
+    let events: Api<k8s_openapi::api::events::v1::Event> = Api::namespaced(c.clone(), &ns);
+    let event = wait_for(
+        "FleetConflict on the Plugin",
+        Duration::from_secs(60),
+        || async {
+            events
+                .list(&Default::default())
+                .await
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|e| {
+                    e.reason.as_deref() == Some("FleetConflict")
+                        && e.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some("fake")
+                })
+        },
+    )
+    .await;
+    assert_eq!(
+        event.note.as_deref(),
+        Some("Fleet m belongs to Daemon other, not default: left as it is")
+    );
+    let still = fleets.get("m").await.unwrap();
+    assert_eq!(still.spec.daemon, "other");
+    assert_eq!(still.spec.crews["c"].repo, "acme/theirs");
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn dropping_the_plugin_deletes_its_fleets() {
     let (env, ns, stub, _clock, operator) = world("drop", &["fake"]).await;
     let c = env.client.clone();
@@ -972,5 +1025,280 @@ async fn a_refused_managed_request_is_an_event_and_the_rest_go_on() {
             .then_some(())
     })
     .await;
+    operator.abort();
+}
+
+/// The Daemon's `type_` condition: status, reason, message.
+async fn daemon_condition(daemons: &Api<Daemon>, type_: &str) -> Option<(String, String, String)> {
+    let s = daemons.get("default").await.unwrap().status?;
+    let c = s.conditions.iter().find(|c| c.type_ == type_)?;
+    Some((c.status.clone(), c.reason.clone(), c.message.clone()))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_name_a_service_cannot_take_is_refused_before_anything_is_made() {
+    // a valid object name, but not a Service's (DNS-1035 starts with a letter)
+    let (env, ns, stub, _clock, operator) = world("badname", &["1password"]).await;
+    let c = env.client.clone();
+    let plugins: Api<Plugin> = Api::namespaced(c.clone(), &ns);
+    plugins
+        .create(
+            &PostParams::default(),
+            &Plugin::new("1password", plugin_spec(serde_json::json!({}))),
+        )
+        .await
+        .unwrap();
+    let why = "metadata.name: starts with a digit; its Service's name must start with a letter";
+    let got = wait_for(
+        "Deployed=False/InvalidSpec",
+        Duration::from_secs(60),
+        || async {
+            condition(&plugins.get("1password").await.unwrap(), "Deployed")
+                .filter(|c| c.1 == "InvalidSpec")
+        },
+    )
+    .await;
+    assert_eq!(got.2, why);
+    // the Daemon holds its list back and still writes its status
+    let daemons: Api<Daemon> = Api::namespaced(c.clone(), &ns);
+    let got = wait_for(
+        "PluginsReady=False/InvalidSpec",
+        Duration::from_secs(60),
+        || async {
+            daemon_condition(&daemons, "PluginsReady")
+                .await
+                .filter(|c| c.1 == "InvalidSpec")
+        },
+    )
+    .await;
+    assert_eq!(
+        (got.0.as_str(), got.2.as_str()),
+        ("False", format!("1password: {why}").as_str())
+    );
+    assert!(
+        made(&stub)
+            .iter()
+            .all(|l| !l.contains(&"1password".to_string())),
+        "{:?}",
+        made(&stub)
+    );
+    // nothing was made for it
+    assert!(
+        Api::<Deployment>::namespaced(c.clone(), &ns)
+            .get_opt("balerix-plugin-1password")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        Api::<Service>::namespaced(c.clone(), &ns)
+            .get_opt("1password")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        Api::<Secret>::namespaced(c.clone(), &ns)
+            .get_opt("balerix-plugin-1password-token")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_list_the_daemon_refuses_is_list_refused() {
+    let (env, ns, stub, _clock, operator) = world("listrefused", &["web"]).await;
+    stub.reject_lists(Some("plugins[0].grant: not a capability"));
+    Api::<Plugin>::namespaced(env.client.clone(), &ns)
+        .create(
+            &PostParams::default(),
+            &Plugin::new("web", plugin_spec(serde_json::json!({}))),
+        )
+        .await
+        .unwrap();
+    let daemons: Api<Daemon> = Api::namespaced(env.client.clone(), &ns);
+    let got = wait_for(
+        "PluginsReady=False/ListRefused",
+        Duration::from_secs(60),
+        || async {
+            daemon_condition(&daemons, "PluginsReady")
+                .await
+                .filter(|c| c.1 == "ListRefused")
+        },
+    )
+    .await;
+    assert_eq!(
+        (got.0.as_str(), got.2.as_str()),
+        ("False", "plugins[0].grant: not a capability")
+    );
+    let ready = daemon_condition(&daemons, "Ready").await.unwrap();
+    assert_eq!(
+        (ready.0.as_str(), ready.1.as_str()),
+        ("False", "ListRefused")
+    );
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secret_the_operator_manages_is_never_a_plugins_config() {
+    let (env, ns, stub, _clock, operator) = world("opsecret", &["web"]).await;
+    let c = env.client.clone();
+    let plugins: Api<Plugin> = Api::namespaced(c.clone(), &ns);
+    plugins
+        .create(
+            &PostParams::default(),
+            &Plugin::new("web", plugin_spec(serde_json::json!({}))),
+        )
+        .await
+        .unwrap();
+    // sent once, so the Daemon judges web's config rather than leaving it
+    // out for want of a token
+    wait_for("a list with web", Duration::from_secs(60), || async {
+        made(&stub).iter().any(|l| l == &["web"]).then_some(())
+    })
+    .await;
+    plugins
+        .patch(
+            "web",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": {
+        "secrets": { "key": { "secretName": "balerix-default-ca", "key": "ca.key" } } } })),
+        )
+        .await
+        .unwrap();
+    let why = "spec.secrets.key: Secret balerix-default-ca is managed by the operator";
+    let got = wait_for(
+        "Deployed=False/InvalidSpec",
+        Duration::from_secs(60),
+        || async {
+            condition(&plugins.get("web").await.unwrap(), "Deployed")
+                .filter(|c| c.1 == "InvalidSpec")
+        },
+    )
+    .await;
+    assert_eq!(got.2, why);
+    let daemons: Api<Daemon> = Api::namespaced(c.clone(), &ns);
+    let got = wait_for(
+        "PluginsReady=False/InvalidSpec",
+        Duration::from_secs(60),
+        || async {
+            daemon_condition(&daemons, "PluginsReady")
+                .await
+                .filter(|c| c.1 == "InvalidSpec")
+        },
+    )
+    .await;
+    assert_eq!(got.2, format!("web: {why}"));
+    // the key itself is nowhere: no condition, no Event, no list
+    let key = Api::<Secret>::namespaced(c.clone(), &ns)
+        .get("balerix-default-ca")
+        .await
+        .unwrap()
+        .data
+        .unwrap()["ca.key"]
+        .0
+        .clone();
+    let key = String::from_utf8(key).unwrap();
+    let body = key
+        .lines()
+        .find(|l| !l.starts_with("-----") && !l.is_empty())
+        .unwrap()
+        .to_string();
+    let plugin = serde_json::to_string(&plugins.get("web").await.unwrap()).unwrap();
+    let daemon = serde_json::to_string(&daemons.get("default").await.unwrap()).unwrap();
+    let events = serde_json::to_string(
+        &Api::<k8s_openapi::api::events::v1::Event>::namespaced(c.clone(), &ns)
+            .list(&Default::default())
+            .await
+            .unwrap()
+            .items,
+    )
+    .unwrap();
+    let lists = serde_json::to_string(&stub.lists()).unwrap();
+    for (what, text) in [
+        ("Plugin", plugin),
+        ("Daemon", daemon),
+        ("Events", events),
+        ("lists", lists),
+    ] {
+        assert!(!text.contains(&body), "the CA key in the {what}");
+    }
+    operator.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_plugins_remade_token_holds_the_list_back() {
+    let (env, ns, stub, _clock, operator) = world("remade", &["fake"]).await;
+    let c = env.client.clone();
+    let plugins: Api<Plugin> = Api::namespaced(c.clone(), &ns);
+    plugins
+        .create(
+            &PostParams::default(),
+            &Plugin::new(
+                "fake",
+                plugin_spec(serde_json::json!({ "needs": ["fleets", "manage"] })),
+            ),
+        )
+        .await
+        .unwrap();
+    stub.set_managed(vec![managed("m", "fake", None)]);
+    stub.set_plugin_rows(vec![ready_row("fake")]);
+    let fleets: Api<balerix_operator::api::Fleet> = Api::namespaced(c.clone(), &ns);
+    wait_for("Fleet m", Duration::from_secs(60), || async {
+        fleets.get_opt("m").await.unwrap()
+    })
+    .await;
+    // the Plugin controller cannot remake the token while fake's config is
+    // blocked, so the Daemon controller sees it missing for a running plugin
+    plugins
+        .patch(
+            "fake",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": {
+        "secrets": { "password": { "secretName": "absent", "key": "pw" } } } })),
+        )
+        .await
+        .unwrap();
+    let daemons: Api<Daemon> = Api::namespaced(c.clone(), &ns);
+    wait_for(
+        "PluginsReady=False/SecretMissing",
+        Duration::from_secs(60),
+        || async {
+            daemon_condition(&daemons, "PluginsReady")
+                .await
+                .filter(|c| c.1 == "SecretMissing")
+        },
+    )
+    .await;
+    let before = stub.lists().len();
+    Api::<Secret>::namespaced(c.clone(), &ns)
+        .delete("balerix-plugin-fake-token", &DeleteParams::default())
+        .await
+        .unwrap();
+    let got = wait_for(
+        "PluginsReady=False/PluginNotReady",
+        Duration::from_secs(60),
+        || async {
+            daemon_condition(&daemons, "PluginsReady")
+                .await
+                .filter(|c| c.1 == "PluginNotReady")
+        },
+    )
+    .await;
+    assert_eq!(got.2, "fake: its token or serving Secret is being remade");
+    // no list without fake went out, so the Daemon keeps its managed requests
+    let sent = stub.lists().len();
+    support::hold_for(
+        "a list sent while fake's token is being remade",
+        Duration::from_secs(3),
+        || async { (stub.lists().len() > sent).then_some(()) },
+    )
+    .await;
+    let lists = made(&stub);
+    assert!(lists[before..].iter().all(|l| l == &["fake"]), "{lists:?}");
+    let m = fleets.get("m").await.unwrap();
+    assert!(m.metadata.deletion_timestamp.is_none());
     operator.abort();
 }

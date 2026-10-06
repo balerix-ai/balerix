@@ -47,6 +47,24 @@ fn name_of(plugin: &Plugin) -> Result<(&str, &str), DesiredError> {
     Ok((name, namespace))
 }
 
+/// Why a Plugin may not take `name`, if it may not: the Daemon's own rule
+/// for a plugin's name (`AgentName` and the reserved names, which
+/// `PUT /v1/plugins` answers 400 to) and a Service's (`<name>` is the
+/// plugin's Service, a DNS-1035 label: it starts with a letter).
+pub fn check_name(name: &str) -> Result<(), String> {
+    balerix_core::name::validate_name(name).map_err(|why| format!("metadata.name: {why}"))?;
+    if let Some(why) = balerix_core::reserved_plugin_reason(name) {
+        return Err(format!("metadata.name: {why}"));
+    }
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Err(
+            "metadata.name: starts with a digit; its Service's name must start with a letter"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// `spec.needs` as capabilities, the first unknown one named.
 pub fn grant(spec: &PluginSpec) -> Result<BTreeSet<Capability>, String> {
     spec.needs
@@ -198,6 +216,9 @@ pub fn plugin_objects(
             "metadata": metadata(names::plugin(name)),
             "spec": {
                 "replicas": 1,
+                // the old pod goes first: a scratch claim is ReadWriteOnce,
+                // and a new pod on another node would wait on it forever
+                "strategy": { "type": "Recreate" },
                 "selector": { "matchLabels": selector },
                 "template": {
                     "metadata": { "labels": labels, "annotations": { HASH_ANNOTATION: revision } },
@@ -566,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn a_managed_fleet_is_the_file_beneath_the_plugins_fleet_defaults() {
+    fn a_managed_fleet_is_the_file_over_the_plugins_fleet_defaults() {
         let p = plugin(json!({ "fleetDefaults": { "claude": { "model": "sonnet" },
             "sandbox": { "network": { "block": false } } } }));
         let row: ManagedFleet = serde_json::from_value(json!({ "name": "m", "plugin": "web", "file": {
@@ -590,6 +611,31 @@ mod tests {
             "beneath it, the plugin's"
         );
         assert_eq!(f.metadata.owner_references.as_ref().unwrap()[0].name, "web");
+    }
+
+    #[test]
+    fn a_plugin_name_is_one_the_daemon_and_a_service_can_take() {
+        for ok in ["web", "flow", "github2", "a-b"] {
+            assert_eq!(check_name(ok), Ok(()), "{ok}");
+        }
+        let long = "a".repeat(64);
+        for (bad, why) in [
+            (
+                "1password",
+                "metadata.name: starts with a digit; its Service's name must start with a letter",
+            ),
+            (
+                "kubernetes",
+                "metadata.name: reserved: it is the owner name of the operator's fleets",
+            ),
+            (
+                "my.plugin",
+                "metadata.name: contains characters other than a-z, 0-9 and '-'",
+            ),
+            (long.as_str(), "metadata.name: longer than 63 characters"),
+        ] {
+            assert_eq!(check_name(bad), Err(why.to_string()), "{bad}");
+        }
     }
 
     #[test]

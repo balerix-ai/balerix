@@ -25,6 +25,8 @@ struct Inner {
     /// `<fleet>` to (`fleet/crew/agent` to status), laid over every record read.
     agents: BTreeMap<String, BTreeMap<String, AgentStatus>>,
     lists: Vec<DeclaredPlugins>,
+    /// `PUT /v1/plugins` answers 400 with this.
+    reject_lists: Option<String>,
     plugin_rows: Vec<PluginStatus>,
     managed: Vec<ManagedFleet>,
 }
@@ -94,9 +96,22 @@ async fn delete_fleet(State(s): State<Shared>, Path(name): Path<String>) -> Stat
     StatusCode::NO_CONTENT
 }
 
-async fn put_plugins(State(s): State<Shared>, Json(list): Json<DeclaredPlugins>) -> StatusCode {
-    s.0.lock().unwrap().lists.push(list);
-    StatusCode::NO_CONTENT
+async fn put_plugins(
+    State(s): State<Shared>,
+    Json(list): Json<DeclaredPlugins>,
+) -> axum::response::Response {
+    let mut inner = s.0.lock().unwrap();
+    inner.lists.push(list);
+    match &inner.reject_lists {
+        Some(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: message.clone(),
+            }),
+        )
+            .into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
 }
 
 async fn get_plugins(State(s): State<Shared>) -> Json<Vec<PluginStatus>> {
@@ -157,6 +172,9 @@ impl StubDaemon {
     }
     pub fn reject(&self, message: Option<&str>) {
         self.state.0.lock().unwrap().reject = message.map(str::to_string);
+    }
+    pub fn reject_lists(&self, message: Option<&str>) {
+        self.state.0.lock().unwrap().reject_lists = message.map(str::to_string);
     }
     pub fn set_agent(&self, fleet: &str, key: &str, status: AgentStatus) {
         self.state

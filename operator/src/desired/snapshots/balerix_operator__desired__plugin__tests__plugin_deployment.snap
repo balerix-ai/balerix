@@ -24,6 +24,8 @@ spec:
     matchLabels:
       balerix.ai/component: plugin
       balerix.ai/plugin: web
+  strategy:
+    type: Recreate
   template:
     metadata:
       annotations:

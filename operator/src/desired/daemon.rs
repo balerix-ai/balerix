@@ -284,7 +284,10 @@ pub fn daemon_objects(
 
 /// `StorageReady`, `SystemToolsReady`, `PluginsReady`, `Ready` (§4.1). A
 /// `spec.resources` that is not a `ResourceRequirements` makes `Ready`
-/// false, reason `InvalidResources`, before anything else.
+/// false, reason `InvalidResources`, before anything else. `PluginsReady`
+/// is `Unknown/Pending` here (`NoPlugins` with none listed) and `Ready`
+/// does not wait on it: once the Daemon answers, the controller judges
+/// `PluginsReady` from its rows and `Ready` follows it (§23.9).
 pub fn daemon_status(
     daemon: &Daemon,
     cfg: &OperatorConfig,

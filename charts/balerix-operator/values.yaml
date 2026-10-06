@@ -1,0 +1,4 @@
+# The CustomResourceDefinitions, as templates kept on `helm uninstall`
+# (Spec O §24.1). Set false when another release installs them.
+crds:
+  install: true

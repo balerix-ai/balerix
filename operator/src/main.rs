@@ -19,11 +19,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Print the five CustomResourceDefinitions, or write one file each.
+    /// Print the five CustomResourceDefinitions, or write them as the
+    /// operator chart's templates (`mise run crds`).
     Crds {
-        /// A directory for `<plural>.balerix.ai.yaml`; stdout when absent.
+        /// The chart's `templates/crds/`: one guarded template per kind.
         #[arg(long)]
-        out: Option<PathBuf>,
+        chart_dir: Option<PathBuf>,
     },
     /// Run the controllers against the cluster the kubeconfig names
     /// (`KUBECONFIG`, or in-cluster).
@@ -94,19 +95,19 @@ async fn run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn crds(out: Option<PathBuf>) -> Result<()> {
-    let files = balerix_operator::api::crd_files()?;
-    match out {
+fn crds(chart_dir: Option<PathBuf>) -> Result<()> {
+    match chart_dir {
         None => {
+            let files = balerix_operator::api::crd_files()?;
             let docs: Vec<&str> = files.iter().map(|(_, yaml)| yaml.trim_end()).collect();
             println!("{}", docs.join("\n---\n"));
         }
         Some(dir) => {
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
-            for (name, yaml) in &files {
-                let path = dir.join(name);
-                std::fs::write(&path, yaml)
+            for (name, text) in balerix_operator::api::chart_crd_files()? {
+                let path = dir.join(&name);
+                std::fs::write(&path, text)
                     .with_context(|| format!("cannot write {}", path.display()))?;
             }
         }
@@ -125,7 +126,7 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let result = match cli.command {
-        Command::Crds { out } => crds(out),
+        Command::Crds { chart_dir } => crds(chart_dir),
         Command::Run(args) => match tokio::runtime::Runtime::new() {
             Ok(rt) => rt.block_on(run(args)),
             Err(e) => Err(e.into()),

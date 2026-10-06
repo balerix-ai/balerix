@@ -21,7 +21,8 @@ case "$1" in
     CARGO_TARGET_DIR="$target" cargo fmt --manifest-path "$dir/Cargo.toml" --all
     ;;
   crds)
-    CARGO_TARGET_DIR="$target" cargo run -q --manifest-path "$dir/Cargo.toml" -- crds --out "$dir/crds"
+    CARGO_TARGET_DIR="$target" cargo run -q --manifest-path "$dir/Cargo.toml" -- \
+        crds --chart-dir "$repo/charts/balerix-operator/templates/crds"
     ;;
   check)
     (cd "$repo" && cargo build -q -p balerix)

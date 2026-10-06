@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Spec O §4, §13, §14.1: five namespaced kinds, printed by `crds`, and
-//! the committed files are what the types generate.
+//! the chart's templates are what the types generate.
 use std::process::Command;
 
 use balerix_operator::api;
@@ -75,18 +75,73 @@ fn the_settings_layers_are_open_objects_and_an_agent_prints_its_phase() {
     assert_eq!(columns, ["Phase", "Restarts", "Age"]);
 }
 
+const GUARD: &str = "{{- if .Values.crds.install }}\n";
+const END: &str = "{{- end }}\n";
+
+fn chart_crds() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../charts/balerix-operator/templates/crds")
+}
+
 /// `mise run crds` regenerates them; this is the check that fails when a
-/// type changed and the files did not (§14.1).
+/// type changed and the chart did not (§14.1, §24.1).
 #[test]
-fn the_committed_files_are_what_the_types_generate() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("crds");
-    let files = api::crd_files().unwrap();
+fn the_chart_templates_are_what_the_types_generate() {
+    let dir = chart_crds();
+    let files = api::chart_crd_files().unwrap();
     assert_eq!(files.len(), 5);
-    for (name, yaml) in &files {
+    for (name, text) in &files {
         let committed = std::fs::read_to_string(dir.join(name))
             .unwrap_or_else(|e| panic!("{name}: {e}; run `mise run crds`"));
-        assert_eq!(&committed, yaml, "{name} is stale; run `mise run crds`");
+        assert_eq!(&committed, text, "{name} is stale; run `mise run crds`");
     }
     let on_disk = std::fs::read_dir(&dir).unwrap().count();
-    assert_eq!(on_disk, 5, "a file in operator/crds no type generates");
+    assert_eq!(on_disk, 5, "a file in templates/crds no type generates");
+}
+
+/// §24.1: Helm never upgrades its `crds/` directory, so the definitions
+/// are templates: guarded by `crds.install`, kept on `helm uninstall`.
+#[test]
+fn a_chart_template_is_guarded_and_kept() {
+    let plain = api::crd_files().unwrap();
+    for ((name, text), (_, yaml)) in api::chart_crd_files().unwrap().iter().zip(&plain) {
+        let inner = text
+            .strip_prefix(GUARD)
+            .and_then(|t| t.strip_suffix(END))
+            .unwrap_or_else(|| panic!("{name} is not guarded: {text:.80}"));
+        assert!(
+            !inner.contains("{{"),
+            "{name}: template syntax inside a definition"
+        );
+        let doc: serde_json::Value = serde_norway::from_str(inner).unwrap();
+        assert_eq!(
+            doc["metadata"]["annotations"]["helm.sh/resource-policy"], "keep",
+            "{name}"
+        );
+        let mut without: serde_json::Value = doc.clone();
+        without["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("annotations");
+        let plain_doc: serde_json::Value = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(
+            without, plain_doc,
+            "{name}: the chart's copy differs beyond the annotation"
+        );
+    }
+}
+
+#[test]
+fn crds_chart_dir_writes_the_templates() {
+    let dir = std::env::temp_dir().join(format!("crds-chart-{}", std::process::id()));
+    let out = Command::new(BIN)
+        .args(["crds", "--chart-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    for (name, text) in api::chart_crd_files().unwrap() {
+        assert_eq!(std::fs::read_to_string(dir.join(&name)).unwrap(), text);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }

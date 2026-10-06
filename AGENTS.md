@@ -21,7 +21,7 @@ credentials, hook input, or sandbox rules.
 - `operator` — lint and test the standalone `operator/` project
   (`balerix-operator`, Spec O §12); builds `balerix` first, since its
   client test runs `balerix serve --mode kubernetes`. Fails when
-  `operator/crds/` differs from the Rust types. The controller tests run
+  `charts/balerix-operator/templates/crds/` differs from the Rust types. The controller tests run
   on the envtest binaries the task pins (a `kube-apiserver` and `etcd`, no
   cluster, no kubelet: the test stands in for it). `scripts/operator.sh
   check` leaves the journey out (`-E 'not binary(e2e_k8s)'`);
@@ -29,7 +29,7 @@ credentials, hook input, or sandbox rules.
   `operator/.config/nextest.toml` holds the `envtest` test group (four API
   servers at once) and the `e2e-k8s` profile. Its own CI job; not part of
   `check`.
-- `crds` — regenerates `operator/crds/` from `operator/src/api/`.
+- `crds` — regenerates `charts/balerix-operator/templates/crds/` from `operator/src/api/`.
 - `mutants` — nightly tier: mutation-tests `balerix-core` (the reconciler).
   `.cargo/mutants.toml` excludes `fakes.rs`: the fakes are exercised by
   `balerix-server`'s tests, which that run never executes.

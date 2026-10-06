@@ -58,7 +58,8 @@ kubectl -n local-path-storage patch configmap local-path-config --type merge \
   -p '{"data":{"config.json":"{\"nodePathMap\":[],\"sharedFileSystemPath\":\"/var/local-path-shared\"}"}}'
 kubectl -n local-path-storage rollout restart deployment local-path-provisioner
 kubectl -n local-path-storage rollout status deployment local-path-provisioner --timeout=120s
-kubectl apply -f operator/crds/
+# the definitions, until e2e-k8s installs the operator chart (Spec O §24.3)
+CARGO_TARGET_DIR="$repo/operator/target" cargo run -q --manifest-path operator/Cargo.toml -- crds | kubectl apply -f -
 
 # the daemon and agent images, from this tree: native release builds, no musl, no scan
 cargo build --release -q -p balerix

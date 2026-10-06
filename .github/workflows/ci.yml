@@ -116,6 +116,7 @@ jobs:
   # service account. Path-filtered on pull requests.
   charts:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       BALERIX_REQUIRE_TOOLS: "1"
     steps:

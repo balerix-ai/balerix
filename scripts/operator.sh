@@ -66,7 +66,7 @@ case "$1" in
     # the operator in the cluster, from the chart, under its own RBAC
     # (Spec O §24.3): one cluster-wide release both journeys share
     helm upgrade --install balerix-operator "$repo/charts/balerix-operator" \
-      --namespace balerix-system --create-namespace \
+      --namespace balerix-system --create-namespace --take-ownership \
       --set image.repository=balerix-operator --set image.tag=e2e \
       --set images.daemon=balerix:e2e --set images.agent=balerix-agent:e2e \
       --wait --timeout 5m

@@ -13,10 +13,15 @@ images:
 
 # Namespaces to watch. Empty watches every namespace under one
 # ClusterRole; a list gives a Role in each of them instead (Spec O §5.6).
+# A second release in the cluster must list namespaces no other release
+# watches: two operators on the same objects, with no leader election
+# between releases, fight.
 watchNamespaces: []
 
 # The CustomResourceDefinitions, as templates kept on `helm uninstall`
-# (Spec O §24.1). Set false when another release installs them.
+# (Spec O §24.1). A second release in the cluster must set false: the
+# definitions are owned by the first. To adopt definitions that kubectl
+# applied, install or upgrade with `--take-ownership`.
 crds:
   install: true
 

@@ -33,6 +33,8 @@ resources: {}
 # object of that name and is listed by the Daemon, in the order flow,
 # web, matrix, github. `image.tag` is the plugin's released version,
 # moved by its release (Spec O §24.5); `needs` is its manifest's grant.
+# Plugin objects are named after the plugin, so in one namespace only one
+# release enables a given plugin; any other release lists it in `extraPlugins`.
 plugins:
   flow:
     enabled: false

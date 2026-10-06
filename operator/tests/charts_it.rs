@@ -593,6 +593,8 @@ fn empty_optionals_render_nothing() {
     let web = find(&docs, "Plugin", "web");
     assert!(web["spec"].get("expose").is_none());
     assert!(web["spec"].get("scratch").is_none());
+    let docs = daemon_chart("d", json!({ "extraPlugins": null }));
+    assert_eq!(find(&docs, "Daemon", "d")["spec"]["plugins"], json!([]));
 }
 
 #[test]

@@ -2412,7 +2412,8 @@ The operator runs as one replica with no leader election and no metrics
 ### 24.3 Testing 5a
 
 - **`mise run charts`:** its own CI job, on pull requests touching
-  `charts/`, `operator/src/` or `scripts/kind-up.sh`; not part of
+  `charts/`, `operator/`, `plugins/`, `scripts/operator.sh`,
+  `scripts/kind-up.sh`, `mise.toml` or `.github/workflows/ci.yml`; not part of
   `check`. `helm lint` both charts; `helm template` with the default
   values, with `watchNamespaces: [a, b]`, and with every plugin enabled
   and `crds.install: false`; then a server-side dry-run apply of
@@ -2537,7 +2538,12 @@ The operator runs as one replica with no leader election and no metrics
 - **`crds --chart-dir`** replaces `crds --out`. The template carries a
   "generated" comment inside the guard.
 - **ClusterRole names are `<namespace>-<release>`,** so two releases in
-  different namespaces do not collide.
+  different namespaces do not collide. The name stops the RBAC collision
+  only: a second release must also set `crds.install=false` (the
+  definitions are templates owned by the first release) and a
+  `watchNamespaces` that overlaps no other release's, since two operators
+  on the same objects, with no leader election between releases, fight.
+  Documentation only: the chart has no `lookup` guard.
 - **The Deployment's security context** sets `runAsUser: 65532`, which is
   distroless `nonroot`. The chart adds a `logLevel` value (`RUST_LOG`,
   default `info,kube=warn`).
@@ -2554,7 +2560,7 @@ The operator runs as one replica with no leader election and no metrics
   cluster passed with the table as written.
 - **A missing grant shows as a timeout, not a 403.** The controllers
   retry, so a journey fails with a `wait_for` timeout naming the step
-  (for example "timed out waiting for the pool Job" with the
+  (for example "timed out waiting for the Fleet's Jobs" with the
   `networkpolicies` rule removed). The operator's log has the 403. Only
   the Events check and the outside-namespace check show the API error
   directly.

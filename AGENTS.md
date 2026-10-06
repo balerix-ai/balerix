@@ -47,7 +47,7 @@ credentials, hook input, or sandbox rules.
   CI only.
 - `e2e-k8s` — the Phase 3 and plugin journeys on that cluster
   (`operator/tests/e2e_k8s.rs`): `scripts/operator.sh e2e` installs the
-  operator chart (the CRDs, and the operator in the cluster under its own
+  operator chart (with `--take-ownership`, so definitions an earlier `kubectl apply` made are adopted; the CRDs, and the operator in the cluster under its own
   RBAC); each journey installs the daemon chart; `dev fake-claude` in the pods. Fails, not skips, without the cluster. Its own CI job,
   path-filtered on pull requests.
 - `package-plugins [names…]` — builds the named in-tree plugins inside

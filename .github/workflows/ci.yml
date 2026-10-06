@@ -166,7 +166,7 @@ jobs:
           for ns in $(kubectl get ns -o name | sed -n 's|namespace/\(e2e-.*\)|\1|p'); do
             echo "== $ns"; kubectl -n "$ns" get daemons,fleets,crews,agents,plugins,deployments,pods,jobs,pvc -o wide || true
             # the kinds' conditions carry the operator's reasons and messages
-            kubectl -n "$ns" get daemons,fleets,crews,agents -o yaml || true
+            kubectl -n "$ns" get daemons,fleets,crews,agents,plugins -o yaml || true
             kubectl -n "$ns" describe pods || true
             for pod in $(kubectl -n "$ns" get pods -o name); do echo "-- $pod"; kubectl -n "$ns" logs "$pod" --all-containers --prefix || true; done
           done

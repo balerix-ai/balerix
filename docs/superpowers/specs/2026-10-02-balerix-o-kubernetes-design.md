@@ -2247,9 +2247,11 @@ while building it, as built.
 - **`DaemonError::ListPending(String)`** is the Daemon's refusal of a
   `hello` built for another revision (§23.8), answered 409.
 - **`PluginsReady` is `Unknown/Pending` ("judged once the daemon
-  answers") until the Daemon answers,** and it is no longer part of
-  `daemon_status`'s `Ready`: a Daemon whose plugins are not up is itself
-  still serving.
+  answers") until the Daemon answers.** `daemon_status` (pure) reports
+  it so and does not hold `Ready` on it; once the Daemon answers, the
+  controller judges `PluginsReady` from its rows and `Ready` follows it
+  (a `PluginsReady` other than `True` makes `Ready=False` with its reason
+  and message).
 - **The Daemon requeues at the Fleet period while it lists plugins,**
   not the slower reconcile period: the rows and the managed requests are
   polled (§23.4).
@@ -2268,7 +2270,8 @@ while building it, as built.
   list back for the pass.** The Daemon keeps its last list and with it
   every plugin's managed requests; sending a list without the plugin would
   drop them (see the second ruling below). Only a plugin whose token or
-  serving Secret is not made yet is left out: it has nothing to lose.
+  serving Secret is not made yet, and that the Daemon has no row for, is
+  left out: it has nothing to lose.
 - **The fake plugin image is a heredoc stage in `kind-up`:** `FROM
   balerix:e2e`, entrypoint `balerix dev fake-plugin`. It has no
   Dockerfile of its own.
@@ -2285,8 +2288,8 @@ Rulings made while building it:
 - **A plugin listed by two Daemons also holds the list back**
   (`PluginsReady=False/PluginListedTwice`). Leaving it out would let the
   Daemon drop its managed requests and later delete its Fleets.
-- **A managed request the operator cannot write** (a `managed_fleet`
-  error or a 4xx from the API server) is a Warning Event
+- **A managed request the operator cannot write or delete** (a
+  `managed_fleet` error or a 4xx from the API server) is a Warning Event
   `ManagedFleetRefused` on the Plugin, and the pass goes on. Transport
   errors and 5xx fail the reconcile.
 - **An unlisted Plugin deletes only the objects whose owner references
@@ -2301,3 +2304,35 @@ Rulings made while building it:
 - **§5.5's "a Secret with its resolved config" is replaced by §23.4:**
   the config reaches the Daemon only in `PUT /v1/plugins`, never as a file
   in the plugin's pod.
+- **A Plugin's name is checked before anything is made:** the Daemon's
+  rule for a plugin's name (`balerix_core::name::validate_name`, at most
+  63 characters of `a-z`, `0-9` and `-`, and `reserved_plugin_reason`,
+  which refuses `kubernetes`) and a Service's (DNS-1035: it starts with a
+  letter, so `1password` is refused). One that fails is
+  `Deployed=False/InvalidSpec` with `metadata.name: <why>` and nothing is
+  applied; on the Daemon it is `PluginsReady=False/InvalidSpec`
+  (`<plugin>: metadata.name: <why>`) and the list is held back, like any
+  `InvalidSpec`.
+- **A list the Daemon refuses** (`PUT /v1/plugins` answers 400) is
+  `PluginsReady=False/ListRefused` with the Daemon's message; the status
+  is still written and no managed Fleet is touched that pass.
+- **The plugin's Deployment is `strategy: Recreate`.** With one replica
+  a rolling update keeps the old pod until the new one is ready, and a
+  `ReadWriteOnce` scratch claim attached on another node would keep the
+  new one from starting.
+- **A Secret the operator manages is never a plugin's config.**
+  `spec.secrets` naming a Secret labelled
+  `app.kubernetes.io/managed-by: balerix-operator` (a Daemon's
+  authority, its admin token, a plugin's token) is `InvalidSpec`,
+  `spec.secrets.<key>: Secret <name> is managed by the operator`; the
+  value is never read into a message.
+- **A running plugin whose token or serving Secret is being remade holds
+  the list back.** The Daemon controller asks for the Daemon's rows
+  first; a plugin with a missing Secret that already has a row is
+  `PluginsReady=False/PluginNotReady`, `<plugin>: its token or serving
+  Secret is being remade`, instead of being left out (which would drop
+  its managed requests and then delete its Fleets).
+- **A Fleet of another Daemon is a `FleetConflict` too.** A managed
+  request whose Fleet carries this plugin's label but whose `spec.daemon`
+  is another Daemon is not written or re-pointed: a `FleetConflict` Event
+  `Fleet <name> belongs to Daemon <other>, not <this>: left as it is`.

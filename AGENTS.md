@@ -21,7 +21,7 @@ credentials, hook input, or sandbox rules.
 - `operator` — lint and test the standalone `operator/` project
   (`balerix-operator`, Spec O §12); builds `balerix` first, since its
   client test runs `balerix serve --mode kubernetes`. Fails when
-  `operator/crds/` differs from the Rust types. The controller tests run
+  `charts/balerix-operator/templates/crds/` differs from the Rust types. The controller tests run
   on the envtest binaries the task pins (a `kube-apiserver` and `etcd`, no
   cluster, no kubelet: the test stands in for it). `scripts/operator.sh
   check` leaves the journey out (`-E 'not binary(e2e_k8s)'`);
@@ -29,19 +29,26 @@ credentials, hook input, or sandbox rules.
   `operator/.config/nextest.toml` holds the `envtest` test group (four API
   servers at once) and the `e2e-k8s` profile. Its own CI job; not part of
   `check`.
-- `crds` — regenerates `operator/crds/` from `operator/src/api/`.
+- `crds` — regenerates `charts/balerix-operator/templates/crds/` from `operator/src/api/`.
+- `charts` — `helm lint` both charts under `charts/`, then
+  `operator/tests/charts_it.rs`: renderings asserted, a server-side dry run
+  of each against the envtest API server, and the controllers run as the
+  operator chart's service account (impersonated), so a verb its RBAC
+  lacks fails. Its own CI job; not part of `check` or `operator`.
 - `mutants` — nightly tier: mutation-tests `balerix-core` (the reconciler).
   `.cargo/mutants.toml` excludes `fakes.rs`: the fakes are exercised by
   `balerix-server`'s tests, which that run never executes.
 - `e2e` — the Phase 3 journey against a real daemon; needs the same tools as `test-it`.
 - `kind-up` — a kind cluster `balerix-e2e` for `e2e-k8s`: the shared
-  local-path class (§19.3), the CRDs, and the daemon and agent images built
-  from this tree and loaded (`balerix:e2e`, `balerix-agent:e2e`). Needs
+  local-path class (§19.3), and the daemon, agent, operator and plugin
+  images built from this tree and loaded (`balerix:e2e`,
+  `balerix-agent:e2e`, `balerix-operator:e2e`, …); no CRDs. Needs
   docker; `mise run kind-up -- down` deletes it. This host has no docker:
   CI only.
-- `e2e-k8s` — the Phase 3 journey on that cluster (`operator/tests/e2e_k8s.rs`):
-  the operator runs outside the cluster as the test's child; `dev fake-claude`
-  in the pods. Fails, not skips, without the cluster. Its own CI job,
+- `e2e-k8s` — the Phase 3 and plugin journeys on that cluster
+  (`operator/tests/e2e_k8s.rs`): `scripts/operator.sh e2e` installs the
+  operator chart (with `--take-ownership`, so definitions an earlier `kubectl apply` made are adopted; the CRDs, and the operator in the cluster under its own
+  RBAC); each journey installs the daemon chart; `dev fake-claude` in the pods. Fails, not skips, without the cluster. Its own CI job,
   path-filtered on pull requests.
 - `package-plugins [names…]` — builds the named in-tree plugins inside
   their own projects and assembles each as a directory source under

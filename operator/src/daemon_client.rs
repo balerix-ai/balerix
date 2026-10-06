@@ -100,25 +100,9 @@ impl DaemonClient {
         admin_token: &str,
         timeout: Duration,
     ) -> Result<Self, ClientError> {
-        Self::new_resolving(base_url, authority_pem, admin_token, timeout, &[])
-    }
-
-    /// `new`, where `resolve` maps a Service host to a socket address for
-    /// an operator outside the cluster; the certificate is still verified
-    /// against the host. The address's port replaces the endpoint's:
-    /// reqwest's own `resolve` keeps a URL's port and ignores the
-    /// address's, which would send a port-forwarded client to the
-    /// Service's port on the forward's host.
-    pub fn new_resolving(
-        base_url: &str,
-        authority_pem: &str,
-        admin_token: &str,
-        timeout: Duration,
-        resolve: &[(String, std::net::SocketAddr)],
-    ) -> Result<Self, ClientError> {
         let setup =
             |what: &str, e: &dyn std::fmt::Display| ClientError::Setup(format!("{what}: {e}"));
-        let mut url = reqwest::Url::parse(base_url)
+        let url = reqwest::Url::parse(base_url)
             .map_err(|e| setup("the Daemon's endpoint is not a URL", &e))?;
         let scheme = url.scheme().to_string();
         if scheme != "https" {
@@ -147,29 +131,15 @@ impl DaemonClient {
         .map_err(|e| setup("TLS", &e))?
         .with_root_certificates(roots)
         .with_no_client_auth();
-        let mut builder = reqwest::Client::builder()
+        let http = reqwest::Client::builder()
             .use_preconfigured_tls(tls)
             .no_proxy()
-            .timeout(timeout);
-        for (host, addr) in resolve {
-            builder = builder.resolve(host, *addr);
-        }
-        let http = builder.build().map_err(|e| setup("the HTTP client", &e))?;
-        let resolved = url
-            .host_str()
-            .and_then(|h| resolve.iter().find(|(host, _)| host == h))
-            .map(|(_, addr)| addr.port());
-        if let Some(port) = resolved {
-            url.set_port(Some(port))
-                .map_err(|()| ClientError::Setup(format!("{base_url}: cannot carry a port")))?;
-        }
-        let base = match resolved {
-            Some(_) => url.as_str(),
-            None => base_url,
-        };
+            .timeout(timeout)
+            .build()
+            .map_err(|e| setup("the HTTP client", &e))?;
         Ok(Self {
             http,
-            base: base.trim_end_matches('/').to_string(),
+            base: base_url.trim_end_matches('/').to_string(),
             token: admin_token.to_string(),
         })
     }

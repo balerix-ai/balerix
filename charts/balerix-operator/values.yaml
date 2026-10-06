@@ -1,0 +1,36 @@
+# The operator's image; the tag is the chart's appVersion when empty.
+image:
+  repository: ghcr.io/balerix-ai/balerix-operator
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# The images the operator gives each Daemon and agent pod
+# (`--daemon-image`, `--agent-image`); empty is the operator's own
+# version of ghcr.io/balerix-ai/balerix and balerix-agent.
+images:
+  daemon: ""
+  agent: ""
+
+# Namespaces to watch. Empty watches every namespace under one
+# ClusterRole; a list gives a Role in each of them instead (Spec O §5.6).
+# A second release in the cluster must list namespaces no other release
+# watches: two operators on the same objects, with no leader election
+# between releases, fight.
+watchNamespaces: []
+
+# The CustomResourceDefinitions, as templates kept on `helm uninstall`
+# (Spec O §24.1). A second release in the cluster must set false: the
+# definitions are owned by the first. To adopt definitions that kubectl
+# applied, install or upgrade with `--take-ownership`.
+crds:
+  install: true
+
+# RUST_LOG
+logLevel: info,kube=warn
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi

@@ -302,6 +302,7 @@ where
                     tracing::debug!(job = %name, ?holders, "waiting: the crew is held");
                     if let (Some((fleet, crew)), Some(h)) =
                         (crew_lock, stuck(&holders, ctx.now(), ctx.run.stuck_after))
+                        && ctx.crew_locked_due(&format!("{namespace}/{fleet}/{crew}"))
                     {
                         let since = h
                             .deleting_since
@@ -324,6 +325,9 @@ where
                     })
                 }
                 Created::Made => {
+                    if let Some((fleet, crew)) = crew_lock {
+                        ctx.crew_unlocked(&format!("{namespace}/{fleet}/{crew}"));
+                    }
                     tracing::info!(job = %name, attempt = attempts.get(&name).copied().unwrap_or(1), "created");
                     Ok(Ensured::new(JobOutcome::Running, soon))
                 }

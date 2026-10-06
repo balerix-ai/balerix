@@ -1,0 +1,12 @@
+apiVersion: v2
+name: balerix-operator
+description: The balerix operator, its CustomResourceDefinitions and its RBAC (Spec O §14.1).
+type: application
+# moved by `release-prepare charts` (Spec O §24.5)
+version: 0.1.0
+# the core version; moved by `release-prepare core`
+appVersion: "0.2.0"
+kubeVersion: ">=1.32.0-0"
+home: https://github.com/balerix-ai/balerix
+sources:
+  - https://github.com/balerix-ai/balerix

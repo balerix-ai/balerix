@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # A kind cluster for e2e-k8s (Spec O §15, §19.3, §21.4): every node (the
 # control plane and two workers) mounts one host directory, the local-path
-# provisioner told to provision ReadWriteMany claims from it, the five
-# definitions applied, and the daemon, agent and plugin images (flow, web
-# and fake plugin) built from this tree and loaded. The control plane
-# mounts it too: local-path's helper pod, which creates each volume's
-# directory, tolerates the control plane and may run there. Nothing here is
-# a production class: the shared directory is one host path, not a network
-# filesystem.
+# provisioner told to provision ReadWriteMany claims from it, and the
+# daemon, agent, operator and plugin images (flow, web and fake plugin)
+# built from this tree and loaded. No definitions are applied here: the
+# operator chart installs them (scripts/operator.sh e2e, §24.3). The
+# control plane mounts it too: local-path's helper pod, which creates each
+# volume's directory, tolerates the control plane and may run there.
+# Nothing here is a production class: the shared directory is one host
+# path, not a network filesystem.
 #
 # usage: kind-up.sh [up|down]
 set -euo pipefail
@@ -58,7 +59,15 @@ kubectl -n local-path-storage patch configmap local-path-config --type merge \
   -p '{"data":{"config.json":"{\"nodePathMap\":[],\"sharedFileSystemPath\":\"/var/local-path-shared\"}"}}'
 kubectl -n local-path-storage rollout restart deployment local-path-provisioner
 kubectl -n local-path-storage rollout status deployment local-path-provisioner --timeout=120s
-kubectl apply -f operator/crds/
+
+# the musl target the operator and plugin images' static binaries build for
+case "$(uname -m)" in
+  x86_64 | amd64) musl=x86_64-unknown-linux-musl ;;
+  aarch64 | arm64) musl=aarch64-unknown-linux-musl ;;
+  *) echo "kind-up: no musl target for $(uname -m)" >&2; exit 2 ;;
+esac
+command -v musl-gcc >/dev/null || { echo "kind-up: musl-gcc is not on PATH (apt-get install musl-tools)" >&2; exit 2; }
+rustup target add "$musl" >/dev/null
 
 # the daemon and agent images, from this tree: native release builds, no musl, no scan
 cargo build --release -q -p balerix
@@ -74,16 +83,17 @@ docker build ${secret[@]+"${secret[@]}"} -t balerix:e2e -f docker/balerix/Docker
 rm -rf "$root/context-agent" && mkdir -p "$root/context-agent"
 cp "$repo/agent/target/release/balerix-agent" "$root/context-agent/balerix-agent"
 docker build --build-arg BASE=balerix:e2e -t balerix-agent:e2e -f docker/agent/Dockerfile "$root/context-agent"
+# the operator image (Spec O §24.3): the static musl binary distroless/static
+# runs; ring's C needs musl-gcc, as scripts/release/build.sh sets it
+CC_x86_64_unknown_linux_musl=musl-gcc CC_aarch64_unknown_linux_musl=musl-gcc \
+  CARGO_TARGET_DIR="$repo/operator/target" cargo build --release --locked -q \
+  --manifest-path operator/Cargo.toml --target "$musl"
+rm -rf "$root/context-operator" && mkdir -p "$root/context-operator"
+cp "$repo/operator/target/$musl/release/balerix-operator" "$root/context-operator/balerix-operator"
+docker build -t balerix-operator:e2e -f docker/operator/Dockerfile "$root/context-operator"
 # the plugin images (Spec O §23.5): flow and web as released, a static musl
 # binary on distroless (docker/plugin/Dockerfile); and the fake plugin, the
 # balerix image whose entrypoint is `balerix dev fake-plugin`
-case "$(uname -m)" in
-  x86_64 | amd64) musl=x86_64-unknown-linux-musl ;;
-  aarch64 | arm64) musl=aarch64-unknown-linux-musl ;;
-  *) echo "kind-up: no musl target for $(uname -m)" >&2; exit 2 ;;
-esac
-command -v musl-gcc >/dev/null || { echo "kind-up: musl-gcc is not on PATH (apt-get install musl-tools)" >&2; exit 2; }
-rustup target add "$musl" >/dev/null
 for unit in flow web; do
   out="$root/dist-$unit"
   scripts/release/build.sh "$unit" "$musl" "$out" >/dev/null
@@ -95,7 +105,7 @@ FROM balerix:e2e
 ENTRYPOINT ["/usr/bin/tini", "--", "balerix", "dev", "fake-plugin"]
 CMD []
 EOF2
-kind load docker-image --name "$name" balerix:e2e balerix-agent:e2e \
+kind load docker-image --name "$name" balerix:e2e balerix-agent:e2e balerix-operator:e2e \
   balerix-plugin-flow:e2e balerix-plugin-web:e2e balerix-fake-plugin:e2e
 
 echo "kind-up: cluster $name ready; KUBECONFIG=$KUBECONFIG"

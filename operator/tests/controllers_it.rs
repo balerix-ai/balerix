@@ -1964,6 +1964,92 @@ async fn a_crew_held_by_a_pod_deleting_past_the_bound_puts_crew_locked_on_the_ow
     assert_eq!(made.outcome, JobOutcome::Running);
 }
 
+/// §24.1: a stuck crew is reported once per `stuck_after`, not on every
+/// 5 s wait of every waiter. The Recorder folds repeats into a series, so
+/// one publish is an Event with no `series`.
+#[tokio::test(flavor = "multi_thread")]
+async fn crew_locked_is_published_once_per_stuck_after() {
+    use balerix_operator::controllers::jobs::ensure_job;
+    use k8s_openapi::api::events::v1::Event;
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, mut ctx, owner) = job_rule("throttle").await;
+    // A 60 s bound, not job_rule's 1 s: the clock counts whole wall-clock
+    // seconds, so five calls straddling a second boundary would otherwise
+    // look like a full stuck_after elapsed and publish twice.
+    ctx.run.stuck_after = Duration::from_secs(60);
+    let clock = TestClock::default();
+    ctx.run.clock = clock.clock();
+    let client = env.client.clone();
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let events: Api<Event> = Api::namespaced(client.clone(), &ns);
+    let job_name = [("batch.kubernetes.io/job-name", "f-c-sync")];
+    pods.create(
+        &PostParams::default(),
+        &crew_pod(&ns, "f-c-sync-x1", &job_name, Some("balerix.ai/test-hold")),
+    )
+    .await
+    .unwrap();
+    pods.delete("f-c-sync-x1", &DeleteParams::default())
+        .await
+        .unwrap();
+    clock.advance(120); // well past the 60 s stuck_after
+    let locked = || async {
+        events
+            .list(&Default::default())
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .filter(|e| e.reason.as_deref() == Some("CrewLocked"))
+            .collect::<Vec<_>>()
+    };
+    // five waits inside one stuck_after: one publish
+    for _ in 0..5 {
+        ensure_job(
+            &ctx,
+            &owner,
+            crew_job(&ns, "f-c-a-harvest", "h"),
+            Some(("f", "c")),
+        )
+        .await
+        .unwrap();
+    }
+    let once = wait_for("one CrewLocked", Duration::from_secs(10), || async {
+        let got = locked().await;
+        (!got.is_empty()).then_some(got)
+    })
+    .await;
+    assert_eq!(once.len(), 1);
+    assert!(
+        once[0].series.is_none(),
+        "published more than once: {:?}",
+        once[0].series
+    );
+    // past stuck_after again: a second publish, folded into a series
+    clock.advance(120);
+    ensure_job(
+        &ctx,
+        &owner,
+        crew_job(&ns, "f-c-a-harvest", "h"),
+        Some(("f", "c")),
+    )
+    .await
+    .unwrap();
+    wait_for("the repeat folded", Duration::from_secs(10), || async {
+        locked().await.first()?.series.as_ref().map(|_| ())
+    })
+    .await;
+    pods.patch(
+        "f-c-sync-x1",
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({ "metadata": { "finalizers": null } })),
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_harvest_keeps_the_agent_until_it_is_purged() {
     if envtest().await.is_none() {

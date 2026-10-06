@@ -381,6 +381,14 @@ pub fn now() -> i64 {
         .as_secs() as i64
 }
 
+/// Nanoseconds since the epoch: a name no other call in this process has.
+pub fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
 /// The kubelet's part for the Daemon `default`: once its StatefulSet and
 /// pool Job exist, the pool synced, the shared claim bound, the pod ready.
 pub async fn make_daemon_ready(client: &Client, ns: &str) {

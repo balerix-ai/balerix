@@ -19,11 +19,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Print the five CustomResourceDefinitions, or write one file each.
+    /// Print the five CustomResourceDefinitions, or write them as the
+    /// operator chart's templates (`mise run crds`).
     Crds {
-        /// A directory for `<plural>.balerix.ai.yaml`; stdout when absent.
+        /// The chart's `templates/crds/`: one guarded template per kind.
         #[arg(long)]
-        out: Option<PathBuf>,
+        chart_dir: Option<PathBuf>,
     },
     /// Run the controllers against the cluster the kubeconfig names
     /// (`KUBECONFIG`, or in-cluster).
@@ -44,21 +45,6 @@ struct RunArgs {
     /// The agent image; this operator's version of `ghcr.io/balerix-ai/balerix-agent` when absent.
     #[arg(long)]
     agent_image: Option<String>,
-    /// `host=ip:port`, repeatable: reach a Daemon's Service at that address
-    /// (an operator outside the cluster, through a port-forward).
-    #[arg(long, value_parser = resolve_entry)]
-    resolve: Vec<(String, std::net::SocketAddr)>,
-    /// Tests only: talk to this plain-HTTP Daemon instead of each Daemon's Service.
-    #[arg(long, hide = true)]
-    insecure_daemon_url: Option<String>,
-}
-
-fn resolve_entry(s: &str) -> Result<(String, std::net::SocketAddr), String> {
-    let (host, addr) = s
-        .split_once('=')
-        .ok_or_else(|| format!("{s:?}: expected host=ip:port"))?;
-    let addr = addr.parse().map_err(|e| format!("{addr:?}: {e}"))?;
-    Ok((host.to_string(), addr))
 }
 
 async fn run(args: RunArgs) -> Result<()> {
@@ -75,8 +61,6 @@ async fn run(args: RunArgs) -> Result<()> {
         .context("--namespace or POD_NAMESPACE is required: the Daemon's NetworkPolicy admits the operator's namespace")?;
     let mut cfg = RunConfig::new(version, images, &namespace);
     cfg.watch_namespaces = args.watch_namespaces;
-    cfg.insecure_daemon_url = args.insecure_daemon_url;
-    cfg.resolve = args.resolve;
     let config = kube::Config::infer()
         .await
         .context("cannot connect to the cluster (KUBECONFIG, or in-cluster)")?;
@@ -94,19 +78,19 @@ async fn run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn crds(out: Option<PathBuf>) -> Result<()> {
-    let files = balerix_operator::api::crd_files()?;
-    match out {
+fn crds(chart_dir: Option<PathBuf>) -> Result<()> {
+    match chart_dir {
         None => {
+            let files = balerix_operator::api::crd_files()?;
             let docs: Vec<&str> = files.iter().map(|(_, yaml)| yaml.trim_end()).collect();
             println!("{}", docs.join("\n---\n"));
         }
         Some(dir) => {
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
-            for (name, yaml) in &files {
-                let path = dir.join(name);
-                std::fs::write(&path, yaml)
+            for (name, text) in balerix_operator::api::chart_crd_files()? {
+                let path = dir.join(&name);
+                std::fs::write(&path, text)
                     .with_context(|| format!("cannot write {}", path.display()))?;
             }
         }
@@ -125,7 +109,7 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let result = match cli.command {
-        Command::Crds { out } => crds(out),
+        Command::Crds { chart_dir } => crds(chart_dir),
         Command::Run(args) => match tokio::runtime::Runtime::new() {
             Ok(rt) => rt.block_on(run(args)),
             Err(e) => Err(e.into()),

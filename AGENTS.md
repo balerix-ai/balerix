@@ -30,6 +30,11 @@ credentials, hook input, or sandbox rules.
   servers at once) and the `e2e-k8s` profile. Its own CI job; not part of
   `check`.
 - `crds` — regenerates `charts/balerix-operator/templates/crds/` from `operator/src/api/`.
+- `charts` — `helm lint` both charts under `charts/`, then
+  `operator/tests/charts_it.rs`: renderings asserted, a server-side dry run
+  of each against the envtest API server, and the controllers run as the
+  operator chart's service account (impersonated), so a verb its RBAC
+  lacks fails. Its own CI job; not part of `check` or `operator`.
 - `mutants` — nightly tier: mutation-tests `balerix-core` (the reconciler).
   `.cargo/mutants.toml` excludes `fakes.rs`: the fakes are exercised by
   `balerix-server`'s tests, which that run never executes.

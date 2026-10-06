@@ -8,7 +8,7 @@
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 
-usage() { echo "usage: $0 {build|fmt|check|crds|e2e}" >&2; exit 2; }
+usage() { echo "usage: $0 {build|fmt|check|crds|charts|e2e}" >&2; exit 2; }
 [[ $# -eq 1 ]] || usage
 dir="$repo/operator"
 target="$dir/target"
@@ -37,13 +37,26 @@ case "$1" in
     fi
     # Every test but tests/e2e_k8s.rs, the journey, which needs the kind
     # cluster and fails without it under BALERIX_REQUIRE_TOOLS=1 (the `e2e`
+    # mode runs it), and tests/charts_it.rs, which needs helm (the `charts`
     # mode runs it). A filter, not a list of targets, so a new tests/*.rs
     # runs here without an edit; nextest rejects a binary() filter that
     # matches no binary, so the journey's file must keep its name.
     CARGO_TARGET_DIR="$target" cargo nextest run \
       --config-file "$dir/.config/nextest.toml" \
       --manifest-path "$dir/Cargo.toml" \
-      -E 'not binary(e2e_k8s)'
+      -E 'not binary(e2e_k8s) and not binary(charts_it)'
+    ;;
+  charts)
+    # Spec O §24.3: lint both charts, then tests/charts_it.rs, which
+    # renders them and applies them against the envtest API server
+    for c in "$repo"/charts/*/; do helm lint --strict "$c"; done
+    if command -v kube-apiserver >/dev/null; then
+      ENVTEST_DIR="$(dirname "$(command -v kube-apiserver)")"
+      export ENVTEST_DIR
+    fi
+    CARGO_TARGET_DIR="$target" cargo nextest run \
+      --config-file "$dir/.config/nextest.toml" \
+      --manifest-path "$dir/Cargo.toml" --test charts_it
     ;;
   e2e)
     root="${CARGO_TARGET_DIR:-$repo/target}/tmp/kind"

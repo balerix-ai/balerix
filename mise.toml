@@ -99,6 +99,12 @@ run = "scripts/operator.sh check"
 description = "Regenerate charts/balerix-operator/templates/crds/ from the Rust types (Spec O §24.1)"
 run = "scripts/operator.sh crds"
 
+[tasks.charts]
+description = "Lint the two Helm charts and run operator/tests/charts_it.rs: renderings asserted, a server-side dry run of each, and the controllers as the chart's service account, on the envtest binaries (Spec O §24.3). Its own CI job; not part of `check`"
+tools = { "github:kubernetes-sigs/controller-tools" = { version = "envtest-v1.34.1", bin_path = "envtest" }, helm = "4.3.0" }
+env = { BALERIX_REQUIRE_TOOLS = "1" }
+run = "scripts/operator.sh charts"
+
 [tasks.check]
 description = "Everything the PR tier runs"
 depends = ["lint", "test"]

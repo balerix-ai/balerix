@@ -111,6 +111,42 @@ jobs:
             operator -> target
           key: operator
       - run: mise run operator
+  # The charts (Spec O §24.3): helm lint, renderings asserted and dry-run
+  # applied on the envtest API server, the controllers as the chart's
+  # service account. Path-filtered on pull requests.
+  charts:
+    runs-on: ubuntu-latest
+    env:
+      BALERIX_REQUIRE_TOOLS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ $EVENT != pull_request ]]; then echo run=true >>"$GITHUB_OUTPUT"; exit 0; fi
+          git fetch -q --depth=1 origin "$BASE"
+          if git diff --name-only "$BASE" HEAD | grep -qE '^(charts/|operator/|scripts/operator\.sh|scripts/kind-up\.sh|mise\.toml|\.github/workflows/ci\.yml)'; then
+            echo run=true >>"$GITHUB_OUTPUT"
+          else
+            echo "nothing the charts depend on changed"; echo run=false >>"$GITHUB_OUTPUT"
+          fi
+      - if: steps.changes.outputs.run == 'true'
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with: { version: 2026.9.2, install: false, cache: true }
+      - if: steps.changes.outputs.run == 'true'
+        run: mise install rust cargo:cargo-nextest helm@4.3.0 github:kubernetes-sigs/controller-tools@envtest-v1.34.1
+      - if: steps.changes.outputs.run == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            operator -> target
+          key: charts
+      - if: steps.changes.outputs.run == 'true'
+        run: mise run charts
   # The Phase 3 journey on a kind cluster (Spec O §21.4): five builds,
   # five images, one cluster. Path-filtered on pull requests to what
   # can change it; always on main and the nightly.

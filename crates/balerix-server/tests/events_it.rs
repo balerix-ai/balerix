@@ -119,6 +119,7 @@ async fn start_flow(w: &World) -> (Arc<FlowLike>, Host) {
         ca: None,
         tls: None,
         listen: "127.0.0.1:0".into(),
+        revision: None,
     };
     tokio::spawn({
         let plugin = plugin.clone();
@@ -501,6 +502,7 @@ async fn plugin_metrics_are_re_exported_under_the_prefix_rule() {
             ca: None,
             tls: None,
             listen: "127.0.0.1:0".into(),
+            revision: None,
         };
         Host::new(env)
             .unwrap()

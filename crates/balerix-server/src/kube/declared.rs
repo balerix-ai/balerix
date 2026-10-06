@@ -135,6 +135,9 @@ impl DeclaredPlugins {
             if list[..index].iter().any(|q| q.token == p.token) {
                 return Err(err("token", "listed twice".into()));
             }
+            if p.revision.is_empty() {
+                return Err(err("revision", "required".into()));
+            }
             if !p.url.starts_with("https://") {
                 return Err(err("url", "must be https://".into()));
             }
@@ -266,9 +269,20 @@ impl DeclaredPlugins {
                 req.protocol
             ))
         } else {
-            match &req.manifest {
-                None => Err("hello.manifest: required in kubernetes mode".to_string()),
-                Some(m) => check_manifest(&e.plugin, m).map(|()| m.clone()),
+            match req.revision.as_deref() {
+                None => Err("hello.revision: required in kubernetes mode".to_string()),
+                // §23.8: a pod built for the next list; the entry and the
+                // pod still serving under it are left alone
+                Some(r) if r != e.plugin.revision => {
+                    return Err(DaemonError::ListPending(format!(
+                        "hello.revision: this daemon holds {}, the plugin is {r}; the list has not arrived yet",
+                        e.plugin.revision
+                    )));
+                }
+                Some(_) => match &req.manifest {
+                    None => Err("hello.manifest: required in kubernetes mode".to_string()),
+                    Some(m) => check_manifest(&e.plugin, m).map(|()| m.clone()),
+                },
             }
         };
         let manifest = match checked {
@@ -407,6 +421,7 @@ mod tests {
             fleet_defaults: json!({}),
             token: format!("{name}-token-0123456789abcdef0123456789"),
             url: format!("https://{name}.ns.svc:7644"),
+            revision: "r1".into(),
         }
     }
 
@@ -422,11 +437,81 @@ mod tests {
                 ))
                 .unwrap(),
             ),
+            revision: Some("r1".into()),
         }
     }
 
     fn n(s: &str) -> AgentName {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn another_revision_is_409_and_leaves_the_entry_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = PluginRegistry::new();
+        let d = DeclaredPlugins::new(dir.path().into(), reg.clone());
+        d.replace(vec![entry("flow", &[Capability::Actions, Capability::Kv])])
+            .unwrap();
+        d.hello(&n("flow"), &hello("flow", "actions, kv")).unwrap();
+        assert_eq!(d.list(|_| 0)[0].phase, AgentPhase::Ready);
+
+        // a new pod built for r2 says hello before the list carrying r2 arrives
+        let mut early = hello("flow", "actions, kv");
+        early.revision = Some("r2".into());
+        let err = d.hello(&n("flow"), &early).unwrap_err();
+        assert_eq!(
+            err,
+            DaemonError::ListPending(
+                "hello.revision: this daemon holds r1, the plugin is r2; the list has not arrived yet"
+                    .into()
+            )
+        );
+        // the old pod still serves: nothing changed
+        let row = &d.list(|_| 0)[0];
+        assert_eq!((row.phase, row.message.as_str()), (AgentPhase::Ready, ""));
+        assert!(reg.ready_addr(&n("flow")).is_some(), "still in the chain");
+
+        // the list arrives: the entry waits, and the early pod is accepted
+        let mut r2 = entry("flow", &[Capability::Actions, Capability::Kv]);
+        r2.revision = "r2".into();
+        d.replace(vec![r2]).unwrap();
+        assert_eq!(d.list(|_| 0)[0].phase, AgentPhase::Starting);
+        d.hello(&n("flow"), &early).unwrap();
+        assert_eq!(d.list(|_| 0)[0].phase, AgentPhase::Ready);
+    }
+
+    #[test]
+    fn a_hello_without_a_revision_is_refused_and_kept_on_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = DeclaredPlugins::new(dir.path().into(), PluginRegistry::new());
+        d.replace(vec![entry("flow", &[Capability::Kv])]).unwrap();
+        let mut none = hello("flow", "kv");
+        none.revision = None;
+        let err = d.hello(&n("flow"), &none).unwrap_err().to_string();
+        assert!(
+            err.ends_with("hello.revision: required in kubernetes mode"),
+            "{err}"
+        );
+        let row = &d.list(|_| 0)[0];
+        assert_eq!(
+            (row.phase, row.message.as_str()),
+            (
+                AgentPhase::Failed,
+                "hello.revision: required in kubernetes mode"
+            )
+        );
+    }
+
+    #[test]
+    fn an_entry_without_a_revision_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = DeclaredPlugins::new(dir.path().into(), PluginRegistry::new());
+        let mut e = entry("flow", &[]);
+        e.revision = String::new();
+        assert_eq!(
+            d.replace(vec![e]).unwrap_err().to_string(),
+            "plugins[0].revision: required"
+        );
     }
 
     #[test]
@@ -486,6 +571,8 @@ mod tests {
         if let Some(m) = wrong_name.manifest.as_mut() {
             m.name = "web".into();
         }
+        let mut no_revision = hello("flow", "kv");
+        no_revision.revision = None;
         let mut old_protocol = hello("flow", "kv");
         old_protocol.protocol = 2;
         for (req, want) in [
@@ -493,6 +580,7 @@ mod tests {
                 old_protocol,
                 "hello.protocol: this daemon speaks protocol 1, got 2",
             ),
+            (no_revision, "hello.revision: required in kubernetes mode"),
             (no_manifest, "hello.manifest: required in kubernetes mode"),
             (
                 wrong_name,

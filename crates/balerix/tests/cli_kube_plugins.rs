@@ -112,6 +112,7 @@ fn fake_plugin(k: &Kube, port: u16, scratch: &Path) -> Kill {
         .env_clear()
         .env("BALERIX_API_URL", format!("https://{}", k.addr))
         .env("BALERIX_PLUGIN_NAME", "fake")
+        .env("BALERIX_PLUGIN_REVISION", "r1")
         .env("BALERIX_PLUGIN_TOKEN_FILE", &token)
         .env("BALERIX_PLUGIN_SCRATCH", scratch)
         .env("BALERIX_CA_FILE", &k.ca)
@@ -133,7 +134,8 @@ fn declare(k: &Kube, port: u16, grant: &[&str], config: Value) {
         Some(ADMIN),
         Some(&json!({
             "plugins": [{ "name": "fake", "grant": grant, "config": config,
-                          "token": FAKE_TOKEN, "url": format!("https://127.0.0.1:{port}") }]
+                          "token": FAKE_TOKEN, "url": format!("https://127.0.0.1:{port}"),
+                          "revision": "r1" }]
         })),
     );
     assert_eq!(s, 204, "{v}");

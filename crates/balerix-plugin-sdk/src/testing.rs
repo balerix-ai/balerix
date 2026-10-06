@@ -49,6 +49,8 @@ struct Inner {
     /// `close_attaches`: a close frame to every open attach.
     attach_close: broadcast::Sender<(u16, String)>,
     hellos: Mutex<Vec<HelloRequest>>,
+    /// `refuse_hellos`: `(status, message)` for the next hellos, in order.
+    hello_refusals: Mutex<Vec<(u16, String)>>,
     actions: Mutex<Vec<(String, PluginAction)>>,
     resizes: Mutex<Vec<(String, Value)>>,
     attaches: Mutex<Vec<String>>,
@@ -84,6 +86,7 @@ impl FakeHost {
             watch_connections: AtomicUsize::new(0),
             attach_close: broadcast::channel(8).0,
             hellos: Mutex::new(Vec::new()),
+            hello_refusals: Mutex::new(Vec::new()),
             actions: Mutex::new(Vec::new()),
             resizes: Mutex::new(Vec::new()),
             attaches: Mutex::new(Vec::new()),
@@ -120,7 +123,19 @@ impl FakeHost {
             ca: None,
             tls: None,
             listen: "127.0.0.1:0".into(),
+            revision: None,
         }
+    }
+
+    /// The next `n` hellos are recorded and answered `status` with
+    /// `{"error": message}`.
+    pub fn refuse_hellos(&self, n: usize, status: u16, message: &str) {
+        let mut r = self
+            .inner
+            .hello_refusals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        r.extend(std::iter::repeat_n((status, message.to_string()), n));
     }
 
     pub fn hellos(&self) -> Vec<HelloRequest> {
@@ -361,6 +376,19 @@ async fn hello(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(req);
+    let refusal = {
+        let mut r = inner
+            .hello_refusals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (!r.is_empty()).then(|| r.remove(0))
+    };
+    if let Some((status, message)) = refusal {
+        return error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT),
+            message,
+        );
+    }
     Json(HelloResponse {
         config: inner.config.clone(),
     })

@@ -147,7 +147,7 @@ fn request_for(name: &str, tokens: Option<Value>) -> Value {
 
 fn entry(name: &str, url: &str, grant: &[&str]) -> Value {
     json!({ "name": name, "grant": grant, "config": { "greeting": "hi" },
-            "token": format!("{name}-tok-0123456789abcdef0123456789ab"), "url": url })
+            "token": format!("{name}-tok-0123456789abcdef0123456789ab"), "url": url, "revision": "r1" })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -221,7 +221,7 @@ async fn the_list_is_declared_hello_is_checked_and_the_row_says_why() {
     };
     let hello = |needs: &str| {
         json!({ "name": "flow", "version": "1.0.0", "protocol": 1,
-        "listen": "0.0.0.0:7644", "manifest": manifest(needs) })
+        "listen": "0.0.0.0:7644", "revision": "r1", "manifest": manifest(needs) })
     };
     let (s, v) = w
         .call(
@@ -353,7 +353,8 @@ async fn a_plugin_back_after_three_missed_polls_has_its_pairs_activated_again() 
         .unwrap()
         .to_string();
     let hello = json!({ "name": "flow", "version": "1.0.0", "protocol": 1,
-        "listen": "0.0.0.0:7644", "manifest": { "apiVersion": "balerix/v1", "kind": "Plugin",
+        "listen": "0.0.0.0:7644", "revision": "r1",
+        "manifest": { "apiVersion": "balerix/v1", "kind": "Plugin",
         "name": "flow", "version": "1.0.0", "protocol": 1, "start": "serve", "needs": ["kv"] } });
     let (s, v) = w
         .call("POST", "/v1/plugin-host/hello", Some(&token), Some(hello))
@@ -407,7 +408,8 @@ async fn declare_fake(w: &World, h: &Harness, listen: &str) -> String {
         .unwrap()
         .to_string();
     let hello = json!({ "name": "fake", "version": "1.0.0", "protocol": 1,
-        "listen": "0.0.0.0:7644", "manifest": { "apiVersion": "balerix/v1", "kind": "Plugin",
+        "listen": "0.0.0.0:7644", "revision": "r1",
+        "manifest": { "apiVersion": "balerix/v1", "kind": "Plugin",
         "name": "fake", "version": "1.0.0", "protocol": 1, "start": "serve",
         "needs": ["fleets", "manage"] } });
     let (s, v) = w
@@ -416,6 +418,46 @@ async fn declare_fake(w: &World, h: &Harness, listen: &str) -> String {
     assert_eq!(s, 200, "{v}");
     h.resolver.set(Ok(spec()));
     token
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hello_for_another_revision_is_409_on_the_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let (client, stub) = tls_stub(dir.path()).await;
+    let h = Harness::kube(Duration::from_secs(3600));
+    let w = world_with(&h, client).await;
+    let (s, _) = w
+        .call(
+            "PUT",
+            "/v1/plugins",
+            Some(ADMIN),
+            Some(json!({ "plugins": [entry("fake", &stub.listen, &["fleets", "manage"])] })),
+        )
+        .await;
+    assert_eq!(s, 204);
+    let token = entry("fake", "", &[])["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hello = json!({ "name": "fake", "version": "1.0.0", "protocol": 1,
+        "listen": "0.0.0.0:7644", "revision": "r2",
+        "manifest": { "apiVersion": "balerix/v1", "kind": "Plugin",
+        "name": "fake", "version": "1.0.0", "protocol": 1, "start": "serve",
+        "needs": ["fleets", "manage"] } });
+    let (s, v) = w
+        .call("POST", "/v1/plugin-host/hello", Some(&token), Some(hello))
+        .await;
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (
+            409,
+            Some(
+                "hello.revision: this daemon holds r1, the plugin is r2; the list has not arrived yet"
+            )
+        )
+    );
+    let (_, rows) = w.call("GET", "/v1/plugins", Some(ADMIN), None).await;
+    assert_eq!(rows[0]["phase"], "starting", "{rows}");
 }
 
 async fn tls_stub(dir: &std::path::Path) -> (PluginClient, balerix_server::testing::StubPlugin) {

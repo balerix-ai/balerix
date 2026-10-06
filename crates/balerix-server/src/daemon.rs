@@ -97,6 +97,10 @@ pub enum DaemonError {
     /// The owner rule (Spec L §5): a 409 naming who manages the fleet.
     #[error("{0}")]
     Managed(String),
+    /// Spec O §23.8: a plugin's hello names a revision the Daemon's list
+    /// does not hold yet. 409, and nothing changes; the SDK retries.
+    #[error("{0}")]
+    ListPending(String),
 }
 
 /// Who is applying or downing a fleet (Spec L §5). The admin API and a
@@ -1580,6 +1584,7 @@ mod tests {
                     protocol: balerix_api::PLUGIN_PROTOCOL,
                     listen: listen.into(),
                     manifest: None,
+                    revision: None,
                 },
             )
             .await

@@ -152,6 +152,8 @@ impl Host {
             protocol: PLUGIN_PROTOCOL,
             listen: listen.to_string(),
             manifest: manifest.cloned(),
+            // like the manifest (§23.1): a 0.2.0 daemon refuses unknown fields
+            revision: self.env.ca.as_ref().and(self.env.revision.clone()),
         };
         self.json(self.http.post(self.url("hello")).json(&req))
             .await
@@ -986,6 +988,7 @@ mod tls_tests {
             ca,
             tls: None,
             listen: "127.0.0.1:0".into(),
+            revision: None,
         };
         // Env's fields are public: Host refuses https:// without an
         // authority itself rather than fall back to the system's roots

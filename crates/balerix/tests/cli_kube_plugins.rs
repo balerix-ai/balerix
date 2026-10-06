@@ -296,6 +296,9 @@ fn a_daemon_restart_keeps_a_running_plugin_ready_without_a_new_hello() {
     let version = before["version"].as_str().unwrap().to_string();
     assert!(!version.is_empty(), "{before}");
     let hello = scratch.path().join("fake-plugin.hello");
+    // the fake writes it in `configure`, after its hello is accepted, so
+    // the row can be ready before the file exists
+    wait_for_file(&hello);
     let hello_at = std::fs::metadata(&hello).unwrap().modified().unwrap();
     // restart the Daemon on the same state (the fake keeps running), then
     // re-send the list as the operator does after a restart

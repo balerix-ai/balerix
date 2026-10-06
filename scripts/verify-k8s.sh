@@ -34,11 +34,12 @@ PROMPT="Reply with the single word: ready."
 FLOW_TEXT="Run the tests and fix any failures."
 FAILED=()
 
+usage() { echo "usage: $0 [--from tree|index] | down" >&2; exit 2; }
 while (($#)); do
   case $1 in
-    --from) FROM=${2:-}; shift 2 ;;
+    --from) (($# >= 2)) || usage; FROM=$2; shift 2 ;;
     down) MODE=down; shift ;;
-    *) echo "usage: $0 [--from tree|index] | down" >&2; exit 2 ;;
+    *) usage ;;
   esac
 done
 [[ $FROM == tree || $FROM == index ]] || { echo "--from is tree or index" >&2; exit 2; }
@@ -258,7 +259,8 @@ hr "F. drop bob: harvested into the crew cache"
 timeout 900 kubectl -n "$NS" get pods -l job-name=payments-backend-bob-harvest -w -o jsonpath='{.status.containerStatuses[*].state.terminated.message}{"\n"}' 2>/dev/null | grep -m1 . >"$ROOT/harvest" &
 watcher=$!
 kn patch fleets.balerix.ai payments --type merge -p '{"spec":{"crews":{"backend":{"agents":{"bob":null}}}}}' >/dev/null
-if wait_until 900 sh -c "! kubectl -n $NS get agents.balerix.ai payments-backend-bob"; then ok "bob's Agent gone"; else bad "bob's Agent still there"; fi
+# gone means NotFound, not any error kubectl may report
+if wait_until 900 sh -c "kubectl -n $NS get agents.balerix.ai payments-backend-bob 2>&1 | grep -q '(NotFound)'"; then ok "bob's Agent gone"; else bad "bob's Agent still there"; fi
 kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null
 branch=$(sed -n 's/^harvested //p' "$ROOT/harvest" | head -n 1)
 if [[ -z $branch ]]; then

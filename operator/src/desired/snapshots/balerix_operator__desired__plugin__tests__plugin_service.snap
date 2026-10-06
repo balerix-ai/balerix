@@ -1,0 +1,31 @@
+---
+source: src/desired/plugin.rs
+expression: o.service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: balerix-operator
+    balerix.ai/component: plugin
+    balerix.ai/daemon: default
+    balerix.ai/plugin: web
+  name: web
+  namespace: team-a
+  ownerReferences:
+    - apiVersion: balerix.ai/v1alpha1
+      controller: true
+      kind: Plugin
+      name: web
+      uid: plugin-uid
+spec:
+  ports:
+    - name: plugin
+      port: 7644
+      targetPort: plugin
+    - name: expose
+      port: 8080
+      targetPort: expose
+  selector:
+    balerix.ai/component: plugin
+    balerix.ai/plugin: web

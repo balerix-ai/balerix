@@ -1,0 +1,57 @@
+---
+source: src/desired/plugin.rs
+expression: o.policy
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: balerix-operator
+    balerix.ai/component: plugin
+    balerix.ai/daemon: default
+    balerix.ai/plugin: web
+  name: balerix-plugin-web
+  namespace: team-a
+  ownerReferences:
+    - apiVersion: balerix.ai/v1alpha1
+      controller: true
+      kind: Plugin
+      name: web
+      uid: plugin-uid
+spec:
+  egress:
+    - ports:
+        - port: 7643
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              balerix.ai/component: daemon
+              balerix.ai/daemon: default
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - ports:
+        - port: 443
+          protocol: TCP
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              balerix.ai/component: daemon
+              balerix.ai/daemon: default
+      ports:
+        - port: 7644
+          protocol: TCP
+    - ports:
+        - port: 8080
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      balerix.ai/component: plugin
+      balerix.ai/plugin: web
+  policyTypes:
+    - Ingress
+    - Egress

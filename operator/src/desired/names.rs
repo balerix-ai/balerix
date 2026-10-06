@@ -76,6 +76,28 @@ pub fn endpoint(namespace: &str, daemon_name: &str) -> String {
         daemon(daemon_name)
     )
 }
+
+/// A plugin's Deployment and NetworkPolicy (§23.4); its Service is the
+/// plugin's own name, the host of its url.
+pub fn plugin(plugin: &str) -> String {
+    job_name(&format!("balerix-plugin-{plugin}"), "")
+}
+pub fn plugin_token(plugin: &str) -> String {
+    job_name(&format!("balerix-plugin-{plugin}"), "-token")
+}
+pub fn plugin_serving(plugin: &str) -> String {
+    job_name(&format!("balerix-plugin-{plugin}"), "-tls")
+}
+pub fn plugin_scratch(plugin: &str) -> String {
+    job_name(&format!("balerix-plugin-{plugin}"), "-scratch")
+}
+pub fn plugin_url(namespace: &str, plugin: &str) -> String {
+    format!(
+        "https://{plugin}.{namespace}.svc:{}",
+        crate::desired::plugin::PLUGIN_PORT
+    )
+}
+
 pub fn fleet_pool_job(fleet: &str) -> String {
     job_name(fleet, "-pool")
 }

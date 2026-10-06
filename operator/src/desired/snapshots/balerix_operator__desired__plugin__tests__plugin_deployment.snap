@@ -1,0 +1,117 @@
+---
+source: src/desired/plugin.rs
+expression: o.deployment
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: balerix-operator
+    balerix.ai/component: plugin
+    balerix.ai/daemon: default
+    balerix.ai/plugin: web
+  name: balerix-plugin-web
+  namespace: team-a
+  ownerReferences:
+    - apiVersion: balerix.ai/v1alpha1
+      controller: true
+      kind: Plugin
+      name: web
+      uid: plugin-uid
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      balerix.ai/component: plugin
+      balerix.ai/plugin: web
+  template:
+    metadata:
+      annotations:
+        balerix.ai/input-hash: e6ed531c7c45101cf5d723c851db428c85ca1c50426af87a8f28af24ff625a7c
+      labels:
+        app.kubernetes.io/managed-by: balerix-operator
+        balerix.ai/component: plugin
+        balerix.ai/daemon: default
+        balerix.ai/plugin: web
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - env:
+            - name: BALERIX_API_URL
+              value: "https://balerix-default.team-a.svc:7643"
+            - name: BALERIX_PLUGIN_NAME
+              value: web
+            - name: BALERIX_PLUGIN_TOKEN_FILE
+              value: /balerix/token/token
+            - name: BALERIX_PLUGIN_SCRATCH
+              value: /balerix/scratch
+            - name: BALERIX_CA_FILE
+              value: /balerix/ca/ca.crt
+            - name: BALERIX_PLUGIN_TLS_CERT
+              value: /balerix/tls/tls.crt
+            - name: BALERIX_PLUGIN_TLS_KEY
+              value: /balerix/tls/tls.key
+            - name: BALERIX_PLUGIN_LISTEN
+              value: "0.0.0.0:7644"
+            - name: BALERIX_PLUGIN_REVISION
+              value: e6ed531c7c45101cf5d723c851db428c85ca1c50426af87a8f28af24ff625a7c
+            - name: HOME
+              value: /tmp
+          image: "balerix-plugin-web:e2e"
+          name: plugin
+          ports:
+            - containerPort: 7644
+              name: plugin
+            - containerPort: 8080
+              name: expose
+          resources:
+            requests:
+              cpu: 50m
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - mountPath: /balerix/token
+              name: token
+              readOnly: true
+            - mountPath: /balerix/tls
+              name: tls
+              readOnly: true
+            - mountPath: /balerix/ca
+              name: ca
+              readOnly: true
+            - mountPath: /balerix/scratch
+              name: scratch
+            - mountPath: /tmp
+              name: tmp
+      enableServiceLinks: false
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: token
+          secret:
+            defaultMode: 288
+            secretName: balerix-plugin-web-token
+        - name: tls
+          secret:
+            defaultMode: 288
+            secretName: balerix-plugin-web-tls
+        - configMap:
+            name: balerix-default-ca
+          name: ca
+        - name: scratch
+          persistentVolumeClaim:
+            claimName: balerix-plugin-web-scratch
+        - emptyDir: {}
+          name: tmp

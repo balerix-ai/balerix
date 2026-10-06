@@ -288,11 +288,37 @@ async fn a_changed_authority_reissues_the_plugins_certificate() {
         secrets.get_opt("balerix-plugin-web-tls").await.unwrap()
     })
     .await;
-    // a new authority: delete it, and the Daemon controller mints another (§22.4)
-    secrets
-        .delete("balerix-default-ca", &DeleteParams::default())
-        .await
-        .unwrap();
+    // a new authority: delete it, and the Daemon controller mints another
+    // (§22.4). A reconcile that read the CA before the delete applies it
+    // again, so the delete is repeated while the old one is back
+    let configmaps: Api<ConfigMap> = Api::namespaced(c.clone(), &ns);
+    let ca_of = |m: ConfigMap| m.data.unwrap()["ca.crt"].clone();
+    let original = ca_of(configmaps.get("balerix-default-ca").await.unwrap());
+    wait_for("a new authority", Duration::from_secs(60), || async {
+        if ca_of(configmaps.get("balerix-default-ca").await.ok()?) != original {
+            return Some(());
+        }
+        let old = secrets
+            .get_opt("balerix-default-ca")
+            .await
+            .ok()?
+            .is_some_and(|s| {
+                s.data
+                    .is_some_and(|d| d.get("ca.crt").is_some_and(|v| v.0 == original.as_bytes()))
+            });
+        if old {
+            match secrets
+                .delete("balerix-default-ca", &DeleteParams::default())
+                .await
+            {
+                Ok(_) => {}
+                Err(kube::Error::Api(e)) if e.code == 404 => {}
+                Err(e) => panic!("deleting the CA Secret: {e}"),
+            }
+        }
+        None
+    })
+    .await;
     let after = wait_for(
         "a reissued certificate",
         Duration::from_secs(60),
@@ -302,13 +328,7 @@ async fn a_changed_authority_reissues_the_plugins_certificate() {
         },
     )
     .await;
-    let ca = Api::<ConfigMap>::namespaced(c.clone(), &ns)
-        .get("balerix-default-ca")
-        .await
-        .unwrap()
-        .data
-        .unwrap()["ca.crt"]
-        .clone();
+    let ca = ca_of(configmaps.get("balerix-default-ca").await.unwrap());
     assert!(pki::verifies(
         &ca,
         &cert(after),

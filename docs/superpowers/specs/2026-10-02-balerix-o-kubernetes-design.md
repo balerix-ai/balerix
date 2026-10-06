@@ -907,7 +907,8 @@ Each gets its own plan.
    §21). 3a done 2026-10; 3b done 2026-10 (PR #127).
 4. **Plugins.** §9. Done when `e2e-k8s` passes with flow and web, and the
    managed journey passes with `dev fake-plugin`. Built as two plans, 4a
-   without a cluster and 4b on one (§23).
+   without a cluster and 4b on one (§23). 4a done 2026-10 (PR #143); 4b
+   done 2026-10 (PR #144).
 5. **Release and charts.** §13, §14. Done when a fork rehearsal publishes
    images and both charts and `helm install` from the published index
    brings up a Ready fleet.
@@ -2232,3 +2233,71 @@ order the two controllers, a `hello` names the entry it was built for.
   `PluginsReady=False/PluginNotReady`, so a roll that never completes is
   visible.
 - `PluginStatus` is unchanged.
+
+### 23.9 Decided by the 4b plan
+
+What 4b's plan decided beyond §23.4–§23.6 and §23.8, and the rulings made
+while building it, as built.
+
+- **A plugin's objects are named for it:** `balerix-plugin-<p>` is the
+  Deployment, `balerix-plugin-<p>-token` the token Secret,
+  `balerix-plugin-<p>-tls` the serving Secret and
+  `balerix-plugin-<p>-scratch` the optional claim. The Service is `<p>`,
+  so the Daemon's list entry reaches it as `https://<p>.<namespace>.svc:…`.
+- **`DaemonError::ListPending(String)`** is the Daemon's refusal of a
+  `hello` built for another revision (§23.8), answered 409.
+- **`PluginsReady` is `Unknown/Pending` ("judged once the daemon
+  answers") until the Daemon answers,** and it is no longer part of
+  `daemon_status`'s `Ready`: a Daemon whose plugins are not up is itself
+  still serving.
+- **The Daemon requeues at the Fleet period while it lists plugins,**
+  not the slower reconcile period: the rows and the managed requests are
+  polled (§23.4).
+- **The revision's inputs are the plugin's name, its spec, its resolved
+  config, its token and its serving certificate.** A referenced Secret's
+  data reaches it through the resolved config, so a changed Secret moves
+  the revision without being hashed on its own.
+- **`HOME=/tmp` in the plugin pod,** the pod's `emptyDir` mount, so a
+  plugin's tools have a writable home.
+- **No readiness probe.** `Deployed` is the Deployment's available
+  replica, and `Ready` is the Daemon's row for the plugin (§23.2), which
+  the plugin's own `hello` and the Daemon's health polls decide.
+- **An unlisted Plugin's scratch claim is deleted with its other
+  objects.** Nothing of a Plugin that no Daemon lists is kept.
+- **A listed plugin whose grant or config cannot be built holds the whole
+  list back for the pass.** The Daemon keeps its last list and with it
+  every plugin's managed requests; sending a list without the plugin would
+  drop them (see the second ruling below). Only a plugin whose token or
+  serving Secret is not made yet is left out: it has nothing to lose.
+- **The fake plugin image is a heredoc stage in `kind-up`:** `FROM
+  balerix:e2e`, entrypoint `balerix dev fake-plugin`. It has no
+  Dockerfile of its own.
+- **`e2e-k8s` runs its two journeys one at a time** (the `e2e-k8s`
+  nextest profile sets `test-threads = 1`): both use the one three-node
+  kind cluster.
+
+Rulings made while building it:
+
+- **A listed plugin whose grant or config cannot be built** puts that
+  plugin's own reason (`SecretMissing` or `InvalidSpec`) on the Daemon's
+  `PluginsReady`, with the message `<plugin>: <why>`, and no list is sent
+  that pass.
+- **A plugin listed by two Daemons also holds the list back**
+  (`PluginsReady=False/PluginListedTwice`). Leaving it out would let the
+  Daemon drop its managed requests and later delete its Fleets.
+- **A managed request the operator cannot write** (a `managed_fleet`
+  error or a 4xx from the API server) is a Warning Event
+  `ManagedFleetRefused` on the Plugin, and the pass goes on. Transport
+  errors and 5xx fail the reconcile.
+- **An unlisted Plugin deletes only the objects whose owner references
+  carry its uid** (a uid precondition on the delete). A same-named object
+  it does not own is left alone.
+- **The managed Fleet's defaults are the file's over the Plugin's
+  `fleetDefaults`,** which is Spec M's layer order: host settings, then
+  `fleetDefaults`, then the file.
+- **The SDK logs `hello accepted`** once a hello is accepted. The e2e
+  journey's config roll reads it from the new pod's log, because a
+  Plugin's `Ready` can still be the old pod's.
+- **§5.5's "a Secret with its resolved config" is replaced by §23.4:**
+  the config reaches the Daemon only in `PUT /v1/plugins`, never as a file
+  in the plugin's pod.

@@ -839,7 +839,8 @@ its index by hand.
    `balerix-agent` and `charts/*` public.
 4. Add `charts` to the branch protection's required checks.
 
-`docs/RELEASING.md` gains the unit, the steps and this setup.
+`docs/RELEASING.md` (and §24.5's order) gains the unit, the steps and
+this setup.
 
 ## 15. Testing
 
@@ -2564,3 +2565,47 @@ The operator runs as one replica with no leader election and no metrics
   `networkpolicies` rule removed). The operator's log has the 403. Only
   the Events check and the outside-namespace check show the API error
   directly.
+
+### 24.8 Decided by the 5b plan
+
+- **Images by name.** `lib.sh` `unit_images` lists a unit's images in
+  build order. Image scripts take an image name, and `merge-images` and
+  `promote-images` run once per image. One composite action
+  (`build-unit-images`) builds a unit's images in order. Digest artifacts
+  stay one per unit and architecture, holding `<image>/<digest>`.
+- **The agent's base.** The smoke build uses the docker driver with `BASE`
+  set to the `balerix` just loaded on the runner. The push build uses the
+  `balerix` per-architecture digest just pushed.
+- **One archive.** Core's `balerix-v<ver>-<target>.tar.gz` holds all three
+  binaries. `build.sh` checks each one's linkage and `--version`.
+  `kind-up` builds its images through `build.sh core`, so `e2e-k8s` runs
+  the static release binaries.
+- **The charts job packages first** and uploads the archives before any
+  cargo-built code runs. `mise run charts` then lints, renders and
+  validates the tree's `charts/`, and the packaged archives are what gets
+  installed on `kind-up cluster`. Upstream's staged charts equal the
+  tree's byte for byte; a fork's differ only in their image repositories.
+  What passes the check is what gets published.
+- **Pins at release time.** A run can release core or a plugin together
+  with the charts (release PRs merged together or queued behind one
+  another), moving a pin after the gate passed. The charts job waits for
+  `merge-images`, and first checks (`check-pins.sh`) that every pin is
+  tagged or is the version a unit in the same run releases; otherwise it
+  fails, naming the pin.
+- **Pins in the changelog.** A charts release lists moved pins under
+  `### Images`. A pin-only release carries no "Initial release." line.
+- **OCI re-runs.** Pushing an archive that is already there is a no-op
+  at the registry, and a re-run signs it again. The index step skips when
+  `index.yaml` already lists both archive URLs.
+- **verify-charts waits for Pages** for up to 10 minutes before it fails
+  and flags.
+- **verify-k8s** is a report-printing script, like `verify-claude.sh`. Its
+  Fleet is `examples/payments.yaml` with the repo replaced by a git server
+  pod, push off and a pod runner. It types the first prompt into alice's
+  tmux window, re-pressing Enter until the transcript has it (#99). It
+  reads flow's text from Claude's own transcript. It creates its namespace
+  before the operator chart (whose `watchNamespaces` Role lives there) and
+  streams the harvest pod with a watch.
+- **The first charts release** follows the first core release that ships
+  `balerix-operator`. `appVersion` 0.2.0 has no operator image, and the
+  check job would fail on it.

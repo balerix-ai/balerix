@@ -10,7 +10,10 @@
 # Nothing here is a production class: the shared directory is one host
 # path, not a network filesystem.
 #
-# usage: kind-up.sh [up|down]
+# `cluster` makes the cluster and the shared class only, with no images: the
+# charts release check installs the published ones (Spec O §24.5).
+#
+# usage: kind-up.sh [up|cluster|down]
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo"
@@ -22,18 +25,21 @@ export KUBECONFIG="$root/kubeconfig"
 # kind 0.33.0's node image for the spike's Kubernetes line (§19)
 node_image="kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d"
 
-for tool in kind kubectl docker cargo rustup; do
+mode=${1:-up}
+tools=(kind kubectl docker)
+[[ $mode != up ]] || tools+=(cargo rustup jq)
+for tool in "${tools[@]}"; do
   command -v "$tool" >/dev/null || { echo "kind-up: $tool is not on PATH" >&2; exit 2; }
 done
 
-case "${1:-up}" in
+case "$mode" in
   down)
     kind delete cluster --name "$name" 2>/dev/null || true
     rm -rf "$root"
     exit 0
     ;;
-  up) ;;
-  *) echo "usage: $0 [up|down]" >&2; exit 2 ;;
+  up | cluster) ;;
+  *) echo "usage: $0 [up|cluster|down]" >&2; exit 2 ;;
 esac
 
 mkdir -p "$root" "$shared"
@@ -60,7 +66,12 @@ kubectl -n local-path-storage patch configmap local-path-config --type merge \
 kubectl -n local-path-storage rollout restart deployment local-path-provisioner
 kubectl -n local-path-storage rollout status deployment local-path-provisioner --timeout=120s
 
-# the musl target the operator and plugin images' static binaries build for
+if [[ $mode == cluster ]]; then
+  echo "kind-up: cluster $name ready, no images loaded; KUBECONFIG=$KUBECONFIG"
+  exit 0
+fi
+
+# the musl target the images' static binaries build for
 case "$(uname -m)" in
   x86_64 | amd64) musl=x86_64-unknown-linux-musl ;;
   aarch64 | arm64) musl=aarch64-unknown-linux-musl ;;
@@ -69,36 +80,24 @@ esac
 command -v musl-gcc >/dev/null || { echo "kind-up: musl-gcc is not on PATH (apt-get install musl-tools)" >&2; exit 2; }
 rustup target add "$musl" >/dev/null
 
-# the daemon and agent images, from this tree: native release builds, no musl, no scan
-cargo build --release -q -p balerix
-CARGO_TARGET_DIR="$repo/agent/target" cargo build --release -q --manifest-path agent/Cargo.toml
-dist="$root/dist"
-rm -rf "$dist" && mkdir -p "$dist"
-cp "${CARGO_TARGET_DIR:-$repo/target}/release/balerix" "$dist/balerix"
-context=$(scripts/release/image-context.sh core "$dist" "$root/context-core" | sed -n 's/^context=//p')
+# the daemon, agent and operator images (Spec O §24.4): core's three static
+# binaries from scripts/release/build.sh, each image from its own context
+dist="$root/dist-core"
+scripts/release/build.sh core "$musl" "$dist" >/dev/null
+context() { scripts/release/image-context.sh "$1" "$2" "$root/context-$1" | sed -n 's/^context=//p'; }
 secret=()
 [[ -n ${GITHUB_TOKEN:-} ]] && secret=(--secret "id=github_token,env=GITHUB_TOKEN")
 # bash 3.2 (macOS) calls an empty "${secret[@]}" unbound under set -u
-docker build ${secret[@]+"${secret[@]}"} -t balerix:e2e -f docker/balerix/Dockerfile "$context"
-rm -rf "$root/context-agent" && mkdir -p "$root/context-agent"
-cp "$repo/agent/target/release/balerix-agent" "$root/context-agent/balerix-agent"
-docker build --build-arg BASE=balerix:e2e -t balerix-agent:e2e -f docker/agent/Dockerfile "$root/context-agent"
-# the operator image (Spec O §24.3): the static musl binary distroless/static
-# runs; ring's C needs musl-gcc, as scripts/release/build.sh sets it
-CC_x86_64_unknown_linux_musl=musl-gcc CC_aarch64_unknown_linux_musl=musl-gcc \
-  CARGO_TARGET_DIR="$repo/operator/target" cargo build --release --locked -q \
-  --manifest-path operator/Cargo.toml --target "$musl"
-rm -rf "$root/context-operator" && mkdir -p "$root/context-operator"
-cp "$repo/operator/target/$musl/release/balerix-operator" "$root/context-operator/balerix-operator"
-docker build -t balerix-operator:e2e -f docker/operator/Dockerfile "$root/context-operator"
+docker build ${secret[@]+"${secret[@]}"} -t balerix:e2e -f docker/balerix/Dockerfile "$(context balerix "$dist")"
+docker build --build-arg BASE=balerix:e2e -t balerix-agent:e2e -f docker/agent/Dockerfile "$(context balerix-agent "$dist")"
+docker build -t balerix-operator:e2e -f docker/operator/Dockerfile "$(context balerix-operator "$dist")"
 # the plugin images (Spec O §23.5): flow and web as released, a static musl
 # binary on distroless (docker/plugin/Dockerfile); and the fake plugin, the
 # balerix image whose entrypoint is `balerix dev fake-plugin`
 for unit in flow web; do
   out="$root/dist-$unit"
   scripts/release/build.sh "$unit" "$musl" "$out" >/dev/null
-  context=$(scripts/release/image-context.sh "$unit" "$out" "$root/context-$unit" | sed -n 's/^context=//p')
-  docker build -t "balerix-plugin-$unit:e2e" -f docker/plugin/Dockerfile "$context"
+  docker build -t "balerix-plugin-$unit:e2e" -f docker/plugin/Dockerfile "$(context "balerix-plugin-$unit" "$out")"
 done
 docker build -t balerix-fake-plugin:e2e - <<'EOF2'
 FROM balerix:e2e

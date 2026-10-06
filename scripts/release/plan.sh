@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Which release units have a merged release PR awaiting its tag (Spec I §5.1):
 # a manifest version with no tag and a changelog section for that version.
-# Prints GitHub step outputs: units=, plugins=, binaries= and crates=
-# (JSON arrays), core=true|false.
+# Prints GitHub step outputs: units=, plugins=, binaries=, crates= and
+# images= (JSON arrays; images are {unit, image} objects, in build order),
+# core=true|false and
+# charts=true|false.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 # shellcheck source=scripts/release/lib.sh
@@ -12,7 +14,9 @@ units=()
 plugins=()
 binaries=()
 crates=()
+images=()
 core=false
+charts=false
 for unit in "${UNITS[@]}"; do
   version=$(unit_version "$unit")
   tag=$(unit_tag "$unit" "$version")
@@ -32,11 +36,20 @@ for unit in "${UNITS[@]}"; do
     core) core=true; binaries+=("$unit"); crates+=("$unit") ;;
     plugin) plugins+=("$unit"); binaries+=("$unit") ;;
     library) crates+=("$unit") ;;
+    charts) charts=true ;;
   esac
+  if [[ $(unit_kind "$unit") == core || $(unit_kind "$unit") == plugin ]]; then
+    while IFS= read -r image; do
+      images+=("{\"unit\":\"$unit\",\"image\":\"$image\"}")
+    done < <(unit_images "$unit")
+  fi
 done
 
 echo "units=$(json_list "${units[@]}")"
 echo "plugins=$(json_list "${plugins[@]}")"
 echo "binaries=$(json_list "${binaries[@]}")"
 echo "crates=$(json_list "${crates[@]}")"
+# A matrix of objects: merge-images and promote-images run once per image.
+echo "images=[$(IFS=,; echo "${images[*]}")]"
 echo "core=$core"
+echo "charts=$charts"

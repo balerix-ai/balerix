@@ -18,8 +18,6 @@ crate=$(unit_crate "$unit")
 version=$(unit_version "$unit")
 tag=$(unit_tag "$unit" "$version")
 kind=$(unit_kind "$unit")
-image=
-[[ $kind == library ]] || image=$(unit_image "$unit")
 
 [[ $kind == library || -f $assets/SHA256SUMS ]] || die "$unit: no SHA256SUMS in $assets"
 
@@ -57,20 +55,51 @@ cargo add $crate@$version
 EOF
 fi
 
-if [[ $kind != library ]]; then
+if [[ $kind == charts ]]; then
+  for chart in "${CHARTS[@]}"; do
+    [[ -f $assets/$chart-$version.tgz ]] || die "$unit: no $chart-$version.tgz in $assets"
+  done
+  owner=${GITHUB_REPOSITORY%%/*}
+  owner=${owner,,}
   cat >>"$notes" <<EOF
+
+### Install
+
+\`\`\`sh
+helm repo add balerix https://$owner.github.io/helm-charts
+helm install balerix-operator balerix/balerix-operator --version $version \\
+  --namespace balerix-system --create-namespace
+helm install balerix balerix/balerix-daemon --version $version --namespace <namespace>
+\`\`\`
+
+Or from \`oci://ghcr.io/$owner/charts/balerix-operator\` and \`oci://ghcr.io/$owner/charts/balerix-daemon\`.
 
 ### Verify
 
 \`\`\`sh
-gh attestation verify $crate-v$version-x86_64-unknown-linux-musl.tar.gz --repo $GITHUB_REPOSITORY
+gh attestation verify balerix-operator-$version.tgz --repo $GITHUB_REPOSITORY
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify oci://$image:$version --repo $GITHUB_REPOSITORY
-cosign verify $image:$version \\
+cosign verify ghcr.io/$owner/charts/balerix-operator:$version \\
   --certificate-identity https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/heads/main \\
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 \`\`\`
 EOF
+fi
+
+if [[ $kind == core || $kind == plugin ]]; then
+  {
+    printf '\n### Verify\n\n```sh\n'
+    printf 'gh attestation verify %s --repo %s\n' "$crate-v$version-x86_64-unknown-linux-musl.tar.gz" "$GITHUB_REPOSITORY"
+    printf 'sha256sum --check --ignore-missing SHA256SUMS\n'
+    while IFS= read -r name; do
+      ref="$(image_ref "$name"):$version"
+      printf 'gh attestation verify oci://%s --repo %s\n' "$ref" "$GITHUB_REPOSITORY"
+      printf 'cosign verify %s \\\n' "$ref"
+      printf '  --certificate-identity https://github.com/%s/.github/workflows/release.yml@refs/heads/main \\\n' "$GITHUB_REPOSITORY"
+      printf '  --certificate-oidc-issuer https://token.actions.githubusercontent.com\n'
+    done < <(unit_images "$unit")
+    printf '```\n'
+  } >>"$notes"
 fi
 
 # Drafts have no tag yet, so they cannot be looked up by tag name.

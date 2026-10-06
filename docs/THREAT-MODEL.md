@@ -144,13 +144,13 @@ phases; the rest exist in code today.
 - **The crates.io publish right** for `balerix-api` and `balerix-plugin-sdk` — anything published there lands in plugin authors' builds.
 - **The ghcr namespace** `ghcr.io/balerix-ai/*` — images operators run with their credentials mounted.
 - **Tags and release assets** — the binaries and plugin packages operators and the daemon's mise install.
-- **The release App's private key** — can push branches and edit pull requests on this repository.
+- **The release App's private key** — can push branches and edit pull requests on this repository, and push to `helm-charts`, whose `index.yaml` every `helm repo add` trusts for archive URLs. The archives themselves are checked against the attested `SHA256SUMS`, and the OCI charts are cosign-signed.
 
 ### Trust boundaries
 - **Pull request ↔ CI** — a pull request's code runs in `ci.yml`, `images.yml`, `release-scripts.yml` and `pr-title.yml` with a read-only token and no secrets. **Untrusted input.**
 - **`main` ↔ release workflows** — `release-pr.yml` and `release.yml` run only on push to `main` or dispatch, and hold the App token, OIDC and write permissions.
 - **Build job ↔ publishing jobs** — build and image jobs hand artifacts to jobs that sign, publish and tag.
-- **CI ↔ registries** — crates.io through trusted publishing (OIDC, 30-minute token), ghcr through `GITHUB_TOKEN`, GitHub Releases through `GITHUB_TOKEN`.
+- **CI ↔ registries** — crates.io through trusted publishing (OIDC, 30-minute token), ghcr (the images and the OCI charts under `charts/`) through `GITHUB_TOKEN`, GitHub Releases through `GITHUB_TOKEN`, and the `helm-charts` index (a push to its `main`, served by Pages) through the release App's token scoped to that repository.
 
 ### Adversaries
 - **A malicious pull request** — wants secrets, a poisoned cache or artifact that a release later picks up, or a workflow run with write permissions.

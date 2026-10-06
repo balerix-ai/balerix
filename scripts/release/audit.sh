@@ -11,10 +11,15 @@ source scripts/release/lib.sh
 (($#)) || die "usage: $0 <unit>..."
 for unit in "$@"; do
   require_unit "$unit"
+  if [[ $unit == charts ]]; then echo "charts: no Rust dependencies to audit" >&2; continue; fi
   echo "== $unit" >&2
   if [[ $unit == core ]]; then
     cargo audit
     cargo deny check advisories bans sources licenses
+    for project in "${CORE_PROJECTS[@]}"; do
+      cargo audit --file "$project/Cargo.lock"
+      cargo deny --manifest-path "$project/Cargo.toml" check advisories bans sources licenses
+    done
   else
     cargo audit --file "plugins/$unit/Cargo.lock"
     cargo deny --manifest-path "plugins/$unit/Cargo.toml" check advisories bans sources licenses

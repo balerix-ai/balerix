@@ -29,7 +29,7 @@ fixture() {
   local dir="$root/$1"
   git clone -q "$repo" "$dir"
   git -C "$dir" tag --list | xargs -r git -C "$dir" tag -d >/dev/null
-  rm -rf "$dir/scripts/release" "$dir/CHANGELOG.md" "$dir"/plugins/*/CHANGELOG.md
+  rm -rf "$dir/scripts/release" "$dir/CHANGELOG.md" "$dir"/plugins/*/CHANGELOG.md "$dir/charts/CHANGELOG.md"
   cp -R "$repo/scripts/release" "$dir/scripts/release"
   cp "$repo/cliff.toml" "$dir/cliff.toml"
   gitc "$dir" add -A
@@ -67,6 +67,42 @@ release() {
   gitc "$dir" tag "$(field tag "$out")"
 }
 
+# A field both charts share, and one plugin's pin, in <dir>.
+charts_field_of() {
+  (
+    cd "$1"
+    # shellcheck source=scripts/release/lib.sh
+    source scripts/release/lib.sh
+    charts_field "$2"
+  )
+}
+chart_pin_of() {
+  (
+    cd "$1"
+    # shellcheck source=scripts/release/lib.sh
+    source scripts/release/lib.sh
+    chart_pin "$2"
+  )
+}
+set_chart_pin_of() {
+  (
+    cd "$1"
+    # shellcheck source=scripts/release/lib.sh
+    source scripts/release/lib.sh
+    set_chart_pin "$2" "$3"
+  )
+}
+
+# Releases every version the charts name, as they name them: what the
+# charts gate waits for (Spec O §24.5).
+release_charts_deps() {
+  local dir=$1 plugin
+  release "$dir" core "$(charts_field_of "$dir" appVersion)"
+  for plugin in flow web matrix github; do
+    release "$dir" "$plugin" "$(chart_pin_of "$dir" "$plugin")"
+  done
+}
+
 manifest_version() {
   (
     cd "$1"
@@ -90,9 +126,18 @@ dep_version_of() {
   )
 }
 
+project_version_of() {
+  (
+    cd "$1"
+    # shellcheck source=scripts/release/lib.sh
+    source scripts/release/lib.sh
+    project_version "$2"
+  )
+}
+
 # Every manifest, lockfile and plugin manifest agrees (Spec I §10).
 assert_consistent() {
-  local dir=$1 label=$2 core plugin version
+  local dir=$1 label=$2 core plugin project version
   core=$(manifest_version "$dir" core)
   expect_eq "$label: Cargo.lock has balerix $core" "$(lock_version "$dir/Cargo.lock" balerix)" "$core"
   for plugin in flow web matrix github; do
@@ -106,6 +151,13 @@ assert_consistent() {
   done
   expect_eq "$label: common Cargo.lock has the SDK at $core" \
     "$(lock_version "$dir/plugins/common/Cargo.lock" balerix-plugin-sdk)" "$core"
+  for project in operator agent; do
+    expect_eq "$label: $project Cargo.toml at core" "$(project_version_of "$dir" "$project")" "$core"
+    expect_eq "$label: $project Cargo.lock has balerix-$project at core" \
+      "$(lock_version "$dir/$project/Cargo.lock" "balerix-$project")" "$core"
+    expect_eq "$label: $project Cargo.lock has balerix-core at core" \
+      "$(lock_version "$dir/$project/Cargo.lock" balerix-core)" "$core"
+  done
 }
 
 scenario_initial() {
@@ -186,6 +238,19 @@ scenario_core_bump() {
   assert_consistent "$dir" "core bump"
 }
 
+# A commit under operator/ or agent/ releases core (Spec O §24.4).
+scenario_core_projects() {
+  local dir
+  dir=$(fixture core-projects)
+  release "$dir" core 0.4.0
+  change "$dir" operator/src/release-test.rs "fix(operator): an operator fix"
+  expect_eq "operator change: core releases" "$(field status "$(prepare "$dir" core)")" release
+  assert_consistent "$dir" "operator change"
+  discard "$dir"
+  change "$dir" agent/src/release-test.rs "fix(agent): an agent fix"
+  expect_eq "agent change: core releases" "$(field status "$(prepare "$dir" core)")" release
+}
+
 scenario_in_progress() {
   local dir out
   dir=$(fixture in-progress)
@@ -224,11 +289,24 @@ scenario_plan() {
   expect_eq "plan, merged initial flow PR: units" "$(field units "$out")" '["flow"]'
   expect_eq "plan, merged initial flow PR: plugins" "$(field plugins "$out")" '["flow"]'
   expect_eq "plan, merged initial flow PR: core" "$(field core "$out")" false
+  expect_eq "plan, merged initial flow PR: images" "$(field images "$out")" '[{"unit":"flow","image":"balerix-plugin-flow"}]'
 
   gitc "$dir" tag "$tag"
   out=$(plan "$dir")
   expect_eq "plan, flow tagged: units" "$(field units "$out")" '[]'
   expect_eq "plan, flow tagged: plugins" "$(field plugins "$out")" '[]'
+}
+
+# A merged core release builds core's three images, in build order.
+scenario_plan_core_images() {
+  local dir out
+  dir=$(fixture plan-core)
+  prepare "$dir" core >/dev/null
+  gitc "$dir" add -A
+  gitc "$dir" commit -qm "chore(release): core initial"
+  out=$(plan "$dir")
+  expect_eq "plan, merged core PR: images in build order" "$(field images "$out")" \
+    '[{"unit":"core","image":"balerix"},{"unit":"core","image":"balerix-agent"},{"unit":"core","image":"balerix-operator"}]'
 }
 
 scenario_forced_released() {
@@ -288,9 +366,9 @@ scenario_hand_bump() {
   expect_eq "hand bump, forced: version" "$(field version "$out")" 0.5.0
   assert_consistent "$dir" "hand bump, forced"
   expect_grep "hand bump, forced: changelog section" "## 0.5.0 - " "$dir/plugins/flow/CHANGELOG.md"
-  expect_eq "hand bump, forced: manifest untouched, only yaml and changelog written" \
+  expect_eq "hand bump, forced: manifest untouched, only yaml, pin and changelog written" \
     "$(git -C "$dir" status --porcelain | awk '{print $2}' | sort)" \
-    "$(printf '%s\n' plugins/flow/CHANGELOG.md plugins/flow/package/balerix-plugin.yaml | sort)"
+    "$(printf '%s\n' charts/balerix-daemon/values.yaml plugins/flow/CHANGELOG.md plugins/flow/package/balerix-plugin.yaml | sort)"
   gitc "$dir" add -A
   gitc "$dir" commit -q -m "chore(release): flow v0.5.0"
   out=$(plan "$dir")
@@ -373,20 +451,36 @@ scenario_package() {
   fi
 }
 
-# Each unit's image carries its own name and description, not the repository's.
+# Each image carries its own name and description, not the repository's,
+# and a core image's context holds its binary under its own name.
 scenario_image_context() {
   local dir="$root/image-context" out
   mkdir -p "$dir/dist"
-  touch "$dir/dist/balerix" "$dir/dist/balerix-plugin-flow"
-  out=$(GITHUB_REPOSITORY_OWNER=Example "$repo/scripts/release/image-context.sh" flow "$dir/dist" "$dir/flow" 2>>"$log")
+  touch "$dir/dist/balerix" "$dir/dist/balerix-agent" "$dir/dist/balerix-operator" "$dir/dist/balerix-plugin-flow"
+  out=$(GITHUB_REPOSITORY_OWNER=Example "$repo/scripts/release/image-context.sh" balerix-plugin-flow "$dir/dist" "$dir/flow" 2>>"$log")
   expect_eq "image context: flow image" "$(field image "$out")" ghcr.io/example/balerix-plugin-flow
   expect_eq "image context: flow title" "$(field title "$out")" balerix-plugin-flow
   expect_eq "image context: flow description drops the spec reference" "$(field description "$out")" \
     "The flow plugin: a per-agent state machine over hook events"
-  out=$("$repo/scripts/release/image-context.sh" core "$dir/dist" "$dir/core" 2>>"$log")
+  out=$("$repo/scripts/release/image-context.sh" balerix "$dir/dist" "$dir/core" 2>>"$log")
   expect_eq "image context: core title" "$(field title "$out")" balerix
   expect_eq "image context: core description" "$(field description "$out")" \
     "Control plane and orchestrator for fleets of coding agents"
+  out=$(GITHUB_REPOSITORY_OWNER=Example "$repo/scripts/release/image-context.sh" balerix-operator "$dir/dist" "$dir/operator" 2>>"$log")
+  expect_eq "image context: operator image" "$(field image "$out")" ghcr.io/example/balerix-operator
+  expect_eq "image context: operator Dockerfile" "$(field dockerfile "$out")" "$repo/docker/operator/Dockerfile"
+  expect_eq "image context: operator description" "$(field description "$out")" \
+    "The balerix operator: five custom resources reconciled into pods, claims, Secrets and Jobs"
+  expect_eq "image context: operator binary" "$(ls "$dir/operator")" balerix-operator
+  out=$("$repo/scripts/release/image-context.sh" balerix-agent "$dir/dist" "$dir/agent" 2>>"$log")
+  expect_eq "image context: agent Dockerfile" "$(field dockerfile "$out")" "$repo/docker/agent/Dockerfile"
+  expect_eq "image context: agent binary" "$(ls "$dir/agent")" balerix-agent
+  expect_eq "image context: agent version is core's" "$(field version "$out")" "$(manifest_version "$repo" core)"
+  if "$repo/scripts/release/image-context.sh" balerix-plugin-common "$dir/dist" "$dir/common" >/dev/null 2>>"$log"; then
+    fail "image context: a library has no image, but one was assembled"
+  else
+    pass "image context: a library's image is refused"
+  fi
 }
 
 affected() {
@@ -412,6 +506,10 @@ scenario_affected() {
     "$(affected_by "$dir" plugins/matrix/src/release-test.rs)" '["matrix"]'
   expect_eq "affected: a core crate change" \
     "$(affected_by "$dir" crates/balerix-server/src/release-test.rs)" '["core"]'
+  expect_eq "affected: an operator change is core" \
+    "$(affected_by "$dir" operator/src/release-test.rs)" '["core"]'
+  expect_eq "affected: an agent change is core" \
+    "$(affected_by "$dir" agent/src/release-test.rs)" '["core"]'
   expect_eq "affected: an sdk change reaches every plugin" \
     "$(affected_by "$dir" crates/balerix-plugin-sdk/src/release-test.rs)" '["core","flow","web","matrix","github"]'
   expect_eq "affected: the root lockfile is core" \
@@ -440,14 +538,14 @@ scenario_affected() {
 # prepare.sh on a library that must wait for core, stdout and stderr
 # apart: the status on stdout, the reason on stderr.
 prepare_refused() {
-  local dir=$1 label=$2 out err needle
+  local dir=$1 unit=$2 label=$3 out err needle
   err="$root/${label// /-}.err"
   # Direct, not through the prepare() helper: that helper always sends
   # stderr to $log, so a redirect at the call site cannot recapture it.
-  out=$("$dir/scripts/release/prepare.sh" common 2>"$err")
+  out=$("$dir/scripts/release/prepare.sh" "$unit" 2>"$err")
   cat "$err" >>"$log"
   expect_eq "$label: status" "$(field status "$out")" none
-  for needle in "${@:3}"; do
+  for needle in "${@:4}"; do
     expect_grep "$label: says why" "$needle" "$err"
   done
   expect_eq "$label: working tree untouched" "$(git -C "$dir" status --porcelain)" ""
@@ -459,7 +557,7 @@ scenario_common_ordering() {
   local dir out sdk
   dir=$(fixture common)
   sdk=$(dep_version_of "$dir" plugins/common/Cargo.toml balerix-plugin-sdk)
-  prepare_refused "$dir" "common before core" "no tag balerix-v$sdk yet" "release core $sdk first, then common"
+  prepare_refused "$dir" common "common before core" "no tag balerix-v$sdk yet" "release core $sdk first, then common"
   release "$dir" core "$sdk"
   out=$(prepare "$dir" common)
   expect_eq "common after core: status" "$(field status "$out")" release
@@ -476,7 +574,7 @@ scenario_common_waits_for_core_changes() {
   release "$dir" core 0.4.0
   release "$dir" common 0.4.0
   change "$dir" crates/balerix-plugin-sdk/release-test.txt "feat(sdk): a new host call"
-  prepare_refused "$dir" "sdk changed since balerix-v0.4.0" "changed since balerix-v0.4.0; release core first"
+  prepare_refused "$dir" common "sdk changed since balerix-v0.4.0" "changed since balerix-v0.4.0; release core first"
   release "$dir" core 0.5.0
   out=$(prepare "$dir" common)
   expect_eq "after core 0.5.0: common status" "$(field status "$out")" release
@@ -540,6 +638,177 @@ scenario_plan_crates() {
   expect_eq "plan, merged common PR: core" "$(field core "$out")" false
 }
 
+# The charts name core's version and each plugin's; until every one is
+# tagged, nothing is proposed, and the refusal names the missing tag.
+scenario_charts_gate() {
+  local dir out app
+  dir=$(fixture charts-gate)
+  app=$(charts_field_of "$dir" appVersion)
+  prepare_refused "$dir" charts "charts before core" "balerix-v$app (appVersion)"
+  release "$dir" core "$app"
+  release "$dir" flow "$(chart_pin_of "$dir" flow)"
+  release "$dir" web "$(chart_pin_of "$dir" web)"
+  release "$dir" matrix "$(chart_pin_of "$dir" matrix)"
+  prepare_refused "$dir" charts "charts before github" \
+    "balerix-plugin-github-v$(chart_pin_of "$dir" github) (plugins.github.image.tag)"
+  release "$dir" github "$(chart_pin_of "$dir" github)"
+  out=$(prepare "$dir" charts)
+  expect_eq "charts after all: status" "$(field status "$out")" release
+  expect_eq "charts after all: initial version" "$(field version "$out")" "$(charts_field_of "$dir" version)"
+  expect_eq "charts after all: tag" "$(field tag "$out")" "balerix-charts-v$(charts_field_of "$dir" version)"
+  expect_grep "charts after all: changelog section" "## $(charts_field_of "$dir" version) - " "$dir/charts/CHANGELOG.md"
+}
+
+# At release time every pin is tagged or released by this same run, at the
+# version the run releases: the charts job waits for merge-images, so the
+# run's image tags exist by then (Spec O §24.5).
+scenario_charts_pins_at_release() {
+  local dir err pin
+  dir=$(fixture charts-pins)
+  err="$root/charts-pins.err"
+  release "$dir" core "$(charts_field_of "$dir" appVersion)"
+  release "$dir" flow "$(chart_pin_of "$dir" flow)"
+  release "$dir" web "$(chart_pin_of "$dir" web)"
+  release "$dir" matrix "$(chart_pin_of "$dir" matrix)"
+  pin=$(chart_pin_of "$dir" github)
+  expect_eq "pins: github's pin is its manifest version" "$pin" "$(manifest_version "$dir" github)"
+  if "$dir/scripts/release/check-pins.sh" charts 2>"$err"; then
+    fail "pins: github untagged and not in the run: passed"
+  else
+    pass "pins: github untagged and not in the run: fails"
+  fi
+  cat "$err" >>"$log"
+  expect_grep "pins: names the missing tag" "balerix-plugin-github-v$pin (plugins.github.image.tag)" "$err"
+  if "$dir/scripts/release/check-pins.sh" charts github 2>>"$log"; then
+    pass "pins: github untagged but in the run: ok"
+  else
+    fail "pins: github untagged but in the run: failed"
+  fi
+  set_chart_pin_of "$dir" github 9.9.9
+  if "$dir/scripts/release/check-pins.sh" charts github 2>"$err"; then
+    fail "pins: in the run at another version: passed"
+  else
+    pass "pins: in the run at another version: fails"
+  fi
+  cat "$err" >>"$log"
+  expect_grep "pins: names the pinned tag" "balerix-plugin-github-v9.9.9 (plugins.github.image.tag)" "$err"
+  discard "$dir"
+  release "$dir" github "$pin"
+  if "$dir/scripts/release/check-pins.sh" charts 2>>"$log"; then
+    pass "pins: all tagged: ok"
+  else
+    fail "pins: all tagged: failed"
+  fi
+}
+
+# A plugin release moves its pin and nothing else in the daemon values;
+# plugins.github is not credentials.github.
+scenario_plugin_moves_pin() {
+  local dir
+  dir=$(fixture plugin-pin)
+  release "$dir" github 0.1.0
+  change "$dir" plugins/github/src/release-test.rs "fix: a github fix"
+  prepare "$dir" github >/dev/null
+  expect_eq "github release: pin moved" "$(chart_pin_of "$dir" github)" 0.1.1
+  expect_eq "github release: only the pin line changed" \
+    "$(git -C "$dir" diff --numstat -- charts/balerix-daemon/values.yaml | cut -f1,2)" "$(printf '1\t1')"
+  expect_grep "github release: credentials.github untouched" '    secretName: ""' "$dir/charts/balerix-daemon/values.yaml"
+}
+
+# A core release moves both charts' appVersion.
+scenario_core_moves_app_version() {
+  local dir
+  dir=$(fixture core-app-version)
+  release "$dir" core 0.4.0
+  expect_eq "core 0.4.0: appVersion" "$(charts_field_of "$dir" appVersion)" 0.4.0
+  expect_grep "core 0.4.0: appVersion stays a quoted string" 'appVersion: "0.4.0"' "$dir/charts/balerix-daemon/Chart.yaml"
+}
+
+# A moved pin is a change even with no commit under charts/; its notes
+# list the image, not "Initial release".
+scenario_charts_pin_only() {
+  local dir out version
+  dir=$(fixture charts-pin-only)
+  release_charts_deps "$dir"
+  version=$(charts_field_of "$dir" version)
+  release "$dir" charts "$version"
+  out=$(prepare "$dir" charts)
+  expect_eq "charts, nothing moved: status" "$(field status "$out")" none
+  change "$dir" plugins/flow/src/release-test.rs "fix: a flow fix"
+  release "$dir" flow 0.1.2
+  out=$(prepare "$dir" charts)
+  expect_eq "charts, flow pin moved: status" "$(field status "$out")" release
+  expect_eq "charts, flow pin moved: patch" "$(field version "$out")" 0.1.1
+  expect_eq "charts, flow pin moved: both charts" "$(charts_field_of "$dir" version)" 0.1.1
+  expect_grep "charts, flow pin moved: Images section" '### Images' "$dir/$(field notes "$out")"
+  # shellcheck disable=SC2016 # literal backticks: markdown code
+  expect_grep "charts, flow pin moved: the image" '`balerix-plugin-flow` 0.1.1 → 0.1.2' "$dir/$(field notes "$out")"
+  if grep -q 'Initial release' "$dir/$(field notes "$out")"; then
+    fail "charts, flow pin moved: notes say Initial release"
+  else
+    pass "charts, flow pin moved: no Initial release line"
+  fi
+}
+
+# A core minor is a chart minor, whatever the chart's own commits ask.
+scenario_charts_core_minor() {
+  local dir out
+  dir=$(fixture charts-core-minor)
+  release_charts_deps "$dir"
+  release "$dir" charts "$(charts_field_of "$dir" version)"
+  change "$dir" charts/balerix-daemon/release-test.txt "fix(charts): a chart fix"
+  change "$dir" crates/balerix-server/release-test.txt "feat!: a breaking daemon change"
+  release "$dir" core 0.3.0
+  out=$(prepare "$dir" charts)
+  expect_eq "charts after core 0.3.0: minor" "$(field version "$out")" 0.2.0
+  expect_grep "charts after core 0.3.0: the fix listed" 'A chart fix' "$dir/$(field notes "$out")"
+  # shellcheck disable=SC2016 # literal backticks: markdown code
+  expect_grep "charts after core 0.3.0: the image listed" '`balerix` 0.2.0 → 0.3.0' "$dir/$(field notes "$out")"
+}
+
+# Staged as published: upstream's charts are the tree's, byte for byte.
+scenario_stage_charts() {
+  local dir="$root/stage-upstream" chart
+  GITHUB_REPOSITORY_OWNER=balerix-ai "$repo/scripts/release/stage-charts.sh" "$dir" >/dev/null 2>>"$log"
+  for chart in balerix-operator balerix-daemon; do
+    if diff -r "$repo/charts/$chart" "$dir/$chart" >>"$log" 2>&1; then
+      pass "stage, upstream: $chart is the tree's"
+    else
+      fail "stage, upstream: $chart differs from the tree"
+    fi
+  done
+}
+
+# A fork's charts install the fork's images, lowercased (Spec O §24.5).
+scenario_stage_charts_fork() {
+  local dir="$root/stage-fork" app
+  app=$(charts_field_of "$repo" appVersion)
+  GITHUB_REPOSITORY_OWNER=Example "$repo/scripts/release/stage-charts.sh" "$dir" >/dev/null 2>>"$log"
+  expect_grep "stage, fork: operator repository" 'repository: ghcr.io/example/balerix-operator' "$dir/balerix-operator/values.yaml"
+  expect_grep "stage, fork: daemon image" "daemon: \"ghcr.io/example/balerix:$app\"" "$dir/balerix-operator/values.yaml"
+  expect_grep "stage, fork: agent image" "agent: \"ghcr.io/example/balerix-agent:$app\"" "$dir/balerix-operator/values.yaml"
+  expect_grep "stage, fork: a plugin repository" 'repository: ghcr.io/example/balerix-plugin-github' "$dir/balerix-daemon/values.yaml"
+  if grep -rq 'ghcr.io/balerix-ai/' "$dir"/*/values.yaml; then
+    fail "stage, fork: a balerix-ai image is left"
+  else
+    pass "stage, fork: no balerix-ai image left"
+  fi
+}
+
+scenario_plan_charts() {
+  local dir out
+  dir=$(fixture plan-charts)
+  release_charts_deps "$dir"
+  prepare "$dir" charts >/dev/null
+  gitc "$dir" add -A
+  gitc "$dir" commit -qm "chore(release): charts initial"
+  out=$(plan "$dir")
+  expect_eq "plan, merged charts PR: units" "$(field units "$out")" '["charts"]'
+  expect_eq "plan, merged charts PR: charts" "$(field charts "$out")" true
+  expect_eq "plan, merged charts PR: binaries" "$(field binaries "$out")" '[]'
+  expect_eq "plan, merged charts PR: images" "$(field images "$out")" '[]'
+}
+
 scenario_initial
 scenario_bumps_0x
 scenario_bumps_1x
@@ -547,8 +816,10 @@ scenario_skipped_types
 scenario_sdk_change
 scenario_plugin_only
 scenario_core_bump
+scenario_core_projects
 scenario_in_progress
 scenario_plan
+scenario_plan_core_images
 scenario_forced_released
 scenario_forced_in_progress
 scenario_forced_below_last
@@ -563,6 +834,15 @@ scenario_common_waits_for_core_changes
 scenario_core_bump_moves_common
 scenario_common_change_releases_dependents
 scenario_plan_crates
+scenario_charts_gate
+scenario_charts_pins_at_release
+scenario_plugin_moves_pin
+scenario_core_moves_app_version
+scenario_charts_pin_only
+scenario_charts_core_minor
+scenario_plan_charts
+scenario_stage_charts
+scenario_stage_charts_fork
 
 if ((failures)); then
   echo "$failures check(s) failed; fixtures and $log kept" >&2

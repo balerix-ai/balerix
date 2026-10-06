@@ -10,7 +10,8 @@
 # Prints key=value lines on stdout; progress goes to stderr.
 #   status=release       files changed; version=, tag= and notes= follow
 #   status=none          no releasable commit since the last tag, or a
-#                        library whose core release has not happened yet
+#                        library or charts unit whose dependencies have not
+#                        been released yet
 #                        (the reason is on stderr)
 #   status=in-progress   the manifest version is already awaiting its tag
 #
@@ -33,6 +34,8 @@ current=$(unit_version "$unit")
 last=$(last_tag "$unit")
 notes_dir=${RELEASE_NOTES_DIR:-target/release-notes}
 notes="$notes_dir/$unit.md"
+count=-1
+pins=
 
 emit() { printf '%s=%s\n' "$@"; }
 
@@ -58,6 +61,57 @@ library_blocked() {
   fi
 }
 
+# The charts name core's version (appVersion) and each plugin's (its image
+# tag): until every one is tagged, a release would install images that do
+# not exist (Spec O §24.5). A status, not a failure, as for a library.
+charts_blocked() {
+  local app plugin pin missing=()
+  app=$(charts_field appVersion)
+  tag_exists "$(unit_tag core "$app")" || missing+=("$(unit_tag core "$app") (appVersion)")
+  for plugin in "${PLUGIN_UNITS[@]}"; do
+    pin=$(chart_pin "$plugin")
+    [[ -n $pin ]] || die "charts: $DAEMON_VALUES has no plugins.$plugin.image.tag"
+    tag_exists "$(unit_tag "$plugin" "$pin")" ||
+      missing+=("$(unit_tag "$plugin" "$pin") (plugins.$plugin.image.tag)")
+  done
+  ((${#missing[@]})) || return 1
+  echo "charts: they name versions with no release tag yet: ${missing[*]}; release those first, then charts" >&2
+}
+
+# The pins that moved since <tag>, one `<image> <old> <new>` line each: a
+# core or plugin release moves them in a chore(release) commit, which
+# git-cliff does not count, so they count here (Spec O §24.5).
+charts_pin_changes() {
+  local tag=$1 plugin old new
+  old=$(git show "$tag:charts/balerix-operator/Chart.yaml" | yaml_field - appVersion)
+  new=$(charts_field appVersion)
+  [[ $old == "$new" ]] || echo "balerix $old $new"
+  for plugin in "${PLUGIN_UNITS[@]}"; do
+    old=$(chart_pin "$plugin" <(git show "$tag:$DAEMON_VALUES"))
+    new=$(chart_pin "$plugin")
+    [[ $old == "$new" ]] || echo "$(unit_crate "$plugin") $old $new"
+  done
+}
+
+# The charts' next version: the largest of the bump their own commits ask
+# and each moved pin's. A core minor is a chart minor.
+charts_next() {
+  local lastversion=$1 count=$2 pins=$3 level='' candidate image old new
+  if ((count)); then
+    candidate=$(cliff charts --bumped-version)
+    level=$(bump_level "$lastversion" "${candidate#"$prefix"}")
+  fi
+  while read -r image old new; do
+    [[ -n $image ]] || continue
+    candidate=$(bump_level "$old" "$new")
+    if (($(level_rank "$candidate") > $(level_rank "$level"))); then level=$candidate; fi
+  done <<<"$pins"
+  bump_version "$lastversion" "$level"
+}
+
+# `last` is always an existing tag or empty.
+if [[ $unit == charts && -n $last ]]; then pins=$(charts_pin_changes "$last"); fi
+
 if ! tag_exists "$(unit_tag "$unit" "$current")" && has_section "$unit" "$current"; then
   # A release PR was merged and release.yml has not tagged it yet, or failed
   # (Spec I §8.2): prepare.sh always writes the section, so this also covers
@@ -67,6 +121,9 @@ if ! tag_exists "$(unit_tag "$unit" "$current")" && has_section "$unit" "$curren
   emit status in-progress version "$current"
   exit 0
 elif [[ $(unit_kind "$unit") == library ]] && library_blocked; then
+  emit status none
+  exit 0
+elif [[ $unit == charts ]] && charts_blocked; then
   emit status none
   exit 0
 elif [[ -n $forced ]]; then
@@ -93,23 +150,27 @@ elif ! tag_exists "$(unit_tag "$unit" "$current")"; then
     "version set to it."
 else
   count=$(cliff "$unit" --unreleased --context | jq '[.[].commits[]] | length')
-  if [[ $count -eq 0 ]]; then
+  if [[ $count -eq 0 && -z $pins ]]; then
     echo "$unit: nothing to release since $last" >&2
     emit status none
     exit 0
   fi
-  next=$(cliff "$unit" --bumped-version)
-  next=${next#"$prefix"}
+  if [[ $unit == charts ]]; then
+    next=$(charts_next "${last#"$prefix"}" "$count" "$pins")
+  else
+    next=$(cliff "$unit" --bumped-version)
+    next=${next#"$prefix"}
+  fi
 fi
 
 tag=$(unit_tag "$unit" "$next")
 
 if [[ $next != "$current" ]]; then
-  if [[ $unit == core ]]; then
-    cargo set-version --workspace "$next" >&2
-  else
-    cargo set-version --manifest-path "plugins/$unit/Cargo.toml" "$next" >&2
-  fi
+  case $(unit_kind "$unit") in
+    core) cargo set-version --workspace "$next" >&2 ;;
+    charts) set_charts_field version "$next" ;;
+    *) cargo set-version --manifest-path "plugins/$unit/Cargo.toml" "$next" >&2 ;;
+  esac
 fi
 if [[ $unit == core ]]; then
   # A library names the two core crates by version for crates.io; the
@@ -142,6 +203,8 @@ if [[ $unit == core ]]; then
     mapfile -t locals < <(project_path_crates "$project")
     cargo update --manifest-path "$project/Cargo.toml" "${locals[@]/#/--package=}" >&2
   done
+  # The charts run this core version (Spec O §24.5).
+  set_charts_field appVersion "$next"
 fi
 if [[ $(unit_kind "$unit") == library ]]; then
   # Plugins built on the library lock it through their path dependency, and
@@ -155,10 +218,26 @@ if [[ $(unit_kind "$unit") == library ]]; then
 fi
 if [[ $(unit_kind "$unit") == plugin ]]; then
   sed -i "s/^version: .*/version: $next/" "plugins/$unit/package/balerix-plugin.yaml"
+  # The daemon chart installs this plugin version (Spec O §24.5).
+  set_chart_pin "$unit" "$next"
 fi
 
 mkdir -p "$notes_dir"
 cliff "$unit" --unreleased --tag "$tag" --strip header >"$notes"
+if [[ $unit == charts ]]; then
+  # A pin-only release has no commit; the template's "Initial release." is
+  # wrong for it: the moved images are the change.
+  [[ $count -ne 0 ]] || sed -i '/^- Initial release\.$/d' "$notes"
+  if [[ -n $pins ]]; then
+    {
+      printf '\n### Images\n\n'
+      while read -r image old new; do
+        # shellcheck disable=SC2016 # literal backticks: markdown code
+        printf -- '- `%s` %s → %s\n' "$image" "$old" "$new"
+      done <<<"$pins"
+    } >>"$notes"
+  fi
+fi
 {
   printf '# Changelog\n\n%s\n' "$(<"$notes")"
   if [[ -f $changelog ]]; then

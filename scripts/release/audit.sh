@@ -11,6 +11,7 @@ source scripts/release/lib.sh
 (($#)) || die "usage: $0 <unit>..."
 for unit in "$@"; do
   require_unit "$unit"
+  if [[ $unit == charts ]]; then echo "charts: no Rust dependencies to audit" >&2; continue; fi
   echo "== $unit" >&2
   if [[ $unit == core ]]; then
     cargo audit

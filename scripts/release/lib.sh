@@ -1,11 +1,11 @@
 # shellcheck shell=bash
 # The release units (Spec I §3): the one place that knows each unit's crate,
-# manifest, tag, changelog, image and include paths. Sourced by every script
+# manifest, tag, changelog, image and include paths (`charts` is a unit with no crate). Sourced by every script
 # under scripts/release/, never run on its own. Callers `cd` to the
 # repository root first.
 
 # shellcheck disable=SC2034 # read by the scripts that source this file
-UNITS=(core common flow web matrix github)
+UNITS=(core common flow web matrix github charts)
 # shellcheck disable=SC2034
 PLUGIN_UNITS=(flow web matrix github)
 # Units that ship crates and no binary (Spec K §5).
@@ -35,24 +35,30 @@ die() {
 
 require_unit() {
   case ${1:-} in
-    core | common | flow | web | matrix | github) ;;
+    core | common | flow | web | matrix | github | charts) ;;
     *) die "unknown release unit: '${1:-}' (expected one of: ${UNITS[*]})" ;;
   esac
 }
 
-# core, library or plugin.
+# core, library, plugin or charts.
 unit_kind() {
   require_unit "$1"
   case $1 in
     core) echo core ;;
     common) echo library ;;
+    charts) echo charts ;;
     *) echo plugin ;;
   esac
 }
 
 unit_crate() {
   require_unit "$1"
-  if [[ $1 == core ]]; then echo balerix; else echo "balerix-plugin-$1"; fi
+  case $1 in
+    core) echo balerix ;;
+    # no crate: the release's name, for its tag and its title
+    charts) echo balerix-charts ;;
+    *) echo "balerix-plugin-$1" ;;
+  esac
 }
 
 unit_tag_prefix() {
@@ -67,12 +73,20 @@ unit_tag() {
 
 unit_manifest() {
   require_unit "$1"
-  if [[ $1 == core ]]; then echo Cargo.toml; else echo "plugins/$1/Cargo.toml"; fi
+  case $1 in
+    core) echo Cargo.toml ;;
+    charts) echo charts/balerix-operator/Chart.yaml ;;
+    *) echo "plugins/$1/Cargo.toml" ;;
+  esac
 }
 
 unit_changelog() {
   require_unit "$1"
-  if [[ $1 == core ]]; then echo CHANGELOG.md; else echo "plugins/$1/CHANGELOG.md"; fi
+  case $1 in
+    core) echo CHANGELOG.md ;;
+    charts) echo charts/CHANGELOG.md ;;
+    *) echo "plugins/$1/CHANGELOG.md" ;;
+  esac
 }
 
 # The images a unit ships, by repository name, in build order (Spec O
@@ -129,6 +143,8 @@ unit_paths() {
   if [[ $1 == core ]]; then
     printf '%s\n' 'crates/**' Cargo.toml Cargo.lock mise.toml \
       'operator/**' 'agent/**' 'docker/operator/**' 'docker/agent/**'
+  elif [[ $1 == charts ]]; then
+    printf '%s\n' 'charts/**'
   else
     printf '%s\n' "plugins/$1/**" 'crates/balerix-api/**' 'crates/balerix-plugin-sdk/**'
     if [[ $(unit_kind "$1") == plugin ]] && grep -q '^balerix-plugin-common ' "plugins/$1/Cargo.toml"; then
@@ -152,7 +168,9 @@ unit_package() {
     jq --arg c "$crate" '.packages[] | select(.name == $c)'
 }
 
-unit_version() { unit_package "$1" | jq -r .version; }
+unit_version() {
+  if [[ $1 == charts ]]; then charts_field version; else unit_package "$1" | jq -r .version; fi
+}
 
 # A core project's version (balerix-<project> in <project>/Cargo.toml).
 project_version() {
@@ -203,4 +221,95 @@ cliff() {
   local args=(--config cliff.toml --tag-pattern "^$(unit_tag_prefix "$unit")")
   while IFS= read -r path; do args+=(--include-path "$path"); done < <(unit_paths "$unit")
   git-cliff "${args[@]}" "$@"
+}
+
+# The two charts (Spec O §14.1): one version and one appVersion between them.
+CHARTS=(balerix-operator balerix-daemon)
+DAEMON_VALUES=charts/balerix-daemon/values.yaml
+
+# A top-level `<field>: <value>` of a YAML file (`-` is stdin), quotes dropped.
+yaml_field() {
+  sed -n "s/^$2: \"\{0,1\}\([^\"]*\)\"\{0,1\}\$/\1/p" "$1"
+}
+
+chart_field() { yaml_field "charts/$1/Chart.yaml" "$2"; }
+
+# <field> of both charts; dies when they differ (they move together).
+charts_field() {
+  local field=$1 chart value first=
+  for chart in "${CHARTS[@]}"; do
+    value=$(chart_field "$chart" "$field")
+    [[ -n $value ]] || die "charts/$chart/Chart.yaml has no $field"
+    [[ -z $first || $value == "$first" ]] ||
+      die "charts: $field is $first in ${CHARTS[0]} but $value in $chart; they move together"
+    first=$value
+  done
+  echo "$first"
+}
+
+# Writes <field> into both Chart.yaml files; appVersion stays a quoted string.
+set_charts_field() {
+  local field=$1 value=$2 chart
+  [[ $field != appVersion ]] || value="\"$value\""
+  for chart in "${CHARTS[@]}"; do
+    sed -i "s/^$field: .*/$field: $value/" "charts/$chart/Chart.yaml"
+  done
+}
+
+# plugins.<plugin>.image.tag in the daemon chart's values: the plugin version
+# the chart installs (Spec O §24.5). Only the key under `plugins:` counts:
+# `credentials:` has a `github:` key at the same depth.
+chart_pin() {
+  awk -v want="  $1:" '
+    /^[^ #]/ { top = $1; inside = 0 }
+    top == "plugins:" && /^  [^ #]/ { inside = ($0 == want) }
+    inside && /^      tag: / { sub(/^      tag: "?/, ""); sub(/"$/, ""); print; exit }
+  ' "${2:-$DAEMON_VALUES}"
+}
+
+set_chart_pin() {
+  local tmp="$DAEMON_VALUES.new"
+  awk -v want="  $1:" -v v="$2" '
+    /^[^ #]/ { top = $1; inside = 0 }
+    top == "plugins:" && /^  [^ #]/ { inside = ($0 == want) }
+    inside && /^      tag: / { $0 = "      tag: \"" v "\""; inside = 0 }
+    { print }
+  ' "$DAEMON_VALUES" >"$tmp"
+  mv "$tmp" "$DAEMON_VALUES"
+  [[ $(chart_pin "$1") == "$2" ]] || die "charts: could not set plugins.$1.image.tag in $DAEMON_VALUES"
+}
+
+# major, minor or patch: the largest component that differs between two
+# versions; nothing when they are equal.
+bump_level() {
+  local -a a b
+  IFS=. read -ra a <<<"$1"
+  IFS=. read -ra b <<<"$2"
+  if [[ ${a[0]:-} != "${b[0]:-}" ]]; then
+    echo major
+  elif [[ ${a[1]:-} != "${b[1]:-}" ]]; then
+    echo minor
+  elif [[ ${a[2]:-} != "${b[2]:-}" ]]; then
+    echo patch
+  fi
+}
+
+bump_version() {
+  local -a v
+  IFS=. read -ra v <<<"$1"
+  case $2 in
+    major) echo "$((v[0] + 1)).0.0" ;;
+    minor) echo "${v[0]}.$((v[1] + 1)).0" ;;
+    patch) echo "${v[0]}.${v[1]}.$((v[2] + 1))" ;;
+    *) die "not a bump level: '$2'" ;;
+  esac
+}
+
+level_rank() {
+  case ${1:-} in
+    major) echo 3 ;;
+    minor) echo 2 ;;
+    patch) echo 1 ;;
+    *) echo 0 ;;
+  esac
 }

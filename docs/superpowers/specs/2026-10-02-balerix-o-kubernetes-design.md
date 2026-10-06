@@ -2580,9 +2580,18 @@ The operator runs as one replica with no leader election and no metrics
   binaries. `build.sh` checks each one's linkage and `--version`.
   `kind-up` builds its images through `build.sh core`, so `e2e-k8s` runs
   the static release binaries.
-- **The charts job packages first** and then checks the archives it
-  packaged: `mise run charts`, then an install on `kind-up cluster`. What
-  passes the check is what gets published.
+- **The charts job packages first** and uploads the archives before any
+  cargo-built code runs. `mise run charts` then lints, renders and
+  validates the tree's `charts/`, and the packaged archives are what gets
+  installed on `kind-up cluster`. Upstream's staged charts equal the
+  tree's byte for byte; a fork's differ only in their image repositories.
+  What passes the check is what gets published.
+- **Pins at release time.** A run can release core or a plugin together
+  with the charts (release PRs merged together or queued behind one
+  another), moving a pin after the gate passed. The charts job waits for
+  `merge-images`, and first checks (`check-pins.sh`) that every pin is
+  tagged or is the version a unit in the same run releases; otherwise it
+  fails, naming the pin.
 - **Pins in the changelog.** A charts release lists moved pins under
   `### Images`. A pin-only release carries no "Initial release." line.
 - **OCI re-runs.** Pushing an archive that is already there is a no-op

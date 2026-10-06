@@ -150,7 +150,7 @@ phases; the rest exist in code today.
 - **Pull request ↔ CI** — a pull request's code runs in `ci.yml`, `images.yml`, `release-scripts.yml` and `pr-title.yml` with a read-only token and no secrets. **Untrusted input.**
 - **`main` ↔ release workflows** — `release-pr.yml` and `release.yml` run only on push to `main` or dispatch, and hold the App token, OIDC and write permissions.
 - **Build job ↔ publishing jobs** — build and image jobs hand artifacts to jobs that sign, publish and tag.
-- **CI ↔ registries** — crates.io through trusted publishing (OIDC, 30-minute token), ghcr through `GITHUB_TOKEN`, GitHub Releases through `GITHUB_TOKEN`.
+- **CI ↔ registries** — crates.io through trusted publishing (OIDC, 30-minute token), ghcr (the images and the OCI charts under `charts/`) through `GITHUB_TOKEN`, GitHub Releases through `GITHUB_TOKEN`, and the `helm-charts` index (a push to its `main`, served by Pages) through the release App's token scoped to that repository.
 
 ### Adversaries
 - **A malicious pull request** — wants secrets, a poisoned cache or artifact that a release later picks up, or a workflow run with write permissions.

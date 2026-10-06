@@ -99,6 +99,9 @@ else
   daemon_chart=balerix-verify/balerix-daemon
   [[ -z ${BALERIX_VERIFY_VERSION:-} ]] || version_args=(--version "$BALERIX_VERIFY_VERSION")
 fi
+
+k create namespace "$NS" --dry-run=client -o yaml | k apply -f - >/dev/null
+
 helm upgrade --install balerix-operator "$op_chart" "${version_args[@]}" \
   --namespace "$SYSTEM" --create-namespace --set "watchNamespaces={$NS}" --wait --timeout 5m ||
   { say "the operator chart did not install"; exit 1; }
@@ -110,7 +113,6 @@ agent_image=$(jq -r '.spec.template.spec.containers[0].args as $a | ($a | index(
 agent_image=${agent_image:-ghcr.io/balerix-ai/balerix-agent:$app}
 say "  agent image: $agent_image"
 
-k create namespace "$NS" --dry-run=client -o yaml | k apply -f - >/dev/null
 kn create secret generic claude-credentials --from-file=credentials.json="$CREDS" \
   --dry-run=client -o yaml | kn apply -f - >/dev/null
 
@@ -253,13 +255,7 @@ fi
 
 hr "F. drop bob: harvested into the crew cache"
 : >"$ROOT/harvest"
-(
-  for _ in $(seq 400); do
-    m=$(kn get pods -l job-name=payments-backend-bob-harvest -o jsonpath='{.items[*].status.containerStatuses[*].state.terminated.message}' 2>/dev/null)
-    if [[ -n $m ]]; then printf '%s\n' "$m" >"$ROOT/harvest"; exit 0; fi
-    sleep 2
-  done
-) &
+timeout 900 kn get pods -l job-name=payments-backend-bob-harvest -w -o jsonpath='{.status.containerStatuses[*].state.terminated.message}{"\n"}' 2>/dev/null | grep -m1 . >"$ROOT/harvest" &
 watcher=$!
 kn patch fleets.balerix.ai payments --type merge -p '{"spec":{"crews":{"backend":{"agents":{"bob":null}}}}}' >/dev/null
 if wait_until 900 sh -c "! kubectl -n $NS get agents.balerix.ai payments-backend-bob"; then ok "bob's Agent gone"; else bad "bob's Agent still there"; fi

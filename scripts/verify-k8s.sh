@@ -255,7 +255,7 @@ fi
 
 hr "F. drop bob: harvested into the crew cache"
 : >"$ROOT/harvest"
-timeout 900 kn get pods -l job-name=payments-backend-bob-harvest -w -o jsonpath='{.status.containerStatuses[*].state.terminated.message}{"\n"}' 2>/dev/null | grep -m1 . >"$ROOT/harvest" &
+timeout 900 kubectl -n "$NS" get pods -l job-name=payments-backend-bob-harvest -w -o jsonpath='{.status.containerStatuses[*].state.terminated.message}{"\n"}' 2>/dev/null | grep -m1 . >"$ROOT/harvest" &
 watcher=$!
 kn patch fleets.balerix.ai payments --type merge -p '{"spec":{"crews":{"backend":{"agents":{"bob":null}}}}}' >/dev/null
 if wait_until 900 sh -c "! kubectl -n $NS get agents.balerix.ai payments-backend-bob"; then ok "bob's Agent gone"; else bad "bob's Agent still there"; fi

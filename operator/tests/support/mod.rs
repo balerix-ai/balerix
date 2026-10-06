@@ -372,3 +372,47 @@ pub async fn reap_job(client: &Client, namespace: &str, name: &str, uid: &str, t
     })
     .await;
 }
+
+/// The system clock, in Unix seconds.
+pub fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// The kubelet's part for the Daemon `default`: once its StatefulSet and
+/// pool Job exist, the pool synced, the shared claim bound, the pod ready.
+pub async fn make_daemon_ready(client: &Client, ns: &str) {
+    use k8s_openapi::api::apps::v1::StatefulSet;
+    use k8s_openapi::api::batch::v1::Job;
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+    use kube::api::{Patch, PatchParams};
+    let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), ns);
+    wait_for("the StatefulSet", Duration::from_secs(60), || async {
+        statefulsets.get_opt("balerix-default").await.unwrap()
+    })
+    .await;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
+    wait_for("the pool Job", Duration::from_secs(60), || async {
+        jobs.get_opt("balerix-default-pool").await.unwrap()
+    })
+    .await;
+    finish_job(client, ns, "balerix-default-pool", true, Some("synced")).await;
+    Api::<PersistentVolumeClaim>::namespaced(client.clone(), ns)
+        .patch_status(
+            "balerix-default-shared",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "status": { "phase": "Bound" } })),
+        )
+        .await
+        .unwrap();
+    statefulsets
+        .patch_status(
+            "balerix-default",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "status": { "replicas": 1, "readyReplicas": 1 } })),
+        )
+        .await
+        .unwrap();
+}

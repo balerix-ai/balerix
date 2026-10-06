@@ -278,6 +278,34 @@ pub async fn serve<P: Plugin>(host: &Host, version: &str, plugin: P) -> Result<(
     serve_on(host, version, plugin, listener, listen).await
 }
 
+/// Spec O §23.8: the first wait after a 409 hello, doubled per refusal.
+const HELLO_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+const HELLO_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `hello`, again after every 409: a pod that started before the Daemon
+/// holds its revision waits for the list rather than exit and crash-loop.
+async fn hello_until_listed(
+    host: &Host,
+    version: &str,
+    listen: &str,
+    manifest: Option<&PluginManifest>,
+) -> Result<balerix_api::HelloResponse, SdkError> {
+    let mut wait = HELLO_RETRY_FIRST;
+    loop {
+        match host.hello(version, listen, manifest).await {
+            Err(SdkError::Status {
+                status: 409,
+                message,
+            }) => {
+                tracing::info!("hello: {message}; again in {wait:?}");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(HELLO_RETRY_MAX);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// `serve`'s body, taking an already-bound listener so tests can observe
 /// its address. If `hello` fails, the spawned server is aborted (and
 /// awaited, so the port is free again) before the error is returned — a
@@ -306,8 +334,13 @@ async fn serve_on<P: Plugin>(
         server.abort();
         let _ = server.await;
     };
-    let reply = match host.hello(version, &listen, manifest.as_ref()).await {
-        Ok(reply) => reply,
+    let reply = match hello_until_listed(host, version, &listen, manifest.as_ref()).await {
+        Ok(reply) => {
+            // the Daemon accepts only a hello whose revision it holds
+            // (Spec O §23.8): the e2e reads this line in a rolled pod's log
+            tracing::info!("hello accepted");
+            reply
+        }
         Err(e) => {
             stop(server).await;
             return Err(e);
@@ -684,6 +717,67 @@ mod tests {
         let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(seen.len(), 1, "configure called once");
         assert_eq!(seen[0]["homeserver"], "https://h");
+    }
+
+    /// Spec O §23.8: a pod that says hello before the list naming its
+    /// revision arrives is answered 409; it waits, keeps its server bound,
+    /// and is configured once a hello is accepted.
+    #[tokio::test]
+    async fn a_409_hello_is_retried_until_accepted() {
+        struct Recording(Arc<std::sync::Mutex<Option<Value>>>);
+        impl Plugin for Recording {
+            async fn configure(&self, config: Value) -> Result<(), String> {
+                *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(config);
+                Ok(())
+            }
+        }
+
+        let fake = crate::testing::FakeHost::start("tok", json!({ "k": 1 }), vec![]).await;
+        fake.refuse_hellos(
+            2,
+            409,
+            "hello.revision: this daemon holds r1, the plugin is r2; the list has not arrived yet",
+        );
+        let host = Host::new(fake.env("rec", std::path::Path::new("/s"))).unwrap();
+        let (listener, listen) = bind().await.unwrap();
+        let configured = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let plugin = Recording(configured.clone());
+        let started = std::time::Instant::now();
+        let serving =
+            tokio::spawn(async move { serve_on(&host, "0.1.0", plugin, listener, listen).await });
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(c) = configured.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                    return c;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("configured after the retries");
+        assert_eq!(got, json!({ "k": 1 }));
+        assert_eq!(fake.hellos().len(), 3, "two refused, one accepted");
+        // 1 s, then 2 s
+        assert!(started.elapsed() >= std::time::Duration::from_secs(3));
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn any_other_refused_hello_still_ends_serve() {
+        let fake = crate::testing::FakeHost::start("tok", json!({}), vec![]).await;
+        fake.refuse_hellos(1, 400, "hello.revision: required in kubernetes mode");
+        let host = Host::new(fake.env("rec", std::path::Path::new("/s"))).unwrap();
+        let (listener, listen) = bind().await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            serve_on(&host, "0.1.0", Silent, listener, listen),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&result, Err(SdkError::Status { status: 400, .. })),
+            "{result:?}"
+        );
     }
 
     /// A plugin that implements nothing accepts any config.

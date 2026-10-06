@@ -14,13 +14,15 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 envtest = { max-threads = 4 }
 
 [[profile.default.overrides]]
-filter = 'binary(controllers_it)'
+filter = 'binary(controllers_it) | binary(plugins_it)'
 test-group = 'envtest'
 
-# The kind journey (tests/e2e_k8s.rs, `scripts/operator.sh e2e`): one test
-# that waits up to 900 s for a step (an image pull, a Job, a pod's restart)
-# and runs the whole of Phase 3, so the default profile's 180 s would kill
-# an honest run. 45 periods of 60 s is 45 minutes, inside the CI job's
-# budget; a hung journey still fails instead of waiting for the job's limit.
+# The kind journeys (tests/e2e_k8s.rs, `scripts/operator.sh e2e`): each
+# waits up to 900 s for a step (an image pull, a Job, a pod's restart), so
+# the default profile's 180 s would kill an honest run. 45 periods of 60 s
+# is 45 minutes per journey, inside the CI job's budget; a hung journey
+# still fails instead of waiting for the job's limit.
 [profile.e2e-k8s]
+# two journeys on one three-node kind cluster: one at a time
+test-threads = 1
 slow-timeout = { period = "60s", terminate-after = 45 }

@@ -149,6 +149,7 @@ async fn start_plugin<P: Plugin + 'static>(w: &World, name: &str, plugin: Arc<P>
         ca: None,
         tls: None,
         listen: "127.0.0.1:0".into(),
+        revision: None,
     };
     let (listener, listen) = bind().await.unwrap();
     let tok = env.token.clone();

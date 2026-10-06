@@ -907,7 +907,8 @@ Each gets its own plan.
    §21). 3a done 2026-10; 3b done 2026-10 (PR #127).
 4. **Plugins.** §9. Done when `e2e-k8s` passes with flow and web, and the
    managed journey passes with `dev fake-plugin`. Built as two plans, 4a
-   without a cluster and 4b on one (§23).
+   without a cluster and 4b on one (§23). 4a done 2026-10 (PR #143); 4b
+   done 2026-10 (PR #144).
 5. **Release and charts.** §13, §14. Done when a fork rehearsal publishes
    images and both charts and `helm install` from the published index
    brings up a Ready fleet.
@@ -2102,8 +2103,15 @@ This refines §9.4.
   agent's Stop; web's review page is fetched through the Daemon's
   `/v1/plugins/web/…` over the port-forward; `dev fake-plugin` with
   `manage` brings up a managed Fleet whose agents become Ready; removing
-  it from `spec.plugins` deletes the Fleet. The operator runs out of
-  cluster as in §21.4, so the missing Events RBAC does not bite here.
+  it from `spec.plugins` deletes the Fleet; changing web's Plugin config
+  mid-journey brings both pods back to `Ready` with no restart by hand
+  (§23.8). The operator runs out of cluster as in §21.4, so the missing
+  Events RBAC does not bite here.
+- **4b, §23.8:** `Declared` unit tests (a revision mismatch is 409 and
+  leaves the entry as it was; a missing revision is refused; a matching
+  one is accepted); an SDK test where a fake host answers 409 twice, then
+  accepts, and `configure` runs; an envtest check that the pod's
+  `BALERIX_PLUGIN_REVISION` equals the list entry's `revision`.
 
 ### 23.7 Decided by the plan
 
@@ -2187,3 +2195,144 @@ Rulings made while building it:
   `hello.manifest.<field>: <reason>` (`hello.manifest.hooks.intercept:
   unknown event "Foo"`), the config-path form of the name and needs
   refusals. A restored `hello.json` is held to the same rules.
+
+### 23.8 A hello belongs to one revision (4b, 2026-10-06)
+
+4a's final review found a race. A changed Plugin rolls its Deployment and
+the Daemon controller sends the new list, in separate steps. A new pod
+whose `hello` reaches the Daemon before the list does is accepted under
+the old entry; the new list then puts the entry back to `Waiting`, and
+the pod never says hello again. The plugin stays `Starting`. Rather than
+order the two controllers, a `hello` names the entry it was built for.
+
+- **The revision is the pod template's hash.** The Plugin controller's
+  hash annotation (§23.4: spec, grant, resolved config, referenced
+  Secrets' data, token, serving certificate) is the plugin's revision. It
+  reaches the pod as `BALERIX_PLUGIN_REVISION` and the list as
+  `DeclaredPlugin.revision`, a required field. A new revision is a new
+  pod, and that pod is the one that must say hello.
+- **Wire.** `HelloRequest` gains an optional `revision`. The SDK reads it
+  in `Env` and sends it only with an authority (`BALERIX_CA_FILE`), as
+  the manifest (§23.7), so a 0.2.0 Daemon never sees it. A one-machine
+  Daemon accepts and ignores it.
+- **The Daemon** checks the revision after the protocol and before the
+  manifest, in `Declared::hello`:
+  - none: refused and kept on the row, as a missing manifest is —
+    `hello.revision: required in kubernetes mode`;
+  - another revision: 409 `hello.revision: this daemon holds <a>, the
+    plugin is <b>; the list has not arrived yet`, and the entry is left
+    as it was. An old pod still serving during the roll stays in the
+    chain, and no `hello.json` is removed;
+  - the same revision: the checks of §23.2 and §23.7, unchanged.
+  The revision is part of the entry's hash, so a new one already sends
+  the entry to `Waiting` and keeps a stale `hello.json` from being
+  restored.
+- **The SDK retries a 409 `hello`** with back-off from 1 s, doubling to
+  30 s, without limit, the server bound meanwhile. Any other failure
+  still ends `serve`. While it waits the row is `Starting` and the Daemon
+  `PluginsReady=False/PluginNotReady`, so a roll that never completes is
+  visible.
+- `PluginStatus` is unchanged.
+
+### 23.9 Decided by the 4b plan
+
+What 4b's plan decided beyond §23.4–§23.6 and §23.8, and the rulings made
+while building it, as built.
+
+- **A plugin's objects are named for it:** `balerix-plugin-<p>` is the
+  Deployment, `balerix-plugin-<p>-token` the token Secret,
+  `balerix-plugin-<p>-tls` the serving Secret and
+  `balerix-plugin-<p>-scratch` the optional claim. The Service is `<p>`,
+  so the Daemon's list entry reaches it as `https://<p>.<namespace>.svc:…`.
+- **`DaemonError::ListPending(String)`** is the Daemon's refusal of a
+  `hello` built for another revision (§23.8), answered 409.
+- **`PluginsReady` is `Unknown/Pending` ("judged once the daemon
+  answers") until the Daemon answers.** `daemon_status` (pure) reports
+  it so and does not hold `Ready` on it; once the Daemon answers, the
+  controller judges `PluginsReady` from its rows and `Ready` follows it
+  (a `PluginsReady` other than `True` makes `Ready=False` with its reason
+  and message).
+- **The Daemon requeues at the Fleet period while it lists plugins,**
+  not the slower reconcile period: the rows and the managed requests are
+  polled (§23.4).
+- **The revision's inputs are the plugin's name, its spec, its resolved
+  config, its token and its serving certificate.** A referenced Secret's
+  data reaches it through the resolved config, so a changed Secret moves
+  the revision without being hashed on its own.
+- **`HOME=/tmp` in the plugin pod,** the pod's `emptyDir` mount, so a
+  plugin's tools have a writable home.
+- **No readiness probe.** `Deployed` is the Deployment's available
+  replica, and `Ready` is the Daemon's row for the plugin (§23.2), which
+  the plugin's own `hello` and the Daemon's health polls decide.
+- **An unlisted Plugin's scratch claim is deleted with its other
+  objects.** Nothing of a Plugin that no Daemon lists is kept.
+- **A listed plugin whose grant or config cannot be built holds the whole
+  list back for the pass.** The Daemon keeps its last list and with it
+  every plugin's managed requests; sending a list without the plugin would
+  drop them (see the second ruling below). Only a plugin whose token or
+  serving Secret is not made yet, and that the Daemon has no row for, is
+  left out: it has nothing to lose.
+- **The fake plugin image is a heredoc stage in `kind-up`:** `FROM
+  balerix:e2e`, entrypoint `balerix dev fake-plugin`. It has no
+  Dockerfile of its own.
+- **`e2e-k8s` runs its two journeys one at a time** (the `e2e-k8s`
+  nextest profile sets `test-threads = 1`): both use the one three-node
+  kind cluster.
+
+Rulings made while building it:
+
+- **A listed plugin whose grant or config cannot be built** puts that
+  plugin's own reason (`SecretMissing` or `InvalidSpec`) on the Daemon's
+  `PluginsReady`, with the message `<plugin>: <why>`, and no list is sent
+  that pass.
+- **A plugin listed by two Daemons also holds the list back**
+  (`PluginsReady=False/PluginListedTwice`). Leaving it out would let the
+  Daemon drop its managed requests and later delete its Fleets.
+- **A managed request the operator cannot write or delete** (a
+  `managed_fleet` error or a 4xx from the API server) is a Warning Event
+  `ManagedFleetRefused` on the Plugin, and the pass goes on. Transport
+  errors and 5xx fail the reconcile.
+- **An unlisted Plugin deletes only the objects whose owner references
+  carry its uid** (a uid precondition on the delete). A same-named object
+  it does not own is left alone.
+- **The managed Fleet's defaults are the file's over the Plugin's
+  `fleetDefaults`,** which is Spec M's layer order: host settings, then
+  `fleetDefaults`, then the file.
+- **The SDK logs `hello accepted`** once a hello is accepted. The e2e
+  journey's config roll reads it from the new pod's log, because a
+  Plugin's `Ready` can still be the old pod's.
+- **§5.5's "a Secret with its resolved config" is replaced by §23.4:**
+  the config reaches the Daemon only in `PUT /v1/plugins`, never as a file
+  in the plugin's pod.
+- **A Plugin's name is checked before anything is made:** the Daemon's
+  rule for a plugin's name (`balerix_core::name::validate_name`, at most
+  63 characters of `a-z`, `0-9` and `-`, and `reserved_plugin_reason`,
+  which refuses `kubernetes`) and a Service's (DNS-1035: it starts with a
+  letter, so `1password` is refused). One that fails is
+  `Deployed=False/InvalidSpec` with `metadata.name: <why>` and nothing is
+  applied; on the Daemon it is `PluginsReady=False/InvalidSpec`
+  (`<plugin>: metadata.name: <why>`) and the list is held back, like any
+  `InvalidSpec`.
+- **A list the Daemon refuses** (`PUT /v1/plugins` answers 400) is
+  `PluginsReady=False/ListRefused` with the Daemon's message; the status
+  is still written and no managed Fleet is touched that pass.
+- **The plugin's Deployment is `strategy: Recreate`.** With one replica
+  a rolling update keeps the old pod until the new one is ready, and a
+  `ReadWriteOnce` scratch claim attached on another node would keep the
+  new one from starting.
+- **A Secret the operator manages is never a plugin's config.**
+  `spec.secrets` naming a Secret labelled
+  `app.kubernetes.io/managed-by: balerix-operator` (a Daemon's
+  authority, its admin token, a plugin's token) is `InvalidSpec`,
+  `spec.secrets.<key>: Secret <name> is managed by the operator`; the
+  value is never read into a message.
+- **A running plugin whose token or serving Secret is being remade holds
+  the list back.** The Daemon controller asks for the Daemon's rows
+  first; a plugin with a missing Secret that already has a row is
+  `PluginsReady=False/PluginNotReady`, `<plugin>: its token or serving
+  Secret is being remade`, instead of being left out (which would drop
+  its managed requests and then delete its Fleets).
+- **A Fleet of another Daemon is a `FleetConflict` too.** A managed
+  request whose Fleet carries this plugin's label but whose `spec.daemon`
+  is another Daemon is not written or re-pointed: a `FleetConflict` Event
+  `Fleet <name> belongs to Daemon <other>, not <this>: left as it is`.

@@ -223,6 +223,8 @@ pub fn daemon_objects(
                                 "--tls-cert", "/balerix/tls/tls.crt",
                                 "--tls-key", "/balerix/tls/tls.key",
                                 "--admin-token-file", "/balerix/admin/token",
+                                // its plugins' serving certificates come from this authority (§23.4)
+                                "--tls-ca", "/balerix/ca/ca.crt",
                             ],
                             // its XDG roots: the state claim, the only writable path
                             "env": [{ "name": "HOME", "value": "/balerix/state" }],
@@ -237,12 +239,14 @@ pub fn daemon_objects(
                                 { "name": "state", "mountPath": "/balerix/state" },
                                 { "name": "tls", "mountPath": "/balerix/tls", "readOnly": true },
                                 { "name": "admin", "mountPath": "/balerix/admin", "readOnly": true },
+                                { "name": "ca", "mountPath": "/balerix/ca", "readOnly": true },
                             ],
                         }],
                         "volumes": [
                             { "name": "state", "persistentVolumeClaim": { "claimName": names::state_claim(name) } },
                             { "name": "tls", "secret": { "secretName": names::serving(name), "defaultMode": 0o440 } },
                             { "name": "admin", "secret": { "secretName": names::admin(name), "defaultMode": 0o440 } },
+                            { "name": "ca", "configMap": { "name": names::authority(name) } },
                         ],
                     },
                 },
@@ -280,7 +284,10 @@ pub fn daemon_objects(
 
 /// `StorageReady`, `SystemToolsReady`, `PluginsReady`, `Ready` (§4.1). A
 /// `spec.resources` that is not a `ResourceRequirements` makes `Ready`
-/// false, reason `InvalidResources`, before anything else.
+/// false, reason `InvalidResources`, before anything else. `PluginsReady`
+/// is `Unknown/Pending` here (`NoPlugins` with none listed) and `Ready`
+/// does not wait on it: once the Daemon answers, the controller judges
+/// `PluginsReady` from its rows and `Ready` follows it (§23.9).
 pub fn daemon_status(
     daemon: &Daemon,
     cfg: &OperatorConfig,
@@ -330,18 +337,11 @@ pub fn daemon_status(
                 Cond::no("SystemToolsReady", "PoolSyncRunning", "")
             }
         };
-        // Sub-project 4 replaces this branch with the plugin list (§20.2).
+        // §23.4: the controller replaces this once the daemon answers
         let plugins = if daemon.spec.plugins.is_empty() {
             Cond::yes("PluginsReady", "NoPlugins", "")
         } else {
-            Cond::no(
-                "PluginsReady",
-                "PluginsUnsupported",
-                &format!(
-                    "this operator runs no plugins yet; remove spec.plugins ({})",
-                    daemon.spec.plugins.join(", ")
-                ),
-            )
+            Cond::unknown("PluginsReady", "Pending", "judged once the daemon answers")
         };
         // what `daemon_objects` refuses as a `Shape`, with its config path
         let resources =
@@ -354,7 +354,7 @@ pub fn daemon_status(
             .and_then(|s| s.ready_replicas)
             .unwrap_or(0) // no status yet: nothing is ready
             >= 1;
-        let failing = [&storage, &tools, &plugins]
+        let failing = [&storage, &tools]
             .into_iter()
             .find(|c| c.status != Some(true));
         let ready = match (resources, failing) {
@@ -615,20 +615,28 @@ mod tests {
         );
     }
 
-    /// §20.2: a Daemon never reports Ready over a plugin list nothing acts on.
+    /// §23.4: the plugins are judged once the Daemon answers; until then
+    /// `PluginsReady` is pending and does not hold `Ready` back.
     #[test]
-    fn a_plugin_list_is_unsupported_until_sub_project_four() {
+    fn a_plugin_list_is_pending_until_the_daemon_answers() {
         let d = daemon(json!({ "plugins": ["flow", "web"] }));
         let s = status_of(&d, Some("Bound"), 1, JobOutcome::Succeeded(String::new()));
         assert_eq!(
             cond(&s, "PluginsReady"),
-            (
-                "False",
-                "PluginsUnsupported",
-                "this operator runs no plugins yet; remove spec.plugins (flow, web)"
-            )
+            ("Unknown", "Pending", "judged once the daemon answers")
         );
-        assert_eq!(cond(&s, "Ready").1, "PluginsUnsupported");
+        assert_eq!(cond(&s, "Ready"), ("True", "Ready", ""));
+    }
+
+    #[test]
+    fn the_daemon_trusts_its_own_authority_for_its_plugins() {
+        let o = daemon_objects(&daemon(json!({})), &cfg(), 1_807_776_000).unwrap();
+        let pod = serde_json::to_value(&o.statefulset).unwrap()["spec"]["template"]["spec"].clone();
+        let args = pod["containers"][0]["args"].as_array().unwrap();
+        let at = args.iter().position(|a| a == "--tls-ca").expect("--tls-ca");
+        assert_eq!(args[at + 1], json!("/balerix/ca/ca.crt"));
+        assert!(pod["volumes"].as_array().unwrap().iter().any(|v| v["name"] == "ca"
+            && v["configMap"]["name"] == json!("balerix-default-ca")));
     }
 
     #[test]

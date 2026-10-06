@@ -47,6 +47,8 @@ spec:
             - /balerix/tls/tls.key
             - "--admin-token-file"
             - /balerix/admin/token
+            - "--tls-ca"
+            - /balerix/ca/ca.crt
           command:
             - balerix
           env:
@@ -85,6 +87,9 @@ spec:
             - mountPath: /balerix/admin
               name: admin
               readOnly: true
+            - mountPath: /balerix/ca
+              name: ca
+              readOnly: true
       enableServiceLinks: false
       securityContext:
         fsGroup: 10001
@@ -105,3 +110,6 @@ spec:
           secret:
             defaultMode: 288
             secretName: balerix-default-admin
+        - configMap:
+            name: balerix-default-ca
+          name: ca

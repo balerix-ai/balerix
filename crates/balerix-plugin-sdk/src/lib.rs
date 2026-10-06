@@ -37,6 +37,9 @@ pub struct Env {
     /// `BALERIX_PLUGIN_LISTEN` (Spec O §23.1): `127.0.0.1:0` on one machine,
     /// `0.0.0.0:7644` in a pod.
     pub listen: String,
+    /// `BALERIX_PLUGIN_REVISION` (Spec O §23.8): the list entry this pod
+    /// was built for; sent in `hello` only with an authority.
+    pub revision: Option<String>,
 }
 
 impl fmt::Debug for Env {
@@ -49,6 +52,7 @@ impl fmt::Debug for Env {
             .field("ca", &self.ca)
             .field("tls", &self.tls)
             .field("listen", &self.listen)
+            .field("revision", &self.revision)
             .finish()
     }
 }
@@ -115,6 +119,7 @@ impl Env {
             ca,
             tls,
             listen: opt("BALERIX_PLUGIN_LISTEN").unwrap_or_else(|| "127.0.0.1:0".into()),
+            revision: opt("BALERIX_PLUGIN_REVISION"),
         })
     }
 
@@ -142,6 +147,23 @@ pub(crate) fn refuse_https_without_ca(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_revision_is_read_and_optional() {
+        let base = |k: &str| match k {
+            "BALERIX_API_URL" => Some("http://127.0.0.1:1".into()),
+            "BALERIX_PLUGIN_NAME" => Some("flow".into()),
+            "BALERIX_PLUGIN_TOKEN" => Some("t".into()),
+            "BALERIX_PLUGIN_SCRATCH" => Some("/s".into()),
+            _ => None,
+        };
+        assert_eq!(Env::from_env(base).unwrap().revision, None);
+        let with = |k: &str| match k {
+            "BALERIX_PLUGIN_REVISION" => Some(" r1 ".into()),
+            other => base(other),
+        };
+        assert_eq!(Env::from_env(with).unwrap().revision.as_deref(), Some("r1"));
+    }
 
     fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let owned: Vec<(String, String)> = vars

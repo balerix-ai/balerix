@@ -48,6 +48,7 @@ case "$1" in
     root="${CARGO_TARGET_DIR:-$repo/target}/tmp/kind"
     export KUBECONFIG="$root/kubeconfig"
     export BALERIX_K8S_IMAGES="${BALERIX_K8S_IMAGES:-balerix:e2e,balerix-agent:e2e}"
+    export BALERIX_K8S_PLUGIN_IMAGES="${BALERIX_K8S_PLUGIN_IMAGES:-balerix-plugin-flow:e2e,balerix-plugin-web:e2e,balerix-fake-plugin:e2e}"
     # the e2e-k8s profile: the journey waits minutes per step, past the
     # default profile's three-minute termination
     CARGO_TARGET_DIR="$target" cargo nextest run \

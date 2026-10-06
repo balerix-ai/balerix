@@ -31,6 +31,9 @@ pub enum DesiredError {
     /// sets, or a Daemon lacks what a Fleet needs of it.
     #[error("{0} has no {1}")]
     Missing(&'static str, &'static str),
+    /// A value the schema admits and the operator refuses: `<path>: <why>`.
+    #[error("{0}")]
+    Invalid(String),
 }
 
 pub fn typed<T: DeserializeOwned>(manifest: Value) -> Result<T, DesiredError> {
@@ -308,6 +311,10 @@ mod tests {
             names::endpoint("team-a", "default"),
             "https://balerix-default.team-a.svc:7643"
         );
+        assert_eq!(names::plugin("web"), "balerix-plugin-web");
+        assert_eq!(names::plugin_token("web"), "balerix-plugin-web-token");
+        assert_eq!(names::plugin_serving("web"), "balerix-plugin-web-tls");
+        assert_eq!(names::plugin_scratch("web"), "balerix-plugin-web-scratch");
         assert_eq!(names::fleet_pool_job("payments"), "payments-pool");
         assert_eq!(names::crew("payments", "backend"), "payments-backend");
         assert_eq!(

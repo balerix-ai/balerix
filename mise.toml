@@ -11,7 +11,7 @@ gitleaks = "8.30.1"
 tmux = "3.7c"
 gh = "2.102.0"
 nono = "0.79.0"
-claude = "2.1.289"
+claude = "2.1.291"
 
 # Release and workflow tooling (Spec I). Only `claude` and `gh` from this
 # table reach agents (balerix-runtime's INHERITED list).
@@ -147,7 +147,7 @@ env = { BALERIX_REQUIRE_TOOLS = "1" }
 run = "cargo nextest run -p balerix --test e2e"
 
 [tasks.kind-up]
-description = "A kind cluster for e2e-k8s with the shared local-path class, the CRDs and the daemon and agent images built from this tree (needs docker; `-- down` deletes it)"
+description = "A kind cluster for e2e-k8s with the shared local-path class, the CRDs and the daemon, agent and flow, web and fake plugin images built from this tree (needs docker; `-- down` deletes it)"
 # kind and kubectl are pinned here, not in [tools], so only this task and
 # e2e-k8s download them. kind 0.33.0 ships the node image the script pins.
 tools = { kind = "0.33.0", kubectl = "1.34.12" }

@@ -271,6 +271,15 @@ impl Drop for Kill {
 /// `balerix serve --mode kubernetes` on a free port, serving a
 /// certificate this operator's `pki` issued.
 fn serve(balerix: &std::path::Path, root: &std::path::Path) -> (Kill, String, pki::Issued) {
+    serve_with(balerix, root, false)
+}
+
+/// `serve`, optionally with `--tls-ca` (Kubernetes mode's plugin calls).
+fn serve_with(
+    balerix: &std::path::Path,
+    root: &std::path::Path,
+    tls_ca: bool,
+) -> (Kill, String, pki::Issued) {
     let authority = pki::new_authority("team-a", "default", now()).unwrap();
     let serving = pki::issue_serving(
         &authority,
@@ -294,7 +303,8 @@ fn serve(balerix: &std::path::Path, root: &std::path::Path) -> (Kill, String, pk
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let log = std::fs::File::create(root.join("daemon.log")).unwrap();
-    let child = Command::new(balerix)
+    let mut command = Command::new(balerix);
+    command
         .args([
             "serve",
             "--mode",
@@ -315,20 +325,16 @@ fn serve(balerix: &std::path::Path, root: &std::path::Path) -> (Kill, String, pk
         .env_remove("XDG_STATE_HOME")
         .env_remove("XDG_DATA_HOME")
         .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::from(log));
+    if tls_ca {
+        std::fs::write(root.join("ca.crt"), &authority.cert_pem).unwrap();
+        command.arg("--tls-ca").arg(root.join("ca.crt"));
+    }
+    let child = command.spawn().unwrap();
     (Kill(child), format!("https://127.0.0.1:{port}"), authority)
 }
 
-#[tokio::test]
-async fn a_real_kubernetes_mode_daemon_takes_the_operators_apply() {
-    let Some(balerix) = support::balerix() else {
-        return;
-    };
-    let root = support::temp_root("client-real-daemon");
-    let (_daemon, base, authority) = serve(&balerix, &root);
-    let c = DaemonClient::new(&base, &authority.cert_pem, TOKEN, Duration::from_secs(10)).unwrap();
+async fn wait_ready(c: &DaemonClient, root: &std::path::Path) {
     let mut waited = 0;
     while let Err(e) = c.ready().await {
         waited += 1;
@@ -340,6 +346,17 @@ async fn a_real_kubernetes_mode_daemon_takes_the_operators_apply() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+#[tokio::test]
+async fn a_real_kubernetes_mode_daemon_takes_the_operators_apply() {
+    let Some(balerix) = support::balerix() else {
+        return;
+    };
+    let root = support::temp_root("client-real-daemon");
+    let (_daemon, base, authority) = serve(&balerix, &root);
+    let c = DaemonClient::new(&base, &authority.cert_pem, TOKEN, Duration::from_secs(10)).unwrap();
+    wait_ready(&c, &root).await;
 
     // `--resolve`: the Service's name and port, reached at another
     // address and port (an operator outside the cluster, a port-forward)
@@ -413,5 +430,88 @@ async fn a_real_kubernetes_mode_daemon_takes_the_operators_apply() {
             status: 401,
             message: "missing or invalid admin token".into()
         }
+    );
+}
+
+#[tokio::test]
+async fn a_real_kubernetes_mode_daemon_takes_the_list_and_lists_its_rows() {
+    let Some(balerix) = support::balerix() else {
+        return;
+    };
+    let root = support::temp_root("client-real-plugins");
+    let (_daemon, base, authority) = serve_with(&balerix, &root, true);
+    let c = DaemonClient::new(&base, &authority.cert_pem, TOKEN, Duration::from_secs(10)).unwrap();
+    wait_ready(&c, &root).await;
+    let list: balerix_api::DeclaredPlugins =
+        serde_json::from_value(serde_json::json!({ "plugins": [{
+        "name": "flow", "grant": ["actions", "kv"], "config": {},
+        "token": "flow-token-0123456789abcdef0123456789", "url": "https://flow.team-a.svc:7644",
+        "revision": "r1" }] }))
+        .unwrap();
+    c.declare_plugins(&list).await.unwrap();
+    c.declare_plugins(&list).await.unwrap(); // idempotent
+    let rows = c.plugins().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].name.as_str(), rows[0].phase),
+        ("flow", balerix_api::AgentPhase::Starting)
+    );
+    assert_eq!(
+        rows[0].listen.as_deref(),
+        Some("https://flow.team-a.svc:7644")
+    );
+    assert_eq!(c.managed_fleets().await.unwrap(), vec![]);
+    // a list without revisions is refused whole
+    let mut bad = list.clone();
+    bad.plugins[0].revision = String::new();
+    assert_eq!(
+        c.declare_plugins(&bad).await.unwrap_err(),
+        ClientError::Rejected("plugins[0].revision: required".into())
+    );
+}
+
+#[tokio::test]
+async fn the_plugin_calls_have_their_meaning() {
+    let row = serde_json::json!([{ "name": "flow", "version": "0.1.1", "phase": "ready",
+        "listen": "https://flow.ns.svc:7644", "routes": false, "message": "", "active_agents": 0 }]);
+    let managed = serde_json::json!([{ "name": "m", "plugin": "fake", "file": { "crews": {} },
+        "down": { "keep_repos": true, "keep_sessions": false, "purge": false, "force": false } }]);
+    let base = stub(
+        Router::new()
+            .route(
+                "/v1/plugins",
+                get(move || {
+                    let row = row.clone();
+                    async move { Json(row) }
+                })
+                .put(|| async {
+                    refusal(StatusCode::BAD_REQUEST, "plugins[0].token: listed twice")
+                }),
+            )
+            .route(
+                "/v1/managed-fleets",
+                get(move || {
+                    let m = managed.clone();
+                    async move { Json(m) }
+                }),
+            ),
+    )
+    .await;
+    let c = client(&base);
+    assert_eq!(
+        c.declare_plugins(&balerix_api::DeclaredPlugins::default())
+            .await
+            .unwrap_err(),
+        ClientError::Rejected("plugins[0].token: listed twice".into())
+    );
+    let rows = c.plugins().await.unwrap();
+    assert_eq!(
+        (rows[0].name.as_str(), rows[0].phase),
+        ("flow", balerix_api::AgentPhase::Ready)
+    );
+    let m = c.managed_fleets().await.unwrap();
+    assert_eq!(
+        (m[0].name.as_str(), m[0].down.unwrap().keep_repos),
+        ("m", true)
     );
 }

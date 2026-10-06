@@ -10,8 +10,7 @@ use super::common::{SecretKeyRef, empty_object, open_object};
 
 /// A plugin a Daemon in its namespace may list (Spec O §4.5). Defined
 /// here so the five kinds are reviewed once; its controller is
-/// sub-project 4, and until then a Daemon that lists any plugin is
-/// `PluginsReady=False`, reason `PluginsUnsupported` (§20.2).
+/// sub-project 4 (§23).
 #[derive(CustomResource, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "balerix.ai",

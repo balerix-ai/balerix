@@ -7,8 +7,10 @@
 pub mod agent;
 pub mod crew;
 pub mod daemon;
+mod daemon_plugins;
 pub mod fleet;
 pub mod jobs;
+pub mod plugin;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -557,7 +559,7 @@ pub async fn run(client: Client, watches: Client, cfg: RunConfig) {
     futures_util::future::join_all(sets).await;
 }
 
-/// The four controllers over one namespace (or all).
+/// The five controllers over one namespace (or all).
 async fn set(ctx: Arc<Context>, watches: &Client, namespace: Option<String>) {
     tracing::info!(namespace = namespace.as_deref().unwrap_or("*"), "watching");
     let ns = namespace.as_deref();
@@ -566,6 +568,7 @@ async fn set(ctx: Arc<Context>, watches: &Client, namespace: Option<String>) {
         Box::pin(fleet::controller(ctx.clone(), watches, ns)),
         Box::pin(crew::controller(ctx.clone(), watches, ns)),
         Box::pin(agent::controller(ctx.clone(), watches, ns)),
+        Box::pin(plugin::controller(ctx.clone(), watches, ns)),
     ];
     futures_util::future::join_all(controllers).await;
 }

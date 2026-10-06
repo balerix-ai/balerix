@@ -67,7 +67,11 @@ pub fn read_secret_string(secret: &Secret, key: &str) -> Option<String> {
     String::from_utf8(bytes.0.clone()).ok()
 }
 
-fn read_issued(secret: Option<&Secret>, cert_key: &str, key_key: &str) -> Option<Issued> {
+pub(crate) fn read_issued(
+    secret: Option<&Secret>,
+    cert_key: &str,
+    key_key: &str,
+) -> Option<Issued> {
     let secret = secret?;
     let not_after = secret
         .annotations()
@@ -242,12 +246,36 @@ pub async fn reconcile(daemon: Arc<Daemon>, ctx: Arc<Context>) -> Result<Action,
             &authority,
             &token,
         )?;
-        if let Err(e) = client.ready().await {
-            let not_ready = Cond::no("Ready", "DaemonNotReady", &e.to_string());
-            with_condition(&mut status.conditions, &daemon, not_ready, &ctx.k8s_now());
+        match client.ready().await {
+            Err(e) => {
+                let not_ready = Cond::no("Ready", "DaemonNotReady", &e.to_string());
+                with_condition(&mut status.conditions, &daemon, not_ready, &ctx.k8s_now());
+            }
+            Ok(()) => {
+                // §23.4: on every reconcile; it is how the list returns
+                // after a Daemon restart
+                let (plugins, sent) =
+                    super::daemon_plugins::send_list(&ctx, &daemon, &namespace, &client).await?;
+                // a held-back list wrote nothing new to the Daemon: leave the Fleets
+                if let Some(sent) = sent {
+                    super::daemon_plugins::write_managed(&ctx, &daemon, &namespace, &client, &sent)
+                        .await?;
+                }
+                if plugins.status != Some(true) {
+                    let ready = Cond::no("Ready", &plugins.reason, &plugins.message);
+                    with_condition(&mut status.conditions, &daemon, ready, &ctx.k8s_now());
+                }
+                with_condition(&mut status.conditions, &daemon, plugins, &ctx.k8s_now());
+            }
         }
     }
     patch_status(&ctx.client, daemon.as_ref(), &status).await?;
     reconciled(&ctx, daemon.as_ref());
-    Ok(Action::requeue(again.min(ctx.run.period)))
+    // the managed requests and the rows are polled (§23.4)
+    let period = if daemon.spec.plugins.is_empty() {
+        ctx.run.period
+    } else {
+        ctx.run.fleet_period
+    };
+    Ok(Action::requeue(again.min(period)))
 }

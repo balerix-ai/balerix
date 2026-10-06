@@ -237,7 +237,12 @@ pub fn plan_fleet(
                 .filter_map(|key| tokens.get(key).map(|t| (key.clone(), t.clone())))
                 .collect(),
         ),
-        managed_by: None,
+        managed_by: fleet
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(crate::desired::plugin::MANAGED_BY_LABEL))
+            .cloned(),
     });
     Ok(FleetPlan {
         spec,
@@ -499,6 +504,18 @@ mod tests {
         assert_eq!(request.spec, all.spec);
         let sent: Vec<&String> = request.agent_tokens.as_ref().unwrap().keys().collect();
         assert_eq!(sent, ["payments/backend/alice", "payments/backend/bob"]);
+    }
+
+    #[test]
+    fn a_managed_fleet_tells_the_daemon_which_plugin_it_acts_for() {
+        let mut f = fleet("payments", payments());
+        f.metadata.labels = Some(std::collections::BTreeMap::from([(
+            crate::desired::plugin::MANAGED_BY_LABEL.to_string(),
+            "fake".to_string(),
+        )]));
+        let all = tokens(&["payments/backend/alice", "payments/backend/bob"]);
+        let plan = plan_fleet(&f, &daemon(json!({})), &all, &images()).unwrap();
+        assert_eq!(plan.request.unwrap().managed_by.as_deref(), Some("fake"));
     }
 
     #[test]

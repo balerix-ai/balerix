@@ -169,6 +169,16 @@ pub fn daemon_names(namespace: &str, daemon: &str) -> Vec<String> {
     ]
 }
 
+/// The names the Daemon calls a plugin by: its Service, `<plugin>`.
+pub fn plugin_names(namespace: &str, plugin: &str) -> Vec<String> {
+    vec![
+        plugin.to_string(),
+        format!("{plugin}.{namespace}"),
+        format!("{plugin}.{namespace}.svc"),
+        format!("{plugin}.{namespace}.svc.cluster.local"),
+    ]
+}
+
 /// 32 random bytes as hex: an agent's token (the Daemon wants at least
 /// 32 characters, §7.4) or a Daemon's admin token.
 pub fn new_token() -> String {

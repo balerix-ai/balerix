@@ -118,6 +118,12 @@ pub struct HelloRequest {
     /// unknown fields here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<PluginManifest>,
+    /// The revision of the list entry this plugin was built for (Spec O
+    /// §23.8): `BALERIX_PLUGIN_REVISION`. Sent, like the manifest, only
+    /// with an authority; a Daemon in Kubernetes mode refuses a hello
+    /// without it and answers 409 to another one. Ignored on one machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 /// One entry of `PUT /v1/plugins` (Spec O §23.2): what the operator knows
@@ -141,6 +147,9 @@ pub struct DeclaredPlugin {
     pub token: String,
     /// `https://<plugin>.<namespace>.svc:7644`.
     pub url: String,
+    /// The operator's hash over everything the plugin's pod is built from
+    /// (Spec O §23.8); the pod's `BALERIX_PLUGIN_REVISION` carries the same.
+    pub revision: String,
 }
 
 /// Hand-written: `token` and `config` hold secrets.
@@ -153,6 +162,7 @@ impl std::fmt::Debug for DeclaredPlugin {
             .field("fleet_defaults", &self.fleet_defaults)
             .field("token", &"<redacted>")
             .field("url", &self.url)
+            .field("revision", &self.revision)
             .finish()
     }
 }
@@ -341,6 +351,7 @@ mod tests {
             protocol: PLUGIN_PROTOCOL,
             listen: "127.0.0.1:4321".into(),
             manifest: None,
+            revision: None,
         };
         let back: HelloRequest = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
         assert_eq!(back, h);
@@ -462,6 +473,7 @@ mod tests {
             protocol: PLUGIN_PROTOCOL,
             listen: "0.0.0.0:7644".into(),
             manifest: Some(m.clone()),
+            revision: None,
         };
         let v = serde_json::to_value(&h).unwrap();
         assert_eq!(v["manifest"]["needs"], serde_json::json!(["actions", "kv"]));
@@ -470,11 +482,42 @@ mod tests {
     }
 
     #[test]
+    fn a_hello_carries_the_revision_only_when_given() {
+        let mut h: HelloRequest = serde_json::from_value(json!({
+            "name": "flow", "version": "1.0.0", "protocol": 1, "listen": "0.0.0.0:7644"
+        }))
+        .unwrap();
+        assert_eq!(h.revision, None);
+        assert!(!serde_json::to_string(&h).unwrap().contains("revision"));
+        h.revision = Some("r1".into());
+        assert_eq!(serde_json::to_value(&h).unwrap()["revision"], json!("r1"));
+    }
+
+    #[test]
+    fn a_declared_plugin_requires_its_revision() {
+        let entry = json!({
+            "name": "flow", "grant": ["kv"], "token": "t0123456789abcdef0123456789abcdef",
+            "url": "https://flow.ns.svc:7644"
+        });
+        let e = serde_json::from_value::<DeclaredPlugin>(entry.clone()).unwrap_err();
+        assert!(e.to_string().contains("missing field `revision`"), "{e}");
+        let mut with = entry;
+        with["revision"] = json!("r1");
+        assert_eq!(
+            serde_json::from_value::<DeclaredPlugin>(with)
+                .unwrap()
+                .revision,
+            "r1"
+        );
+    }
+
+    #[test]
     fn a_declared_plugin_parses_redacts_and_refuses_an_unknown_capability() {
         let body = serde_json::json!({ "plugins": [{
             "name": "flow", "grant": ["actions", "kv"], "config": { "secret": "s3cret" },
             "fleetDefaults": { "claude": { "binary": "fake-claude" } },
-            "token": "t0123456789abcdef0123456789abcdef", "url": "https://flow.ns.svc:7644"
+            "token": "t0123456789abcdef0123456789abcdef", "url": "https://flow.ns.svc:7644",
+            "revision": "r1"
         }]});
         let d: DeclaredPlugins = serde_json::from_value(body.clone()).unwrap();
         assert_eq!(

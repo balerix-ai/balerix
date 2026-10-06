@@ -2102,8 +2102,15 @@ This refines §9.4.
   agent's Stop; web's review page is fetched through the Daemon's
   `/v1/plugins/web/…` over the port-forward; `dev fake-plugin` with
   `manage` brings up a managed Fleet whose agents become Ready; removing
-  it from `spec.plugins` deletes the Fleet. The operator runs out of
-  cluster as in §21.4, so the missing Events RBAC does not bite here.
+  it from `spec.plugins` deletes the Fleet; changing web's Plugin config
+  mid-journey brings both pods back to `Ready` with no restart by hand
+  (§23.8). The operator runs out of cluster as in §21.4, so the missing
+  Events RBAC does not bite here.
+- **4b, §23.8:** `Declared` unit tests (a revision mismatch is 409 and
+  leaves the entry as it was; a missing revision is refused; a matching
+  one is accepted); an SDK test where a fake host answers 409 twice, then
+  accepts, and `configure` runs; an envtest check that the pod's
+  `BALERIX_PLUGIN_REVISION` equals the list entry's `revision`.
 
 ### 23.7 Decided by the plan
 
@@ -2187,3 +2194,41 @@ Rulings made while building it:
   `hello.manifest.<field>: <reason>` (`hello.manifest.hooks.intercept:
   unknown event "Foo"`), the config-path form of the name and needs
   refusals. A restored `hello.json` is held to the same rules.
+
+### 23.8 A hello belongs to one revision (4b, 2026-10-06)
+
+4a's final review found a race. A changed Plugin rolls its Deployment and
+the Daemon controller sends the new list, in separate steps. A new pod
+whose `hello` reaches the Daemon before the list does is accepted under
+the old entry; the new list then puts the entry back to `Waiting`, and
+the pod never says hello again. The plugin stays `Starting`. Rather than
+order the two controllers, a `hello` names the entry it was built for.
+
+- **The revision is the pod template's hash.** The Plugin controller's
+  hash annotation (§23.4: spec, grant, resolved config, referenced
+  Secrets' data, token, serving certificate) is the plugin's revision. It
+  reaches the pod as `BALERIX_PLUGIN_REVISION` and the list as
+  `DeclaredPlugin.revision`, a required field. A new revision is a new
+  pod, and that pod is the one that must say hello.
+- **Wire.** `HelloRequest` gains an optional `revision`. The SDK reads it
+  in `Env` and sends it only with an authority (`BALERIX_CA_FILE`), as
+  the manifest (§23.7), so a 0.2.0 Daemon never sees it. A one-machine
+  Daemon accepts and ignores it.
+- **The Daemon** checks the revision after the protocol and before the
+  manifest, in `Declared::hello`:
+  - none: refused and kept on the row, as a missing manifest is —
+    `hello.revision: required in kubernetes mode`;
+  - another revision: 409 `hello.revision: this daemon holds <a>, the
+    plugin is <b>; the list has not arrived yet`, and the entry is left
+    as it was. An old pod still serving during the roll stays in the
+    chain, and no `hello.json` is removed;
+  - the same revision: the checks of §23.2 and §23.7, unchanged.
+  The revision is part of the entry's hash, so a new one already sends
+  the entry to `Waiting` and keeps a stale `hello.json` from being
+  restored.
+- **The SDK retries a 409 `hello`** with back-off from 1 s, doubling to
+  30 s, without limit, the server bound meanwhile. Any other failure
+  still ends `serve`. While it waits the row is `Starting` and the Daemon
+  `PluginsReady=False/PluginNotReady`, so a roll that never completes is
+  visible.
+- `PluginStatus` is unchanged.

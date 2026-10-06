@@ -535,3 +535,153 @@ async fn the_operator_runs_under_the_charts_namespaced_rbac() {
 async fn the_operator_runs_under_the_charts_cluster_rbac() {
     rbac_journey("rbac-cluster", false).await;
 }
+
+fn daemon_chart(release: &str, values: Value) -> Vec<Value> {
+    render(&chart("balerix-daemon"), release, "team-a", values)
+}
+
+#[test]
+fn the_daemon_is_named_for_the_release_and_carries_the_values() {
+    if !helm_ok() {
+        return;
+    }
+    let docs = daemon_chart(
+        "payments",
+        json!({
+            "storage": { "shared": { "size": "50Gi", "storageClassName": "nfs" } },
+            "credentials": { "claude": { "secretName": "claude-creds" } },
+            "defaults": { "claude": { "settings": { "model": "sonnet" } } },
+            "resources": { "requests": { "cpu": "500m" } }
+        }),
+    );
+    assert_eq!(kinds(&docs), ["Daemon/payments"]);
+    let d: Daemon = serde_json::from_value(find(&docs, "Daemon", "payments").clone()).unwrap();
+    assert_eq!(d.metadata.namespace.as_deref(), Some("team-a"));
+    let want: balerix_operator::api::DaemonSpec = serde_json::from_value(json!({
+        "storage": { "state": { "size": "1Gi" },
+                     "shared": { "size": "50Gi", "storageClassName": "nfs" },
+                     "agent": { "size": "2Gi" } },
+        "credentials": { "claude": { "secretName": "claude-creds" } },
+        "defaults": { "claude": { "settings": { "model": "sonnet" } } },
+        "plugins": [],
+        "resources": { "requests": { "cpu": "500m" } }
+    }))
+    .unwrap();
+    assert_eq!(d.spec, want);
+    let named = daemon_chart("payments", json!({ "name": "default" }));
+    find(&named, "Daemon", "default");
+}
+
+/// Plan Review Focus 5: an empty optional is absent, never "".
+#[test]
+fn empty_optionals_render_nothing() {
+    if !helm_ok() {
+        return;
+    }
+    let docs = daemon_chart("d", json!({ "plugins": { "web": { "enabled": true } } }));
+    let d = find(&docs, "Daemon", "d");
+    for claim in ["state", "shared", "agent"] {
+        assert!(
+            d["spec"]["storage"][claim]
+                .get("storageClassName")
+                .is_none(),
+            "{claim}"
+        );
+    }
+    assert!(d["spec"].get("credentials").is_none());
+    assert!(d["spec"].get("version").is_none(), "the operator's version");
+    let web = find(&docs, "Plugin", "web");
+    assert!(web["spec"].get("expose").is_none());
+    assert!(web["spec"].get("scratch").is_none());
+}
+
+#[test]
+fn enabled_plugins_are_objects_listed_in_order_then_the_extra_ones() {
+    if !helm_ok() {
+        return;
+    }
+    let docs = daemon_chart(
+        "d",
+        json!({
+            "plugins": {
+                "web": { "enabled": true, "config": { "enabled": true } },
+                "flow": { "enabled": true, "image": { "repository": "balerix-plugin-flow", "tag": "e2e" } },
+                "github": { "enabled": true, "expose": { "port": 8080 },
+                            "secrets": { "webhook_secret": { "secretName": "gh", "key": "secret" } } }
+            },
+            "extraPlugins": ["fake"]
+        }),
+    );
+    assert_eq!(
+        find(&docs, "Daemon", "d")["spec"]["plugins"],
+        json!(["flow", "web", "github", "fake"])
+    );
+    assert!(
+        !docs
+            .iter()
+            .any(|d| d["kind"] == "Plugin" && d["metadata"]["name"] == "matrix")
+    );
+    assert!(
+        !docs
+            .iter()
+            .any(|d| d["kind"] == "Plugin" && d["metadata"]["name"] == "fake")
+    );
+    let flow: Plugin = serde_json::from_value(find(&docs, "Plugin", "flow").clone()).unwrap();
+    assert_eq!(flow.spec.image, "balerix-plugin-flow:e2e");
+    let web: Plugin = serde_json::from_value(find(&docs, "Plugin", "web").clone()).unwrap();
+    assert_eq!(
+        web.spec.image,
+        "ghcr.io/balerix-ai/balerix-plugin-web:0.2.1"
+    );
+    assert_eq!(web.spec.config, json!({ "enabled": true }));
+    let github: Plugin = serde_json::from_value(find(&docs, "Plugin", "github").clone()).unwrap();
+    assert_eq!(github.spec.expose.unwrap().port, 8080);
+    assert_eq!(github.spec.secrets["webhook_secret"].secret_name, "gh");
+}
+
+/// Plan Review Focus 2: the chart's grant is each plugin's manifest's.
+#[test]
+fn each_plugins_needs_are_its_manifests() {
+    if !helm_ok() {
+        return;
+    }
+    let all = json!({ "plugins": {
+        "flow": { "enabled": true }, "web": { "enabled": true },
+        "matrix": { "enabled": true }, "github": { "enabled": true } } });
+    let docs = daemon_chart("d", all);
+    for p in ["flow", "web", "matrix", "github"] {
+        let manifest: Value = serde_norway::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("../plugins/{p}/package/balerix-plugin.yaml")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            find(&docs, "Plugin", p)["spec"]["needs"],
+            manifest["needs"],
+            "{p}: the chart's needs differ from its manifest's"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daemon_chart_is_accepted_by_the_api_server() {
+    if !helm_ok() {
+        return;
+    }
+    let Some(env) = envtest().await else { return };
+    let ns = namespace(&env.client, "daemon-chart").await;
+    let all = json!({
+        "storage": { "shared": { "storageClassName": "nfs" } },
+        "credentials": { "claude": { "secretName": "c" }, "github": { "secretName": "g" } },
+        "plugins": {
+            "flow": { "enabled": true }, "web": { "enabled": true },
+            "matrix": { "enabled": true }, "github": { "enabled": true, "expose": { "port": 8080 } } },
+        "extraPlugins": ["fake"] });
+    for values in [json!({}), all] {
+        let docs = render(&chart("balerix-daemon"), "d", &ns, values);
+        dry_run_apply(&env.client, &docs).await;
+    }
+}

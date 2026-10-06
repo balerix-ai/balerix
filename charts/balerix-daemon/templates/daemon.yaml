@@ -1,0 +1,29 @@
+apiVersion: balerix.ai/v1alpha1
+kind: Daemon
+metadata:
+  name: {{ include "balerix-daemon.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "balerix-daemon.labels" . | nindent 4 }}
+spec:
+  storage:
+    state:
+      {{- include "balerix-daemon.claim" .Values.storage.state | nindent 6 }}
+    shared:
+      {{- include "balerix-daemon.claim" .Values.storage.shared | nindent 6 }}
+    agent:
+      {{- include "balerix-daemon.claim" .Values.storage.agent | nindent 6 }}
+  {{- if or .Values.credentials.claude.secretName .Values.credentials.github.secretName }}
+  credentials:
+    {{- with .Values.credentials.claude.secretName }}
+    claude:
+      secretName: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.credentials.github.secretName }}
+    github:
+      secretName: {{ . | quote }}
+    {{- end }}
+  {{- end }}
+  defaults: {{ toJson .Values.defaults }}
+  plugins: {{ concat (include "balerix-daemon.ownPlugins" . | fromJsonArray) .Values.extraPlugins | default (list) | toJson }}
+  resources: {{ toJson .Values.resources }}

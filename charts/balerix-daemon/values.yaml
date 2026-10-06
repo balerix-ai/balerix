@@ -1,0 +1,90 @@
+# The Daemon's name; the release's when empty. A Fleet names it in
+# spec.daemon.
+name: ""
+
+# The Daemon's claims (Spec O §4.1). `shared` must be a ReadWriteMany
+# class; an empty storageClassName is the cluster's default.
+storage:
+  state:
+    size: 1Gi
+    storageClassName: ""
+  shared:
+    size: 10Gi
+    storageClassName: ""
+  agent:
+    size: 2Gi
+    storageClassName: ""
+
+# Secrets you create; this chart creates none. claude: key
+# `credentials.json`; github: key `token`.
+credentials:
+  claude:
+    secretName: ""
+  github:
+    secretName: ""
+
+# The merge layer settings.json is on one machine.
+defaults: {}
+
+# The daemon container's ResourceRequirements.
+resources: {}
+
+# The four plugins this repository releases. An enabled one is a Plugin
+# object of that name and is listed by the Daemon, in the order flow,
+# web, matrix, github. `image.tag` is the plugin's released version,
+# moved by its release (Spec O §24.5); `needs` is its manifest's grant.
+plugins:
+  flow:
+    enabled: false
+    image:
+      repository: ghcr.io/balerix-ai/balerix-plugin-flow
+      tag: "0.1.1"
+    needs: [actions, kv]
+    config: {}
+    secrets: {}
+    fleetDefaults: {}
+    expose: null
+    scratch: null
+    resources: {}
+  web:
+    enabled: false
+    image:
+      repository: ghcr.io/balerix-ai/balerix-plugin-web
+      tag: "0.2.1"
+    needs: [fleets, attach, actions, workspace]
+    config: {}
+    secrets: {}
+    fleetDefaults: {}
+    expose: null
+    scratch: null
+    resources: {}
+  matrix:
+    enabled: false
+    image:
+      repository: ghcr.io/balerix-ai/balerix-plugin-matrix
+      tag: "0.1.1"
+    needs: [fleets, actions, kv]
+    config: {}
+    secrets: {}
+    fleetDefaults: {}
+    expose: null
+    # matrix keeps its store in its scratch directory
+    scratch:
+      size: 1Gi
+    resources: {}
+  github:
+    enabled: false
+    image:
+      repository: ghcr.io/balerix-ai/balerix-plugin-github
+      tag: "0.1.0"
+    needs: [fleets, actions, kv, manage]
+    config: {}
+    secrets: {}
+    fleetDefaults: {}
+    # the webhook's port: set config.listen to it (Spec O §23.1)
+    expose: null
+    scratch: null
+    resources: {}
+
+# Plugin objects made outside this chart, listed after the four above.
+extraPlugins: []

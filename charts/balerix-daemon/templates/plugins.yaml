@@ -1,0 +1,26 @@
+{{- range $p := list "flow" "web" "matrix" "github" }}
+{{- $v := index $.Values.plugins $p }}
+{{- if $v.enabled }}
+---
+apiVersion: balerix.ai/v1alpha1
+kind: Plugin
+metadata:
+  name: {{ $p }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "balerix-daemon.labels" $ | nindent 4 }}
+spec:
+  image: "{{ $v.image.repository }}:{{ $v.image.tag }}"
+  needs: {{ toJson $v.needs }}
+  config: {{ toJson $v.config }}
+  secrets: {{ toJson $v.secrets }}
+  fleetDefaults: {{ toJson $v.fleetDefaults }}
+  {{- with $v.expose }}
+  expose: {{ toJson . }}
+  {{- end }}
+  {{- with $v.scratch }}
+  scratch: {{ toJson . }}
+  {{- end }}
+  resources: {{ toJson $v.resources }}
+{{- end }}
+{{- end }}

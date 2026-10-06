@@ -2415,8 +2415,8 @@ The operator runs as one replica with no leader election and no metrics
   `charts/`, `operator/src/` or `scripts/kind-up.sh`; not part of
   `check`. `helm lint` both charts; `helm template` with the default
   values, with `watchNamespaces: [a, b]`, and with every plugin enabled
-  and `crds.install: false`; then `kubectl apply --dry-run=server` of
-  each rendering against the envtest API server the `operator` task pins,
+  and `crds.install: false`; then a server-side dry-run apply of
+  each rendering (§24.7) against the envtest API server the `operator` task pins,
   after applying the chart's definitions to it. That validates the
   built-in kinds and the definitions' schemas on a real 1.34 API server,
   without kubeconform. It also fails when the definition templates differ
@@ -2516,3 +2516,45 @@ The operator runs as one replica with no leader election and no metrics
   setup and the cluster are the user's.
 - **`docs/RELEASING.md`** gains the charts unit, its steps, the setup and
   the rehearsal.
+
+### 24.7 Decided by the 5a plan
+
+- **`extraPlugins`:** the daemon chart lists Plugin objects made outside
+  it after its own four. The plugin journey's fake plugin goes through
+  it. Order is fixed: flow, web, matrix, github, then the extras. With no
+  plugin enabled and `extraPlugins` empty it renders `plugins: []`, not
+  `null`.
+- **Each plugin's `needs` is a chart value,** defaulted to its manifest's
+  and held to it by `charts_it`. The test reads each
+  `plugins/*/package/balerix-plugin.yaml`, so the CI `charts` job's path
+  filter includes `plugins/` (§24.3).
+- **matrix's `scratch`** defaults to 1Gi.
+- **The checks are a Rust test binary, `operator/tests/charts_it.rs`, on
+  the envtest harness.** It does a server-side dry-run apply through
+  discovery, replacing `kubectl apply --dry-run=server`, and runs the
+  controllers impersonating the chart's service account, so both RBAC
+  modes are proven without a cluster. `mise run operator` leaves it out.
+- **`crds --chart-dir`** replaces `crds --out`. The template carries a
+  "generated" comment inside the guard.
+- **ClusterRole names are `<namespace>-<release>`,** so two releases in
+  different namespaces do not collide.
+- **The Deployment's security context** sets `runAsUser: 65532`, which is
+  distroless `nonroot`. The chart adds a `logLevel` value (`RUST_LOG`,
+  default `info,kube=warn`).
+- **`e2e-k8s` installs the operator chart once,** cluster-wide, into
+  `balerix-system` from `scripts/operator.sh e2e`. The per-namespace Role
+  mode is proven by `charts_it` only. Phase 3's fleet read goes through
+  the test's own `admin_http` over the port-forward.
+- **`RunConfig::insecure_daemon_url` stays** for the in-process tests (no
+  flag sets it). `--resolve`, `RunConfig::resolve` and
+  `DaemonClient::new_resolving` are gone.
+- **Helm 4.3.0.**
+- **No grant was added beyond §24.1's table.** Both RBAC journeys in
+  `charts_it` (namespaced Roles and cluster-wide) and `e2e-k8s` in the
+  cluster passed with the table as written.
+- **A missing grant shows as a timeout, not a 403.** The controllers
+  retry, so a journey fails with a `wait_for` timeout naming the step
+  (for example "timed out waiting for the pool Job" with the
+  `networkpolicies` rule removed). The operator's log has the 403. Only
+  the Events check and the outside-namespace check show the API error
+  directly.

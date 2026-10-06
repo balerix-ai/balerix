@@ -2,10 +2,10 @@
 # A kind cluster for e2e-k8s (Spec O §15, §19.3, §21.4): every node (the
 # control plane and two workers) mounts one host directory, the local-path
 # provisioner told to provision ReadWriteMany claims from it, the five
-# definitions applied, and the daemon and agent images built from this
-# tree and loaded. The control plane mounts it too: local-path's helper
-# pod, which creates each volume's directory, tolerates the control plane
-# and may run there. Nothing here is
+# definitions applied, and the daemon, agent and plugin images (flow, web
+# and fake plugin) built from this tree and loaded. The control plane
+# mounts it too: local-path's helper pod, which creates each volume's
+# directory, tolerates the control plane and may run there. Nothing here is
 # a production class: the shared directory is one host path, not a network
 # filesystem.
 #
@@ -21,7 +21,7 @@ export KUBECONFIG="$root/kubeconfig"
 # kind 0.33.0's node image for the spike's Kubernetes line (§19)
 node_image="kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d"
 
-for tool in kind kubectl docker cargo; do
+for tool in kind kubectl docker cargo rustup; do
   command -v "$tool" >/dev/null || { echo "kind-up: $tool is not on PATH" >&2; exit 2; }
 done
 
@@ -60,7 +60,7 @@ kubectl -n local-path-storage rollout restart deployment local-path-provisioner
 kubectl -n local-path-storage rollout status deployment local-path-provisioner --timeout=120s
 kubectl apply -f operator/crds/
 
-# the two images, from this tree: native release builds, no musl, no scan
+# the daemon and agent images, from this tree: native release builds, no musl, no scan
 cargo build --release -q -p balerix
 CARGO_TARGET_DIR="$repo/agent/target" cargo build --release -q --manifest-path agent/Cargo.toml
 dist="$root/dist"
@@ -74,6 +74,28 @@ docker build ${secret[@]+"${secret[@]}"} -t balerix:e2e -f docker/balerix/Docker
 rm -rf "$root/context-agent" && mkdir -p "$root/context-agent"
 cp "$repo/agent/target/release/balerix-agent" "$root/context-agent/balerix-agent"
 docker build --build-arg BASE=balerix:e2e -t balerix-agent:e2e -f docker/agent/Dockerfile "$root/context-agent"
-kind load docker-image --name "$name" balerix:e2e balerix-agent:e2e
+# the plugin images (Spec O §23.5): flow and web as released, a static musl
+# binary on distroless (docker/plugin/Dockerfile); and the fake plugin, the
+# balerix image whose entrypoint is `balerix dev fake-plugin`
+case "$(uname -m)" in
+  x86_64 | amd64) musl=x86_64-unknown-linux-musl ;;
+  aarch64 | arm64) musl=aarch64-unknown-linux-musl ;;
+  *) echo "kind-up: no musl target for $(uname -m)" >&2; exit 2 ;;
+esac
+command -v musl-gcc >/dev/null || { echo "kind-up: musl-gcc is not on PATH (apt-get install musl-tools)" >&2; exit 2; }
+rustup target add "$musl" >/dev/null
+for unit in flow web; do
+  out="$root/dist-$unit"
+  scripts/release/build.sh "$unit" "$musl" "$out" >/dev/null
+  context=$(scripts/release/image-context.sh "$unit" "$out" "$root/context-$unit" | sed -n 's/^context=//p')
+  docker build -t "balerix-plugin-$unit:e2e" -f docker/plugin/Dockerfile "$context"
+done
+docker build -t balerix-fake-plugin:e2e - <<'EOF2'
+FROM balerix:e2e
+ENTRYPOINT ["/usr/bin/tini", "--", "balerix", "dev", "fake-plugin"]
+CMD []
+EOF2
+kind load docker-image --name "$name" balerix:e2e balerix-agent:e2e \
+  balerix-plugin-flow:e2e balerix-plugin-web:e2e balerix-fake-plugin:e2e
 
 echo "kind-up: cluster $name ready; KUBECONFIG=$KUBECONFIG"

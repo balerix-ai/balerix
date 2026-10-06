@@ -335,7 +335,12 @@ async fn serve_on<P: Plugin>(
         let _ = server.await;
     };
     let reply = match hello_until_listed(host, version, &listen, manifest.as_ref()).await {
-        Ok(reply) => reply,
+        Ok(reply) => {
+            // the Daemon accepts only a hello whose revision it holds
+            // (Spec O §23.8): the e2e reads this line in a rolled pod's log
+            tracing::info!("hello accepted");
+            reply
+        }
         Err(e) => {
             stop(server).await;
             return Err(e);

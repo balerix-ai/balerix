@@ -27,9 +27,9 @@ use balerix_operator::daemon_client::DaemonClient;
 use futures_util::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, Secret, Service};
-use kube::Api;
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::runtime::{WatchStreamExt, watcher};
+use kube::{Api, ResourceExt};
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use support::wait_for;
@@ -356,15 +356,15 @@ async fn wait_agent_ready(
     .await
 }
 
-/// The uid of web's one running pod, not being deleted; `None` while
-/// there is none, or two (a roll under way).
-async fn web_pod_uid(client: &kube::Client, ns: &str) -> Option<String> {
+/// Web's one running pod, not being deleted; `None` while there is
+/// none, or two (a roll under way).
+async fn web_pod(client: &kube::Client, ns: &str) -> Option<Pod> {
     let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
     let listed = pods
         .list(&ListParams::default().labels("balerix.ai/plugin=web"))
         .await
         .unwrap();
-    let running: Vec<Pod> = listed
+    let mut running: Vec<Pod> = listed
         .items
         .into_iter()
         .filter(|p| {
@@ -372,10 +372,19 @@ async fn web_pod_uid(client: &kube::Client, ns: &str) -> Option<String> {
                 && p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
         })
         .collect();
-    match &running[..] {
-        [one] => one.metadata.uid.clone(),
+    match running.len() {
+        1 => running.pop(),
         _ => None,
     }
+}
+
+/// The plugin container's log so far; empty when kubectl cannot read it.
+fn plugin_log(ns: &str, pod: &str) -> String {
+    let out = Command::new("kubectl")
+        .args(["-n", ns, "logs", pod, "-c", "plugin"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -763,8 +772,8 @@ async fn the_plugin_journey_on_kind() {
 
     // 4. §23.8: web's config changes; its pod rolls and says hello under
     // the new revision with no restart by hand; flow stays Ready
-    let before = wait_for("web's pod", Duration::from_secs(60), || {
-        web_pod_uid(&client, &ns)
+    let before = wait_for("web's pod", Duration::from_secs(60), || async {
+        web_pod(&client, &ns).await?.metadata.uid
     })
     .await;
     plugins
@@ -775,13 +784,34 @@ async fn the_plugin_journey_on_kind() {
         )
         .await
         .unwrap();
-    wait_for("web's pod rolled", Duration::from_secs(300), || async {
-        web_pod_uid(&client, &ns)
-            .await
-            .filter(|now| *now != before)
-            .map(|_| ())
+    let rolled = wait_for("web's pod rolled", Duration::from_secs(300), || async {
+        let pod = web_pod(&client, &ns).await?;
+        (pod.metadata.uid.as_ref() != Some(&before)).then_some(pod.metadata.name?)
     })
     .await;
+    // the Plugin's Ready can still be the old pod's (the list goes out on
+    // the Daemon controller's next poll, and the Deployment has no
+    // readiness probe): the new pod's own log says its hello was taken,
+    // and the Daemon takes only a hello whose revision it holds
+    wait_for(
+        "the rolled pod's hello accepted",
+        Duration::from_secs(300),
+        || async {
+            plugin_log(&ns, &rolled)
+                .contains("hello accepted")
+                .then_some(())
+        },
+    )
+    .await;
+    let restarts = Api::<Pod>::namespaced(client.clone(), &ns)
+        .get(&rolled)
+        .await
+        .unwrap()
+        .status
+        .and_then(|s| s.container_statuses)
+        .and_then(|cs| cs.into_iter().find(|c| c.name == "plugin"))
+        .map(|c| c.restart_count);
+    assert_eq!(restarts, Some(0), "web's rolled pod {rolled} restarted");
     wait_for_condition(&plugins, "web", "Ready", Duration::from_secs(300)).await;
     wait_for_condition(&plugins, "flow", "Ready", Duration::from_secs(60)).await;
 
@@ -819,9 +849,10 @@ async fn the_plugin_journey_on_kind() {
         fleets.get_opt("m").await.unwrap()
     })
     .await;
-    assert_eq!(
-        m.metadata.labels.unwrap_or_default()["balerix.ai/managed-by"],
-        "fake"
+    assert!(
+        m.labels().get("balerix.ai/managed-by").map(String::as_str) == Some("fake"),
+        "Fleet m is not labelled managed-by fake: {:?}",
+        m.labels()
     );
     wait_agent_ready(&client, &ns, "m-c-carol", Duration::from_secs(900)).await;
 

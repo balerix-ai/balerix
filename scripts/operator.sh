@@ -63,6 +63,14 @@ case "$1" in
     export KUBECONFIG="$root/kubeconfig"
     export BALERIX_K8S_IMAGES="${BALERIX_K8S_IMAGES:-balerix:e2e,balerix-agent:e2e}"
     export BALERIX_K8S_PLUGIN_IMAGES="${BALERIX_K8S_PLUGIN_IMAGES:-balerix-plugin-flow:e2e,balerix-plugin-web:e2e,balerix-fake-plugin:e2e}"
+    # the operator in the cluster, from the chart, under its own RBAC
+    # (Spec O §24.3): one cluster-wide release both journeys share
+    helm upgrade --install balerix-operator "$repo/charts/balerix-operator" \
+      --namespace balerix-system --create-namespace \
+      --set image.repository=balerix-operator --set image.tag=e2e \
+      --set images.daemon=balerix:e2e --set images.agent=balerix-agent:e2e \
+      --wait --timeout 5m
+    export BALERIX_K8S_CHARTS="$repo/charts"
     # the e2e-k8s profile: the journey waits minutes per step, past the
     # default profile's three-minute termination
     CARGO_TARGET_DIR="$target" cargo nextest run \

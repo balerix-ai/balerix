@@ -45,21 +45,6 @@ struct RunArgs {
     /// The agent image; this operator's version of `ghcr.io/balerix-ai/balerix-agent` when absent.
     #[arg(long)]
     agent_image: Option<String>,
-    /// `host=ip:port`, repeatable: reach a Daemon's Service at that address
-    /// (an operator outside the cluster, through a port-forward).
-    #[arg(long, value_parser = resolve_entry)]
-    resolve: Vec<(String, std::net::SocketAddr)>,
-    /// Tests only: talk to this plain-HTTP Daemon instead of each Daemon's Service.
-    #[arg(long, hide = true)]
-    insecure_daemon_url: Option<String>,
-}
-
-fn resolve_entry(s: &str) -> Result<(String, std::net::SocketAddr), String> {
-    let (host, addr) = s
-        .split_once('=')
-        .ok_or_else(|| format!("{s:?}: expected host=ip:port"))?;
-    let addr = addr.parse().map_err(|e| format!("{addr:?}: {e}"))?;
-    Ok((host.to_string(), addr))
 }
 
 async fn run(args: RunArgs) -> Result<()> {
@@ -76,8 +61,6 @@ async fn run(args: RunArgs) -> Result<()> {
         .context("--namespace or POD_NAMESPACE is required: the Daemon's NetworkPolicy admits the operator's namespace")?;
     let mut cfg = RunConfig::new(version, images, &namespace);
     cfg.watch_namespaces = args.watch_namespaces;
-    cfg.insecure_daemon_url = args.insecure_daemon_url;
-    cfg.resolve = args.resolve;
     let config = kube::Config::infer()
         .await
         .context("cannot connect to the cluster (KUBECONFIG, or in-cluster)")?;

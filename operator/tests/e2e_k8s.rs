@@ -7,10 +7,12 @@
 //! flow and web listed and Ready, a flow rule acting on an agent's Stop,
 //! web's review page through the Daemon, web's config rolling its pod, and
 //! the fake plugin's managed Fleet coming and going. Each journey has a
-//! namespace of its own. The operator runs outside the cluster, as a
-//! child of the test. Needs `KUBECONFIG` (scripts/kind-up.sh) and
-//! `BALERIX_K8S_IMAGES`, and `BALERIX_K8S_PLUGIN_IMAGES` for the plugin
-//! journey; skips without them, fails under `BALERIX_REQUIRE_TOOLS=1`.
+//! namespace of its own. The operator runs in the cluster, installed by
+//! `scripts/operator.sh e2e` from the chart (§24.3); each journey installs
+//! the daemon chart into its namespace. Needs `KUBECONFIG`
+//! (scripts/kind-up.sh), `BALERIX_K8S_IMAGES` and `BALERIX_K8S_CHARTS`, and
+//! `BALERIX_K8S_PLUGIN_IMAGES` for the plugin journey; skips without them,
+//! fails under `BALERIX_REQUIRE_TOOLS=1`.
 //! kind's network plugin does not enforce NetworkPolicy: the operator's
 //! policies are applied here but inert.
 mod support;
@@ -20,27 +22,24 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use balerix_operator::api::{
-    Agent, Crew, Daemon, DaemonSpec, Fleet, FleetSpec, Plugin, PluginSpec,
-};
-use balerix_operator::daemon_client::DaemonClient;
+use balerix_api::FleetRecord;
+use balerix_operator::api::{Agent, Crew, Daemon, Fleet, FleetSpec, Plugin, PluginSpec};
 use futures_util::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, Secret, Service};
-use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, ListParams, PostParams};
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Api, ResourceExt};
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use support::wait_for;
 
-const OPERATOR: &str = env!("CARGO_BIN_EXE_balerix-operator");
-
 fn gate() -> Option<(String, String)> {
     let images = std::env::var("BALERIX_K8S_IMAGES").ok();
     let kubeconfig = std::env::var_os("KUBECONFIG").filter(|p| std::path::Path::new(p).is_file());
-    match (images, kubeconfig) {
-        (Some(images), Some(_)) => {
+    let charts = std::env::var_os("BALERIX_K8S_CHARTS");
+    match (images, kubeconfig, charts) {
+        (Some(images), Some(_), Some(_)) => {
             let (daemon, agent) = images
                 .split_once(',')
                 .expect("BALERIX_K8S_IMAGES is <daemon>,<agent>");
@@ -49,21 +48,12 @@ fn gate() -> Option<(String, String)> {
         _ => {
             if std::env::var("BALERIX_REQUIRE_TOOLS").as_deref() == Ok("1") {
                 panic!(
-                    "KUBECONFIG and BALERIX_K8S_IMAGES are required (BALERIX_REQUIRE_TOOLS=1); run `mise run kind-up` first"
+                    "KUBECONFIG, BALERIX_K8S_IMAGES and BALERIX_K8S_CHARTS are required (BALERIX_REQUIRE_TOOLS=1); run `mise run kind-up` first, then `mise run e2e-k8s`"
                 );
             }
-            eprintln!("skip: no kind cluster (KUBECONFIG, BALERIX_K8S_IMAGES)");
+            eprintln!("skip: no kind cluster (KUBECONFIG, BALERIX_K8S_IMAGES, BALERIX_K8S_CHARTS)");
             None
         }
-    }
-}
-
-/// Ends the operator child when the test ends, however it ends.
-struct Operator(Child);
-impl Drop for Operator {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 
@@ -166,33 +156,6 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// The operator runs here, not in the cluster: the Daemon's Service is
-/// reached through a port-forward, under the Service's own name (§21.6).
-fn spawn_operator(ns: &str, daemon_image: &str, agent_image: &str, forward_port: u16) -> Operator {
-    let resolve = format!("balerix-default.{ns}.svc=127.0.0.1:{forward_port}");
-    Operator(
-        Command::new(OPERATOR)
-            .args([
-                "run",
-                "--watch-namespaces",
-                ns,
-                "--namespace",
-                ns,
-                "--daemon-image",
-                daemon_image,
-                "--agent-image",
-                agent_image,
-                "--resolve",
-                &resolve,
-            ])
-            .env("RUST_LOG", "info,kube=warn")
-            .stdin(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    )
-}
-
 /// A git server pod and its Service, seeded with one commit; the repo's URL.
 async fn git_server(client: &kube::Client, ns: &str, agent_image: &str) -> String {
     let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
@@ -233,18 +196,44 @@ async fn git_server(client: &kube::Client, ns: &str, agent_image: &str) -> Strin
     format!("git://git.{ns}.svc:9418/repo.git")
 }
 
-/// The Daemon `default`, whose claude is the fake one in the image,
-/// listing `plugins` in that order.
-fn daemon_object(plugins: &[&str]) -> Daemon {
-    let spec: DaemonSpec = serde_json::from_value(serde_json::json!({
+/// `helm upgrade --install balerix <charts>/balerix-daemon` in `ns` with
+/// `values`: what a user does, and what installs and changes the Daemon
+/// and its plugins in both journeys.
+fn daemon_chart(ns: &str, values: serde_json::Value) {
+    let charts = std::env::var("BALERIX_K8S_CHARTS").unwrap();
+    let file = std::env::temp_dir().join(format!("e2e-daemon-{ns}.json"));
+    std::fs::write(&file, serde_json::to_vec(&values).unwrap()).unwrap();
+    let out = Command::new("helm")
+        .args(["upgrade", "--install", "balerix"])
+        .arg(format!("{charts}/balerix-daemon"))
+        .args(["--namespace", ns, "-f"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "helm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The Daemon `default`, whose claude is the fake one in the image; the
+/// journey's storage, as the Daemon object it replaces had.
+fn daemon_values() -> serde_json::Value {
+    serde_json::json!({
+        "name": "default",
         "storage": { "state": { "size": "1Gi" }, "shared": { "size": "2Gi" }, "agent": { "size": "1Gi" } },
         "defaults": {
             "claude": { "binary": "/usr/local/bin/balerix", "args": ["dev", "fake-claude", "--verbose"], "settings": { "model": "sonnet" } },
             "sandbox": { "network": { "block": false } }
-        },
-        "plugins": plugins
-    })).unwrap();
-    Daemon::new("default", spec)
+        }
+    })
+}
+
+/// `name:tag` as the chart's image values.
+fn image_values(image: &str) -> serde_json::Value {
+    let (repository, tag) = image.rsplit_once(':').expect("an image with a tag");
+    serde_json::json!({ "repository": repository, "tag": tag })
 }
 
 async fn wait_daemon_service(client: &kube::Client, ns: &str) {
@@ -296,8 +285,8 @@ async fn admin_credentials(client: &kube::Client, ns: &str) -> (String, String) 
 /// A client asking the Daemon as the operator does: trusting its
 /// authority, `balerix-default.<ns>.svc` resolved to the port-forward;
 /// with the base URL and the admin token. The TLS setup is
-/// `DaemonClient::new_resolving`'s; reqwest keeps a URL's port, so the
-/// base carries the forward's.
+/// `DaemonClient::new`'s; reqwest keeps a URL's port, so the base carries
+/// the forward's.
 async fn admin_http(
     client: &kube::Client,
     ns: &str,
@@ -389,7 +378,7 @@ fn plugin_log(ns: &str, pod: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_phase_3_journey_on_kind() {
-    let Some((daemon_image, agent_image)) = gate() else {
+    let Some((_, agent_image)) = gate() else {
         return;
     };
     let client =
@@ -397,17 +386,13 @@ async fn the_phase_3_journey_on_kind() {
             .unwrap();
     let ns = namespace_for(&client, "phase-3").await;
     let forward_port = free_port();
-    let _operator = spawn_operator(&ns, &daemon_image, &agent_image, forward_port);
 
     // 1. a git server pod and its Service, seeded with one commit
     let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
     let repo = git_server(&client, &ns, &agent_image).await;
 
     // 2. a Daemon whose claude is the fake one in the image
-    Api::<Daemon>::namespaced(client.clone(), &ns)
-        .create(&PostParams::default(), &daemon_object(&[]))
-        .await
-        .unwrap();
+    daemon_chart(&ns, daemon_values());
     wait_daemon_service(&client, &ns).await;
     let _forward = forward(&ns, forward_port);
     wait_daemon_ready(&client, &ns).await;
@@ -615,26 +600,24 @@ async fn the_phase_3_journey_on_kind() {
     // the operator asks, with the
     // admin token and the authority the operator minted, through the
     // port-forward under the Service's own name
-    let (token, authority) = admin_credentials(&client, &ns).await;
-    let daemon = DaemonClient::new_resolving(
-        &format!("https://balerix-default.{ns}.svc:7643"),
-        &authority,
-        &token,
-        Duration::from_secs(10),
-        &[(
-            format!("balerix-default.{ns}.svc"),
-            std::net::SocketAddr::from(([127, 0, 0, 1], forward_port)),
-        )],
-    )
-    .unwrap();
+    let (http, base, token) = admin_http(&client, &ns, forward_port).await;
     // the port-forward restarts now and then: retry the transport, not the answer
-    let listed = wait_for("the Daemon to answer", Duration::from_secs(60), || async {
-        daemon.get("f").await.ok()
+    let response = wait_for("the Daemon to answer", Duration::from_secs(60), || async {
+        http.get(format!("{base}/v1/fleets/f"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .ok()
     })
     .await;
     // the Down reply is sent after the mirror pass, so the phase is already
     // Down and the Daemon's view of the pods is cleared
-    let record = listed.expect("the Daemon keeps the downed fleet f");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "the Daemon keeps the downed fleet f"
+    );
+    let record: FleetRecord = response.json().await.unwrap();
     assert!(
         record.is_down(),
         "fleet f is not down: {:?}",
@@ -652,7 +635,7 @@ async fn the_phase_3_journey_on_kind() {
 /// managed Fleet coming up and going with the plugin.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_plugin_journey_on_kind() {
-    let Some((daemon_image, agent_image)) = gate() else {
+    let Some((_, agent_image)) = gate() else {
         return;
     };
     let Some((flow_image, web_image, fake_image)) = plugin_gate() else {
@@ -663,7 +646,6 @@ async fn the_plugin_journey_on_kind() {
             .unwrap();
     let ns = namespace_for(&client, "plugins").await;
     let forward_port = free_port();
-    let _operator = spawn_operator(&ns, &daemon_image, &agent_image, forward_port);
     let repo = git_server(&client, &ns, &agent_image).await;
 
     // 1. Plugins flow and web, listed by the Daemon in that order; the
@@ -675,35 +657,12 @@ async fn the_plugin_journey_on_kind() {
         )
         .unwrap()
     };
-    plugins
-        .create(
-            &PostParams::default(),
-            &Plugin::new(
-                "flow",
-                plugin(&flow_image, &["actions", "kv"], serde_json::json!({})),
-            ),
-        )
-        .await
-        .unwrap();
-    plugins
-        .create(
-            &PostParams::default(),
-            &Plugin::new(
-                "web",
-                plugin(
-                    &web_image,
-                    &["fleets", "attach", "actions", "workspace"],
-                    serde_json::json!({}),
-                ),
-            ),
-        )
-        .await
-        .unwrap();
-    let daemons: Api<Daemon> = Api::namespaced(client.clone(), &ns);
-    daemons
-        .create(&PostParams::default(), &daemon_object(&["flow", "web"]))
-        .await
-        .unwrap();
+    let mut values = daemon_values();
+    values["plugins"] = serde_json::json!({
+        "flow": { "enabled": true, "image": image_values(&flow_image) },
+        "web": { "enabled": true, "image": image_values(&web_image) }
+    });
+    daemon_chart(&ns, values.clone());
     wait_daemon_service(&client, &ns).await;
     let _forward = forward(&ns, forward_port);
     wait_daemon_ready(&client, &ns).await;
@@ -776,14 +735,8 @@ async fn the_plugin_journey_on_kind() {
         web_pod(&client, &ns).await?.metadata.uid
     })
     .await;
-    plugins
-        .patch(
-            "web",
-            &PatchParams::default(),
-            &Patch::Merge(serde_json::json!({ "spec": { "config": { "enabled": true } } })),
-        )
-        .await
-        .unwrap();
+    values["plugins"]["web"]["config"] = serde_json::json!({ "enabled": true });
+    daemon_chart(&ns, values.clone());
     let rolled = wait_for("web's pod rolled", Duration::from_secs(300), || async {
         let pod = web_pod(&client, &ns).await?;
         (pod.metadata.uid.as_ref() != Some(&before)).then_some(pod.metadata.name?)
@@ -837,14 +790,8 @@ async fn the_plugin_journey_on_kind() {
         )
         .await
         .unwrap();
-    daemons
-        .patch(
-            "default",
-            &PatchParams::default(),
-            &Patch::Merge(serde_json::json!({ "spec": { "plugins": ["flow", "web", "fake"] } })),
-        )
-        .await
-        .unwrap();
+    values["extraPlugins"] = serde_json::json!(["fake"]);
+    daemon_chart(&ns, values.clone());
     let m = wait_for("the managed Fleet m", Duration::from_secs(600), || async {
         fleets.get_opt("m").await.unwrap()
     })
@@ -857,14 +804,8 @@ async fn the_plugin_journey_on_kind() {
     wait_agent_ready(&client, &ns, "m-c-carol", Duration::from_secs(900)).await;
 
     // 6. dropping fake from spec.plugins deletes its Fleet
-    daemons
-        .patch(
-            "default",
-            &PatchParams::default(),
-            &Patch::Merge(serde_json::json!({ "spec": { "plugins": ["flow", "web"] } })),
-        )
-        .await
-        .unwrap();
+    values["extraPlugins"] = serde_json::json!([]);
+    daemon_chart(&ns, values.clone());
     wait_for(
         "the managed Fleet m gone",
         Duration::from_secs(600),

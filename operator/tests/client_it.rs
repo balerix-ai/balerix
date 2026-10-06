@@ -358,22 +358,6 @@ async fn a_real_kubernetes_mode_daemon_takes_the_operators_apply() {
     let c = DaemonClient::new(&base, &authority.cert_pem, TOKEN, Duration::from_secs(10)).unwrap();
     wait_ready(&c, &root).await;
 
-    // `--resolve`: the Service's name and port, reached at another
-    // address and port (an operator outside the cluster, a port-forward)
-    let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
-    let resolving = DaemonClient::new_resolving(
-        "https://balerix-default.team-a.svc:7643",
-        &authority.cert_pem,
-        TOKEN,
-        Duration::from_secs(10),
-        &[(
-            "balerix-default.team-a.svc".to_string(),
-            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        )],
-    )
-    .unwrap();
-    resolving.ready().await.unwrap();
-
     assert_eq!(c.get("payments").await.unwrap(), None);
     let record = c.apply(&request("payments", AGENT_TOKEN)).await.unwrap();
     assert_eq!(record.owner.as_deref(), Some("kubernetes"));

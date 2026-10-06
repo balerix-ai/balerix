@@ -53,13 +53,8 @@ pub struct RunConfig {
     /// waiting Job's owner gets a `CrewLocked` Event (§22.3).
     pub stuck_after: Duration,
     pub clock: Clock,
-    /// Tests only: every Daemon is this plain-HTTP stub. A pod's Daemon is
-    /// `https` and the client refuses anything else.
+    /// Tests only (in-process): every Daemon is this plain-HTTP stub. No flag sets it.
     pub insecure_daemon_url: Option<String>,
-    /// Service host to socket address, for an operator outside the
-    /// cluster (`e2e-k8s`): the name still verifies against the
-    /// certificate; only the connection goes elsewhere.
-    pub resolve: Vec<(String, std::net::SocketAddr)>,
 }
 
 impl RunConfig {
@@ -79,7 +74,6 @@ impl RunConfig {
                     .unwrap_or(0)
             }),
             insecure_daemon_url: None,
-            resolve: Vec::new(),
         }
     }
 }
@@ -417,13 +411,7 @@ impl Context {
         }
         let client = match &self.run.insecure_daemon_url {
             Some(url) => DaemonClient::insecure_for_tests(url, token)?,
-            None => DaemonClient::new_resolving(
-                endpoint,
-                authority_pem,
-                token,
-                Duration::from_secs(10),
-                &self.run.resolve,
-            )?,
+            None => DaemonClient::new(endpoint, authority_pem, token, Duration::from_secs(10))?,
         };
         let client = Arc::new(client);
         clients.insert(

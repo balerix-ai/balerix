@@ -40,13 +40,15 @@ credentials, hook input, or sandbox rules.
   `balerix-server`'s tests, which that run never executes.
 - `e2e` — the Phase 3 journey against a real daemon; needs the same tools as `test-it`.
 - `kind-up` — a kind cluster `balerix-e2e` for `e2e-k8s`: the shared
-  local-path class (§19.3), the CRDs, and the daemon and agent images built
-  from this tree and loaded (`balerix:e2e`, `balerix-agent:e2e`). Needs
+  local-path class (§19.3), and the daemon, agent, operator and plugin
+  images built from this tree and loaded (`balerix:e2e`,
+  `balerix-agent:e2e`, `balerix-operator:e2e`, …); no CRDs. Needs
   docker; `mise run kind-up -- down` deletes it. This host has no docker:
   CI only.
-- `e2e-k8s` — the Phase 3 journey on that cluster (`operator/tests/e2e_k8s.rs`):
-  the operator runs outside the cluster as the test's child; `dev fake-claude`
-  in the pods. Fails, not skips, without the cluster. Its own CI job,
+- `e2e-k8s` — the Phase 3 and plugin journeys on that cluster
+  (`operator/tests/e2e_k8s.rs`): `scripts/operator.sh e2e` installs the
+  operator chart (the CRDs, and the operator in the cluster under its own
+  RBAC); each journey installs the daemon chart; `dev fake-claude` in the pods. Fails, not skips, without the cluster. Its own CI job,
   path-filtered on pull requests.
 - `package-plugins [names…]` — builds the named in-tree plugins inside
   their own projects and assembles each as a directory source under

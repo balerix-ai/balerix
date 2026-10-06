@@ -1,0 +1,74 @@
+name: build-unit-images
+description: >-
+  Build, smoke-test, scan and optionally push every image of one release
+  unit for this runner's architecture, in order (Spec O §24.4): core's
+  balerix, then balerix-agent on it, then balerix-operator; a plugin's one
+  image. When pushing, writes each pushed digest as an empty file
+  <digests>/<image>/<hex>. The caller has checked out the repository,
+  installed jq, hadolint and trivy through mise, and logged in to ghcr when
+  pushing.
+inputs:
+  unit:
+    description: Release unit (core, flow, web, matrix, github)
+    required: true
+  dist:
+    description: Directory holding the unit's bare binaries (build-binary's dist)
+    required: true
+  push:
+    description: "'true' pushes each image by digest after its checks pass"
+    required: false
+    default: "false"
+  github-token:
+    description: Token for mise's GitHub downloads inside the build
+    required: true
+  digests:
+    description: Directory for the pushed digests (used only when pushing)
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - id: first
+      uses: ./.github/actions/build-image
+      with:
+        image: ${{ inputs.unit == 'core' && 'balerix' || format('balerix-plugin-{0}', inputs.unit) }}
+        dist: ${{ inputs.dist }}
+        push: ${{ inputs.push }}
+        github-token: ${{ inputs.github-token }}
+    - id: agent
+      if: inputs.unit == 'core'
+      uses: ./.github/actions/build-image
+      with:
+        image: balerix-agent
+        dist: ${{ inputs.dist }}
+        push: ${{ inputs.push }}
+        github-token: ${{ inputs.github-token }}
+        base-smoke: ${{ steps.first.outputs.smoke }}
+        base-push: ${{ inputs.push == 'true' && format('{0}@{1}', steps.first.outputs.image, steps.first.outputs.digest) || '' }}
+    - id: operator
+      if: inputs.unit == 'core'
+      uses: ./.github/actions/build-image
+      with:
+        image: balerix-operator
+        dist: ${{ inputs.dist }}
+        push: ${{ inputs.push }}
+        github-token: ${{ inputs.github-token }}
+    - name: Record the pushed digests
+      if: inputs.push == 'true'
+      shell: bash
+      env:
+        DIGESTS: ${{ inputs.digests }}
+        FIRST: ${{ inputs.unit == 'core' && 'balerix' || format('balerix-plugin-{0}', inputs.unit) }}
+        FIRST_DIGEST: ${{ steps.first.outputs.digest }}
+        AGENT_DIGEST: ${{ steps.agent.outputs.digest }}
+        OPERATOR_DIGEST: ${{ steps.operator.outputs.digest }}
+      run: |
+        [[ -n $DIGESTS ]] || { echo "build-unit-images: push needs digests" >&2; exit 1; }
+        record() {
+          [[ -n $2 ]] || return 0
+          mkdir -p "$DIGESTS/$1"
+          touch "$DIGESTS/$1/${2#sha256:}"
+        }
+        record "$FIRST" "$FIRST_DIGEST"
+        record balerix-agent "$AGENT_DIGEST"
+        record balerix-operator "$OPERATOR_DIGEST"

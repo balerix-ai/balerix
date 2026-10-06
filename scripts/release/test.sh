@@ -253,11 +253,24 @@ scenario_plan() {
   expect_eq "plan, merged initial flow PR: units" "$(field units "$out")" '["flow"]'
   expect_eq "plan, merged initial flow PR: plugins" "$(field plugins "$out")" '["flow"]'
   expect_eq "plan, merged initial flow PR: core" "$(field core "$out")" false
+  expect_eq "plan, merged initial flow PR: images" "$(field images "$out")" '[{"unit":"flow","image":"balerix-plugin-flow"}]'
 
   gitc "$dir" tag "$tag"
   out=$(plan "$dir")
   expect_eq "plan, flow tagged: units" "$(field units "$out")" '[]'
   expect_eq "plan, flow tagged: plugins" "$(field plugins "$out")" '[]'
+}
+
+# A merged core release builds core's three images, in build order.
+scenario_plan_core_images() {
+  local dir out
+  dir=$(fixture plan-core)
+  prepare "$dir" core >/dev/null
+  gitc "$dir" add -A
+  gitc "$dir" commit -qm "chore(release): core initial"
+  out=$(plan "$dir")
+  expect_eq "plan, merged core PR: images in build order" "$(field images "$out")" \
+    '[{"unit":"core","image":"balerix"},{"unit":"core","image":"balerix-agent"},{"unit":"core","image":"balerix-operator"}]'
 }
 
 scenario_forced_released() {
@@ -402,20 +415,36 @@ scenario_package() {
   fi
 }
 
-# Each unit's image carries its own name and description, not the repository's.
+# Each image carries its own name and description, not the repository's,
+# and a core image's context holds its binary under its own name.
 scenario_image_context() {
   local dir="$root/image-context" out
   mkdir -p "$dir/dist"
-  touch "$dir/dist/balerix" "$dir/dist/balerix-plugin-flow"
-  out=$(GITHUB_REPOSITORY_OWNER=Example "$repo/scripts/release/image-context.sh" flow "$dir/dist" "$dir/flow" 2>>"$log")
+  touch "$dir/dist/balerix" "$dir/dist/balerix-agent" "$dir/dist/balerix-operator" "$dir/dist/balerix-plugin-flow"
+  out=$(GITHUB_REPOSITORY_OWNER=Example "$repo/scripts/release/image-context.sh" balerix-plugin-flow "$dir/dist" "$dir/flow" 2>>"$log")
   expect_eq "image context: flow image" "$(field image "$out")" ghcr.io/example/balerix-plugin-flow
   expect_eq "image context: flow title" "$(field title "$out")" balerix-plugin-flow
   expect_eq "image context: flow description drops the spec reference" "$(field description "$out")" \
     "The flow plugin: a per-agent state machine over hook events"
-  out=$("$repo/scripts/release/image-context.sh" core "$dir/dist" "$dir/core" 2>>"$log")
+  out=$("$repo/scripts/release/image-context.sh" balerix "$dir/dist" "$dir/core" 2>>"$log")
   expect_eq "image context: core title" "$(field title "$out")" balerix
   expect_eq "image context: core description" "$(field description "$out")" \
     "Control plane and orchestrator for fleets of coding agents"
+  out=$(GITHUB_REPOSITORY_OWNER=Example "$repo/scripts/release/image-context.sh" balerix-operator "$dir/dist" "$dir/operator" 2>>"$log")
+  expect_eq "image context: operator image" "$(field image "$out")" ghcr.io/example/balerix-operator
+  expect_eq "image context: operator Dockerfile" "$(field dockerfile "$out")" "$repo/docker/operator/Dockerfile"
+  expect_eq "image context: operator description" "$(field description "$out")" \
+    "The balerix operator: five custom resources reconciled into pods, claims, Secrets and Jobs"
+  expect_eq "image context: operator binary" "$(ls "$dir/operator")" balerix-operator
+  out=$("$repo/scripts/release/image-context.sh" balerix-agent "$dir/dist" "$dir/agent" 2>>"$log")
+  expect_eq "image context: agent Dockerfile" "$(field dockerfile "$out")" "$repo/docker/agent/Dockerfile"
+  expect_eq "image context: agent binary" "$(ls "$dir/agent")" balerix-agent
+  expect_eq "image context: agent version is core's" "$(field version "$out")" "$(manifest_version "$repo" core)"
+  if "$repo/scripts/release/image-context.sh" balerix-plugin-common "$dir/dist" "$dir/common" >/dev/null 2>>"$log"; then
+    fail "image context: a library has no image, but one was assembled"
+  else
+    pass "image context: a library's image is refused"
+  fi
 }
 
 affected() {
@@ -583,6 +612,7 @@ scenario_core_bump
 scenario_core_projects
 scenario_in_progress
 scenario_plan
+scenario_plan_core_images
 scenario_forced_released
 scenario_forced_in_progress
 scenario_forced_below_last

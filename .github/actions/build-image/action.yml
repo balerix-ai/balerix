@@ -1,15 +1,17 @@
 name: build-image
 description: >-
-  Build one release unit's image for this runner's architecture from an
+  Build one image for this runner's architecture from an
   already built binary, smoke-test and scan it, and optionally push it by
   digest (Spec I §6). The caller has checked out the repository, installed
   jq, hadolint and trivy through mise, and logged in to ghcr when pushing.
 inputs:
-  unit:
-    description: Release unit (core, flow, web, matrix, github)
+  image:
+    description: >-
+      Image name from unit_images: balerix, balerix-agent, balerix-operator
+      or balerix-plugin-<name>
     required: true
   dist:
-    description: Directory holding the unit's bare binary (build-binary's dist)
+    description: Directory holding the unit's bare binaries (build-binary's dist)
     required: true
   push:
     description: "'true' pushes the image by digest after the checks pass"
@@ -18,10 +20,27 @@ inputs:
   github-token:
     description: Token for mise's GitHub downloads inside the build
     required: true
+  base-smoke:
+    description: >-
+      BASE for the smoke build: an image already in this runner's local
+      image store (the balerix built earlier in the job). Built with the
+      docker driver, the only one that reads the local store.
+    required: false
+    default: ""
+  base-push:
+    description: BASE for the push build, a registry reference (the pushed balerix digest; never latest)
+    required: false
+    default: ""
 outputs:
   digest:
     description: The pushed per-architecture digest (empty when not pushing)
     value: ${{ steps.push.outputs.digest }}
+  image:
+    description: The image repository (ghcr.io/<owner>/<image>)
+    value: ${{ steps.context.outputs.image }}
+  smoke:
+    description: The locally loaded smoke-test tag
+    value: ${{ steps.context.outputs.image }}:smoke
 runs:
   using: composite
   steps:
@@ -29,15 +48,16 @@ runs:
       id: context
       shell: bash
       env:
-        UNIT: ${{ inputs.unit }}
+        IMAGE: ${{ inputs.image }}
         DIST: ${{ inputs.dist }}
-      run: mise x -- scripts/release/image-context.sh "$UNIT" "$DIST" "$RUNNER_TEMP/image-context" >>"$GITHUB_OUTPUT"
+      run: mise x -- scripts/release/image-context.sh "$IMAGE" "$DIST" "$RUNNER_TEMP/image-context-$IMAGE" >>"$GITHUB_OUTPUT"
     - name: Lint the Dockerfile
       shell: bash
       env:
         DOCKERFILE: ${{ steps.context.outputs.dockerfile }}
       run: mise x -- hadolint "$DOCKERFILE"
-    - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+    - id: buildx
+      uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
     - name: Labels
       id: meta
       uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -55,6 +75,8 @@ runs:
         context: ${{ steps.context.outputs.context }}
         file: ${{ steps.context.outputs.dockerfile }}
         labels: ${{ steps.meta.outputs.labels }}
+        builder: ${{ inputs.base-smoke != '' && 'default' || steps.buildx.outputs.name }}
+        build-args: ${{ inputs.base-smoke != '' && format('BASE={0}', inputs.base-smoke) || '' }}
         load: true
         tags: ${{ steps.context.outputs.image }}:smoke
         secrets: |
@@ -62,9 +84,9 @@ runs:
     - name: Smoke test
       shell: bash
       env:
-        UNIT: ${{ inputs.unit }}
+        IMAGE_NAME: ${{ inputs.image }}
         IMAGE: ${{ steps.context.outputs.image }}
-      run: mise x -- scripts/release/smoke-image.sh "$UNIT" "$IMAGE:smoke"
+      run: mise x -- scripts/release/smoke-image.sh "$IMAGE_NAME" "$IMAGE:smoke"
     - name: Scan
       shell: bash
       env:
@@ -81,6 +103,7 @@ runs:
         context: ${{ steps.context.outputs.context }}
         file: ${{ steps.context.outputs.dockerfile }}
         labels: ${{ steps.meta.outputs.labels }}
+        build-args: ${{ inputs.base-push != '' && format('BASE={0}', inputs.base-push) || '' }}
         sbom: true
         provenance: mode=max
         outputs: type=image,name=${{ steps.context.outputs.image }},push-by-digest=true,name-canonical=true,push=true

@@ -75,12 +75,49 @@ unit_changelog() {
   if [[ $1 == core ]]; then echo CHANGELOG.md; else echo "plugins/$1/CHANGELOG.md"; fi
 }
 
-# ghcr repositories must be lowercase; a fork's owner may not be.
-unit_image() {
+# The images a unit ships, by repository name, in build order (Spec O
+# §24.4): core's balerix-agent is built on the balerix just built.
+unit_images() {
   require_unit "$1"
-  [[ $(unit_kind "$1") != library ]] || die "$1 is a library and has no image"
+  case $(unit_kind "$1") in
+    core) printf '%s\n' balerix balerix-agent balerix-operator ;;
+    plugin) unit_crate "$1" ;;
+    *) die "$1 has no image" ;;
+  esac
+}
+
+# The release unit an image belongs to.
+image_unit() {
+  local unit
+  case $1 in
+    balerix | balerix-agent | balerix-operator) echo core ;;
+    balerix-plugin-*)
+      unit=${1#balerix-plugin-}
+      require_unit "$unit"
+      [[ $(unit_kind "$unit") == plugin ]] || die "$unit is a library and has no image"
+      echo "$unit"
+      ;;
+    *) die "unknown image: '$1'" ;;
+  esac
+}
+
+# ghcr repositories must be lowercase; a fork's owner may not be.
+image_ref() {
+  image_unit "$1" >/dev/null
   local owner=${GITHUB_REPOSITORY_OWNER:-balerix-ai}
-  echo "ghcr.io/${owner,,}/$(unit_crate "$1")"
+  echo "ghcr.io/${owner,,}/$1"
+}
+
+# The image's description: its crate's, less the trailing spec reference.
+image_description() {
+  case $1 in
+    balerix-agent | balerix-operator)
+      cargo metadata --manifest-path "${1#balerix-}/Cargo.toml" --no-deps --format-version 1 |
+        jq -r --arg c "$1" '.packages[] | select(.name == $c) | .description // ""' |
+        sed -E 's/ \([^()]*\)$//'
+      ;;
+    *) unit_description "$(image_unit "$1")" ;;
+  esac
 }
 
 # The paths whose commits count toward the unit, one per line. The SDK and

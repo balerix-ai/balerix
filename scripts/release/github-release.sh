@@ -18,8 +18,6 @@ crate=$(unit_crate "$unit")
 version=$(unit_version "$unit")
 tag=$(unit_tag "$unit" "$version")
 kind=$(unit_kind "$unit")
-image=
-[[ $kind == library ]] || image=$(unit_image "$unit")
 
 [[ $kind == library || -f $assets/SHA256SUMS ]] || die "$unit: no SHA256SUMS in $assets"
 
@@ -58,19 +56,19 @@ EOF
 fi
 
 if [[ $kind != library ]]; then
-  cat >>"$notes" <<EOF
-
-### Verify
-
-\`\`\`sh
-gh attestation verify $crate-v$version-x86_64-unknown-linux-musl.tar.gz --repo $GITHUB_REPOSITORY
-sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify oci://$image:$version --repo $GITHUB_REPOSITORY
-cosign verify $image:$version \\
-  --certificate-identity https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/heads/main \\
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-\`\`\`
-EOF
+  {
+    printf '\n### Verify\n\n```sh\n'
+    printf 'gh attestation verify %s --repo %s\n' "$crate-v$version-x86_64-unknown-linux-musl.tar.gz" "$GITHUB_REPOSITORY"
+    printf 'sha256sum --check --ignore-missing SHA256SUMS\n'
+    while IFS= read -r name; do
+      ref="$(image_ref "$name"):$version"
+      printf 'gh attestation verify oci://%s --repo %s\n' "$ref" "$GITHUB_REPOSITORY"
+      printf 'cosign verify %s \\\n' "$ref"
+      printf '  --certificate-identity https://github.com/%s/.github/workflows/release.yml@refs/heads/main \\\n' "$GITHUB_REPOSITORY"
+      printf '  --certificate-oidc-issuer https://token.actions.githubusercontent.com\n'
+    done < <(unit_images "$unit")
+    printf '```\n'
+  } >>"$notes"
 fi
 
 # Drafts have no tag yet, so they cannot be looked up by tag name.

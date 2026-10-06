@@ -38,6 +38,7 @@ jobs:
       plugins: ${{ steps.plan.outputs.plugins }}
       binaries: ${{ steps.plan.outputs.binaries }}
       crates: ${{ steps.plan.outputs.crates }}
+      images: ${{ steps.plan.outputs.images }}
       core: ${{ steps.plan.outputs.core }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -143,29 +144,23 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - id: image
-        uses: ./.github/actions/build-image
+      - uses: ./.github/actions/build-unit-images
         with:
           unit: ${{ matrix.unit }}
           dist: ${{ runner.temp }}/dist
           push: ${{ !inputs.dry-run }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      - if: ${{ !inputs.dry-run }}
-        env:
-          DIGEST: ${{ steps.image.outputs.digest }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/digests"
-          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+          digests: ${{ runner.temp }}/digests
       - if: ${{ !inputs.dry-run }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: digest-${{ matrix.unit }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/*
+          path: ${{ runner.temp }}/digests
           if-no-files-found: error
 
   merge-images:
     needs: [plan, images]
-    if: ${{ !inputs.dry-run && needs.plan.outputs.binaries != '[]' }}
+    if: ${{ !inputs.dry-run && needs.plan.outputs.images != '[]' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -177,7 +172,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        unit: ${{ fromJSON(needs.plan.outputs.binaries) }}
+        include: ${{ fromJSON(needs.plan.outputs.images) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -201,8 +196,8 @@ jobs:
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - id: merge
         env:
-          UNIT: ${{ matrix.unit }}
-        run: mise x -- scripts/release/merge-image.sh "$UNIT" "$RUNNER_TEMP/digests" >>"$GITHUB_OUTPUT"
+          IMAGE: ${{ matrix.image }}
+        run: mise x -- scripts/release/merge-image.sh "$IMAGE" "$RUNNER_TEMP/digests/$IMAGE" >>"$GITHUB_OUTPUT"
       - name: Sign
         env:
           REF: ${{ steps.merge.outputs.image }}@${{ steps.merge.outputs.digest }}
@@ -398,11 +393,11 @@ jobs:
   # just that plugin's image.
   promote-images:
     needs: [plan, github-release, verify-package]
-    # A library-only run has no binaries: an empty matrix is an error.
+    # A library-only run has no images: an empty matrix is an error.
     if: >-
       ${{ !cancelled() && needs.github-release.result == 'success'
       && (needs.verify-package.result == 'success' || needs.verify-package.result == 'skipped')
-      && needs.plan.outputs.binaries != '[]' }}
+      && needs.plan.outputs.images != '[]' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -410,7 +405,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        unit: ${{ fromJSON(needs.plan.outputs.binaries) }}
+        include: ${{ fromJSON(needs.plan.outputs.images) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -428,6 +423,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - env:
-          UNIT: ${{ matrix.unit }}
+          IMAGE: ${{ matrix.image }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: mise x -- scripts/release/promote-image.sh "$UNIT"
+        run: mise x -- scripts/release/promote-image.sh "$IMAGE"

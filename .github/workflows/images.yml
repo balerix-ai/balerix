@@ -82,7 +82,7 @@ jobs:
         with:
           unit: ${{ matrix.unit }}
           target: ${{ matrix.target }}
-      - uses: ./.github/actions/build-image
+      - uses: ./.github/actions/build-unit-images
         with:
           unit: ${{ matrix.unit }}
           dist: ${{ steps.build.outputs.dist }}

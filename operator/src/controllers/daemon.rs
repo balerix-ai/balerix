@@ -67,7 +67,11 @@ pub fn read_secret_string(secret: &Secret, key: &str) -> Option<String> {
     String::from_utf8(bytes.0.clone()).ok()
 }
 
-fn read_issued(secret: Option<&Secret>, cert_key: &str, key_key: &str) -> Option<Issued> {
+pub(crate) fn read_issued(
+    secret: Option<&Secret>,
+    cert_key: &str,
+    key_key: &str,
+) -> Option<Issued> {
     let secret = secret?;
     let not_after = secret
         .annotations()

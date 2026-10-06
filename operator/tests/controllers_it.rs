@@ -17,8 +17,8 @@ use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use support::envtest::envtest;
 use support::stub_daemon::StubDaemon;
 use support::{
-    TestClock, expire_job, finish_job, hold_for, namespace, reap_claim, reap_pod, reap_pod_uid,
-    spawn_operator, wait_for,
+    TestClock, expire_job, finish_job, hold_for, make_daemon_ready, namespace, reap_claim,
+    reap_pod, reap_pod_uid, spawn_operator, wait_for,
 };
 
 fn daemon_spec() -> DaemonSpec {
@@ -640,35 +640,8 @@ async fn a_daemon_that_fails_readyz_keeps_its_not_ready_transition_time() {
     let clock = TestClock::default();
     // a closed port: every `/readyz` fails
     let operator = spawn_operator(env, &ns, Some("http://127.0.0.1:1".into()), &clock);
-    let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), &ns);
-    wait_for("the StatefulSet", Duration::from_secs(60), || async {
-        statefulsets.get_opt("balerix-default").await.unwrap()
-    })
-    .await;
-    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
-    wait_for("the pool Job", Duration::from_secs(60), || async {
-        jobs.get_opt("balerix-default-pool").await.unwrap()
-    })
-    .await;
-
     // the kubelet: the pool synced, the claim bound, the pod ready
-    finish_job(&client, &ns, "balerix-default-pool", true, Some("synced")).await;
-    Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns)
-        .patch_status(
-            "balerix-default-shared",
-            &PatchParams::default(),
-            &Patch::Merge(serde_json::json!({ "status": { "phase": "Bound" } })),
-        )
-        .await
-        .unwrap();
-    statefulsets
-        .patch_status(
-            "balerix-default",
-            &PatchParams::default(),
-            &Patch::Merge(serde_json::json!({ "status": { "replicas": 1, "readyReplicas": 1 } })),
-        )
-        .await
-        .unwrap();
+    make_daemon_ready(&client, &ns).await;
 
     let ready = wait_for(
         "Ready=False/DaemonNotReady",

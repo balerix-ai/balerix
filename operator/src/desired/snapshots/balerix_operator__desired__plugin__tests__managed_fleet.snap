@@ -1,0 +1,35 @@
+---
+source: src/desired/plugin.rs
+expression: f
+---
+apiVersion: balerix.ai/v1alpha1
+kind: Fleet
+metadata:
+  labels:
+    balerix.ai/managed-by: web
+  name: m
+  namespace: team-a
+  ownerReferences:
+    - apiVersion: balerix.ai/v1alpha1
+      controller: true
+      kind: Plugin
+      name: web
+      uid: plugin-uid
+spec:
+  daemon: default
+  retain: None
+  defaults:
+    claude:
+      model: opus
+    sandbox:
+      network:
+        block: false
+  crews:
+    c:
+      repo: "git://git/repo.git"
+      ref: main
+      git:
+        auth: none
+      defaults: {}
+      agents:
+        carol: {}

@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use balerix_api::{AgentPhase, Capability, DeclaredPlugin, PluginStatus};
+use balerix_api::{AgentPhase, Capability, DeclaredPlugin, DownQuery, ManagedFleet, PluginStatus};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
@@ -17,7 +17,7 @@ use super::common::{
     owner_of, pod_security, typed,
 };
 use super::names;
-use crate::api::{ClaimSpec, Daemon, Plugin, PluginSpec};
+use crate::api::{ClaimSpec, Daemon, Fleet, Plugin, PluginSpec, Retain};
 use crate::pki::Issued;
 
 pub const PLUGIN_PORT: i32 = 7644;
@@ -354,6 +354,102 @@ pub fn plugin_conditions(state: &PluginState<'_>) -> Vec<Cond> {
     }
 }
 
+/// The Daemon's `PluginsReady` (§23.4): the first listed plugin, in list
+/// order, that is not ready names why.
+pub fn plugins_ready(
+    listed: &[String],
+    missing: &[String],
+    twice: &[String],
+    rows: &[PluginStatus],
+) -> Cond {
+    if listed.is_empty() {
+        return Cond::yes("PluginsReady", "NoPlugins", "");
+    }
+    for name in listed {
+        if missing.contains(name) {
+            return Cond::no(
+                "PluginsReady",
+                "PluginMissing",
+                &format!("Plugin {name} does not exist"),
+            );
+        }
+        if twice.contains(name) {
+            return Cond::no(
+                "PluginsReady",
+                "PluginListedTwice",
+                &format!("Plugin {name} is listed by another Daemon too"),
+            );
+        }
+        match rows.iter().find(|r| &r.name == name) {
+            None => {
+                return Cond::no(
+                    "PluginsReady",
+                    "PluginNotReady",
+                    &format!("{name}: not declared yet"),
+                );
+            }
+            Some(r) if r.phase == AgentPhase::Ready => {}
+            Some(r) if r.phase == AgentPhase::Failed => {
+                return Cond::no(
+                    "PluginsReady",
+                    "PluginRefused",
+                    &format!("{name}: {}", r.message),
+                );
+            }
+            Some(r) => {
+                return Cond::no(
+                    "PluginsReady",
+                    "PluginNotReady",
+                    &format!("{name}: {}", wire(&r.phase)),
+                );
+            }
+        }
+    }
+    Cond::yes("PluginsReady", "AllReady", "")
+}
+
+/// `keep-repos` keeps the branches (O-16); any other down is plain.
+pub fn retain_of(down: &DownQuery) -> Retain {
+    if down.keep_repos {
+        Retain::Branches
+    } else {
+        Retain::None
+    }
+}
+
+/// A managed request as a Fleet (§23.4): the file's defaults merged over
+/// the Plugin's `fleetDefaults`, its crews as they are, labelled for the
+/// plugin and owned by its Plugin. The Daemon resolved the file when the
+/// plugin sent it; the restricted surface is not checked again.
+pub fn managed_fleet(
+    row: &ManagedFleet,
+    plugin: &Plugin,
+    daemon: &str,
+) -> Result<Fleet, DesiredError> {
+    let (plugin_name, namespace) = name_of(plugin)?;
+    let file_defaults = row
+        .file
+        .get("defaults")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    typed(json!({
+        "apiVersion": "balerix.ai/v1alpha1",
+        "kind": "Fleet",
+        "metadata": {
+            "name": row.name,
+            "namespace": namespace,
+            "labels": { MANAGED_BY_LABEL: plugin_name },
+            "ownerReferences": [owner_of(plugin)?],
+        },
+        "spec": {
+            "daemon": daemon,
+            "retain": Retain::None,
+            "defaults": balerix_config::merge(&plugin.spec.fleet_defaults, &file_defaults),
+            "crews": row.file.get("crews").cloned().unwrap_or_else(|| json!({})),
+        },
+    }))
+}
+
 /// An `AgentPhase` as the wire spells it.
 fn wire(phase: &AgentPhase) -> String {
     serde_json::to_value(phase)
@@ -381,6 +477,137 @@ mod tests {
             "spec": spec
         }))
         .unwrap()
+    }
+
+    fn row(name: &str, phase: AgentPhase, message: &str) -> PluginStatus {
+        PluginStatus {
+            name: name.into(),
+            version: "1".into(),
+            phase,
+            listen: None,
+            routes: false,
+            message: message.into(),
+            active_agents: 0,
+        }
+    }
+
+    #[test]
+    fn plugins_ready_names_the_first_plugin_in_list_order_that_is_not() {
+        let listed = vec!["flow".to_string(), "web".to_string()];
+        let f = |missing: &[&str], twice: &[&str], rows: &[PluginStatus]| {
+            let c = plugins_ready(
+                &listed,
+                &missing.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                &twice.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                rows,
+            );
+            (c.status, c.reason, c.message)
+        };
+        assert_eq!(plugins_ready(&[], &[], &[], &[]).reason, "NoPlugins");
+        let ok = [
+            row("flow", AgentPhase::Ready, ""),
+            row("web", AgentPhase::Ready, ""),
+        ];
+        assert_eq!(
+            f(&[], &[], &ok),
+            (Some(true), "AllReady".into(), String::new())
+        );
+        assert_eq!(
+            f(&["flow"], &[], &ok),
+            (
+                Some(false),
+                "PluginMissing".into(),
+                "Plugin flow does not exist".into()
+            )
+        );
+        assert_eq!(
+            f(&[], &["web"], &ok),
+            (
+                Some(false),
+                "PluginListedTwice".into(),
+                "Plugin web is listed by another Daemon too".into()
+            )
+        );
+        assert_eq!(
+            f(
+                &[],
+                &[],
+                &[
+                    row(
+                        "flow",
+                        AgentPhase::Failed,
+                        "hello.manifest.needs: kv is not granted"
+                    ),
+                    ok[1].clone()
+                ]
+            ),
+            (
+                Some(false),
+                "PluginRefused".into(),
+                "flow: hello.manifest.needs: kv is not granted".into()
+            )
+        );
+        assert_eq!(
+            f(&[], &[], &[ok[0].clone()]),
+            (
+                Some(false),
+                "PluginNotReady".into(),
+                "web: not declared yet".into()
+            )
+        );
+        assert_eq!(
+            f(
+                &[],
+                &[],
+                &[ok[0].clone(), row("web", AgentPhase::Starting, "")]
+            ),
+            (Some(false), "PluginNotReady".into(), "web: starting".into())
+        );
+    }
+
+    #[test]
+    fn a_managed_fleet_is_the_file_beneath_the_plugins_fleet_defaults() {
+        let p = plugin(json!({ "fleetDefaults": { "claude": { "model": "sonnet" },
+            "sandbox": { "network": { "block": false } } } }));
+        let row: ManagedFleet = serde_json::from_value(json!({ "name": "m", "plugin": "web", "file": {
+            "apiVersion": "balerix/v1", "kind": "Fleet", "name": "m",
+            "defaults": { "claude": { "model": "opus" } },
+            "crews": { "c": { "repo": "git://git/repo.git", "ref": "main", "git": { "auth": "none" },
+                "agents": { "carol": {} } } } } }))
+        .unwrap();
+        let f = managed_fleet(&row, &p, "default").unwrap();
+        insta::assert_yaml_snapshot!("managed_fleet", f);
+        assert_eq!(f.metadata.labels.as_ref().unwrap()[MANAGED_BY_LABEL], "web");
+        assert_eq!(f.spec.daemon, "default");
+        assert_eq!(
+            f.spec.defaults["claude"]["model"],
+            json!("opus"),
+            "the file wins"
+        );
+        assert_eq!(
+            f.spec.defaults["sandbox"]["network"]["block"],
+            json!(false),
+            "beneath it, the plugin's"
+        );
+        assert_eq!(f.metadata.owner_references.as_ref().unwrap()[0].name, "web");
+    }
+
+    #[test]
+    fn keep_repos_is_branches_and_anything_else_is_none() {
+        assert_eq!(
+            retain_of(&DownQuery {
+                keep_repos: true,
+                ..Default::default()
+            }),
+            Retain::Branches
+        );
+        assert_eq!(
+            retain_of(&DownQuery {
+                purge: true,
+                ..Default::default()
+            }),
+            Retain::None
+        );
     }
 
     fn inputs() -> PluginInputs {

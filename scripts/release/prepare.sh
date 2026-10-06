@@ -132,6 +132,16 @@ if [[ $unit == core ]]; then
   for plugin in "${PLUGIN_UNITS[@]}"; do
     cargo update --manifest-path "plugins/$plugin/Cargo.toml" -p balerix-api -p balerix-plugin-sdk >&2
   done
+  # The operator and the agent release with core (Spec O §24.4): core's
+  # version, and lockfiles that lock the core crates they build on by path.
+  # Refresh even when the version is already right, for the reason above.
+  for project in "${CORE_PROJECTS[@]}"; do
+    if [[ $(project_version "$project") != "$next" ]]; then
+      cargo set-version --manifest-path "$project/Cargo.toml" "$next" >&2
+    fi
+    mapfile -t locals < <(project_path_crates "$project")
+    cargo update --manifest-path "$project/Cargo.toml" "${locals[@]/#/--package=}" >&2
+  done
 fi
 if [[ $(unit_kind "$unit") == library ]]; then
   # Plugins built on the library lock it through their path dependency, and

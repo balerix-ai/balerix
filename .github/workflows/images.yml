@@ -8,6 +8,8 @@ on:
     paths:
       - crates/**
       - plugins/**
+      - operator/**
+      - agent/**
       - Cargo.toml
       - Cargo.lock
       - docker/**

@@ -90,9 +90,18 @@ dep_version_of() {
   )
 }
 
+project_version_of() {
+  (
+    cd "$1"
+    # shellcheck source=scripts/release/lib.sh
+    source scripts/release/lib.sh
+    project_version "$2"
+  )
+}
+
 # Every manifest, lockfile and plugin manifest agrees (Spec I §10).
 assert_consistent() {
-  local dir=$1 label=$2 core plugin version
+  local dir=$1 label=$2 core plugin project version
   core=$(manifest_version "$dir" core)
   expect_eq "$label: Cargo.lock has balerix $core" "$(lock_version "$dir/Cargo.lock" balerix)" "$core"
   for plugin in flow web matrix github; do
@@ -106,6 +115,13 @@ assert_consistent() {
   done
   expect_eq "$label: common Cargo.lock has the SDK at $core" \
     "$(lock_version "$dir/plugins/common/Cargo.lock" balerix-plugin-sdk)" "$core"
+  for project in operator agent; do
+    expect_eq "$label: $project Cargo.toml at core" "$(project_version_of "$dir" "$project")" "$core"
+    expect_eq "$label: $project Cargo.lock has balerix-$project at core" \
+      "$(lock_version "$dir/$project/Cargo.lock" "balerix-$project")" "$core"
+    expect_eq "$label: $project Cargo.lock has balerix-core at core" \
+      "$(lock_version "$dir/$project/Cargo.lock" balerix-core)" "$core"
+  done
 }
 
 scenario_initial() {
@@ -184,6 +200,19 @@ scenario_core_bump() {
   out=$(prepare "$dir" core)
   expect_eq "core: breaking bumps minor" "$(field version "$out")" 0.5.0
   assert_consistent "$dir" "core bump"
+}
+
+# A commit under operator/ or agent/ releases core (Spec O §24.4).
+scenario_core_projects() {
+  local dir
+  dir=$(fixture core-projects)
+  release "$dir" core 0.4.0
+  change "$dir" operator/src/release-test.rs "fix(operator): an operator fix"
+  expect_eq "operator change: core releases" "$(field status "$(prepare "$dir" core)")" release
+  assert_consistent "$dir" "operator change"
+  discard "$dir"
+  change "$dir" agent/src/release-test.rs "fix(agent): an agent fix"
+  expect_eq "agent change: core releases" "$(field status "$(prepare "$dir" core)")" release
 }
 
 scenario_in_progress() {
@@ -412,6 +441,10 @@ scenario_affected() {
     "$(affected_by "$dir" plugins/matrix/src/release-test.rs)" '["matrix"]'
   expect_eq "affected: a core crate change" \
     "$(affected_by "$dir" crates/balerix-server/src/release-test.rs)" '["core"]'
+  expect_eq "affected: an operator change is core" \
+    "$(affected_by "$dir" operator/src/release-test.rs)" '["core"]'
+  expect_eq "affected: an agent change is core" \
+    "$(affected_by "$dir" agent/src/release-test.rs)" '["core"]'
   expect_eq "affected: an sdk change reaches every plugin" \
     "$(affected_by "$dir" crates/balerix-plugin-sdk/src/release-test.rs)" '["core","flow","web","matrix","github"]'
   expect_eq "affected: the root lockfile is core" \
@@ -547,6 +580,7 @@ scenario_skipped_types
 scenario_sdk_change
 scenario_plugin_only
 scenario_core_bump
+scenario_core_projects
 scenario_in_progress
 scenario_plan
 scenario_forced_released

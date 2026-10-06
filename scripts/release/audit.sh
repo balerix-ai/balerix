@@ -15,6 +15,10 @@ for unit in "$@"; do
   if [[ $unit == core ]]; then
     cargo audit
     cargo deny check advisories bans sources licenses
+    for project in "${CORE_PROJECTS[@]}"; do
+      cargo audit --file "$project/Cargo.lock"
+      cargo deny --manifest-path "$project/Cargo.toml" check advisories bans sources licenses
+    done
   else
     cargo audit --file "plugins/$unit/Cargo.lock"
     cargo deny --manifest-path "plugins/$unit/Cargo.toml" check advisories bans sources licenses

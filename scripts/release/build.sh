@@ -4,8 +4,9 @@
 # target's architecture: the smoke test executes the binary.
 #
 # usage: build.sh <unit> <target> <out-dir>
-# Writes <out-dir>/<crate> (the bare binary, for images) and
-# <out-dir>/<crate>-v<version>-<target>.tar.gz; prints the archive path.
+# Writes <out-dir>/<binary> for each binary the unit ships (core: balerix,
+# balerix-agent, balerix-operator; a plugin: its one), the bare binaries for
+# images, and <out-dir>/<crate>-v<version>-<target>.tar.gz; prints the archive path.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 # shellcheck source=scripts/release/lib.sh
@@ -31,27 +32,39 @@ export CC_aarch64_unknown_linux_musl=${CC_aarch64_unknown_linux_musl:-musl-gcc}
 
 if [[ $unit == core ]]; then
   cargo build --release --locked --target "$target" -p balerix
-  bin="${CARGO_TARGET_DIR:-target}/$target/release/$crate"
+  bins=("${CARGO_TARGET_DIR:-target}/$target/release/balerix")
+  # The operator and the agent release with core (Spec O §24.4), each from
+  # its own project and target directory, as scripts/operator.sh builds them.
+  for project in "${CORE_PROJECTS[@]}"; do
+    CARGO_TARGET_DIR="$project/target" cargo build --release --locked --target "$target" \
+      --manifest-path "$project/Cargo.toml"
+    bins+=("$project/target/$target/release/balerix-$project")
+  done
 else
   target_dir=$(scripts/plugin.sh target-dir "$unit")
   CARGO_TARGET_DIR="$target_dir" cargo build --release --locked --target "$target" \
     --manifest-path "plugins/$unit/Cargo.toml"
-  bin="$target_dir/$target/release/$crate"
+  bins=("$target_dir/$target/release/$crate")
 fi
 
-# Protocol §7: static builds, so no host libc can mismatch.
-linkage=$(ldd "$bin" 2>&1 || true)
-grep -Eq 'not a dynamic executable|statically linked' <<<"$linkage" ||
-  die "$bin is not statically linked: $linkage"
+for bin in "${bins[@]}"; do
+  # Protocol §7: static builds, so no host libc can mismatch.
+  linkage=$(ldd "$bin" 2>&1 || true)
+  grep -Eq 'not a dynamic executable|statically linked' <<<"$linkage" ||
+    die "$bin is not statically linked: $linkage"
+done
 
 if [[ $unit == core ]]; then
-  got=$("$bin" --version)
-  [[ $got == "balerix $version" ]] || die "balerix --version printed '$got', expected 'balerix $version'"
+  for bin in "${bins[@]}"; do
+    name=$(basename "$bin")
+    got=$("$bin" --version)
+    [[ $got == "$name $version" ]] || die "$name --version printed '$got', expected '$name $version'"
+  done
 else
   # Without the daemon's environment a plugin fails in Env::from_process and
   # exits 1 with "<name>: …", which proves it starts on this architecture.
   set +e
-  err=$(env -i "$bin" 2>&1 >/dev/null)
+  err=$(env -i "${bins[0]}" 2>&1 >/dev/null)
   code=$?
   set -e
   [[ $code -eq 1 ]] || die "$crate exited $code without a daemon environment, expected 1: $err"
@@ -60,17 +73,22 @@ fi
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-files=("$crate" LICENSE)
-cp "$bin" "$stage/$crate"
+files=()
+mkdir -p "$out"
+for bin in "${bins[@]}"; do
+  name=$(basename "$bin")
+  cp "$bin" "$stage/$name"
+  cp "$bin" "$out/$name"
+  files+=("$name")
+done
 cp LICENSE "$stage/LICENSE"
+files+=(LICENSE)
 changelog=$(unit_changelog "$unit")
 if [[ -f $changelog ]]; then
   cp "$changelog" "$stage/CHANGELOG.md"
   files+=(CHANGELOG.md)
 fi
 
-mkdir -p "$out"
-cp "$bin" "$out/$crate"
 archive="$out/$crate-v$version-$target.tar.gz"
 tar -czf "$archive" -C "$stage" "${files[@]}"
 echo "$archive"

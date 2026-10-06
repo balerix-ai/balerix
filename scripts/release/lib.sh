@@ -14,6 +14,10 @@ LIBRARY_UNITS=(common)
 # Units with a binary, an image and an archive: every unit but the libraries.
 # shellcheck disable=SC2034
 IMAGE_UNITS=(core flow web matrix github)
+# The standalone projects that release with core (Spec O §13, §24.4): each
+# has its own manifest, lockfile and target directory, and core's version.
+# shellcheck disable=SC2034
+CORE_PROJECTS=(operator agent)
 
 # The arguments as a JSON array of strings: unit names and other bare
 # identifiers, nothing that needs escaping.
@@ -86,7 +90,8 @@ unit_image() {
 unit_paths() {
   require_unit "$1"
   if [[ $1 == core ]]; then
-    printf '%s\n' 'crates/**' Cargo.toml Cargo.lock mise.toml
+    printf '%s\n' 'crates/**' Cargo.toml Cargo.lock mise.toml \
+      'operator/**' 'agent/**' 'docker/operator/**' 'docker/agent/**'
   else
     printf '%s\n' "plugins/$1/**" 'crates/balerix-api/**' 'crates/balerix-plugin-sdk/**'
     if [[ $(unit_kind "$1") == plugin ]] && grep -q '^balerix-plugin-common ' "plugins/$1/Cargo.toml"; then
@@ -111,6 +116,24 @@ unit_package() {
 }
 
 unit_version() { unit_package "$1" | jq -r .version; }
+
+# A core project's version (balerix-<project> in <project>/Cargo.toml).
+project_version() {
+  cargo metadata --manifest-path "$1/Cargo.toml" --no-deps --format-version 1 |
+    jq -r --arg c "balerix-$1" '.packages[] | select(.name == $c) | .version'
+}
+
+# The core crates <project> builds on by path, as its lockfile lists them:
+# the balerix-* packages with no `source` line, less the project itself.
+project_path_crates() {
+  awk -v self="balerix-$1" '
+    function flush() { if (name != "" && !src && name != self) print name; name = ""; src = 0 }
+    /^\[\[package\]\]/ { flush() }
+    /^name = "balerix/ { name = $3; gsub(/"/, "", name) }
+    /^source = / { src = 1 }
+    END { flush() }
+  ' "$1/Cargo.lock"
+}
 
 # The crate's description, less a trailing spec reference ("… (Spec G)")
 # that means nothing outside this repository.

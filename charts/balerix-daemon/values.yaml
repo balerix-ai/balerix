@@ -40,7 +40,7 @@ plugins:
     enabled: false
     image:
       repository: ghcr.io/balerix-ai/balerix-plugin-flow
-      tag: "0.1.1"
+      tag: "0.1.2"
     needs: [actions, kv]
     config: {}
     secrets: {}

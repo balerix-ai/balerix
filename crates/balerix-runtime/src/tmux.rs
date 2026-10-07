@@ -25,7 +25,7 @@ use balerix_core::{
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
-use crate::supervise::ProcIdentity;
+use crate::supervise::{ProcIdentity, Procfs};
 use crate::tools::Cmd;
 
 /// The window that keeps a session alive when every agent window is gone.
@@ -158,6 +158,9 @@ pub struct TmuxRunner {
     pub socket_path: Option<PathBuf>,
     /// `STOP_WAIT`; a field so a test can shorten it.
     pub stop_wait: Duration,
+    /// Where the one-machine waits read pane processes; a field so a
+    /// test can point it at a fake `/proc`.
+    pub proc: Procfs,
     /// One lock per agent, held for the whole of a `send_text` or a
     /// `send_keys` (Spec J §4.2): a paced key sequence lasts seconds, and
     /// another send landing inside it would corrupt both. Entries are never
@@ -172,6 +175,7 @@ impl TmuxRunner {
             socket: socket.into(),
             socket_path: None,
             stop_wait: STOP_WAIT,
+            proc: Procfs::default(),
             sends: Mutex::new(HashMap::new()),
         }
     }
@@ -183,6 +187,7 @@ impl TmuxRunner {
             socket: String::new(),
             socket_path: Some(socket),
             stop_wait: STOP_WAIT,
+            proc: Procfs::default(),
             sends: Mutex::new(HashMap::new()),
         }
     }
@@ -294,7 +299,14 @@ impl TmuxRunner {
     fn wait_gone(&self, id: &str, procs: &[ProcIdentity]) -> Result<(), RunnerError> {
         let deadline = Instant::now() + self.stop_wait;
         loop {
-            let Some(alive) = procs.iter().find(|p| !p.gone()) else {
+            let mut alive = None;
+            for p in procs {
+                if !self.proc.gone(p).map_err(|e| proc_error(id, &e))? {
+                    alive = Some(p);
+                    break;
+                }
+            }
+            let Some(alive) = alive else {
                 return Ok(());
             };
             if Instant::now() >= deadline {
@@ -305,6 +317,11 @@ impl TmuxRunner {
             }
             std::thread::sleep(STOP_POLL);
         }
+    }
+
+    /// The process running as `pid`, `None` once it has exited.
+    fn identity(&self, id: &str, pid: u32) -> Result<Option<ProcIdentity>, RunnerError> {
+        self.proc.identity(pid).map_err(|e| proc_error(id, &e))
     }
 
     /// The pod-mode wait (Spec O §6.3): the pane's process runs in the
@@ -584,7 +601,7 @@ impl AgentRunner for TmuxRunner {
                     // `Exited` arm does
                     self.respawn_idle(&id, &target, &cwd)?;
                 } else {
-                    let old = ProcIdentity::of(pid);
+                    let old = self.identity(&id, pid)?;
                     self.respawn_idle(&id, &target, &cwd)?;
                     self.wait_gone(&id, old.as_slice())?;
                 }
@@ -653,12 +670,14 @@ impl AgentRunner for TmuxRunner {
             self.run_optional(&id, &["kill-window", "-t", &Self::window_target(agent)])?;
             return Ok(());
         }
+        // An unreadable stat fails the stop, but only after the window is
+        // killed: the stop must still happen (#148).
         let pane = match state {
-            Some(ProcessState::Running { pid }) => ProcIdentity::of(pid),
-            _ => None,
+            Some(ProcessState::Running { pid }) => self.identity(&id, pid),
+            _ => Ok(None),
         };
         self.run_optional(&id, &["kill-window", "-t", &Self::window_target(agent)])?;
-        self.wait_gone(&id, pane.as_slice())
+        self.wait_gone(&id, pane?.as_slice())
     }
 
     fn stop_crew(&self, crew: &CrewRef) -> Result<(), RunnerError> {
@@ -711,6 +730,9 @@ impl AgentRunner for TmuxRunner {
         // of every session of the group, each process once, are what the
         // stop waits on.
         let mut panes: Vec<ProcIdentity> = Vec::new();
+        // a pane whose stat cannot be read fails the stop, after the
+        // sessions are killed and the readable panes waited on (#148)
+        let mut unreadable = None;
         for session in &sessions {
             let found = self
                 .run_optional(
@@ -725,19 +747,22 @@ impl AgentRunner for TmuxRunner {
                     ],
                 )?
                 .map(|text| parse_live_panes(&text))
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(ProcIdentity::of);
-            for p in found {
-                if !panes.contains(&p) {
-                    panes.push(p);
+                .unwrap_or_default();
+            for pid in found {
+                match self.identity(&name, pid) {
+                    Ok(Some(p)) if !panes.contains(&p) => panes.push(p),
+                    Ok(_) => {}
+                    Err(e) => {
+                        unreadable.get_or_insert(e);
+                    }
                 }
             }
         }
         for session in &sessions {
             self.run_optional(&name, &["kill-session", "-t", &format!("={session}")])?;
         }
-        self.wait_gone(&name, &panes)
+        self.wait_gone(&name, &panes)?;
+        unreadable.map_or(Ok(()), Err)
     }
 
     fn observe(&self, fleet: &FleetName) -> Result<ObservedState, RunnerError> {
@@ -943,6 +968,13 @@ impl TmuxRunner {
     }
 }
 
+fn proc_error(id: &str, e: &std::io::Error) -> RunnerError {
+    RunnerError::Proc {
+        id: id.to_string(),
+        message: e.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,6 +993,26 @@ mod tests {
         let one = TmuxRunner::new("tmux".into(), "balerix-x");
         assert!(!one.pod());
         assert_eq!(one.socket_args(), ["-L", "balerix-x"]);
+    }
+
+    /// #148: a pane process whose stat cannot be read is not gone. The
+    /// stop fails, naming the pid's stat, rather than returning Ok.
+    #[test]
+    fn an_unreadable_stat_fails_the_stop_instead_of_reading_as_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let stat = dir.path().join("7").join("stat");
+        std::fs::create_dir_all(stat.parent().unwrap()).unwrap();
+        std::fs::write(&stat, "7 (x) S 1 7 7 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5 1 1").unwrap();
+        let mut runner = TmuxRunner::new("tmux".into(), "balerix-x");
+        runner.proc = Procfs::at(dir.path());
+        let pane = runner.identity("f/c/a", 7).unwrap().unwrap();
+
+        std::fs::write(&stat, "garbage").unwrap();
+        let err = runner.wait_gone("f/c/a", &[pane]).unwrap_err();
+        assert!(matches!(err, RunnerError::Proc { .. }), "{err:?}");
+        assert!(err.to_string().contains("7/stat"), "{err}");
+        let err = runner.identity("f/c/a", 7).unwrap_err();
+        assert!(matches!(err, RunnerError::Proc { .. }), "{err:?}");
     }
 
     #[test]

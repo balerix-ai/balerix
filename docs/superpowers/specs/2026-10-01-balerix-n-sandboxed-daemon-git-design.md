@@ -421,7 +421,10 @@ channel that carries one message per signal.
 6. The kill loop, in both cases: list every descendant from `/proc`
    (parent pids, starting at the wrapper's own pid), SIGKILL each, reap
    with `wait` (not `waitpid`, for the reason in the dependency sentence), repeat until `wait` reports no children. It does
-   not give up; the caller's bound (§13.5) reports a stuck one.
+   not give up; the caller's bound (§13.5) reports a stuck one. Passes
+   run 2 ms apart; after five in a row that found the same pids, the
+   pause doubles up to 100 ms, and any new pid resets it (#120). Not
+   being able to list `/proc` ends the wrapper with an error.
 7. Exit status: the main child's (128+n if a signal killed it), so
    `pane_dead_status` keeps its meaning; 143 if the wrapper was stopped
    before the main child exited.

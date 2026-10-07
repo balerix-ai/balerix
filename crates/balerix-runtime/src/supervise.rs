@@ -6,6 +6,7 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -23,6 +24,10 @@ pub const STOPPED_STATUS: i32 = 143;
 const POLL: Duration = Duration::from_millis(20);
 /// The pause between two passes of the kill loop.
 const KILL_STEP: Duration = Duration::from_millis(2);
+/// The longest pause, once passes keep finding the same pids (#120).
+const KILL_STEP_MAX: Duration = Duration::from_millis(100);
+/// How many passes in a row may find the same pids before the pause grows.
+const SAME_PASSES: usize = 5;
 
 /// The three fields of `/proc/<pid>/stat` this module reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,10 +50,6 @@ pub(crate) fn parse_stat(text: &str) -> Option<Stat> {
     Some(Stat { state, ppid, start })
 }
 
-fn read_stat(pid: u32) -> Option<Stat> {
-    parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
-}
-
 /// One process, told apart from a later one that reuses its pid by its
 /// start time. A zombie has no identity: it has exited, and only waits
 /// for its parent to reap it.
@@ -58,18 +59,77 @@ pub struct ProcIdentity {
     start: u64,
 }
 
-impl ProcIdentity {
-    pub fn of(pid: u32) -> Option<Self> {
-        let stat = read_stat(pid)?;
-        (stat.state != 'Z').then_some(Self {
-            pid,
-            start: stat.start,
-        })
+/// Where process stats are read: `/proc`, or a fake one in a test.
+#[derive(Debug, Clone)]
+pub struct Procfs {
+    root: PathBuf,
+}
+
+impl Default for Procfs {
+    fn default() -> Self {
+        Self::at("/proc")
+    }
+}
+
+impl Procfs {
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// `None` once the process has exited and its entry is gone. Any other
+    /// failure to read or parse the stat is an error, never an exit
+    /// (#148): under `hidepid`, or for another uid's process, a live
+    /// process would otherwise read as gone.
+    fn stat(&self, pid: u32) -> io::Result<Option<Stat>> {
+        let path = self.root.join(pid.to_string()).join("stat");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => parse_stat(&text).map(Some).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: cannot parse {text:?}", path.display()),
+                )
+            }),
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(Errno::SRCH.raw_os_error()) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+        }
+    }
+
+    /// `(pid, ppid)` of every process this shows. A process that exits
+    /// while this reads is skipped, and so is one whose stat cannot be
+    /// read (another uid's, under `hidepid`): descendants normally run as
+    /// the wrapper's uid, and a setuid one it cannot see is left to the
+    /// stop's bound, which reports it (§13.5). Not being able to list at
+    /// all is an error (#120): the kill loop would see nothing and never
+    /// end.
+    pub(crate) fn parents(&self) -> io::Result<Vec<(u32, u32)>> {
+        let entries = std::fs::read_dir(&self.root)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", self.root.display())))?;
+        Ok(entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .filter_map(|pid| Some((pid, self.stat(pid).ok()??.ppid)))
+            .collect())
+    }
+
+    /// `None` when `pid` has exited, a zombie included.
+    pub fn identity(&self, pid: u32) -> io::Result<Option<ProcIdentity>> {
+        Ok(self
+            .stat(pid)?
+            .filter(|s| s.state != 'Z')
+            .map(|s| ProcIdentity {
+                pid,
+                start: s.start,
+            }))
     }
 
     /// The process has exited, whether or not its pid is in use again.
-    pub fn gone(&self) -> bool {
-        Self::of(self.pid) != Some(*self)
+    pub fn gone(&self, id: &ProcIdentity) -> io::Result<bool> {
+        Ok(self.identity(id.pid)? != Some(*id))
     }
 }
 
@@ -89,17 +149,35 @@ pub(crate) fn descendants_of(root: u32, parents: &[(u32, u32)]) -> Vec<u32> {
     out
 }
 
-/// `(pid, ppid)` of every process `/proc` shows. A process that exits
-/// while this reads is skipped.
-fn proc_parents() -> Vec<(u32, u32)> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter_map(|pid| Some((pid, read_stat(pid)?.ppid)))
-        .collect()
+/// The kill loop's pause (#120). `KILL_STEP` while each pass finds a
+/// different set of pids, so a tree that forks faster than one scan is
+/// still emptied; once `SAME_PASSES` passes in a row found the same set
+/// (a descendant that cannot die yet, in uninterruptible sleep on NFS or
+/// FUSE), the pause doubles up to `KILL_STEP_MAX`. Anything new resets it.
+#[derive(Debug, Default)]
+struct KillBackoff {
+    last: Vec<u32>,
+    same: usize,
+    pause: Duration,
+}
+
+impl KillBackoff {
+    fn after(&mut self, found: &[u32]) -> Duration {
+        let mut found = found.to_vec();
+        found.sort_unstable();
+        if found == self.last {
+            self.same += 1;
+        } else {
+            self.last = found;
+            self.same = 0;
+        }
+        self.pause = if self.same < SAME_PASSES {
+            KILL_STEP
+        } else {
+            (self.pause * 2).min(KILL_STEP_MAX)
+        };
+        self.pause
+    }
 }
 
 fn raw(pid: Pid) -> u32 {
@@ -138,17 +216,21 @@ fn reap(main: u32, status: &mut Option<i32>) -> io::Result<bool> {
 }
 
 /// SIGKILL to every descendant, reap, repeat until there are no children.
-/// It does not give up: the caller of `stop` has the bound (§13.5).
+/// It does not give up: the caller of `stop` has the bound (§13.5). A
+/// descendant that will not die costs a bounded scan rate (`KillBackoff`).
 fn kill_until_empty(main: u32, status: &mut Option<i32>) -> io::Result<()> {
     let me = raw(getpid());
+    let proc = Procfs::default();
+    let mut backoff = KillBackoff::default();
     while reap(main, status)? {
-        for pid in descendants_of(me, &proc_parents()) {
+        let found = descendants_of(me, &proc.parents()?);
+        for &pid in &found {
             if let Some(pid) = pid_of(pid) {
                 // gone already is fine; the next pass sees what is left
                 let _ = kill_process(pid, Signal::KILL);
             }
         }
-        std::thread::sleep(KILL_STEP);
+        std::thread::sleep(backoff.after(&found));
     }
     Ok(())
 }
@@ -229,9 +311,10 @@ mod tests {
 
     #[test]
     fn a_live_process_has_an_identity_and_is_not_gone() {
-        let me = ProcIdentity::of(std::process::id()).unwrap();
+        let proc = Procfs::default();
+        let me = proc.identity(std::process::id()).unwrap().unwrap();
         assert_eq!(me.pid, std::process::id());
-        assert!(!me.gone());
+        assert!(!proc.gone(&me).unwrap());
     }
 
     #[test]
@@ -240,12 +323,13 @@ mod tests {
             .arg("60")
             .spawn()
             .unwrap();
-        let id = ProcIdentity::of(child.id()).unwrap();
-        assert!(!id.gone());
+        let proc = Procfs::default();
+        let id = proc.identity(child.id()).unwrap().unwrap();
+        assert!(!proc.gone(&id).unwrap());
         child.kill().unwrap();
         // not waited yet: a zombie, which has exited as far as a stop cares
         let start = std::time::Instant::now();
-        while !id.gone() {
+        while !proc.gone(&id).unwrap() {
             assert!(
                 start.elapsed() < std::time::Duration::from_secs(5),
                 "never a zombie"
@@ -253,21 +337,111 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            ProcIdentity::of(child.id()).is_none(),
+            proc.identity(child.id()).unwrap().is_none(),
             "a zombie has no identity"
         );
         child.wait().unwrap();
-        assert!(id.gone(), "and stays gone once reaped");
+        assert!(proc.gone(&id).unwrap(), "and stays gone once reaped");
     }
 
     #[test]
     fn a_reused_pid_is_a_different_process() {
-        let me = ProcIdentity::of(std::process::id()).unwrap();
+        let proc = Procfs::default();
+        let me = proc.identity(std::process::id()).unwrap().unwrap();
         let other = ProcIdentity {
             start: me.start + 1,
             ..me
         };
-        assert!(other.gone(), "same pid, another start time");
+        assert!(proc.gone(&other).unwrap(), "same pid, another start time");
+    }
+
+    /// A fake `/proc` holding one stat line for `pid`.
+    fn fake_stat(root: &std::path::Path, pid: u32, line: &str) {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), line).unwrap();
+    }
+
+    fn stat_line(pid: u32, state: char, start: u64) -> String {
+        format!("{pid} (x) {state} 1 {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {start} 1 1")
+    }
+
+    #[test]
+    fn a_missing_stat_is_an_exited_process_and_a_garbled_one_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = Procfs::at(dir.path());
+        assert!(
+            proc.identity(7).unwrap().is_none(),
+            "no /proc entry: exited"
+        );
+        fake_stat(dir.path(), 8, "8 (x) S");
+        let err = proc.identity(8).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        fake_stat(dir.path(), 9, &stat_line(9, 'Z', 5));
+        assert!(proc.identity(9).unwrap().is_none(), "a zombie has exited");
+    }
+
+    #[test]
+    fn an_unreadable_stat_is_an_error_not_an_exit() {
+        if rustix::process::geteuid().is_root() {
+            // root reads a mode-000 file; nothing to test
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fake_stat(dir.path(), 7, &stat_line(7, 'S', 5));
+        let stat = dir.path().join("7").join("stat");
+        std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = Procfs::at(dir.path()).identity(7).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    #[test]
+    fn gone_is_an_error_when_the_stat_turns_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = Procfs::at(dir.path());
+        fake_stat(dir.path(), 7, &stat_line(7, 'S', 5));
+        let id = proc.identity(7).unwrap().unwrap();
+        assert!(!proc.gone(&id).unwrap());
+        fake_stat(dir.path(), 7, "garbage");
+        assert!(proc.gone(&id).is_err(), "unreadable is not gone");
+        std::fs::remove_dir_all(dir.path().join("7")).unwrap();
+        assert!(proc.gone(&id).unwrap(), "no entry: gone");
+    }
+
+    #[test]
+    fn an_unreadable_proc_is_an_error_and_an_unreadable_pid_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = Procfs::at(dir.path().join("nope"));
+        assert!(
+            missing.parents().is_err(),
+            "no /proc: the kill loop cannot see"
+        );
+
+        let proc = Procfs::at(dir.path());
+        fake_stat(dir.path(), 7, &stat_line(7, 'S', 5));
+        fake_stat(dir.path(), 8, "garbage");
+        std::fs::create_dir_all(dir.path().join("self")).unwrap();
+        assert_eq!(proc.parents().unwrap(), vec![(7, 1)]);
+    }
+
+    #[test]
+    fn the_kill_loop_slows_only_while_it_finds_the_same_pids() {
+        let mut b = KillBackoff::default();
+        // a changing set (a fork race) keeps the full rate
+        for n in 0..20 {
+            assert_eq!(b.after(&[n]), KILL_STEP, "pass {n}");
+        }
+        // the same set: full rate for a few passes, then doubling to a cap
+        let pauses: Vec<_> = (0..12).map(|_| b.after(&[19])).collect();
+        assert!(
+            pauses[..SAME_PASSES - 1].iter().all(|p| *p == KILL_STEP),
+            "{pauses:?}"
+        );
+        assert!(pauses.windows(2).all(|w| w[1] >= w[0]), "{pauses:?}");
+        assert_eq!(*pauses.last().unwrap(), KILL_STEP_MAX);
+        // anything new: back to full rate at once
+        assert_eq!(b.after(&[19, 20]), KILL_STEP);
     }
 
     #[test]

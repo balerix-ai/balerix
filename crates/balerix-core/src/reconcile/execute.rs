@@ -55,6 +55,9 @@ pub fn execute(plan: &Plan, status: &mut FleetStatus, ctx: &ReconcileContext) ->
         .unwrap_or_default();
     let mut report = ExecuteReport::default();
     let mut failed_agents: Vec<AgentId> = Vec::new();
+    // the agents whose removal (harvest) failed: their unharvested clone
+    // is what holds the crew back until fixed or purged
+    let mut failed_removals: Vec<AgentId> = Vec::new();
     let mut failed_crews: BTreeMap<CrewRef, String> = BTreeMap::new();
     let mut plans: BTreeMap<AgentId, LaunchPlan> = BTreeMap::new();
 
@@ -70,9 +73,21 @@ pub fn execute(plan: &Plan, status: &mut FleetStatus, ctx: &ReconcileContext) ->
                 continue;
             }
         }
+        // Any failed step of one of the crew's agents holds its removal
+        // back (#122): a timed-out stop may leave the agent alive in the
+        // workspace, and a failed removal means a harvest was refused, so
+        // deleting the clone would lose the work. A failed removal's status
+        // says so and names the way out; the crew is retried every pass.
         if let Step::RemoveCrew(crew, _) = step
             && failed_agents.iter().any(|id| id.crew_ref() == *crew)
         {
+            for id in failed_removals.iter().filter(|id| id.crew_ref() == *crew) {
+                status.entry(&id.to_string()).message.push_str(&format!(
+                    "; crew {crew} is kept until this is fixed, or \
+                     `balerix down {} --purge` deletes it unharvested",
+                    crew.fleet
+                ));
+            }
             report.skipped.push(step.clone());
             continue;
         }
@@ -115,6 +130,9 @@ pub fn execute(plan: &Plan, status: &mut FleetStatus, ctx: &ReconcileContext) ->
                 _ => {
                     if let Some(id) = step.agent_id() {
                         failed_agents.push(id.clone());
+                        if matches!(step, Step::RemoveAgent(_)) {
+                            failed_removals.push(id.clone());
+                        }
                     }
                 }
             }
@@ -396,6 +414,46 @@ mod tests {
         assert!(h.r.observed().crews.is_empty());
     }
 
+    /// #122: a crew dropped from a running fleet whose agent cannot be
+    /// removed (its harvest refused) is held back on every pass, so its
+    /// clone is never deleted unharvested, and its agent's status says so
+    /// and names the way out.
+    #[test]
+    fn a_dropped_crew_whose_agent_removal_fails_is_held_back_and_says_how_out() {
+        let h = Harness::new();
+        let mut f = fleet(&["a"]);
+        let other = f.crews[&"c".parse().unwrap()].clone();
+        f.crews.insert("d".parse().unwrap(), other);
+        let mut st = FleetStatus::default();
+        reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        let only_c = fleet(&["a"]);
+        for pass in 0..3 {
+            h.m.fail_next(
+                "remove_agent",
+                "f/d/a",
+                "refusing the clone: .git/commondir present",
+            );
+            let (_, rep) = reconcile_pass(&mut st, &h.ctx(Some(&only_c))).unwrap();
+            assert_eq!(
+                rep.skipped
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                vec!["remove-crew f/d keep-repos=false keep-sessions=false"],
+                "pass {pass}"
+            );
+            assert!(
+                !h.m.calls()
+                    .iter()
+                    .any(|c| c.starts_with("remove_crew f/d ")),
+                "pass {pass}: the clone is not deleted unharvested"
+            );
+            let msg = &st.agents["f/d/a"].message;
+            assert!(msg.contains(".git/commondir present"), "pass {pass}: {msg}");
+            assert!(msg.contains("balerix down f --purge"), "pass {pass}: {msg}");
+        }
+    }
+
     #[test]
     fn a_failed_stop_holds_back_its_crews_removal_until_a_later_pass() {
         let h = Harness::new();
@@ -416,6 +474,11 @@ mod tests {
             ]
         );
         assert_eq!(rep.failures.len(), 1, "{rep:?}");
+        assert!(
+            !st.agents["f/c/a"].message.contains("--purge"),
+            "a failed stop's crew is removed on a later pass; purge is no remedy: {}",
+            st.agents["f/c/a"].message
+        );
         assert_eq!(
             rep.skipped
                 .iter()
@@ -479,6 +542,41 @@ mod tests {
             h.r.observed().get(&"f/c/a".parse().unwrap()),
             Some(&crate::ports::ProcessState::Running { pid: 2 })
         );
+    }
+
+    /// #123: a stop that timed out has killed the window already, so the
+    /// agent is no longer observed; the next pass still shows it stopped,
+    /// with the timed-out stop's message kept.
+    #[test]
+    fn a_timed_out_stop_settles_as_stopped_on_the_next_pass() {
+        let mut h = Harness::new();
+        let f = fleet(&["a"]);
+        let mut st = FleetStatus::default();
+        reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        st.agents.get_mut("f/c/a").unwrap().phase = AgentPhase::Ready;
+        h.stopped.insert("f/c/a".parse().unwrap());
+        let timed_out = "f/c/a: agent processes still running after stop (pid 42)";
+        h.r.fail_next("stop_agent", "f/c/a", timed_out);
+        let (_, rep) = reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        assert!(!rep.all_ok());
+        // what StillRunning leaves behind: the window is gone
+        h.r.remove(&"f/c/a".parse().unwrap());
+
+        let (p, rep) = reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        assert!(rep.all_ok(), "{:?}", rep.failures);
+        assert_eq!(
+            p.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["stop f/c/a", "ensure-crew f/c"]
+        );
+        assert_eq!(st.agents["f/c/a"].phase, AgentPhase::Stopped);
+        assert!(
+            st.agents["f/c/a"].message.contains("pid 42"),
+            "{:?}",
+            st.agents["f/c/a"].message
+        );
+        // and then idle
+        let (p, _) = reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        assert_eq!(p.len(), 1);
     }
 
     #[test]

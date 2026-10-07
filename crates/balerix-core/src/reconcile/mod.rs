@@ -102,7 +102,7 @@ pub fn backoff_secs(policy: &ReconcilePolicy, restarts: u32) -> u64 {
 ///
 /// | observed | condition | steps |
 /// |---|---|---|
-/// | any | in `stopped` | `Stop` if observed, else — |
+/// | any | in `stopped` | `Stop` if observed or its phase is not `Stopped`, else — |
 /// | `Running` | `!changed` | — |
 /// | `Running` | `changed` | `Stop`, `Materialize`, `Start` |
 /// | `Exited` | `changed` | `Materialize`, `Start` |
@@ -115,7 +115,11 @@ pub fn backoff_secs(policy: &ReconcilePolicy, restarts: u32) -> u64 {
 ///
 /// A desired agent in `stopped` (plugins spec §16.4) gets `Stop` if it is
 /// observed at all and nothing else: no restart, no `NoteExit`, even when
-/// its hash changed. Leaving the set is an ordinary "absent → restart".
+/// its hash changed. Unobserved, it still gets `Stop` while it has a status
+/// entry whose phase is not `Stopped`, which settles that phase (#123): a
+/// timed-out stop leaves `Ready` behind, and an exited, failed or dead
+/// agent that is stopped shows `Stopped` too, its last message kept.
+/// Leaving the set is an ordinary "absent → restart".
 ///
 /// Known-but-not-desired agents get `Stop` (if observed) and `RemoveAgent`;
 /// their crews, if no longer desired, `RemoveCrew` with the caller's `keep`.
@@ -182,7 +186,14 @@ pub fn plan(
 
     for (id, agent) in &desired_agents {
         if stopped.contains(id) {
-            if observed.get(id).is_some() {
+            // An unobserved agent not yet Stopped had a stop that timed
+            // out after killing its window (#123): stopping it again is a
+            // no-op that settles its phase, the timeout's message kept.
+            let unsettled = status
+                .agents
+                .get(&id.to_string())
+                .is_some_and(|s| s.phase != AgentPhase::Stopped);
+            if observed.get(id).is_some() || unsettled {
                 stops.push(Step::Stop(id.clone()));
             }
             continue;
@@ -574,10 +585,16 @@ mod tests {
             plan_for(Some(&f), &["f/c/b"], &st, &obs, 5),
             vec!["stop f/c/b", "ensure-crew f/c"]
         );
-        // window gone, phase Stopped: nothing at all
-        st.entry("f/c/b").phase = AgentPhase::Stopped;
+        // window gone but not yet Stopped (a timed-out stop kills the
+        // window first, #123): the stop again, a no-op that settles it
         st.entry("f/c/b").next_restart_at = None;
         obs.remove(&id("f/c/b"));
+        assert_eq!(
+            plan_for(Some(&f), &["f/c/b"], &st, &obs, 5),
+            vec!["stop f/c/b", "ensure-crew f/c"]
+        );
+        // window gone, phase Stopped: nothing at all
+        st.entry("f/c/b").phase = AgentPhase::Stopped;
         assert_eq!(
             plan_for(Some(&f), &["f/c/b"], &st, &obs, 5),
             vec!["ensure-crew f/c"]

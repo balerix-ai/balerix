@@ -122,7 +122,10 @@ shape for one fleet. `owner` is present when a plugin manages the fleet
 **Actions** (`POST agents/{fleet}/{crew}/{agent}/actions`) are one of:
 
 - `{ "action": "send_text", "text": <string>, "submit": <bool> }`
-  (`action.json`)
+  (`action.json`). `text` is at most 256 KiB (262144 bytes of UTF-8,
+  `MAX_SEND_TEXT`); a longer one answers 400 `text: expected at most
+  262144 bytes, got <n>` and nothing is typed. The call returns when the
+  text (and, with `submit`, the Enter) has been sent.
 - `{ "action": "send_keys", "steps": [<step>…], "delay_ms": <int> }`
   (`action-send-keys.json`). A step is `{ "key": "up" | "down" | "enter" |
   "escape" }` or `{ "text": <string> }`. The daemon pauses `delay_ms`

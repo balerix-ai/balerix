@@ -467,6 +467,57 @@ async fn host_routes_are_gated_by_needs_and_kv_and_actions_work() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_cap_send_text_is_a_400_naming_the_field_and_types_nothing() {
+    let w = world().await;
+    let (_plugin, host) = start_flow(&w).await;
+    let (s, _) = w.api.admin(
+        "POST",
+        "/v1/fleets",
+        Some(&json!(FleetRequest {
+            spec: spec(&[("a", json!({}))]),
+            credentials: Default::default(),
+            agent_tokens: None,
+            managed_by: None,
+        })),
+    );
+    assert_eq!(s, 200);
+    wait_for(&w, |r| r.status.observed_generation == 1).await;
+    let over = PluginAction::SendText {
+        text: "x".repeat(balerix_api::MAX_SEND_TEXT + 1),
+        submit: true,
+    };
+    let e = host.action("f/c/a", &over).await.unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "daemon: HTTP 400: text: expected at most {} bytes, got {}",
+            balerix_api::MAX_SEND_TEXT,
+            balerix_api::MAX_SEND_TEXT + 1
+        )
+    );
+    assert!(
+        !w.h.runner
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("send_text")),
+        "the runner was handed nothing"
+    );
+    let at_cap = PluginAction::SendText {
+        text: "x".repeat(balerix_api::MAX_SEND_TEXT),
+        submit: false,
+    };
+    host.action("f/c/a", &at_cap).await.unwrap();
+    assert_eq!(
+        w.h.runner
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("send_text f/c/a"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plugin_metrics_are_re_exported_under_the_prefix_rule() {
     let w = world().await;
     struct Good(balerix_plugin_sdk::Metrics);

@@ -220,6 +220,11 @@ impl Host {
         .await
     }
 
+    /// `POST agents/{agent}/actions`. The daemon checks the bounds
+    /// before running anything and answers 400 naming the field:
+    /// a `send_text` of more than [`balerix_api::MAX_SEND_TEXT`] bytes
+    /// (256 KiB; split a longer text yourself), a `send_keys` outside
+    /// `docs/plugin-protocol.md` §3's limits.
     pub async fn action(&self, agent: &str, action: &PluginAction) -> Result<(), SdkError> {
         self.json::<serde_json::Value>(
             self.http

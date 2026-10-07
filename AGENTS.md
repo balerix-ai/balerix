@@ -513,6 +513,13 @@ credentials, hook input, or sandbox rules.
   clone's `.git` directory makes git refuse instead of discovering the
   repository that holds the state root. Keep those when adding a git call
   there.
+- Two plugin-visible changes came with the sandboxed reader (#108): git
+  inside the git profile sees no `HOME` and no system config, so the
+  daemon user's global `core.excludesFile` no longer hides untracked
+  files (only the clone's `.gitignore` and `.git/info/exclude` do); and
+  `uncommitted` (and the `version` fingerprint) now come from `git status`,
+  so an index-only change (staged, with the worktree back at `HEAD`'s
+  content) counts as uncommitted, where `diff HEAD` used to miss it.
 - A workspace `diff` refuses with `repository config sets <key>; workspace
   diff refused` when the clone's `.git/config` declares a
   `filter.<x>.<clean|smudge|process>`, or when it sets

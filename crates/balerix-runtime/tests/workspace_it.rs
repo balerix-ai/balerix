@@ -78,6 +78,7 @@ fn a_private_clone_borrows_from_the_cache_and_pushes_to_origin() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
 
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
@@ -174,6 +175,7 @@ fn errors_name_the_id_tool_and_first_stderr_line() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     let err = ws
         .ensure_repo(
@@ -245,6 +247,7 @@ fn a_clone_on_an_existing_remote_branch_is_created_from_it_and_reused() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
@@ -312,6 +315,7 @@ fn a_changed_branch_moves_a_clean_clone_and_keeps_the_old_branch() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let head = || {
@@ -427,6 +431,7 @@ fn a_changed_branch_on_a_dirty_clone_fails_and_keeps_the_tree() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -484,6 +489,7 @@ fn a_missing_remote_branch_fails_the_clone_and_leaves_nothing() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let e = ws
@@ -608,6 +614,7 @@ fn an_agent_switching_branches_itself_is_left_alone_on_an_unchanged_setting() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let head = || {
@@ -670,6 +677,7 @@ fn a_clone_without_a_marker_is_judged_by_head_once_then_recorded() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let head = || {
@@ -726,6 +734,7 @@ fn a_changed_branch_the_clone_already_sits_on_is_recorded_without_a_move() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let head = || {
@@ -779,6 +788,7 @@ fn two_agents_on_one_branch_both_materialize() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     for name in ["a", "b"] {
@@ -820,6 +830,7 @@ fn a_worktree_from_0_1_is_refused_with_the_purge_message() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     // what 0.1.x's ensure_worktree made
@@ -869,6 +880,7 @@ fn a_crashed_clone_directory_without_git_is_replaced() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     std::fs::create_dir_all(&paths.workspace).unwrap();
@@ -906,6 +918,7 @@ fn the_clone_step_runs_no_program_from_the_clone_config() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -970,6 +983,7 @@ fn an_unpushed_commit_survives_removal_and_seeds_the_next_clone() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -1056,6 +1070,7 @@ fn removal_harvests_head_without_a_marker_and_skips_what_is_not_there() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     let make = |name: &str| {
@@ -1142,6 +1157,7 @@ fn a_branch_the_cache_has_checked_out_is_harvested_too() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
@@ -1201,6 +1217,7 @@ fn a_broken_clone_fails_the_removal_and_stays() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -1241,6 +1258,7 @@ fn a_worktree_from_0_1_is_refused_and_keep_repos_migrates_it() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     // what 0.1.x left behind: a clone without the gc pin, a worktree, an
     // unpushed commit on the worktree's branch, and no marker
@@ -1332,6 +1350,7 @@ fn a_clone_pointed_at_another_repository_is_refused_and_nothing_is_harvested() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
@@ -1539,6 +1558,7 @@ fn a_clone_rewritten_after_the_checks_serves_nothing_foreign() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
@@ -1721,6 +1741,7 @@ fn an_agent_on_the_default_branch_materializes() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     // origin moves on after the cache was cloned
@@ -1829,6 +1850,7 @@ fn a_force_pushed_default_branch_does_not_seed_from_the_cache() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
@@ -1887,6 +1909,7 @@ fn a_promisor_remote_in_the_clone_fetches_nothing_and_runs_nothing() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
 
@@ -2091,6 +2114,7 @@ fn a_cache_whose_pin_failed_is_removed_and_made_again() {
         tools: &broken,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .ensure_repo("f/c", &crew, &repo, "main")
     .unwrap_err()
@@ -2105,6 +2129,7 @@ fn a_cache_whose_pin_failed_is_removed_and_made_again() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .ensure_repo("f/c", &crew, &repo, "main")
     .unwrap();
@@ -2133,6 +2158,7 @@ fn a_half_made_cache_in_a_directory_that_cannot_be_removed_is_emptied() {
         tools: &broken,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .ensure_repo("f/c", &crew, &repo, "main")
     .unwrap_err()
@@ -2141,6 +2167,7 @@ fn a_half_made_cache_in_a_directory_that_cannot_be_removed_is_emptied() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .ensure_repo("f/c", &crew, &repo, "main");
     std::fs::set_permissions(&crew.root, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2171,6 +2198,7 @@ fn an_unreadable_head_without_a_marker_fails_the_removal() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -2182,6 +2210,7 @@ fn an_unreadable_head_without_a_marker_fails_the_removal() {
         tools: &broken,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .harvest_and_remove("f/c/a", &crew, &paths)
     .unwrap_err()
@@ -2215,6 +2244,7 @@ fn an_unreadable_head_fails_a_branch_change() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -2225,6 +2255,7 @@ fn an_unreadable_head_fails_a_branch_change() {
         tools: &broken,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .ensure_clone(
         "f/c/a",
@@ -2263,6 +2294,7 @@ fn a_failed_harvest_probe_fails_the_clone() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .ensure_repo("f/c", &crew, &repo, "main")
     .unwrap();
@@ -2272,6 +2304,7 @@ fn a_failed_harvest_probe_fails_the_clone() {
         tools: &broken,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
     .unwrap_err()
@@ -2302,6 +2335,7 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -2371,6 +2405,7 @@ fn a_state_root_with_a_space_and_a_quote_is_harvested() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -2404,6 +2439,7 @@ fn a_harvest_without_a_working_nono_fails_and_keeps_the_clone() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .ensure_repo("f/c", &crew, &repo, "main")
     .unwrap();
@@ -2411,6 +2447,7 @@ fn a_harvest_without_a_working_nono_fails_and_keeps_the_clone() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
     .unwrap();
@@ -2423,6 +2460,7 @@ fn a_harvest_without_a_working_nono_fails_and_keeps_the_clone() {
         tools: &no_nono,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .harvest_and_remove("f/c/a", &crew, &paths)
     .unwrap_err()
@@ -2466,6 +2504,7 @@ fn a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -2492,6 +2531,7 @@ fn a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone() {
         tools: &broken,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .harvest_and_remove("f/c/a", &crew, &paths)
     .expect_err("a nono that cannot run must fail the removal")
@@ -2586,6 +2626,7 @@ fn clone_with_unpushed_work(
         tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
@@ -2616,6 +2657,7 @@ fn a_nono_failure_after_the_canary_fails_the_removal_and_keeps_the_clone() {
         tools: &broken,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .harvest_and_remove("f/c/a", &crew, &paths)
     .expect_err("a nono failure must not read as git's no")
@@ -2656,6 +2698,7 @@ fn a_nono_failure_after_the_canary_fails_a_branch_change() {
         tools: &broken,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .ensure_clone(
         "f/c/a",
@@ -2701,6 +2744,7 @@ fn a_git_warning_on_a_successful_probe_does_not_fail_the_harvest() {
         tools: &noisy,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .harvest_and_remove("f/c/a", &crew, &paths)
     .unwrap();
@@ -2736,10 +2780,87 @@ fn a_git_warning_beside_a_no_fails_the_removal_and_keeps_the_clone() {
         tools: &noisy,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .harvest_and_remove("f/c/a", &crew, &paths)
     .unwrap_err()
     .to_string();
     assert_eq!(e, "f/c/a: git config: warning: shim noise");
     assert!(paths.workspace.join("work.txt").exists());
+}
+
+/// #111: a git that loads something from outside the system prefixes (a
+/// nix or Linuxbrew git's libraries; here a shim that reads
+/// `<root>/prefix/lib/marker` before it execs the real git) cannot run
+/// under the git profile. The canary tells that apart from a sandbox that
+/// does not start, and names the setting; with the prefix in the daemon's
+/// `[sandbox] git_read` the removal harvests.
+#[test]
+fn a_git_outside_the_system_prefixes_needs_git_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-git-read");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (_repo, crew, paths) = clone_with_unpushed_work(&tools, &root);
+    let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
+
+    let prefix = root.join("prefix");
+    std::fs::create_dir_all(prefix.join("lib")).unwrap();
+    std::fs::write(prefix.join("lib/marker"), "lib\n").unwrap();
+    let shim = root.join("git-with-a-prefix.sh");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nif ! read line < '{marker}'; then\n  echo 'git: error while loading shared libraries: libmarker.so' >&2\n  exit 127\nfi\nexec {git} \"$@\"\n",
+            marker = prefix.join("lib/marker").display(),
+            git = tools.git.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let prefixed = balerix_runtime::ToolPaths {
+        git: shim,
+        ..tools.clone()
+    };
+
+    let e = Workspace {
+        tools: &prefixed,
+        gh_config_dir: None,
+        cache_is_read_only: false,
+        git_read: &[],
+    }
+    .harvest_and_remove("f/c/a", &crew, &paths)
+    .expect_err("a git that cannot load its libraries must fail the removal")
+    .to_string();
+    assert!(
+        e.starts_with(
+            "f/c/a: git version: git could not run under the git profile (the sandbox itself starts); \
+             if it loads libraries from outside /usr, /lib, /lib64 and /bin, add that prefix to \
+             `sandbox.git_read` in the daemon's config.toml; see "
+        ) && e.contains("/logs/nono-git.log: "),
+        "{e}"
+    );
+    assert!(paths.workspace.exists(), "a failed removal deletes nothing");
+
+    let granted = [prefix.canonicalize().unwrap()];
+    Workspace {
+        tools: &prefixed,
+        gh_config_dir: None,
+        cache_is_read_only: false,
+        git_read: &granted,
+    }
+    .harvest_and_remove("f/c/a", &crew, &paths)
+    .unwrap();
+    assert!(!paths.workspace.exists());
+    assert_eq!(
+        git(&crew.repo, &["rev-parse", "refs/heads/balerix/f/c/a"]),
+        sha,
+        "harvested through the git profile with the prefix granted"
+    );
 }

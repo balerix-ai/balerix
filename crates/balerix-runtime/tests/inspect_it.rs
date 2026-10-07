@@ -76,6 +76,7 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         tools: &tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     let rt = Runtime::new(layout.clone(), tools.clone());
 
@@ -495,6 +496,7 @@ fn clone_with_changes(
         tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     };
     ws.ensure_repo("f/c/a", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")

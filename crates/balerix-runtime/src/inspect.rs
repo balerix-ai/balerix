@@ -83,26 +83,28 @@ impl Runtime {
     ) -> Result<(AgentPaths, CrewPaths), WorkspaceError> {
         let (paths, crew) = self.workspace_of(agent)?;
         let id = agent.to_string();
-        write_git_profile(&self.tools, &id, &paths, &crew).map_err(|e| match e {
-            MaterializeError::Io { path, message, .. } => WorkspaceError::Io { path, message },
-            MaterializeError::Tool {
-                subcommand,
-                args,
-                stderr,
-                ..
-            } => WorkspaceError::Tool {
-                id: id.clone(),
-                subcommand,
-                args,
-                stderr,
+        write_git_profile(&self.tools, &id, &paths, &crew, &self.git_read).map_err(
+            |e| match e {
+                MaterializeError::Io { path, message, .. } => WorkspaceError::Io { path, message },
+                MaterializeError::Tool {
+                    subcommand,
+                    args,
+                    stderr,
+                    ..
+                } => WorkspaceError::Tool {
+                    id: id.clone(),
+                    subcommand,
+                    args,
+                    stderr,
+                },
+                other => WorkspaceError::Tool {
+                    id: id.clone(),
+                    subcommand: "git profile".into(),
+                    args: Vec::new(),
+                    stderr: other.to_string(),
+                },
             },
-            other => WorkspaceError::Tool {
-                id: id.clone(),
-                subcommand: "git profile".into(),
-                args: Vec::new(),
-                stderr: other.to_string(),
-            },
-        })?;
+        )?;
         Ok((paths, crew))
     }
 

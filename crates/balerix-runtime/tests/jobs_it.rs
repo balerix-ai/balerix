@@ -350,6 +350,7 @@ fn pod_clone(
         tools,
         gh_config_dir: None,
         cache_is_read_only: true,
+        git_read: &[],
     }
     .ensure_clone(
         &id.to_string(),

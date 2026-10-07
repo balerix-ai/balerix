@@ -329,6 +329,21 @@ fn first_symlink_with(
     Ok(None)
 }
 
+/// `/usr, /lib, /lib64 and /bin`: the git profile's system prefixes, as
+/// the canary's hint names them (`/etc` is granted too, but holds no
+/// library).
+fn system_prefixes() -> String {
+    let dirs: Vec<&str> = crate::sandbox::SYSTEM_READ
+        .iter()
+        .copied()
+        .filter(|d| *d != "/etc")
+        .collect();
+    match dirs.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => dirs.join(", "),
+    }
+}
+
 /// `nono`'s arguments up to and including the git binary, for a git
 /// call in `agent`'s existing clone: `-s --log-file <logs>/nono-git.log
 /// run --profile <git profile> -- <git>`. The profile is
@@ -452,6 +467,9 @@ pub struct Workspace<'a> {
     /// Spec O §8.1: the cache is a read-only mount kept current by a Job;
     /// a new clone skips the fetch into it and the harvested-branch seed.
     pub cache_is_read_only: bool,
+    /// The daemon's `[sandbox] git_read` (#111): read-only prefixes the
+    /// git profile grants beside the system ones. Empty in a pod.
+    pub git_read: &'a [PathBuf],
 }
 
 impl Workspace<'_> {
@@ -701,14 +719,18 @@ impl Workspace<'_> {
     /// exit 1 as git's answer, and nono's own failure to run also exits 1;
     /// a `version` that must exit 0 tells the two apart for a nono that
     /// validates but cannot run at all, and names the log to read. A
-    /// failure on a later call is caught by `is_gits_answer`.
+    /// failure on a later call is caught by `is_gits_answer`. When
+    /// `version` fails, `/bin/true` under the same profile says whether
+    /// the sandbox started at all, and the error names `sandbox.git_read`
+    /// when it did (#111).
     fn prepare_sandbox(
         &self,
         id: &str,
         crew: &CrewPaths,
         agent: &AgentPaths,
     ) -> Result<(), MaterializeError> {
-        write_git_profile(self.tools, id, agent, crew)?;
+        write_git_profile(self.tools, id, agent, crew, self.git_read)?;
+        let log = agent.logs.join("nono-git.log");
         self.agent_git(id, crew, agent, &["version"], &[0])
             .map(|_| ())
             .map_err(|e| match e {
@@ -719,18 +741,45 @@ impl Workspace<'_> {
                     subcommand,
                     args,
                     stderr,
-                } => MaterializeError::Tool {
-                    id,
-                    tool,
-                    subcommand,
-                    args,
-                    stderr: format!(
-                        "the sandbox did not start; see {}: {stderr}",
-                        agent.logs.join("nono-git.log").display()
-                    ),
-                },
+                } => {
+                    // #111: a sandbox that runs `/bin/true` started; it is
+                    // git that could not run under it, typically a git
+                    // that loads its libraries from its own prefix
+                    let hint = if self.sandbox_starts(agent) {
+                        format!(
+                            "git could not run under the git profile (the sandbox itself \
+                             starts); if it loads libraries from outside {}, add that prefix \
+                             to `sandbox.git_read` in the daemon's config.toml",
+                            system_prefixes()
+                        )
+                    } else {
+                        "the sandbox did not start".to_string()
+                    };
+                    MaterializeError::Tool {
+                        id,
+                        tool,
+                        subcommand,
+                        args,
+                        stderr: format!("{hint}; see {}: {stderr}", log.display()),
+                    }
+                }
                 other => other,
             })
+    }
+
+    /// Whether `/bin/true` runs under the git profile: the canary's
+    /// second question, asked only once `git version` has failed.
+    fn sandbox_starts(&self, agent: &AgentPaths) -> bool {
+        let mut args = sandbox_args(self.tools, agent);
+        args.pop();
+        args.push("/bin/true".into());
+        Cmd::new(&self.tools.nono)
+            .env_clear()
+            .env("HOME", agent.nono_home.display().to_string())
+            .env("PATH", outer_path(self.tools))
+            .args(args)
+            .run()
+            .is_ok()
     }
 
     /// One git call inside the agent's existing clone, under the git

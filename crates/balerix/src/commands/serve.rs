@@ -4,7 +4,7 @@
 use std::fs::OpenOptions;
 use std::net::SocketAddr;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,6 +31,9 @@ const DETACH_WAIT: Duration = Duration::from_secs(10);
 pub struct ServerConfig {
     pub bind: String,
     pub log: String,
+    /// `[sandbox] git_read`: read-only prefixes the git profile grants
+    /// beside the system ones (#111), canonical and validated.
+    pub git_read: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -38,6 +41,16 @@ pub struct ServerConfig {
 struct ConfigFile {
     #[serde(default)]
     server: ServerTable,
+    #[serde(default)]
+    sandbox: SandboxTable,
+}
+
+/// `[sandbox]`: the daemon's own, never a fleet's `sandbox` block.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxTable {
+    #[serde(default)]
+    git_read: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -48,7 +61,8 @@ struct ServerTable {
 }
 
 impl ServerConfig {
-    pub fn load(path: &Path) -> Result<Self> {
+    /// `path` parsed, `git_read` checked against `layout`'s roots.
+    pub fn load_for(path: &Path, layout: &StateLayout) -> Result<Self> {
         let file: ConfigFile = match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text)
                 .map_err(|e| anyhow::anyhow!("{}: invalid config: {e}", path.display()))?,
@@ -61,8 +75,50 @@ impl ServerConfig {
                 .bind
                 .unwrap_or_else(|| "127.0.0.1:7643".to_string()),
             log: file.server.log.unwrap_or_else(|| "info".to_string()),
+            git_read: file
+                .sandbox
+                .git_read
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    check_git_read(entry, layout)
+                        .map_err(|e| anyhow!("config.toml: sandbox.git_read[{i}]: {e:#}"))
+                })
+                .collect::<Result<_>>()?,
         })
     }
+}
+
+/// One `git_read` entry (#111): an absolute path to an existing
+/// directory, not `/`, and clear of balerix's own state, data and config
+/// roots, which the git profile must never read wholesale. Canonical,
+/// since Landlock binds a rule to what the path resolves to.
+fn check_git_read(entry: &Path, layout: &StateLayout) -> Result<PathBuf> {
+    if !entry.is_absolute() {
+        bail!("{} is not an absolute path", entry.display());
+    }
+    let dir = std::fs::canonicalize(entry).with_context(|| entry.display().to_string())?;
+    if !dir.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    if dir == Path::new("/") {
+        bail!("/ grants the whole filesystem");
+    }
+    for (name, root) in [
+        ("state", &layout.state_root),
+        ("data", &layout.data_root),
+        ("config", &layout.config_root),
+    ] {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        if dir.starts_with(&root) || root.starts_with(&dir) {
+            bail!(
+                "{} overlaps balerix's {name} root {}",
+                dir.display(),
+                root.display()
+            );
+        }
+    }
+    Ok(dir)
 }
 
 /// Reject any `bind` address that is not loopback (Phase 3 spec P3-1: the
@@ -85,8 +141,8 @@ fn require_loopback(bind: &str) -> Result<SocketAddr> {
 pub fn serve_command(args: &ServeArgs) -> Result<String> {
     let layout = layout_from_env()?;
     let paths = server_paths(&layout);
-    let config = ServerConfig::load(&layout.config_root.join("config.toml"))?;
-    let bind = args.bind.clone().unwrap_or(config.bind);
+    let config = ServerConfig::load_for(&layout.config_root.join("config.toml"), &layout)?;
+    let bind = args.bind.clone().unwrap_or_else(|| config.bind.clone());
     match args.mode {
         ServeMode::Tmux => {
             if args.tls_cert.is_some()
@@ -106,7 +162,7 @@ pub fn serve_command(args: &ServeArgs) -> Result<String> {
                 &layout,
                 &paths,
                 &bind,
-                &config.log,
+                &config,
                 &args.tmux_socket,
                 args.detached_child,
             )
@@ -284,10 +340,11 @@ fn run(
     layout: &StateLayout,
     paths: &ServerPaths,
     bind: &str,
-    log: &str,
+    config: &ServerConfig,
     tmux_socket: &str,
     detached_child: bool,
 ) -> Result<String> {
+    let log = config.log.as_str();
     if let Some(url) = already_running(paths)? {
         bail!("a balerix daemon is already running at {url}");
     }
@@ -304,7 +361,9 @@ fn run(
             .await
             .with_context(|| format!("cannot bind {bind}"))?;
         let url = format!("http://{}", listener.local_addr()?);
-        let runtime = Arc::new(Runtime::new(layout.clone(), tools.clone()));
+        let runtime = Arc::new(
+            Runtime::new(layout.clone(), tools.clone()).with_git_read(config.git_read.clone()),
+        );
         let ports = Ports {
             materializer: runtime.clone(),
             runner: Arc::new(TmuxRunner::new(tools.tmux.clone(), tmux_socket)),
@@ -465,20 +524,122 @@ mod tests {
     fn config_defaults_when_missing_and_parses_the_server_table() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let c = ServerConfig::load(&path).unwrap();
+        let layout = StateLayout::xdg(
+            dir.path().join("state"),
+            dir.path().join("data"),
+            dir.path().join("config"),
+        );
+        let load = |p: &Path| ServerConfig::load_for(p, &layout);
+        let c = load(&path).unwrap();
         assert_eq!(
             (c.bind.as_str(), c.log.as_str()),
             ("127.0.0.1:7643", "info")
         );
         std::fs::write(&path, "[server]\nbind = \"127.0.0.1:9000\"\n").unwrap();
-        let c = ServerConfig::load(&path).unwrap();
+        let c = load(&path).unwrap();
         assert_eq!(
             (c.bind.as_str(), c.log.as_str()),
             ("127.0.0.1:9000", "info")
         );
         std::fs::write(&path, "[server]\nport = 1\n").unwrap();
-        let e = ServerConfig::load(&path).unwrap_err().to_string();
+        let e = load(&path).unwrap_err().to_string();
         assert!(e.contains("config.toml") && e.contains("port"), "{e}");
+    }
+
+    /// #111: `[sandbox] git_read`, validated at load.
+    #[test]
+    fn git_read_is_validated_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let layout = StateLayout::xdg(base.join("state"), base.join("data"), base.join("config"));
+        for d in [&layout.state_root, &layout.data_root, &layout.config_root] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let path = layout.config_root.join("config.toml");
+        let load = |toml: &str| {
+            std::fs::write(&path, toml).unwrap();
+            ServerConfig::load_for(&path, &layout).map(|c| c.git_read)
+        };
+        let err = |toml: &str| load(toml).unwrap_err().to_string();
+
+        assert_eq!(load("").unwrap(), Vec::<PathBuf>::new(), "empty by default");
+        let store = base.join("nix/store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::os::unix::fs::symlink(&store, base.join("store-link")).unwrap();
+        assert_eq!(
+            load(&format!(
+                "[sandbox]\ngit_read = [\"{}\"]\n",
+                base.join("store-link").display()
+            ))
+            .unwrap(),
+            vec![store.clone()],
+            "canonical"
+        );
+
+        assert_eq!(
+            err("[sandbox]\ngit_read = [\"nix/store\"]\n"),
+            "config.toml: sandbox.git_read[0]: nix/store is not an absolute path"
+        );
+        let missing = base.join("missing");
+        assert!(
+            err(&format!(
+                "[sandbox]\ngit_read = [\"{}\", \"{}\"]\n",
+                store.display(),
+                missing.display()
+            ))
+            .starts_with(&format!(
+                "config.toml: sandbox.git_read[1]: {}: ",
+                missing.display()
+            ))
+        );
+        let file = base.join("a-file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(
+            err(&format!("[sandbox]\ngit_read = [\"{}\"]\n", file.display())),
+            format!(
+                "config.toml: sandbox.git_read[0]: {} is not a directory",
+                file.display()
+            )
+        );
+        assert_eq!(
+            err("[sandbox]\ngit_read = [\"/\"]\n"),
+            "config.toml: sandbox.git_read[0]: / grants the whole filesystem"
+        );
+        assert_eq!(
+            err(&format!("[sandbox]\ngit_read = [\"{}\"]\n", base.display())),
+            format!(
+                "config.toml: sandbox.git_read[0]: {} overlaps balerix's state root {}",
+                base.display(),
+                layout.state_root.display()
+            ),
+            "a parent of balerix's roots"
+        );
+        let inside = layout.data_root.join("mise");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert_eq!(
+            err(&format!(
+                "[sandbox]\ngit_read = [\"{}\"]\n",
+                inside.display()
+            )),
+            format!(
+                "config.toml: sandbox.git_read[0]: {} overlaps balerix's data root {}",
+                inside.display(),
+                layout.data_root.display()
+            ),
+            "inside one of them"
+        );
+        assert_eq!(
+            err(&format!(
+                "[sandbox]\ngit_read = [\"{}\"]\n",
+                layout.config_root.display()
+            )),
+            format!(
+                "config.toml: sandbox.git_read[0]: {0} overlaps balerix's config root {0}",
+                layout.config_root.display()
+            )
+        );
+        let e = err("[sandbox]\nagent_read = []\n");
+        assert!(e.contains("config.toml") && e.contains("agent_read"), "{e}");
     }
 
     #[test]

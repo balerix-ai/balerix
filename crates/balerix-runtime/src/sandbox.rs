@@ -129,17 +129,23 @@ pub fn render_profile(
 /// (#109). Its libraries are not granted: a git that loads them from
 /// outside `SYSTEM_READ` (nix, Linuxbrew), or a mise shim, cannot run
 /// under this profile and the calls fail closed (Spec N amendment §12.1,
-/// NS-6).
+/// NS-6) unless the operator names their prefix in the daemon's
+/// `[sandbox] git_read` (#111), which `git_read` carries.
 pub fn render_git_profile(
     id: &AgentId,
     paths: &AgentPaths,
     crew: &CrewPaths,
     git: &Path,
     exec_path: &Path,
+    git_read: &[PathBuf],
 ) -> Value {
     let mut read: Vec<PathBuf> = SYSTEM_READ.iter().map(PathBuf::from).collect();
     read.push(std::fs::canonicalize(git).unwrap_or_else(|_| git.to_path_buf()));
     read.push(exec_path.to_path_buf());
+    // the daemon's `[sandbox] git_read` (config.toml, #111): read-only
+    // prefixes a git built outside the system prefixes loads its libraries
+    // from; validated at load, never from a fleet's `sandbox` block
+    read.extend(git_read.iter().cloned());
     read.push(crew.cache_objects());
     read.push(crew.no_hooks());
     read.push(paths.workspace.clone());
@@ -209,6 +215,7 @@ pub fn write_git_profile(
     id: &str,
     paths: &AgentPaths,
     crew: &CrewPaths,
+    git_read: &[PathBuf],
 ) -> Result<(), MaterializeError> {
     let agent_id: AgentId = id.parse().map_err(|_| MaterializeError::Invalid {
         id: id.to_string(),
@@ -222,7 +229,7 @@ pub fn write_git_profile(
         })?;
     }
     let exec_path = git_exec_path(tools, id)?;
-    let profile = render_git_profile(&agent_id, paths, crew, &tools.git, &exec_path);
+    let profile = render_git_profile(&agent_id, paths, crew, &tools.git, &exec_path, git_read);
     let path = paths.git_profile.clone();
     if write_profile_at(&agent_id, &path, &profile)? {
         validate_profile_at(
@@ -881,7 +888,7 @@ mod tests {
         let crew = layout.crew(&id.crew_ref());
         let git = Path::new("/opt/git/bin/git");
         let exec_path = Path::new("/opt/git/libexec/git-core");
-        let p = render_git_profile(&id, &paths, &crew, git, exec_path);
+        let p = render_git_profile(&id, &paths, &crew, git, exec_path, &[]);
 
         assert_eq!(p["meta"]["name"], "balerix-git-f-c-a");
         let fs = p["filesystem"].as_object().unwrap();
@@ -938,5 +945,20 @@ mod tests {
             "upload-pack spawns pack-objects through git's exec-path (#109)"
         );
         assert!(!read.contains(&paths.home), "the agent's home is not git's");
+
+        // #111: the daemon's read-only prefixes, and nothing else, join it
+        let with = render_git_profile(
+            &id,
+            &paths,
+            &crew,
+            git,
+            exec_path,
+            &[PathBuf::from("/nix/store")],
+        );
+        let mut expected = p["filesystem"]["read"].as_array().unwrap().clone();
+        expected.insert(7, json!("/nix/store")); // after git's own grants
+        assert_eq!(with["filesystem"]["read"], Value::Array(expected));
+        assert_eq!(with["environment"], p["environment"]);
+        assert_eq!(with["network"], p["network"]);
     }
 }

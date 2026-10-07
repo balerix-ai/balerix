@@ -289,7 +289,11 @@ credentials, hook input, or sandbox rules.
   `sandbox::git_exec_path`; a git that cannot answer fails the step),
   not its shared libraries, so a `git` that loads them from elsewhere
   (nix, Linuxbrew) or is a mise shim cannot run under it (#109, Spec N
-  amendment NS-6). That fails closed: `down` without
+  amendment NS-6) unless the daemon's `config.toml` names the prefix in
+  `[sandbox] git_read` (#111; `Runtime::with_git_read`, validated in
+  `serve.rs`; pods get none). When the canary's `git version` fails,
+  `/bin/true` under the same profile tells "git could not run" (the
+  error names `sandbox.git_read`) from "the sandbox did not start". That fails closed: `down` without
   `--purge`, `remove` and a branch change fail on such a host, `--purge`
   is the way past, and the user `sandbox` block does not reach this
   profile.

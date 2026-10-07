@@ -299,7 +299,7 @@ fn the_git_profile_reads_the_clone_and_the_cache_and_writes_nothing() {
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::write(outside.join("secret"), "outside\n").unwrap();
 
-    balerix_runtime::write_git_profile(&tools, "f/c/a", &paths, &crew).unwrap();
+    balerix_runtime::write_git_profile(&tools, "f/c/a", &paths, &crew, &[]).unwrap();
     assert_eq!(
         std::fs::metadata(&paths.git_profile)
             .unwrap()
@@ -405,7 +405,7 @@ fn the_git_profile_grants_gits_exec_path() {
         ),
     );
 
-    balerix_runtime::write_git_profile(&shimmed, "f/c/a", &paths, &crew).unwrap();
+    balerix_runtime::write_git_profile(&shimmed, "f/c/a", &paths, &crew, &[]).unwrap();
     let granted = std::fs::canonicalize(&real).unwrap();
     let profile = std::fs::read_to_string(&paths.git_profile).unwrap();
     assert!(
@@ -460,7 +460,7 @@ fn a_git_that_cannot_name_its_exec_path_writes_no_profile() {
         "git-refusing.sh",
         "echo 'shim: no exec path' >&2\nexit 3",
     );
-    let e = balerix_runtime::write_git_profile(&refusing, "f/c/a", &paths, &crew)
+    let e = balerix_runtime::write_git_profile(&refusing, "f/c/a", &paths, &crew, &[])
         .unwrap_err()
         .to_string();
     assert_eq!(e, "f/c/a: git --exec-path: shim: no exec path");
@@ -473,7 +473,7 @@ fn a_git_that_cannot_name_its_exec_path_writes_no_profile() {
         "git-lost.sh",
         &format!("echo '{}'", missing.display()),
     );
-    let e = balerix_runtime::write_git_profile(&lost, "f/c/a", &paths, &crew)
+    let e = balerix_runtime::write_git_profile(&lost, "f/c/a", &paths, &crew, &[])
         .unwrap_err()
         .to_string();
     assert!(
@@ -490,7 +490,7 @@ fn a_git_that_cannot_name_its_exec_path_writes_no_profile() {
         "git-wrong.sh",
         &format!("echo '{}'", file.display()),
     );
-    let e = balerix_runtime::write_git_profile(&wrong, "f/c/a", &paths, &crew)
+    let e = balerix_runtime::write_git_profile(&wrong, "f/c/a", &paths, &crew, &[])
         .unwrap_err()
         .to_string();
     assert!(e.ends_with(": not a directory"), "{e}");
@@ -529,6 +529,6 @@ fn the_exec_path_query_starts_from_an_empty_environment() {
             tools.git.display()
         ),
     );
-    balerix_runtime::write_git_profile(&strict, "f/c/a", &paths, &crew).unwrap();
+    balerix_runtime::write_git_profile(&strict, "f/c/a", &paths, &crew, &[]).unwrap();
     assert!(paths.git_profile.exists());
 }

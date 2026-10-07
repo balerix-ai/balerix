@@ -361,6 +361,106 @@ fn first_symlink_with(
     Ok(None)
 }
 
+/// `nono`'s arguments up to and including the git binary, for a git
+/// call in `agent`'s existing clone: `-s --log-file <logs>/nono-git.log
+/// run --profile <git profile> -- <git>`. The profile is
+/// `sandbox::render_git_profile`; `write_git_profile` must have run.
+fn sandbox_args(tools: &ToolPaths, agent: &AgentPaths) -> Vec<String> {
+    vec![
+        "-s".into(),
+        "--log-file".into(),
+        agent.logs.join("nono-git.log").display().to_string(),
+        "run".into(),
+        "--profile".into(),
+        agent.git_profile.display().to_string(),
+        "--".into(),
+        tools.git.display().to_string(),
+    ]
+}
+
+/// What `sandboxed_git` writes to the crew's `git.log`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitLog {
+    /// argv, stdout, stderr and the exit status.
+    Full,
+    /// argv, stderr and the exit status: for a call whose stdout is a
+    /// request's payload (the workspace reader's diffs).
+    #[expect(dead_code, reason = "the workspace reader moves onto it next (#108)")]
+    ArgvOnly,
+}
+
+/// A failed `sandboxed_git`, reported as git's: git's subcommand (its
+/// first argument), and the argv nono ran, or git's own arguments when the
+/// call ran and its answer was not git's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitFailure {
+    pub subcommand: String,
+    pub args: Vec<String>,
+    pub stderr: String,
+}
+
+/// One git call inside the agent's existing clone, run under the git
+/// profile (`sandbox::render_git_profile`; Spec N amendment 2026-10-01,
+/// #68, #70): it reads the clone and the crew cache's objects, writes
+/// nothing and has no network, so whatever the clone points at, git sees
+/// no more than the agent could. The checks before it give the operator a
+/// readable refusal; the profile is the boundary, and holds even when the
+/// clone changes after the checks.
+///
+/// nono starts from an empty environment (`HOME` is the agent's `nono/`,
+/// as for `launch.sh`), and the profile's `set_vars` carry the hardening
+/// `harden_agent_git` sets for a command's environment; the `-c` pairs
+/// are the same. `--git-dir` names `workspace/.git` exactly: with `-C`
+/// alone, a `.git` git rejects (say, its `HEAD` deleted) makes git take
+/// `workspace/` itself for a bare repository. `accepted` are the exit
+/// codes that count as success (0 included). A failure is reported as
+/// git's, with git's subcommand, not nono's. An accepted non-zero exit
+/// that printed anything on stderr is a failure too (`is_gits_answer`).
+/// `write_git_profile` must have run.
+pub(crate) fn sandboxed_git(
+    tools: &ToolPaths,
+    crew: &CrewPaths,
+    agent: &AgentPaths,
+    args: &[&str],
+    accepted: &[i32],
+    log: GitLog,
+) -> Result<CmdOutput, GitFailure> {
+    let log_file = crew.logs.join("git.log");
+    let cmd = Cmd::new(&tools.nono)
+        .env_clear()
+        .env("HOME", agent.nono_home.display().to_string())
+        .env("PATH", outer_path(tools));
+    let cmd = match log {
+        GitLog::Full => cmd.log(&log_file),
+        GitLog::ArgvOnly => cmd.log_argv_only(&log_file),
+    }
+    .args(sandbox_args(tools, agent))
+    .args(["-c", "core.fsmonitor=false"])
+    .args([
+        "-c".to_string(),
+        format!("core.hooksPath={}", crew.no_hooks().display()),
+        "-C".to_string(),
+        agent.workspace.display().to_string(),
+        format!("--git-dir={}", agent.workspace.join(".git").display()),
+        format!("--work-tree={}", agent.workspace.display()),
+    ])
+    .args(args.iter().copied());
+    let subcommand = args.first().copied().unwrap_or_default().to_string();
+    let out = cmd.run_with_exit_codes(accepted).map_err(|f| GitFailure {
+        subcommand: subcommand.clone(),
+        args: f.args,
+        stderr: f.stderr,
+    })?;
+    if !is_gits_answer(&out) {
+        return Err(GitFailure {
+            subcommand,
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            stderr: out.stderr,
+        });
+    }
+    Ok(out)
+}
+
 pub struct Workspace<'a> {
     pub tools: &'a ToolPaths,
     /// `GH_CONFIG_DIR` for the daemon's git calls when `git.auth: gh`.
@@ -649,41 +749,8 @@ impl Workspace<'_> {
             })
     }
 
-    /// `nono`'s arguments up to and including the git binary, for a git
-    /// call in `agent`'s existing clone: `-s --log-file <logs>/nono-git.log
-    /// run --profile <git profile> -- <git>`. The profile is
-    /// `sandbox::render_git_profile`; `write_git_profile` must have run.
-    fn sandbox_args(&self, agent: &AgentPaths) -> Vec<String> {
-        vec![
-            "-s".into(),
-            "--log-file".into(),
-            agent.logs.join("nono-git.log").display().to_string(),
-            "run".into(),
-            "--profile".into(),
-            agent.git_profile.display().to_string(),
-            "--".into(),
-            self.tools.git.display().to_string(),
-        ]
-    }
-
-    /// One git call inside the agent's existing clone, run under the git
-    /// profile (`sandbox::render_git_profile`; Spec N amendment
-    /// 2026-10-01, #68, #70): it reads the clone and the crew cache's
-    /// objects, writes nothing and has no network, so whatever the clone
-    /// points at, git sees no more than the agent could. The checks
-    /// before it give the operator a readable refusal; the profile is the
-    /// boundary, and holds even when the clone changes after the checks.
-    ///
-    /// nono starts from an empty environment (`HOME` is the agent's
-    /// `nono/`, as for `launch.sh`), and the profile's `set_vars` carry
-    /// the hardening `harden_agent_git` sets for the workspace reader;
-    /// the `-c` pairs are the same. `--git-dir` names `workspace/.git`
-    /// exactly: with `-C` alone, a `.git` git rejects (say, its `HEAD`
-    /// deleted) makes git take `workspace/` itself for a bare repository.
-    /// `accepted` are the exit codes that count as success (0 included).
-    /// A failure is reported as git's, with git's subcommand, not nono's.
-    /// An accepted non-zero exit that printed anything on stderr is a
-    /// failure too (`is_gits_answer`).
+    /// One git call inside the agent's existing clone, under the git
+    /// profile (`sandboxed_git`), as a materialize step.
     fn agent_git(
         &self,
         id: &str,
@@ -692,37 +759,15 @@ impl Workspace<'_> {
         args: &[&str],
         accepted: &[i32],
     ) -> Result<String, MaterializeError> {
-        let cmd = Cmd::new(&self.tools.nono)
-            .env_clear()
-            .env("HOME", agent.nono_home.display().to_string())
-            .env("PATH", outer_path(self.tools))
-            .log(&crew.logs.join("git.log"))
-            .args(self.sandbox_args(agent))
-            .args(["-c", "core.fsmonitor=false"])
-            .args([
-                "-c".to_string(),
-                format!("core.hooksPath={}", crew.no_hooks().display()),
-                "-C".to_string(),
-                agent.workspace.display().to_string(),
-                format!("--git-dir={}", agent.workspace.join(".git").display()),
-                format!("--work-tree={}", agent.workspace.display()),
-            ])
-            .args(args.iter().copied());
-        let tool_error = |argv: Vec<String>, stderr: String| MaterializeError::Tool {
-            id: id.to_string(),
-            tool: "git".into(),
-            subcommand: args.first().copied().unwrap_or_default().to_string(),
-            args: argv,
-            stderr,
-        };
-        let out = cmd
-            .run_with_exit_codes(accepted)
-            .map_err(|f| tool_error(f.args, f.stderr))?;
-        if !is_gits_answer(&out) {
-            let argv = args.iter().map(|a| (*a).to_string()).collect();
-            return Err(tool_error(argv, out.stderr));
-        }
-        Ok(out.stdout)
+        sandboxed_git(self.tools, crew, agent, args, accepted, GitLog::Full)
+            .map(|o| o.stdout)
+            .map_err(|f| MaterializeError::Tool {
+                id: id.to_string(),
+                tool: "git".into(),
+                subcommand: f.subcommand,
+                args: f.args,
+                stderr: f.stderr,
+            })
     }
 
     /// The agent's private clone on `branch` (Spec N §4): a clone of
@@ -1002,7 +1047,7 @@ impl Workspace<'_> {
             sh_quote(&outer_path(self.tools)),
             sh_quote(&self.tools.nono.display().to_string()),
         );
-        for word in self.sandbox_args(agent) {
+        for word in sandbox_args(self.tools, agent) {
             upload_pack.push(' ');
             upload_pack.push_str(&sh_quote(&word));
         }

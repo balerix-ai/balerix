@@ -238,6 +238,7 @@ main{{flex:1;display:flex;min-height:0}}
 .ev .t{{color:#888;margin-right:.4rem}}
 .ev .n{{color:#57606a;margin-right:.4rem}}
 .ev pre{{white-space:pre-wrap;margin:.2rem 0 0;color:#555;max-height:16em;overflow:auto}}
+.ev .x{{white-space:pre-wrap;margin:.2rem 0 0;font:12px system-ui,sans-serif;max-height:24em;overflow:auto}}
 .ev.divider{{background:#fff6d5;font-weight:600}}
 .file{{margin:1rem 0;border:1px solid #ddd;border-radius:4px}}
 .file h3{{margin:0;padding:.4rem .6rem;background:#f6f8fa;font-size:13px;font-weight:600;display:flex;gap:.6rem;align-items:center}}
@@ -462,6 +463,8 @@ const side = document.getElementById("side");
 function renderEvent(e) {{
   const row = el("div", "ev" + (e.name === "review_sent" ? " divider" : ""));
   row.append(el("span", "t", new Date(e.at * 1000).toLocaleTimeString()), el("span", "n", e.name), el("span", "s", e.summary));
+  if (e.payload_truncated || e.text_truncated) row.appendChild(el("span", "badge", " · cut"));
+  if (typeof e.text === "string") row.appendChild(el("div", "x", e.text));
   const pre = el("pre", "", JSON.stringify(e.payload, null, 2) + (e.payload_truncated ? "\n(truncated)" : "")); pre.hidden = true;
   row.appendChild(pre); row.onclick = () => {{ pre.hidden = !pre.hidden; }};
   return row;
@@ -994,6 +997,14 @@ mod tests {
             "the apply rate limit"
         );
         assert!(page.contains("r.workspace"), "the poll reads the version");
+        assert!(
+            page.contains(r#"el("div", "x", e.text)"#),
+            "a turn's text shows on its row, through textContent (#42)"
+        );
+        assert!(
+            page.contains("e.payload_truncated || e.text_truncated"),
+            "a cut entry is marked on its row (#42)"
+        );
         assert!(
             !page.contains("loadDiff();\npollEvents();"),
             "the first diff comes from the first poll"

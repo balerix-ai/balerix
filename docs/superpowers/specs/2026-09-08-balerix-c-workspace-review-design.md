@@ -28,7 +28,7 @@ Where this document and the plugins spec disagree, this document wins.
 | PC-6 | **Comments are anchored by file, side and line, and each carries the diff line it was made on.** No 409 on a changed tree. | The agent is working while you review; a hard conflict would fire constantly. The quoted line lets the agent (and the reviewer after a reload) locate the comment when lines moved. |
 | PC-7 | **Drafts live in the browser; nothing is kept after submit.** `localStorage` under the agent id; cleared on a successful send. No `kv` for web. | No new capability, nothing to purge, the terminal and the activity column show what was sent. A history is a later spec if wanted. |
 | PC-8 | **The activity column is the hook event timeline**, from web observing all nine events into a per-agent ring buffer; not an embedded terminal. | Structured, PR-timeline-like, and not a keyboard into the agent from the review page. The terminal page stays one click away. |
-| PC-9 | **Event buffers are in memory only.** 500 events per agent, payloads cut at 4 KiB. | The daemon offers no catch-up for observers (protocol §4); persisting a partial stream would promise more than it holds. |
+| PC-9 | **Event buffers are in memory only.** 500 events per agent, payloads cut at 4 KiB; a turn's text is kept apart from that cut, up to 40 000 characters (§4.1, #42). | The daemon offers no catch-up for observers (protocol §4); persisting a partial stream would promise more than it holds. |
 
 ## 2. The `workspace` capability
 
@@ -208,10 +208,21 @@ routes: true
 
 `state.rs` gains, per agent, an event ring buffer: `VecDeque<Entry>` of at
 most 500, `Entry { seq: u64, at: Timestamp, name: String, summary: String,
-payload: Value, payload_truncated: bool }`; `seq` is per agent and never
+payload: Value, payload_truncated: bool, text: Option<String>,
+text_truncated: bool }`; `seq` is per agent and never
 reused. `Plugin::observe` appends each event of a batch to its agent's
-buffer, deriving `summary` (§4.3) and cutting the serialized payload at 4
-KiB (kept as `{ "truncated": true, "head": "<first 4 KiB>" }`). Events for
+buffer, deriving `summary` (§4.3), lifting a turn's text out of the
+payload into `text` (`last_assistant_message` of a `Stop`, `prompt` of a
+`UserPromptSubmit`, when it is a string), and cutting the rest of the
+serialized payload at 4 KiB (kept as `{ "truncated": true, "head":
+"<first 4 KiB>" }`). The text is not counted against that cut: it is kept
+whole up to 40 000 characters (the matrix plugin's ceiling, ten
+4000-character parts, Spec G §8), and past that ends with `… N more
+characters dropped` and sets `text_truncated`. Before #42 the whole
+payload was cut at 4 KiB, which lost a long reply mid-key and made
+`events.json` look as if the field had never arrived. `events.json` writes
+`text` and `text_truncated` only when there is a text and when it was
+cut; `payload_truncated` is always written. Events for
 an agent that is not enabled are dropped. `deactivate` drops the buffer with
 the enabled flag. A sent review appends a synthetic entry named
 `review_sent` with `summary` `review sent (n comments)` and the rendered
@@ -262,8 +273,11 @@ successful send. `localStorage` failures are caught and ignored.
 
 **The activity column** polls `events.json?after=<last seq>` every two
 seconds, appends, and keeps itself scrolled to the bottom unless the reader
-scrolled up. An entry is the time, the name and the summary; clicking it
-expands the payload as pretty-printed JSON. The `review_sent` entry is
+scrolled up. An entry is the time, the name and the summary, then the
+turn's `text` in full when it has one (a scrolling block, through
+`textContent` like everything else), and a `cut` badge when
+`payload_truncated` or `text_truncated` is set, so a cut entry never reads
+as a short one; clicking it expands the payload as pretty-printed JSON. The `review_sent` entry is
 rendered as a divider. When the buffer is empty the column says "no events
 yet; the daemon delivers no history".
 

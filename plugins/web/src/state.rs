@@ -19,8 +19,13 @@ pub struct AgentRow {
 
 /// Events kept per agent (Spec C §4.1, PC-9).
 pub const EVENT_BUFFER: usize = 500;
-/// A payload's serialized size beyond which only its head is kept.
+/// A payload's serialized size beyond which only its head is kept. The
+/// text a turn carries is lifted out first and not counted (`lift_text`).
 pub const PAYLOAD_LIMIT: usize = 4096;
+/// Characters of a turn's text kept whole: the matrix plugin's ceiling
+/// (ten 4000-character parts, Spec G §8), far past any real turn. Beyond
+/// it the text ends with a note of how much was dropped.
+pub const TEXT_LIMIT: usize = 10 * 4000;
 
 /// One entry of the activity column: a hook event, or the synthetic
 /// `review_sent` divider.
@@ -34,6 +39,14 @@ pub struct Entry {
     pub payload: Value,
     #[serde(default)]
     pub payload_truncated: bool,
+    /// What the turn said or was asked (`last_assistant_message` of a
+    /// `Stop`, `prompt` of a `UserPromptSubmit`), lifted out of `payload`
+    /// and kept up to `TEXT_LIMIT` characters (#42).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// `text` passed `TEXT_LIMIT` and ends with the dropped-count note.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_truncated: bool,
 }
 
 /// The `events.json` body (Spec D §3.1 adds `workspace`).
@@ -113,6 +126,50 @@ pub fn cut_payload(payload: Value) -> (Value, bool) {
     )
 }
 
+/// The payload field that carries a turn's text, for the events that have one.
+fn text_field(name: &str) -> Option<&'static str> {
+    match name {
+        "Stop" => Some("last_assistant_message"),
+        "UserPromptSubmit" => Some("prompt"),
+        _ => None,
+    }
+}
+
+/// Splits a turn's text out of its payload: `(text, text cut, the rest)`.
+/// The text is kept up to `TEXT_LIMIT` characters and then ends with
+/// `… N more characters dropped`; the rest is the payload without that
+/// field, for `cut_payload`. Any other event, or a field that is missing
+/// or not a string, leaves the payload as it was.
+pub fn lift_text(name: &str, mut payload: Value) -> (Option<String>, bool, Value) {
+    let Some(field) = text_field(name) else {
+        return (None, false, payload);
+    };
+    let Some(obj) = payload.as_object_mut() else {
+        return (None, false, payload);
+    };
+    if !obj.get(field).is_some_and(Value::is_string) {
+        return (None, false, payload);
+    }
+    let Some(Value::String(text)) = obj.remove(field) else {
+        return (None, false, payload);
+    };
+    let total = text.chars().count();
+    if total <= TEXT_LIMIT {
+        return (Some(text), false, payload);
+    }
+    let dropped = total - TEXT_LIMIT;
+    let plural = if dropped == 1 {
+        "character"
+    } else {
+        "characters"
+    };
+    let kept = format!(
+        "{}\n\n… {dropped} more {plural} dropped",
+        cut(&text, TEXT_LIMIT)
+    );
+    (Some(kept), true, payload)
+}
+
 #[derive(Default)]
 struct Inner {
     enabled: BTreeSet<String>,
@@ -185,7 +242,8 @@ impl Cache {
         let log = i.events.entry(agent.to_string()).or_default();
         log.next_seq += 1;
         let seq = log.next_seq;
-        let (payload, payload_truncated) = cut_payload(payload);
+        let (text, text_truncated, rest) = lift_text(name, payload);
+        let (payload, payload_truncated) = cut_payload(rest);
         log.entries.push_back(Entry {
             seq,
             at,
@@ -193,6 +251,8 @@ impl Cache {
             summary,
             payload,
             payload_truncated,
+            text,
+            text_truncated,
         });
         while log.entries.len() > EVENT_BUFFER {
             log.entries.pop_front();
@@ -436,6 +496,95 @@ mod tests {
         assert_eq!(v["truncated"], true);
         assert_eq!(v["head"].as_str().unwrap().len(), PAYLOAD_LIMIT);
         assert!(now().0 > 1_700_000_000);
+    }
+
+    /// What Claude said and what it was asked survive a payload far past
+    /// `PAYLOAD_LIMIT` (#42): the field is lifted into `text` whole, and
+    /// only the rest of the payload is capped.
+    #[test]
+    fn the_text_of_a_turn_is_kept_whole_beside_the_capped_payload() {
+        use serde_json::json;
+        let c = Cache::new();
+        c.set_enabled("f/c/a", true);
+        let said = "word ".repeat(1943) + "end"; // 9718 bytes, past the cap
+        c.push_event(
+            "f/c/a",
+            Timestamp(1),
+            "Stop",
+            "turn ended".into(),
+            json!({ "cwd": "/w", "hook_event_name": "Stop", "last_assistant_message": said }),
+        );
+        let asked = format!("first line\n{}", "q".repeat(5000));
+        c.push_event(
+            "f/c/a",
+            Timestamp(2),
+            "UserPromptSubmit",
+            "first line".into(),
+            json!({ "prompt": asked, "blob": "z".repeat(PAYLOAD_LIMIT) }),
+        );
+        c.push_event(
+            "f/c/a",
+            Timestamp(3),
+            "Notification",
+            "m".into(),
+            json!({ "message": "m" }),
+        );
+        let e = c.events_after("f/c/a", 0).events;
+        assert_eq!(e[0].text.as_deref(), Some(said.as_str()));
+        assert!(!e[0].text_truncated && !e[0].payload_truncated);
+        assert_eq!(
+            e[0].payload,
+            json!({ "cwd": "/w", "hook_event_name": "Stop" }),
+            "the text is lifted out, not kept twice"
+        );
+        assert_eq!(e[1].text.as_deref(), Some(asked.as_str()));
+        assert!(!e[1].text_truncated);
+        assert!(e[1].payload_truncated, "the rest still has the 4 KiB cap");
+        assert_eq!(e[1].payload["truncated"], true);
+        assert_eq!((e[2].text.as_deref(), e[2].text_truncated), (None, false));
+        assert_eq!(
+            serde_json::to_value(&e[2]).unwrap(),
+            json!({ "seq": 3, "at": 3, "name": "Notification", "summary": "m",
+                    "payload": { "message": "m" }, "payload_truncated": false }),
+            "no text: the entry reads as before"
+        );
+    }
+
+    #[test]
+    fn a_text_past_the_ceiling_ends_with_what_was_dropped() {
+        use serde_json::json;
+        let (text, cut, rest) = lift_text(
+            "Stop",
+            json!({ "last_assistant_message": "é".repeat(TEXT_LIMIT + 5), "cwd": "/w" }),
+        );
+        let text = text.unwrap();
+        assert!(cut);
+        assert_eq!(
+            text,
+            format!("{}\n\n… 5 more characters dropped", "é".repeat(TEXT_LIMIT))
+        );
+        assert_eq!(rest, json!({ "cwd": "/w" }));
+        let (text, cut, _) = lift_text(
+            "Stop",
+            json!({ "last_assistant_message": "a".repeat(TEXT_LIMIT + 1) }),
+        );
+        assert!(cut && text.unwrap().ends_with("… 1 more character dropped"));
+        let (text, cut, _) = lift_text(
+            "Stop",
+            json!({ "last_assistant_message": "a".repeat(TEXT_LIMIT) }),
+        );
+        assert_eq!((text.map(|t| t.len()), cut), (Some(TEXT_LIMIT), false));
+        // only the named event's string field is lifted
+        for (name, payload) in [
+            ("Stop", json!({ "last_assistant_message": 7 })),
+            ("Stop", json!({ "prompt": "p" })),
+            ("UserPromptSubmit", json!({ "last_assistant_message": "s" })),
+            ("Notification", json!({ "message": "m" })),
+            ("Stop", json!(null)),
+        ] {
+            let (text, cut, rest) = lift_text(name, payload.clone());
+            assert_eq!((text, cut, rest), (None, false, payload), "{name}");
+        }
     }
 
     mod props {

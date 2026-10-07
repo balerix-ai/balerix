@@ -483,8 +483,18 @@ async fn an_identical_sync_leaves_the_plugin_unchanged_and_keeps_its_listen() {
         Some("http://127.0.0.1:4000".to_string()),
         "still routable"
     );
-    // the pass that follows the apply finds nothing to do
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // the pass that follows the apply finds nothing to do: a barrier
+    // answers after it (and one more) have run
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    fx.daemon
+        .plugin_host()
+        .unwrap()
+        .handle()
+        .tx
+        .send(balerix_server::Msg::Barrier { reply })
+        .await
+        .unwrap();
+    assert!(rx.await.unwrap(), "a pass ran");
     assert_eq!(
         materialized(fx.h.materializer.calls()),
         before,
@@ -502,24 +512,37 @@ async fn hello_is_rate_limited_per_plugin_after_authentication() {
     // protocol 2: refused after the bucket, so nothing reaches the actor
     let bad =
         json!({ "name": "hello", "version": "0.1.0", "protocol": 2, "listen": "127.0.0.1:4000" });
-    let mut statuses = Vec::new();
-    for _ in 0..120 {
-        let (s, _) = fx
-            .api
-            .call("POST", "/v1/plugin-host/hello", Some("wrong"), Some(&bad));
-        assert_eq!(s, 401, "a bad token is refused, never limited");
-        statuses.push(
-            fx.api
-                .call("POST", "/v1/plugin-host/hello", Some(&token), Some(&bad))
-                .0,
-        );
-    }
-    assert_eq!(statuses[0], 400);
-    assert!(statuses.contains(&429), "{statuses:?}");
+    // 120 at once against a burst of 50 refilling at 20/s: however slow
+    // the host, they all land within a second or two, far over the bucket
+    let api = &fx.api;
+    let statuses: Vec<u16> = tokio::task::block_in_place(|| {
+        let start = std::sync::Barrier::new(120);
+        std::thread::scope(|scope| {
+            let calls: Vec<_> = (0..120)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        api.call("POST", "/v1/plugin-host/hello", Some(&token), Some(&bad))
+                            .0
+                    })
+                })
+                .collect();
+            calls.into_iter().map(|c| c.join().unwrap()).collect()
+        })
+    });
+    let limited = statuses.iter().filter(|s| **s == 429).count();
+    assert!(limited > 0, "none of 120 limited: {statuses:?}");
     assert!(
         statuses.iter().all(|s| [400, 429].contains(s)),
         "{statuses:?}"
     );
+    // with the bucket empty, a bad token is still refused, never limited
+    for _ in 0..5 {
+        let (s, _) = fx
+            .api
+            .call("POST", "/v1/plugin-host/hello", Some("wrong"), Some(&bad));
+        assert_eq!(s, 401, "a bad token is refused, never limited");
+    }
     fx.finish().await;
 }
 

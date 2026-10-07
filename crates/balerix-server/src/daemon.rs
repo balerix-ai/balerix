@@ -55,6 +55,17 @@ const KUBERNETES_PLUGINS: &str =
 
 /// How often every ready plugin's `GET /v1/health` is polled (§16.5).
 pub const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+/// How long `apply` and the purge listener wait for an actor that has
+/// purged its fleet to end (#10); it returns right after, so this is a
+/// bound on a bug, not a timing.
+const PURGE_EXIT_WAIT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
+/// How many times `hello`'s re-activation offers one row while applies
+/// keep changing it under it (#10).
+const REACTIVATE_TRIES: usize = 5;
 
 pub struct Daemon {
     fleets: RwLock<BTreeMap<FleetName, FleetHandle>>,
@@ -308,12 +319,81 @@ impl Daemon {
             let Some(d) = daemon.upgrade() else {
                 return;
             };
-            d.fleets.write().await.remove(&name);
-            if let Some(m) = &d.managed {
-                m.forget(name.as_str());
-            }
-            d.bump();
+            // One task per fleet: a forget waits for its fleet's lock, and
+            // must not hold up another fleet's behind it.
+            tokio::spawn(async move { d.forget_one(&name).await });
         }
+    }
+
+    /// Drops a purged fleet's handle (#10), under the fleet's lock so it
+    /// cannot interleave with an `apply` or `down` of the same name, and
+    /// only while the entry is still the purged actor's: an `apply` that
+    /// got the lock first has already put a new actor in its place, and
+    /// that fleet stays.
+    async fn forget_one(&self, name: &FleetName) {
+        let lock = self.fleet_lock(name);
+        let _guard = lock.lock().await;
+        let entry = self.fleets.read().await.get(name).cloned();
+        if let Some(h) = entry {
+            if !Self::wait_purged(name, &h).await {
+                return;
+            }
+            self.fleets.write().await.remove(name);
+        }
+        if let Some(m) = &self.managed {
+            m.forget(name.as_str());
+        }
+        self.bump();
+    }
+
+    /// `true` once `h`'s actor has ended after purging its fleet; `false`
+    /// at once for a live actor that is not purging. The actor tells the
+    /// purge listener before its task returns, and a settled `Down` with
+    /// `purge` is the last record it publishes, so a handle that shows
+    /// one is about to close: this waits for it (bounded, in case it never
+    /// does) rather than hand that actor a message it would drop.
+    async fn wait_purged(name: &FleetName, h: &FleetHandle) -> bool {
+        if !Self::is_purging(h) {
+            return false;
+        }
+        if tokio::time::timeout(PURGE_EXIT_WAIT, h.tx.closed())
+            .await
+            .is_err()
+        {
+            tracing::error!(fleet = %name, "purged fleet's actor did not end within {PURGE_EXIT_WAIT:?}");
+            return false;
+        }
+        true
+    }
+
+    /// For `apply` and `down`, under the fleet's lock: a fleet whose actor
+    /// is purging is waited out, so it then counts as absent; one whose
+    /// actor outlasts the wait is an error rather than a message sent to
+    /// an actor about to drop it (#10).
+    async fn settle_purge(&self, name: &FleetName) -> Result<(), DaemonError> {
+        let Some(h) = self.fleets.read().await.get(name).cloned() else {
+            return Ok(());
+        };
+        if Self::is_purging(&h) && !Self::wait_purged(name, &h).await {
+            return Err(DaemonError::Internal(format!(
+                "fleet {name}: its purge has not finished; try again"
+            )));
+        }
+        Ok(())
+    }
+
+    /// `h`'s last record is a settled `Down` with `purge`: the actor has
+    /// purged the fleet, or is about to and then end.
+    fn is_purging(h: &FleetHandle) -> bool {
+        let r = h.status.borrow();
+        matches!(r.desired, Desired::Down { purge: true, .. }) && r.is_down()
+    }
+
+    /// A handle that stands for no fleet: its actor purged it and ended.
+    /// An actor that ended any other way (a panic) still holds its fleet,
+    /// which answers `fleet task is gone` rather than being replaced.
+    fn is_purged(h: &FleetHandle) -> bool {
+        h.tx.is_closed() && Self::is_purging(h)
     }
 
     pub fn token(&self) -> &str {
@@ -602,13 +682,35 @@ impl Daemon {
     /// Restart recovery (§16.2): the plugin knows nothing about the
     /// pairs it had; every row is offered again, and a refusal now is
     /// the pair's state, not an error for the plugin.
+    ///
+    /// Not under the fleets' apply locks: a plugin whose `activate` calls
+    /// `PUT fleets/{f}` would wait on its own `hello`. An apply can
+    /// therefore change a row while this runs (#10). Each row is read
+    /// again right before its `activate`, so it is offered its config of
+    /// now, and an answer is written only onto a row that still holds the
+    /// config it answered (`set_state`). When that fails, the apply's
+    /// `activate` may have reached the plugin before this one did, so the
+    /// row's current config is offered again — `activate` replaces in
+    /// place, so this converges — and a row the apply removed is
+    /// deactivated, at most `REACTIVATE_TRIES` offers per row.
     async fn reactivate(&self, name: &AgentName) {
-        if let Some(addr) = self.registry.ready_addr(name) {
-            for (agent, row) in self.registry.rows_for_plugin(name) {
+        let Some(addr) = self.registry.ready_addr(name) else {
+            return;
+        };
+        for (agent, _) in self.registry.rows_for_plugin(name) {
+            let mut offered = false;
+            for _ in 0..REACTIVATE_TRIES {
+                let Some(row) = self.registry.row(&agent, name) else {
+                    if offered {
+                        self.deactivate_pair(&agent, name).await;
+                    }
+                    break;
+                };
                 let req = ActivateRequest {
                     agent: agent.to_string(),
                     config: row.config.clone(),
                 };
+                offered = true;
                 let activation = match self.client.activate(&addr, &req).await {
                     Ok(()) => PluginActivation::active(),
                     Err(e) => {
@@ -616,7 +718,17 @@ impl Daemon {
                         PluginActivation::rejected(Self::activation_message(&e))
                     }
                 };
-                self.registry.set_state(&agent, name, activation);
+                if self
+                    .registry
+                    .set_state(&agent, name, &row.config, activation)
+                {
+                    offered = false;
+                    break;
+                }
+                tracing::info!(plugin = %name, agent = %agent, "row changed during re-activation; offering its current config");
+            }
+            if offered {
+                tracing::warn!(plugin = %name, agent = %agent, "row kept changing during re-activation; the next hello offers it again");
             }
         }
     }
@@ -667,6 +779,7 @@ impl Daemon {
                 self.registry.set_state(
                     &p.agent,
                     &p.plugin,
+                    &p.config,
                     PluginActivation::rejected(Self::activation_message(&e)),
                 );
             }
@@ -930,12 +1043,18 @@ impl Daemon {
         // Whether this is a 409 (Create on a live fleet), a 404 (Replace
         // on an absent one) or the owner's 409 is decided *before* any
         // plugin is told anything: a rejected apply must not leave a
-        // plugin holding a config the fleet never took. The per-fleet
-        // lock is held, and it excludes the only other mutators of this
-        // entry, so the write lock below sees the same answer.
+        // plugin holding a config the fleet never took. A purged fleet's
+        // handle can still be in the map (the purge listener runs after
+        // the actor has ended, and takes this lock to remove it): it is
+        // waited out and counts as absent here and at the insert below,
+        // and the listener leaves alone the actor this apply puts in its
+        // place (#10). `apply` and `down` hold this lock and the listener
+        // removes only a dead handle, so the write lock below sees the
+        // same answer.
+        self.settle_purge(name).await?;
         {
             let fleets = self.fleets.read().await;
-            match fleets.get(name) {
+            match fleets.get(name).filter(|h| !Self::is_purged(h)) {
                 Some(h) => {
                     let current = h.status.borrow();
                     Self::check_owner(name, current.owner.as_deref(), caller, false)?;
@@ -1005,12 +1124,32 @@ impl Daemon {
                         }
                     }
                 }
-                None => rows.push((p.clone(), PluginActivation::pending())),
+                // Not ready (#11): an unchanged row stays as it is — a
+                // rejection keeps its message for `status`, a pending row
+                // is not reset — and a changed config goes pending with
+                // the last message carried over until a plugin answers.
+                None => {
+                    let was = rows_now
+                        .iter()
+                        .find(|(a, pl, _)| a == &p.agent && pl == &p.plugin)
+                        .map(|(_, _, row)| row);
+                    match was {
+                        Some(row) if row.config == p.config => {}
+                        Some(row) => rows.push((
+                            p.clone(),
+                            PluginActivation {
+                                message: row.activation.message.clone(),
+                                ..PluginActivation::pending()
+                            },
+                        )),
+                        None => rows.push((p.clone(), PluginActivation::pending())),
+                    }
+                }
             }
         }
         let handle = {
             let mut fleets = self.fleets.write().await;
-            match fleets.get(name) {
+            match fleets.get(name).filter(|h| !Self::is_purged(h)) {
                 Some(h) => {
                     if mode == ApplyMode::Create && !h.status.borrow().is_down() {
                         return Err(DaemonError::Conflict);
@@ -1124,11 +1263,15 @@ impl Daemon {
         Self::reject_reserved(name)?;
         let lock = self.fleet_lock(name);
         let _guard = lock.lock().await;
+        self.settle_purge(name).await?;
+        // A purged fleet whose handle the purge listener has not dropped
+        // yet is gone already (#10); any other dead actor is not.
         let handle = self
             .fleets
             .read()
             .await
             .get(name)
+            .filter(|h| !Self::is_purged(h))
             .cloned()
             .ok_or(DaemonError::NotFound)?;
         Self::check_owner(name, handle.status.borrow().owner.as_deref(), caller, true)?;
@@ -2015,9 +2158,11 @@ mod tests {
             .unwrap();
         wait_gen(&w.daemon, 1).await;
         let before = w.daemon.registry().rows_for_fleet(&name);
-        // a handle whose task is gone: the receiver is dropped at once
+        // a handle whose task drops every request unanswered (a closed
+        // handle would be a purged fleet's, which counts as absent, #10)
         {
-            let (tx, _) = mpsc::channel(1);
+            let (tx, mut rx) = mpsc::channel::<Msg>(1);
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
             let mut fleets = w.daemon.fleets.write().await;
             let status = fleets[&name].status.clone();
             fleets.insert(name.clone(), FleetHandle { tx, status });
@@ -2035,7 +2180,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(e, DaemonError::Internal("fleet task is gone".into()));
+        assert_eq!(
+            e,
+            DaemonError::Internal("fleet task dropped the request".into())
+        );
         assert_eq!(
             w.daemon.registry().rows_for_fleet(&name),
             before,
@@ -2308,6 +2456,52 @@ mod tests {
             ActivationState::Rejected
         );
 
+        // The plugin goes away (#11): an apply that cannot reach it keeps
+        // the rejection, message and all, while the config is unchanged…
+        // (`unhello`, not `set_ready(false)`: the readiness watcher sets
+        // `ready` again on every record that shows the plugin agent
+        // `Ready`, and its `hello` above may still be on its way there.)
+        w.daemon.registry().unhello(&flow);
+        w.daemon
+            .apply(&name, s.clone(), Default::default(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            w.daemon.registry().row(&agent, &flow).unwrap().activation,
+            PluginActivation::rejected("states.x: unknown"),
+            "a not-ready plugin leaves an unchanged rejected row alone"
+        );
+        // …and a changed config is pending again, still carrying the last
+        // rejection for `status` until a plugin answers.
+        let s2 = spec(&[("a", &[("flow", json!({ "v": 2 }))])]);
+        w.daemon
+            .apply(&name, s2.clone(), Default::default(), true)
+            .await
+            .unwrap();
+        let row = w.daemon.registry().row(&agent, &flow).unwrap();
+        assert_eq!(row.config, json!({ "v": 2 }));
+        assert_eq!(
+            row.activation,
+            PluginActivation {
+                state: ActivationState::Pending,
+                message: "states.x: unknown".into(),
+            }
+        );
+        // An unchanged pending row is not reset by another apply either.
+        w.daemon
+            .apply(&name, s2.clone(), Default::default(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            w.daemon
+                .registry()
+                .row(&agent, &flow)
+                .unwrap()
+                .activation
+                .message,
+            "states.x: unknown"
+        );
+
         // The plugin is fixed and listening again. No `hello` here: the
         // apply itself must re-attempt the row, whose config is unchanged.
         let good = stub_plugin(StubScript {
@@ -2319,7 +2513,7 @@ mod tests {
             .registry()
             .set_listen(&flow, good.listen.clone(), "t".into());
         w.daemon
-            .apply(&name, s, Default::default(), true)
+            .apply(&name, s2, Default::default(), true)
             .await
             .unwrap();
         assert_eq!(
@@ -2333,13 +2527,9 @@ mod tests {
             "a re-attempt is not a config change"
         );
         assert_eq!(
-            w.daemon
-                .registry()
-                .row(&agent, &flow)
-                .unwrap()
-                .activation
-                .state,
-            ActivationState::Active
+            w.daemon.registry().row(&agent, &flow).unwrap().activation,
+            PluginActivation::active(),
+            "an accepted pair clears the old rejection"
         );
     }
 
@@ -2796,5 +2986,427 @@ mod tests {
             DaemonError::Managed("fleet h: plugin flow is not installed".into())
         );
         assert!(w.daemon.get(&h).await.is_none(), "no record was created");
+    }
+
+    /// A handle for fleet `f` whose actor has purged (or is purging) the
+    /// fleet: its record says `Down` with `purge`, settled. With `rx`
+    /// dropped the actor is gone; held, it is still on its way out.
+    fn purging_handle() -> (FleetHandle, mpsc::Receiver<Msg>) {
+        let mut record = FleetRecord::new(spec(&[("a", &[])]));
+        record.desired = Desired::Down {
+            keep: Keep::default(),
+            purge: true,
+        };
+        record.status.phase = balerix_api::FleetPhase::Down;
+        let (tx, rx) = mpsc::channel(1);
+        let (_publish, status) = watch::channel(record);
+        (FleetHandle { tx, status }, rx)
+    }
+
+    /// #10: an apply that got the fleet's lock after a `down --purge`
+    /// finds the purged actor's handle still in the map (the purge
+    /// listener has not run yet). It must start the fleet afresh, and the
+    /// listener, running late, must not delete the fleet it made.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_apply_after_a_purge_is_not_undone_by_the_late_forget() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let (dead, rx) = purging_handle();
+        drop(rx);
+        w.daemon.fleets.write().await.insert(name.clone(), dead);
+
+        let rec = w
+            .daemon
+            .apply(&name, spec(&[("a", &[])]), Default::default(), false)
+            .await
+            .unwrap();
+        assert_eq!(rec.generation, 1, "a new fleet, not the purged one");
+        wait_gen(&w.daemon, 1).await;
+
+        w.daemon.forget_one(&name).await;
+        let live = w.daemon.fleets.read().await.get(&name).cloned().unwrap();
+        assert!(!live.tx.is_closed(), "the new actor is the one in the map");
+        assert!(!w.daemon.get(&name).await.unwrap().is_down());
+
+        // And a forget of a fleet whose actor really is gone removes it.
+        let (dead, rx) = purging_handle();
+        drop(rx);
+        let g: FleetName = "g".parse().unwrap();
+        w.daemon.fleets.write().await.insert(g.clone(), dead);
+        w.daemon.forget_one(&g).await;
+        assert!(w.daemon.get(&g).await.is_none());
+    }
+
+    /// #10 review: only a *purged* actor's closed handle counts as absent.
+    /// An actor that ended any other way (a panic) leaves its fleet in the
+    /// map: an apply must not slip past the owner check and replace the
+    /// record, and both apply and down answer the old internal error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_actor_that_did_not_purge_still_holds_its_fleet() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let mut record = FleetRecord::with_owner(spec(&[("a", &[])]), Some("flow".into()));
+        record.desired = Desired::Down {
+            keep: Keep::default(),
+            purge: false,
+        };
+        record.status.phase = balerix_api::FleetPhase::Down;
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let (_publish, status) = watch::channel(record);
+        w.daemon
+            .fleets
+            .write()
+            .await
+            .insert(name.clone(), FleetHandle { tx, status });
+
+        let e = w
+            .daemon
+            .apply(&name, spec(&[("a", &[])]), Default::default(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, DaemonError::Managed(_)), "{e:?}");
+        let e = w
+            .daemon
+            .apply_as(
+                &name,
+                spec(&[("a", &[])]),
+                Default::default(),
+                ApplyMode::Create,
+                &Caller::Plugin("flow".parse().unwrap()),
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e, DaemonError::Internal("fleet task is gone".into()));
+        let e = w
+            .daemon
+            .down_as(&name, Keep::default(), true, &Caller::Admin { force: true })
+            .await
+            .unwrap_err();
+        assert_eq!(e, DaemonError::Internal("fleet task is gone".into()));
+        assert_eq!(
+            w.daemon.get(&name).await.unwrap().owner.as_deref(),
+            Some("flow"),
+            "the record is the old one"
+        );
+    }
+
+    /// #10: the purge is decided but the actor has not ended yet — an
+    /// apply waits for it rather than handing the spec to a task that is
+    /// about to drop it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_apply_waits_for_a_purging_actor_to_end() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let (purging, rx) = purging_handle();
+        w.daemon.fleets.write().await.insert(name.clone(), purging);
+
+        let d = w.daemon.clone();
+        let n = name.clone();
+        let apply = tokio::spawn(async move {
+            d.apply(&n, spec(&[("a", &[])]), Default::default(), false)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!apply.is_finished(), "waits for the actor to end");
+        drop(rx);
+        let rec = tokio::time::timeout(Duration::from_secs(5), apply)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.generation, 1);
+        wait_gen(&w.daemon, 1).await;
+    }
+
+    /// #10 review: `down` of a fleet whose actor is purging waits for it
+    /// like `apply` does, then finds no fleet (404), rather than handing
+    /// the dying actor a message it drops (500).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_down_waits_for_a_purging_actor_to_end() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let (purging, rx) = purging_handle();
+        w.daemon.fleets.write().await.insert(name.clone(), purging);
+        let d = w.daemon.clone();
+        let n = name.clone();
+        let down = tokio::spawn(async move { d.down(&n, Keep::default(), false).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!down.is_finished(), "waits for the actor to end");
+        drop(rx);
+        let e = tokio::time::timeout(Duration::from_secs(5), down)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(e, DaemonError::NotFound);
+    }
+
+    /// #10 review: an actor that settles a purge and never ends is a clear
+    /// error for `apply` and `down` once the wait runs out, not a message
+    /// sent to it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_purging_actor_that_never_ends_is_a_clear_error() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let (purging, _rx) = purging_handle();
+        w.daemon.fleets.write().await.insert(name.clone(), purging);
+        let want = DaemonError::Internal("fleet f: its purge has not finished; try again".into());
+        let e = w
+            .daemon
+            .apply(&name, spec(&[("a", &[])]), Default::default(), false)
+            .await
+            .unwrap_err();
+        assert_eq!(e, want);
+        let e = w
+            .daemon
+            .down(&name, Keep::default(), false)
+            .await
+            .unwrap_err();
+        assert_eq!(e, want);
+    }
+
+    /// A plugin that holds its answer to the *first* `activate` matching
+    /// `gated` until `open` is notified, then answers it (400 when
+    /// `reject_gated`, else 200); every other `activate` is accepted at
+    /// once. `seen` is every `(agent, config)` in arrival order,
+    /// `answered` in the order the plugin took them (what it holds last).
+    #[derive(Clone)]
+    struct Gate {
+        seen: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        answered: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        open: Arc<tokio::sync::Notify>,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Gate {
+        fn arrived(&self, agent: &str, config: &serde_json::Value) -> bool {
+            self.seen
+                .lock()
+                .unwrap()
+                .contains(&(agent.to_string(), config.clone()))
+        }
+        fn last_for(&self, agent: &str) -> Option<serde_json::Value> {
+            self.answered
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(a, _)| a == agent)
+                .map(|(_, c)| c.clone())
+        }
+    }
+
+    async fn gated_plugin(
+        gated: (&'static str, serde_json::Value),
+        reject_gated: bool,
+    ) -> (Gate, String) {
+        use axum::extract::State;
+        use axum::routing::{get, post};
+        let gate = Gate {
+            seen: Arc::default(),
+            answered: Arc::default(),
+            open: Arc::default(),
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/v1/activate",
+                post(
+                    move |State(g): State<Gate>, axum::Json(req): axum::Json<serde_json::Value>| {
+                        let gated = gated.clone();
+                        async move {
+                            let agent = req["agent"].as_str().unwrap_or_default().to_string();
+                            g.seen
+                                .lock()
+                                .unwrap()
+                                .push((agent.clone(), req["config"].clone()));
+                            if agent == gated.0
+                                && req["config"] == gated.1
+                                && g.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                g.open.notified().await;
+                                if reject_gated {
+                                    // a refusal leaves the plugin as it was
+                                    return (
+                                        axum::http::StatusCode::BAD_REQUEST,
+                                        axum::Json(json!({ "error": "stale" })),
+                                    );
+                                }
+                            }
+                            g.answered
+                                .lock()
+                                .unwrap()
+                                .push((agent, req["config"].clone()));
+                            (axum::http::StatusCode::OK, axum::Json(json!({})))
+                        }
+                    },
+                ),
+            )
+            .route("/v1/health", get(|| async { axum::Json(json!({})) }))
+            .with_state(gate.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (gate, listen)
+    }
+
+    fn spawn_hello(w: &World, listen: String) -> tokio::task::JoinHandle<()> {
+        let d = w.daemon.clone();
+        tokio::spawn(async move {
+            let flow: AgentName = "flow".parse().unwrap();
+            let token = d.hook_secret(&plugin_id(&flow)).await.unwrap();
+            d.plugin_hello(
+                &flow,
+                &token,
+                HelloRequest {
+                    name: "flow".into(),
+                    version: "0.1.0".into(),
+                    protocol: balerix_api::PLUGIN_PROTOCOL,
+                    listen,
+                    manifest: None,
+                    revision: None,
+                },
+            )
+            .await
+            .unwrap();
+        })
+    }
+
+    /// #10: `hello`'s re-activation runs outside the fleet's lock (a
+    /// plugin whose `activate` calls back into `PUT fleets/{f}` would wait
+    /// on it). An apply that changes the row while hello's `activate` is
+    /// in flight wins: the stale answer is not written onto its row, and
+    /// the plugin is offered the row's current config again, so it does
+    /// not end up holding the old one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hello_answer_does_not_clobber_a_concurrent_apply() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let flow: AgentName = "flow".parse().unwrap();
+        let agent: AgentId = "f/c/a".parse().unwrap();
+        w.daemon
+            .apply(
+                &name,
+                spec(&[("a", &[("flow", json!({ "v": 1 }))])]),
+                Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            w.daemon.registry().row(&agent, &flow).unwrap().activation,
+            PluginActivation::pending()
+        );
+        for reject_gated in [true, false] {
+            // back to v1, pending, and a plugin not yet listening
+            w.daemon.registry().unhello(&flow);
+            w.daemon
+                .apply(
+                    &name,
+                    spec(&[("a", &[("flow", json!({ "v": 1 }))])]),
+                    Default::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            let (gate, listen) = gated_plugin(("f/c/a", json!({ "v": 1 })), reject_gated).await;
+            let said_hello = spawn_hello(&w, listen);
+            eventually("hello's activate of v1 is in flight", || {
+                gate.arrived("f/c/a", &json!({ "v": 1 }))
+            })
+            .await;
+            w.daemon
+                .apply(
+                    &name,
+                    spec(&[("a", &[("flow", json!({ "v": 2 }))])]),
+                    Default::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(gate.last_for("f/c/a"), Some(json!({ "v": 2 })));
+            gate.open.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), said_hello)
+                .await
+                .unwrap()
+                .unwrap();
+            let row = w.daemon.registry().row(&agent, &flow).unwrap();
+            assert_eq!(
+                (row.config, row.activation),
+                (json!({ "v": 2 }), PluginActivation::active()),
+                "reject_gated={reject_gated}: the answer about v1 is not written onto v2's row"
+            );
+            assert_eq!(
+                gate.last_for("f/c/a"),
+                Some(json!({ "v": 2 })),
+                "reject_gated={reject_gated}: the plugin holds the row's config"
+            );
+        }
+    }
+
+    /// #10: hello re-activates its rows one after another; a row an apply
+    /// moved on while an earlier row's `activate` was in flight is offered
+    /// with its config *now*, not the one the loop started with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hello_offers_each_row_its_current_config() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let flow: AgentName = "flow".parse().unwrap();
+        w.daemon
+            .apply(
+                &name,
+                spec(&[
+                    ("a", &[("flow", json!({ "a": 1 }))]),
+                    ("b", &[("flow", json!({ "b": 1 }))]),
+                ]),
+                Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let (gate, listen) = gated_plugin(("f/c/a", json!({ "a": 1 })), false).await;
+        let said_hello = spawn_hello(&w, listen);
+        eventually("hello's activate of a is in flight", || {
+            gate.arrived("f/c/a", &json!({ "a": 1 }))
+        })
+        .await;
+        w.daemon
+            .apply(
+                &name,
+                spec(&[
+                    ("a", &[("flow", json!({ "a": 1 }))]),
+                    ("b", &[("flow", json!({ "b": 2 }))]),
+                ]),
+                Default::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        gate.open.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), said_hello)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(gate.last_for("f/c/b"), Some(json!({ "b": 2 })));
+        assert!(
+            !gate
+                .seen
+                .lock()
+                .unwrap()
+                .contains(&("f/c/b".to_string(), json!({ "b": 1 }))),
+            "b's old config was never offered: {:?}",
+            gate.seen.lock().unwrap()
+        );
+        let row = w
+            .daemon
+            .registry()
+            .row(&"f/c/b".parse().unwrap(), &flow)
+            .unwrap();
+        assert_eq!(
+            (row.config, row.activation),
+            (json!({ "b": 2 }), PluginActivation::active())
+        );
     }
 }

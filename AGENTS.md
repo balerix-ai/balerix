@@ -326,12 +326,27 @@ credentials, hook input, or sandbox rules.
   `tmux -L balerix-e2e-<pid> kill-server` and `kill` the `balerix serve`
   whose argv carries that `--tmux-socket` (the plugin e2e uses socket
   `balerix-e2e-plugins-<pid>`, the flow e2e `balerix-e2e-flow-<pid>`).
-- A body over a route's limit is answered 413 the moment the server has
-  read past the limit, and the connection is closed with the rest unread:
-  a client still writing gets EPIPE in place of the answer, and a pooled
-  client hands the dead connection to its next request. A test of a 413
-  sends exactly one byte over, on a connection of its own
-  (`api_it.rs::one_byte_over`; #79, #113).
+- A body over a route's limit is read to its end, up to four times the
+  limit and for at most 10 s, before the route answers it
+  (`body_limit::drain_over_limit`, #116; the SDK keeps a copy): axum alone
+  answers 413 the moment it has read past the limit and the connection
+  closes with the rest unread, so a client still writing got EPIPE in
+  place of the answer. Past four times the limit, or the time, the answer
+  comes at once with `Connection: close`, and a client still writing can
+  miss it. Authentication sits *outside* the drain (the auth
+  `route_layer` goes on after `limited`; the events route has
+  `hooks::require_secret`, the plugin routes `require_plugin`): a caller
+  that fails it is answered 401 having had at most 64 KiB of its body read
+  (`body_limit::refuse`; more than that and the connection is closed
+  unread). A limited router goes through `limited`, never a bare
+  `DefaultBodyLimit`. The answer is the route's own: the middleware hands
+  the handler a stand-in body one byte over the limit, so `hello` still
+  answers 400. `api_it.rs::one_byte_over` sends exactly one byte over, on
+  a connection of its own (#79, #113), and
+  `events_it.rs::every_limited_route_answers_a_client_that_sends_the_whole_body`
+  sends it all.
+- `balerix hook-relay` refuses a hook event over 1 MiB itself (stderr
+  names the limit, stdout `{}`), rather than posting it truncated (#116).
 - `balerix` is a reserved fleet name (the plugin fleet). `FleetName` still
   parses it — the reservation lives in `Daemon::apply`/`down` and
   `balerix_config::resolve`.
@@ -364,7 +379,15 @@ credentials, hook input, or sandbox rules.
   plugin's message. Re-running `update` after fixing the plugin does
   re-attempt it: `Daemon::apply` diffs against the fleet's *active* rows
   only, so a pending or rejected pair is offered again even though its
-  config did not change (R24).
+  config did not change (R24). Only to a ready plugin, though: while it
+  is not ready an unchanged rejected row stays rejected, and `update`'s
+  wait (`fleet.rs::ready_check`) fails at once with the old
+  `crews.<c>.agents.<a>.plugins.<p>: <message>` (the daemon accepted the
+  update; `--no-wait` returns the record) until the plugin's next `hello`
+  re-offers the pair. A changed config is `pending` with the old message
+  kept on the row (`GET /v1/fleets/{f}`'s `plugins.<p>.message`; the
+  CLI's status table shows only the state), and the wait waits for it like any
+  pending pair (#11).
 - The activation table is not persisted: after a daemon restart every pair
   is `pending` until the plugin's next `hello`, which re-activates all of
   them.

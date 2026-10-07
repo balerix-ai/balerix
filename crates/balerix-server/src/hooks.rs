@@ -25,6 +25,34 @@ const HANDLE_TIMEOUT: Duration = Duration::from_secs(2);
 /// 1 MiB cap), then the fleet's actor and the handler under a timeout
 /// (503). Every rejection renders as `ApiError`'s `{ "error": … }` JSON,
 /// never axum's own plain-text body.
+/// The events route's secret check, ahead of the body drain (#116): a
+/// caller without the agent's secret is answered 401 before a byte of its
+/// body is read. A path that does not parse goes on to the handler, which
+/// answers it as before.
+pub(crate) async fn require_secret(
+    State(state): State<AppState>,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Ok(Path((fleet, crew, agent))) = path else {
+        return next.run(req).await;
+    };
+    let ok = match (
+        format!("{fleet}/{crew}/{agent}").parse::<AgentId>(),
+        bearer(req.headers()),
+    ) {
+        (Ok(id), Some(secret)) => state.daemon.verify_secret(&id, secret).await,
+        _ => false,
+    };
+    if ok {
+        next.run(req).await
+    } else {
+        let no = ApiError::new(StatusCode::UNAUTHORIZED, "unknown agent or bad secret");
+        crate::body_limit::refuse(req, no.into_response()).await
+    }
+}
+
 pub(crate) async fn events(
     State(state): State<AppState>,
     path: Result<Path<(String, String, String)>, PathRejection>,

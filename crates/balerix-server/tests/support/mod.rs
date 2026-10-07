@@ -148,6 +148,109 @@ impl Api {
     }
 }
 
+/// How a test body travels: with a `Content-Length`, or chunked.
+#[derive(Clone, Copy, Debug)]
+pub enum Framing {
+    Length,
+    Chunked,
+}
+
+/// #116: a client that writes the *whole* body before it reads the answer
+/// (ureq, on an agent and so a connection of its own): `len` bytes of
+/// `x` to `method path` with `token`. `Err` is the transport error a
+/// server that stops reading would cause (EPIPE, a reset).
+pub fn send_whole(
+    base: &str,
+    method: &str,
+    path: &str,
+    token: &str,
+    len: usize,
+    framing: Framing,
+) -> Result<(u16, Value), String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let url = format!("{base}{path}");
+    let req = match method {
+        "POST" => agent.post(&url),
+        "PUT" => agent.put(&url),
+        _ => unreachable!(),
+    }
+    .header("Authorization", &format!("Bearer {token}"))
+    .header("content-type", "application/json");
+    let body = vec![b'x'; len];
+    let sent = match framing {
+        Framing::Length => req.send(&body[..]),
+        Framing::Chunked => {
+            let mut reader = std::io::Cursor::new(body);
+            req.send(ureq::SendBody::from_reader(&mut reader))
+        }
+    };
+    let mut resp = sent.map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
+    let v = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    Ok((status, v))
+}
+
+/// #116: the request line and headers only, declaring `declared` body
+/// bytes and sending none; the status and body of the answer, read from
+/// the same connection.
+pub fn headers_only(
+    base: &str,
+    method: &str,
+    path: &str,
+    token: &str,
+    declared: usize,
+) -> (u16, Value) {
+    use std::io::Write;
+    let authority = base.trim_start_matches("http://");
+    let mut s = std::net::TcpStream::connect(authority).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(
+        s,
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {declared}\r\n\r\n"
+    )
+    .unwrap();
+    read_answer(&mut s)
+}
+
+/// One HTTP/1.1 answer from `s`, read up to its `Content-Length`: its
+/// status and its body (JSON when it parses).
+pub fn read_answer(s: &mut std::net::TcpStream) -> (u16, Value) {
+    use std::io::Read;
+    let mut answer = Vec::new();
+    loop {
+        let mut buf = [0u8; 4096];
+        let n = s.read(&mut buf).unwrap();
+        assert!(n > 0, "closed before a whole answer");
+        answer.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&answer).to_string();
+        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+            continue;
+        };
+        let length: usize = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse().unwrap())
+            })
+            .expect("an answer with a content-length");
+        if body.len() >= length {
+            let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+            let v = serde_json::from_str(body).unwrap_or(Value::String(body.to_string()));
+            return (status, v);
+        }
+    }
+}
+
 pub struct World {
     pub api: Api,
     pub daemon: Arc<Daemon>,
@@ -184,6 +287,18 @@ pub async fn world_with(extra: &[(&str, &str)]) -> World {
 /// appended under the entry, four-space indented (`"    fleetDefaults:
 /// { env: { A: b } }\n"`), or "".
 pub async fn world_with_entries(extra: &[(&str, &str, &str)]) -> World {
+    world_full(extra, None).await
+}
+
+/// `world`, its listener's receive buffer set to `bytes` (inherited by
+/// every accepted connection): the kernel cannot absorb a body the server
+/// leaves unread, so a client that writes all of it sees what the server
+/// did with it (#116).
+pub async fn world_with_recv_buffer(bytes: u32) -> World {
+    world_full(&[], Some(bytes)).await
+}
+
+async fn world_full(extra: &[(&str, &str, &str)], recv_buffer: Option<u32>) -> World {
     let h = Harness::new(Duration::from_secs(3600));
     let dir = tempfile::tempdir().unwrap();
     write_plugin_package(
@@ -214,7 +329,12 @@ pub async fn world_with_entries(extra: &[(&str, &str, &str)]) -> World {
     // A test may want the failure itself; the ones that need plugins up
     // call `start_silent`, which fails loudly if they are not.
     let _ = daemon.sync_plugins().await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    if let Some(bytes) = recv_buffer {
+        socket.set_recv_buffer_size(bytes).unwrap();
+    }
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(1024).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (stop, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(serve(listener, router(daemon.clone()), async {

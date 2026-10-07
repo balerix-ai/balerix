@@ -98,6 +98,19 @@ struct Inner {
     order: Vec<AgentName>,
     plugins: BTreeMap<AgentName, PluginInfo>,
     rows: BTreeMap<(AgentId, AgentName), ActivationRow>,
+    /// Every accepted `hello` takes the next number; never reset, so a
+    /// generation is newer than every one handed out before it, whatever
+    /// syncs happened in between (#12).
+    hello_seq: u64,
+    hellos: BTreeMap<AgentName, u64>,
+}
+
+impl Inner {
+    fn next_hello(&mut self, name: &AgentName) -> u64 {
+        self.hello_seq += 1;
+        self.hellos.insert(name.clone(), self.hello_seq);
+        self.hello_seq
+    }
 }
 
 #[derive(Default)]
@@ -144,13 +157,39 @@ impl PluginRegistry {
         w.rows.retain(|(_, p), _| names.contains(p));
     }
 
-    pub fn set_listen(&self, name: &AgentName, listen: String, token: String) {
-        if let Some(p) = self.write().plugins.get_mut(name) {
+    /// A `hello`: where the plugin listens, ready. Returns the hello's
+    /// generation (`hello_generation`).
+    pub fn set_listen(&self, name: &AgentName, listen: String, token: String) -> u64 {
+        let mut w = self.write();
+        let generation = w.next_hello(name);
+        if let Some(p) = w.plugins.get_mut(name) {
             p.listen = Some(listen);
             p.token = Some(token);
             p.ready = true;
             p.degraded = None;
         }
+        generation
+    }
+
+    /// Not ready, if `stamp` (the hello generation a record carries) is at
+    /// least the plugin's newest hello's: the record is newer than that
+    /// hello. Compared and cleared under one lock, so a `hello` landing
+    /// between the two is never undone (#12). `true` when it cleared.
+    pub fn clear_ready_if(&self, name: &AgentName, stamp: u64) -> bool {
+        let mut w = self.write();
+        let newest = w.hellos.get(name).copied().unwrap_or(0);
+        match w.plugins.get_mut(name) {
+            Some(p) if stamp >= newest => {
+                p.ready = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The generation of the plugin's newest `hello`; `0` before its first.
+    pub fn hello_generation(&self, name: &AgentName) -> u64 {
+        self.read().hellos.get(name).copied().unwrap_or(0)
     }
 
     /// Spec O §23.2: the operator's list. Every entry is registered at once
@@ -192,7 +231,9 @@ impl PluginRegistry {
         url: String,
         token: String,
     ) {
-        if let Some(p) = self.write().plugins.get_mut(name) {
+        let mut w = self.write();
+        w.next_hello(name);
+        if let Some(p) = w.plugins.get_mut(name) {
             p.manifest = manifest;
             p.listen = Some(url);
             p.token = Some(token);
@@ -264,19 +305,24 @@ impl PluginRegistry {
             .insert((agent.clone(), plugin.clone()), row);
     }
 
-    /// `false` when there is no such row.
+    /// The plugin's answer to `config`, written only while the row still
+    /// holds that config: a caller outside the fleet's apply lock (a
+    /// `hello`'s re-activation, #10) must not put an answer about one
+    /// config onto a row an apply has since moved to another. `false` when
+    /// there is no such row or its config changed.
     pub fn set_state(
         &self,
         agent: &AgentId,
         plugin: &AgentName,
+        config: &Value,
         activation: PluginActivation,
     ) -> bool {
         match self.write().rows.get_mut(&(agent.clone(), plugin.clone())) {
-            Some(row) => {
+            Some(row) if &row.config == config => {
                 row.activation = activation;
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -558,8 +604,28 @@ mod tests {
             ),
             (1, 1)
         );
-        assert!(r.set_state(&a, &name("web"), PluginActivation::active()));
-        assert!(!r.set_state(&id("f/c/z"), &name("web"), PluginActivation::active()));
+        assert!(
+            !r.set_state(
+                &a,
+                &name("web"),
+                &json!({ "k": 2 }),
+                PluginActivation::active()
+            ),
+            "an answer about another config"
+        );
+        assert!(!r.is_active(&a, &name("web")));
+        assert!(r.set_state(
+            &a,
+            &name("web"),
+            &json!({ "k": 1 }),
+            PluginActivation::active()
+        ));
+        assert!(!r.set_state(
+            &id("f/c/z"),
+            &name("web"),
+            &json!({ "k": 1 }),
+            PluginActivation::active()
+        ));
         assert_eq!(r.active_agents(&name("web")), 2);
         assert_eq!(r.rows_for_plugin(&name("web")).len(), 2);
         assert_eq!(r.row(&a, &name("flow")).unwrap().config["k"], 1);
@@ -602,6 +668,22 @@ mod tests {
         assert_eq!(removed.len(), 2);
         assert!(r.rows_for_plugin(&name("flow")).is_empty());
         assert_eq!(r.active_agents(&name("web")), 0);
+    }
+
+    /// #12: the watcher's "is this record newer than the last hello?"
+    /// and its clear are one step, so a hello between them is not undone.
+    #[test]
+    fn clear_ready_if_clears_only_for_a_stamp_at_least_the_last_hello() {
+        let r = PluginRegistry::new();
+        let n = name("flow");
+        r.declare(&[(n.clone(), json!({}))], &[]);
+        let g1 = r.set_listen(&n, "127.0.0.1:1".into(), "t".into());
+        let g2 = r.set_listen(&n, "127.0.0.1:2".into(), "t".into());
+        assert!(!r.clear_ready_if(&n, g1), "older than the last hello");
+        assert!(r.plugin(&n).unwrap().ready);
+        assert!(r.clear_ready_if(&n, g2));
+        assert!(!r.plugin(&n).unwrap().ready);
+        assert!(!r.clear_ready_if(&name("nope"), u64::MAX));
     }
 
     #[test]

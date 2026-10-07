@@ -25,6 +25,11 @@ pub const MAX_KEY_TEXT: usize = 1024;
 /// after 10 s, and a plugin that timed out mid-sequence cannot know what
 /// state the dialog is in.
 pub const MAX_KEY_SEQUENCE_MS: u64 = 8000;
+/// Bytes of `send_text.text` (#9). The tmux runner pastes anything over
+/// its argv-safe size through a buffer, so this is not tmux's limit: it
+/// bounds what one action can type into a prompt, well under the 1 MiB
+/// route body, and an over-cap text is a 400 the plugin sees.
+pub const MAX_SEND_TEXT: usize = 256 * 1024;
 
 /// The keys `send_keys` may press. A closed set: the runner matches each to
 /// a fixed tmux key name, so nothing from the wire reaches tmux as a name.
@@ -55,6 +60,9 @@ pub enum KeyStep {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum PluginAction {
+    /// Types `text` into the agent's prompt, then Enter when `submit`.
+    /// At most [`MAX_SEND_TEXT`] bytes; the daemon answers a longer text
+    /// 400 `text: …` and types nothing.
     SendText {
         text: String,
         #[serde(default)]
@@ -145,9 +153,18 @@ impl PluginAction {
         }
     }
 
-    /// What serde cannot say: the bounds of a `send_keys` (Spec J §4.1).
-    /// The message starts with the field, for the daemon's 400.
+    /// What serde cannot say: the size of a `send_text` (#9) and the
+    /// bounds of a `send_keys` (Spec J §4.1). The message starts with the
+    /// field, for the daemon's 400.
     pub fn validate(&self) -> Result<(), String> {
+        if let PluginAction::SendText { text, .. } = self
+            && text.len() > MAX_SEND_TEXT
+        {
+            return Err(format!(
+                "text: expected at most {MAX_SEND_TEXT} bytes, got {}",
+                text.len()
+            ));
+        }
         let PluginAction::SendKeys { steps, delay_ms } = self else {
             return Ok(());
         };
@@ -512,5 +529,18 @@ mod tests {
         );
         assert!(text("esc\u{1b}[B").validate().is_err());
         assert_eq!(PluginAction::Stop.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_caps_send_text_at_max_send_text_bytes() {
+        let send = |text: String| PluginAction::SendText { text, submit: true };
+        assert_eq!(MAX_SEND_TEXT, 256 * 1024);
+        assert_eq!(send("x".repeat(MAX_SEND_TEXT)).validate(), Ok(()));
+        let err = send("x".repeat(MAX_SEND_TEXT + 1)).validate().unwrap_err();
+        assert!(err.starts_with("text:"), "{err}");
+        assert!(err.contains(&(MAX_SEND_TEXT + 1).to_string()), "{err}");
+        // Bytes, not characters: 'é' is two bytes.
+        assert!(send("é".repeat(MAX_SEND_TEXT / 2 + 1)).validate().is_err());
+        assert_eq!(send(String::new()).validate(), Ok(()));
     }
 }

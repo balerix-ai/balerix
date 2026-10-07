@@ -59,6 +59,14 @@ pub enum Msg {
         name: String,
         at: Timestamp,
     },
+    /// A plugin's accepted `hello` (plugin fleet only): `READY_EVENT` for
+    /// its agent, and the hello's generation stamped on the agent's
+    /// status in the same publish (#12).
+    PluginHello {
+        agent: AgentId,
+        generation: u64,
+        at: Timestamp,
+    },
     /// Spec O §7.2: a sidecar's `status` frame; the Daemon mirrors it.
     /// `first` marks a link's first frame (a connect or a reconnect), the
     /// only one reconciled against the stopped set.
@@ -175,6 +183,7 @@ pub fn spawn(
         publish,
         rx,
         last_pass_clean: true,
+        plugin_hellos: BTreeMap::new(),
     };
     tokio::spawn(actor.run(initial_pass));
     FleetHandle { tx, status }
@@ -191,6 +200,11 @@ struct Actor {
     /// A pass with a failed step retries at the resync cadence, not at
     /// `next_restart_at`: a failing clone must not spin.
     last_pass_clean: bool,
+    /// The newest `hello` generation per plugin agent (#12), kept here
+    /// rather than only on the status entry: a hello can arrive before
+    /// the pass that creates the entry, and a pass can recreate it. Every
+    /// publish stamps it onto the entries that exist.
+    plugin_hellos: BTreeMap<String, u64>,
 }
 
 impl Actor {
@@ -274,6 +288,15 @@ impl Actor {
                     let _ = reply.send(self.record.clone());
                 }
                 Some(Msg::Event { agent, name, at }) => self.event(agent, name, at).await,
+                Some(Msg::PluginHello {
+                    agent,
+                    generation,
+                    at,
+                }) => {
+                    let newest = self.plugin_hellos.entry(agent.to_string()).or_default();
+                    *newest = (*newest).max(generation);
+                    self.event(agent, READY_EVENT.into(), at).await;
+                }
                 Some(Msg::LinkStatus {
                     agent,
                     status,
@@ -601,7 +624,12 @@ impl Actor {
         }
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
+        for (id, generation) in &self.plugin_hellos {
+            if let Some(a) = self.record.status.agents.get_mut(id) {
+                a.plugin_hello = a.plugin_hello.max(*generation);
+            }
+        }
         let _ = self.publish.send(self.record.clone());
     }
 
@@ -845,6 +873,29 @@ mod tests {
         );
         assert!(h.runner.calls().contains(&"stop_agent f/c/b".to_string()));
         assert_eq!(h.store.get("f").unwrap().1.hook_secrets.len(), 1);
+    }
+
+    /// #12 review: a plugin's hello can reach the actor before the pass
+    /// that gives its agent a status entry. The generation is kept and
+    /// lands on the entry once it exists, so a later death of that plugin
+    /// is still recognised as newer than its hello.
+    #[tokio::test]
+    async fn a_hello_generation_before_the_agent_has_a_status_is_kept() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let (handle, _shared, _purged, _pool) = start(&h);
+        handle
+            .tx
+            .send(Msg::PluginHello {
+                agent: id("f/c/a"),
+                generation: 7,
+                at: Timestamp(1),
+            })
+            .await
+            .unwrap();
+        apply(&handle, spec(&["a"])).await;
+        let mut rx = handle.status.clone();
+        let rec = wait(&mut rx, |r| r.status.agents.contains_key("f/c/a")).await;
+        assert_eq!(rec.status.agents["f/c/a"].plugin_hello, 7);
     }
 
     #[tokio::test]

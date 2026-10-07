@@ -22,7 +22,15 @@ Body size caps differ by direction and route: plugin → daemon bodies are
 capped at 1 MiB, except `hello`, capped at 64 KiB
 (`balerix-server/src/api.rs`'s `plugins`/`plugin_host` router layers);
 daemon → plugin request bodies are capped at 1 MiB by the SDK's `router`
-(`balerix-plugin-sdk/src/plugin.rs`); a plugin's response body over 1 MiB is
+(`balerix-plugin-sdk/src/plugin.rs`). On both sides a body over its cap is
+read to its end, up to four times the cap and for at most 10 s, after the
+token is checked (a bad token is a 401 before the body is read), before
+it is answered (the
+route's usual over-cap answer: 413, or 400 where the route folds every
+body error into one), so a client that writes the whole body before
+reading gets that answer rather than a reset; a body declared or found
+larger than four times the cap is answered without being read and the
+connection closed. A plugin's response body over 1 MiB is
 rejected by the daemon before it is parsed and counted as a `body` failure
 — for `intercept`, the interceptor chain's fail-open (§4) —
 (`balerix-server/src/plugins/client.rs`).
@@ -122,7 +130,10 @@ shape for one fleet. `owner` is present when a plugin manages the fleet
 **Actions** (`POST agents/{fleet}/{crew}/{agent}/actions`) are one of:
 
 - `{ "action": "send_text", "text": <string>, "submit": <bool> }`
-  (`action.json`)
+  (`action.json`). `text` is at most 256 KiB (262144 bytes of UTF-8,
+  `MAX_SEND_TEXT`); a longer one answers 400 `text: expected at most
+  262144 bytes, got <n>` and nothing is typed. The call returns when the
+  text (and, with `submit`, the Enter) has been sent.
 - `{ "action": "send_keys", "steps": [<step>…], "delay_ms": <int> }`
   (`action-send-keys.json`). A step is `{ "key": "up" | "down" | "enter" |
   "escape" }` or `{ "text": <string> }`. The daemon pauses `delay_ms`
@@ -327,7 +338,11 @@ activations back without the daemon persisting anything about them. The
 answer to each is the pair's new state: a pair rejected before can become
 active, and one active before can be rejected. An `up` or `update` also
 re-offers every pair whose row is not `active`, even when its config did
-not change. A pair is deactivated when its fleet goes `down` or when an
+not change. When the plugin is not ready at that moment, a pair whose
+config did not change keeps its row as it is (a `rejected` row keeps its
+message, a `pending` one is not reset), and a changed config makes the row
+`pending` with the last `message` still on it; the message is replaced or
+cleared only by the plugin's next answer to that pair. A pair is deactivated when its fleet goes `down` or when an
 `up` or `update` drops the plugin from the agent's spec; a changed config
 arrives as a new `activate` in place, and a rejected one changes nothing
 for that pair. A `rejected`

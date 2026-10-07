@@ -111,6 +111,13 @@ pub struct AgentStatus {
     /// out (a read-time overlay); never stored.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins: BTreeMap<String, PluginActivation>,
+    /// Daemon-internal, never on the wire: for an agent of the plugin
+    /// fleet, the newest `hello` generation its actor has taken, which
+    /// tells the readiness watcher whether a terminal phase it sees is
+    /// newer than the plugin's last `hello` (#12). `0` everywhere else.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub plugin_hello: u64,
 }
 
 impl Default for AgentStatus {
@@ -123,6 +130,7 @@ impl Default for AgentStatus {
             restarts: 0,
             next_restart_at: None,
             plugins: BTreeMap::new(),
+            plugin_hello: 0,
         }
     }
 }

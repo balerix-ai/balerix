@@ -16,7 +16,7 @@ use balerix_api::{
 use balerix_core::plugin_id;
 use balerix_plugin_sdk::{Env, Host, Plugin, bind, run};
 use serde_json::{Value, json};
-use support::{World, world};
+use support::{Framing, World, world};
 
 #[derive(Default)]
 struct FlowLike {
@@ -464,6 +464,184 @@ async fn host_routes_are_gated_by_needs_and_kv_and_actions_work() {
             .unwrap()
             .contains("balerix_plugin_actions_total{action=\"stop\",plugin=\"flow\"} 1")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_cap_send_text_is_a_400_naming_the_field_and_types_nothing() {
+    let w = world().await;
+    let (_plugin, host) = start_flow(&w).await;
+    let (s, _) = w.api.admin(
+        "POST",
+        "/v1/fleets",
+        Some(&json!(FleetRequest {
+            spec: spec(&[("a", json!({}))]),
+            credentials: Default::default(),
+            agent_tokens: None,
+            managed_by: None,
+        })),
+    );
+    assert_eq!(s, 200);
+    wait_for(&w, |r| r.status.observed_generation == 1).await;
+    let over = PluginAction::SendText {
+        text: "x".repeat(balerix_api::MAX_SEND_TEXT + 1),
+        submit: true,
+    };
+    let e = host.action("f/c/a", &over).await.unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "daemon: HTTP 400: text: expected at most {} bytes, got {}",
+            balerix_api::MAX_SEND_TEXT,
+            balerix_api::MAX_SEND_TEXT + 1
+        )
+    );
+    assert!(
+        !w.h.runner
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("send_text")),
+        "the runner was handed nothing"
+    );
+    let at_cap = PluginAction::SendText {
+        text: "x".repeat(balerix_api::MAX_SEND_TEXT),
+        submit: false,
+    };
+    host.action("f/c/a", &at_cap).await.unwrap();
+    assert_eq!(
+        w.h.runner
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("send_text f/c/a"))
+            .count(),
+        1
+    );
+}
+
+/// #116: a body over a route's limit is read to the end (up to four
+/// times the limit) before the answer, so a client that writes the
+/// whole body first still reads it — the answer each route gives today
+/// (`hello` maps every body rejection to 400). Past four times the limit
+/// the answer comes at once, without reading the body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_limited_route_answers_a_client_that_sends_the_whole_body() {
+    // A small receive buffer: without the drain, the bytes the server
+    // leaves unread cannot sit in the kernel and the client's write fails.
+    let w = support::world_with_recv_buffer(4096).await;
+    let (_plugin, host) = start_flow(&w).await;
+    let (s, _) = w.api.admin(
+        "POST",
+        "/v1/fleets",
+        Some(&json!(FleetRequest {
+            spec: spec(&[("a", json!({}))]),
+            credentials: Default::default(),
+            agent_tokens: None,
+            managed_by: None,
+        })),
+    );
+    assert_eq!(s, 200);
+    wait_for(&w, |r| r.status.observed_generation == 1).await;
+    let secret = w
+        .daemon
+        .hook_secret(&"f/c/a".parse().unwrap())
+        .await
+        .unwrap();
+    let flow = token(&w, "flow").await;
+    let admin = w.api.token().to_string();
+    let routes: [(&str, &str, &str, usize, u16); 4] = [
+        ("POST", "/v1/fleets", &admin, 4 << 20, 413),
+        ("POST", "/v1/agents/f/c/a/events", &secret, 1 << 20, 413),
+        ("POST", "/v1/plugin-host/hello", &flow, 64 << 10, 400),
+        ("PUT", "/v1/plugin-host/kv/big", &flow, 1 << 20, 413),
+    ];
+    for (method, path, token, limit, want) in routes {
+        let cases = [
+            (Framing::Length, limit + 1),
+            (Framing::Length, 4 * limit),
+            (Framing::Chunked, 2 * limit),
+        ];
+        for (framing, len) in cases {
+            let (base, m, p, t) = (
+                w.api.base.clone(),
+                method.to_string(),
+                path.to_string(),
+                token.to_string(),
+            );
+            let got = tokio::task::spawn_blocking(move || {
+                support::send_whole(&base, &m, &p, &t, len, framing)
+            })
+            .await
+            .unwrap();
+            let (status, v) =
+                got.unwrap_or_else(|e| panic!("{method} {path}, {len} bytes {framing:?}: {e}"));
+            assert_eq!(
+                status, want,
+                "{method} {path}, {len} bytes {framing:?}: {v}"
+            );
+            let _: balerix_api::ErrorBody = serde_json::from_value(v.clone())
+                .unwrap_or_else(|e| panic!("{method} {path}: {e}: {v}"));
+        }
+        let (base, m, p, t) = (
+            w.api.base.clone(),
+            method.to_string(),
+            path.to_string(),
+            token.to_string(),
+        );
+        let (status, v) = tokio::task::spawn_blocking(move || {
+            support::headers_only(&base, &m, &p, &t, 4 * limit + 1)
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, want, "{method} {path}, declared over 4x: {v}");
+        assert!(v["error"].is_string(), "{v}");
+    }
+    // A body with no length that fits is read by the drain and handed on.
+    let base = w.api.base.clone();
+    let t = flow.clone();
+    let (status, _) = tokio::task::spawn_blocking(move || {
+        support::send_whole(
+            &base,
+            "PUT",
+            "/v1/plugin-host/kv/small",
+            &t,
+            100,
+            Framing::Chunked,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(host.kv_get("small").await.unwrap(), Some(vec![b'x'; 100]));
+}
+
+/// #116 review: authentication answers before the body is read. A
+/// request with a bad token that declares an over-limit body (within the
+/// drain ceiling) and sends none of it gets its 401 at once; the drain
+/// would otherwise wait for bytes that never come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bad_token_is_answered_before_an_over_limit_body_is_read() {
+    let w = world().await;
+    let routes: [(&str, &str, usize); 4] = [
+        ("POST", "/v1/fleets", 4 << 20),
+        ("POST", "/v1/agents/f/c/a/events", 1 << 20),
+        ("POST", "/v1/plugin-host/hello", 64 << 10),
+        ("PUT", "/v1/plugin-host/kv/big", 1 << 20),
+    ];
+    for (method, path, limit) in routes {
+        let base = w.api.base.clone();
+        let started = std::time::Instant::now();
+        let (status, v) = tokio::task::spawn_blocking(move || {
+            support::headers_only(&base, method, path, "wrong", 2 * limit)
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, 401, "{method} {path}: {v}");
+        assert!(v["error"].is_string(), "{v}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{method} {path}: answered without waiting for the body"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

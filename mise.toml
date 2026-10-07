@@ -12,6 +12,10 @@ tmux = "3.7c"
 gh = "2.102.0"
 nono = "0.79.0"
 claude = "2.1.292"
+# The web plugin's review-page script runs under node in its tests
+# (plugins/web/src/routes.rs, #20). The current LTS line (24, Krypton);
+# never inherited by agents (INHERITED is claude and gh only).
+node = "24.21.0"
 
 # Release and workflow tooling (Spec I). Only `claude` and `gh` from this
 # table reach agents (balerix-runtime's INHERITED list).

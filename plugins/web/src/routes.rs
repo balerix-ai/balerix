@@ -974,6 +974,79 @@ mod tests {
         assert_eq!(forwardable(2000), 1011);
     }
 
+    /// Returns `true` if the test may run. Otherwise prints a skip reason,
+    /// or panics when `BALERIX_REQUIRE_TOOLS=1` (CI never skips) — the
+    /// pattern of `balerix-runtime`'s integration tests.
+    fn require_or_skip(name: &str, present: bool) -> bool {
+        if present {
+            return true;
+        }
+        if std::env::var_os("BALERIX_REQUIRE_TOOLS").is_some_and(|v| v == "1") {
+            panic!("{name} is required (BALERIX_REQUIRE_TOOLS=1) but not available");
+        }
+        eprintln!("skip: {name} not available");
+        false
+    }
+
+    /// Spec D PD-4 run as the page runs it (#20): the script is sliced out
+    /// of `review_html` itself — `anchorOf`, `parsePatch` and
+    /// `anchorComments` — and the four cases run under `node`, fed on stdin.
+    #[test]
+    fn anchor_comments_keeps_reanchors_or_stales_under_node() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let node = Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !require_or_skip("node", node) {
+            return;
+        }
+        let page = review_html("", "f/c/a");
+        let start = page.find("const anchorOf").expect("anchorOf in the page");
+        let func = page
+            .find("function anchorComments(")
+            .expect("anchorComments in the page");
+        let end = func + page[func..].find("\n}\n").expect("its closing brace") + 3;
+        let cases = r#"
+const assert = require("node:assert");
+// new: 1 " keep", 2 "+moved", 3 "+twin", 4 "+twin"; old: 1 " keep", 2 "-gone"
+const patch = "@@ -1,2 +1,4 @@\n keep\n-gone\n+moved\n+twin\n+twin\n";
+const d = { files: [{ path: "a.rs", patch }] };
+const exact = { path: "a.rs", side: "new", line: 1, text: " keep" };
+const unique = { path: "a.rs", side: "new", line: 9, text: "+moved" };
+const several = { path: "a.rs", side: "new", line: 9, text: "+twin" };
+const none = { path: "a.rs", side: "new", line: 2, text: "+vanished" };
+const stale = anchorComments(d, [exact, unique, several, none]);
+assert.strictEqual(exact.line, 1, "the exact anchor keeps");
+assert.strictEqual(unique.line, 2, "exactly one same path/side/text line re-anchors");
+assert.deepStrictEqual(stale, [several, none], "several or none: stale");
+assert.strictEqual(several.line, 9, "a stale comment keeps its line");
+console.log("anchor cases ok");
+"#;
+        let script = format!("{}\n{cases}", &page[start..end]);
+        let mut child = Command::new("node")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("node starts");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(script.as_bytes())
+            .expect("the script reaches node");
+        let out = child.wait_with_output().expect("node finishes");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("anchor cases ok"),
+            "node failed:\n{stdout}\n{}\nscript:\n{script}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn the_review_page_links_its_routes_through_the_prefix_and_escapes_the_id() {
         let page = review_html("/v1/plugins/web", "f/c/a");

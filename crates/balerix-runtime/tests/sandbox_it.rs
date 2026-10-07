@@ -182,6 +182,92 @@ fn a_user_network_block_validates_and_a_bogus_key_does_not() {
     );
 }
 
+/// #118: a user block that would loosen signal isolation is refused at
+/// render, naming its config path, before any profile is written or nono
+/// runs. Teeth: the same block merged by hand is one nono accepts, and
+/// under it the sandboxed process does signal the one outside, so the
+/// refusal is what stands between the agent and its supervisor.
+#[test]
+fn a_user_block_cannot_loosen_signal_isolation() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("nono", false));
+        return;
+    };
+    let root = support::temp_root("sandbox-signal-mode");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let layout = support::layout(&root);
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let paths = layout.agent(&id);
+    let crew = layout.crew(&id.crew_ref());
+    for d in [&paths.home, &paths.workspace, &paths.nono_home, &paths.logs] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let grants = balerix_grants(&id, &paths, &crew, &layout, &tools.balerix, &tools.mise);
+    let loosen = serde_json::json!({ "security": { "signal_mode": "allow_all" } });
+
+    let e = render_profile(&id, &grants, 7643, &Default::default(), &loosen).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "f/c/a: sandbox.security.signal_mode: balerix-owned; agents stay signal-isolated"
+    );
+    assert!(
+        !paths.profile.exists(),
+        "refused before a profile is written"
+    );
+    assert!(
+        !paths.logs.join("nono.validate.log").exists(),
+        "refused before nono runs"
+    );
+
+    let pinned = render_profile(
+        &id,
+        &grants,
+        7643,
+        &Default::default(),
+        &serde_json::json!({}),
+    )
+    .unwrap();
+    let signal = |profile: &serde_json::Value| {
+        write_profile(&id, &paths, profile).unwrap();
+        validate_profile(&tools, &id, &paths).unwrap();
+        let out = Command::new(&tools.nono)
+            .args([
+                "-s",
+                "run",
+                "--profile",
+                &paths.profile.display().to_string(),
+                "--",
+                "/bin/sh",
+                "-c",
+                &format!(
+                    "kill -0 {} 2>/dev/null && echo SIGNALLED || echo signal-denied",
+                    std::process::id()
+                ),
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &paths.nono_home)
+            .current_dir(&paths.workspace)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "nono run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(signal(&pinned), "signal-denied");
+    let loosened = balerix_runtime::merge_profile(pinned, &loosen);
+    assert_eq!(
+        signal(&loosened),
+        "SIGNALLED",
+        "without the refusal the block would reach the supervisor"
+    );
+}
+
 /// Spec N amendment §4: under the git profile the clone and the cache's
 /// objects read; the clone cannot be written, the agent's home cannot be
 /// read, nothing outside can be read, and the environment is the

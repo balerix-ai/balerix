@@ -293,6 +293,7 @@ fn run(
     }
     init_tracing(paths, log, detached_child)?;
     let tools = tool_paths()?;
+    warn_without_signal_scoping(&tools, paths);
     let token = load_or_create_token(&paths.token())?;
     let vault = Vault::load_or_create(&paths.vault_key())?;
     let store = FileFleetStore::new(layout.fleets_dir(), vault.clone());
@@ -368,6 +369,21 @@ fn run(
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(String::new())
+}
+
+/// #118: agents' profiles pin `signal_mode: isolated`, which nono enforces
+/// only on Landlock ABI v6 (Linux 6.12). Below that the daemon still runs;
+/// it says so once. nono's `$HOME` for the check is the server directory:
+/// `--check-only` writes nothing there.
+fn warn_without_signal_scoping(tools: &balerix_runtime::ToolPaths, paths: &ServerPaths) {
+    if std::fs::create_dir_all(&paths.dir).is_err() {
+        return;
+    }
+    let abi = balerix_runtime::host_landlock_abi(tools, &paths.dir);
+    match balerix_runtime::signal_scoping_warning(abi) {
+        Some(warning) => tracing::warn!("{warning}"),
+        None => tracing::debug!(?abi, "Landlock ABI"),
+    }
 }
 
 /// SIGINT or SIGTERM ends the daemon; SIGHUP is ignored so a closed

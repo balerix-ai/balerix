@@ -275,6 +275,13 @@ makes an existing remote branch its clone's branch and start point
   localhost TCP on that port only, leaves other egress at nono's default
   (allowed) for the fleet's `sandbox.network` to tighten, and still holds under
   a user `block: true`, so hooks keep flowing when egress is cut off.
+- **Signal isolation is pinned, not inherited.** The agent and plugin
+  profiles write `security.signal_mode: isolated` and refuse the key in the
+  `sandbox` block, at the top level and under `platform_overrides.<os>`
+  (nono applies those after `extends`): `agent-supervise` sits outside the
+  sandbox as the same user, and an agent that could kill it would orphan
+  its tree out of `stop`'s reach (#118). nono enforces it from Landlock
+  ABI v6 (Linux 6.12); below that `serve` logs one warning and runs.
 - **A private clone per agent, over a shared object cache (Spec N).** An
   agent's `workspace/` is a full `git clone --reference crews/<c>/repo`,
   so refs, index, config, hooks and HEAD are its own and the sandbox

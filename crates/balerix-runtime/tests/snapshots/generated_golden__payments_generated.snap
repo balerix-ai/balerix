@@ -210,6 +210,9 @@ python = "3.12.8"
       7643
     ]
   },
+  "security": {
+    "signal_mode": "isolated"
+  },
   "workdir": {
     "access": "none"
   }
@@ -427,6 +430,9 @@ python = "3.12.8"
     "open_port": [
       7643
     ]
+  },
+  "security": {
+    "signal_mode": "isolated"
   },
   "workdir": {
     "access": "none"

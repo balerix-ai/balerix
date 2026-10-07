@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.1 - 2026-10-07
+
+### Features
+
+- **core:** Restricted settings surface for plugin-applied fleet files, the operator's fleetDefaults layer, and the fleets-gated PUT answer (Spec M §12) (#86)
+- **github:** The GitHub plugin, an agent per issue or pull request (Spec M) (#93)
+- **server:** Kubernetes mode and the balerix-agent sidecar over a TLS link (Spec O §6, §7) (#125)
+- **operator:** The operator project, its five kinds and pure desired state; the sync and harvest Jobs (Spec O §20) (#126)
+- **operator:** The controllers, envtest tests, the images, kind and e2e-k8s (Spec O §21) (#127)
+- Plugins without a cluster (Spec O 4a, §23.1–§23.3) (#143)
+- Plugins on a cluster (Spec O 4b, §23.4–§23.9) (#144)
+- The Helm charts (Spec O 5a, §24.1–§24.3) (#145)
+- Release the operator, agent and charts (Spec O 5b, §24.4–§24.6) (#146)
+
+### Bug fixes
+
+- **common:** Press Enter again while a prompt is unconfirmed, adopted by github and matrix (#99) (#101)
+- **flow:** Press Enter again while a submitted send is unconfirmed (#100) (#102)
+- **github:** Ignore a redelivered opening on a live row; deliver reviews in arrival order (#96) (#103)
+- **github:** Write the closed row in end at once; prune closed rows after seven days (#97) (#105)
+- **runtime:** Run daemon git in an agent's clone under a read-only nono profile (#68, #70) (#110)
+- **runtime:** Grant git's exec-path in the git profile; a sandbox failure is never git's "no" (#109) (#112)
+- **server:** Write the activation rows before the actor's first snapshot (#113) (#114)
+- **runtime:** Stop ends the sandbox's whole process tree and waits for it to be empty (#107) (#117)
+- **operator:** Serve the controllers' watches from an unpooled client (#129) (#139)
+- **operator:** Hardening — request bound, timeout back-off, Job failure, crew lock, CA check (Spec O §22) (#141)
+- Flake batch (#136, #137, #142), release-PR CI, claude 2.1.292 (#147)
+
 ## 0.2.0 - 2026-09-27
 
 ### Features

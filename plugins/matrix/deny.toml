@@ -2,10 +2,12 @@
 # Spec H; they belong to the one artifact that actually carries the risk.
 # Everything else matches the core and sibling-plugin policies.
 [advisories]
-# Nothing ignored. The unmaintained `bitmaps` (RUSTSEC-2026-0247) and
-# `proc-macro-error2` (RUSTSEC-2026-0173) left the tree with matrix-sdk
-# 0.19; an entry here needs a reason naming what blocks the upgrade.
-ignore = []
+# The unmaintained `bitmaps` (RUSTSEC-2026-0247) and `proc-macro-error2`
+# (RUSTSEC-2026-0173) left the tree with matrix-sdk 0.19; an entry here
+# needs a reason naming what blocks the upgrade.
+ignore = [
+  { id = "RUSTSEC-2026-0319", reason = "anymap2 (unmaintained) comes only through matrix-sdk, whose latest, 0.19.1, still requires ^0.13; drop this when matrix-sdk moves to anymap3" },
+]
 
 [licenses]
 # The allowance list is deliberately broader than this project's tree, so a

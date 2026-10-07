@@ -1094,7 +1094,6 @@ impl<G: GitHubPort> Actor<G> {
         body: &str,
     ) {
         use balerix_plugin_common::answer::{self, Reaction};
-        use balerix_plugin_common::pending::Stage;
         let Some(open) = self.questions.get(agent).cloned() else {
             return;
         };
@@ -1102,7 +1101,7 @@ impl<G: GitHubPort> Actor<G> {
             .agents
             .get(agent)
             .map_or(balerix_api::DEFAULT_KEY_DELAY_MS, |c| c.key_delay_ms);
-        let d = answer::on_reply(&open, body, delay_ms);
+        let d = answer::on_reply(&open, body, delay_ms, Instant::now());
         // The executor contract of `Decision` (Spec K §4), with comments as
         // posts and reactions on the operator's comment.
         let mut echo = None;
@@ -1117,7 +1116,7 @@ impl<G: GitHubPort> Actor<G> {
                         .inbound
                         .with_label_values(&["send_failed"])
                         .inc();
-                    self.questions.set_stage(agent, Stage::Open);
+                    self.questions.set_stage(agent, d.fallback);
                     self.react(installation, repo, Target::Comment(comment_id), MINUS_ONE)
                         .await;
                     return;
@@ -1133,7 +1132,7 @@ impl<G: GitHubPort> Actor<G> {
                 .with_label_values(&["send_failed"])
                 .inc();
             self.action_failed(agent, "send_keys", &e);
-            self.questions.set_stage(agent, Stage::Open);
+            self.questions.set_stage(agent, d.fallback);
             self.post(installation, repo, number, &not_delivered(agent), "notice")
                 .await;
             self.react(installation, repo, Target::Comment(comment_id), MINUS_ONE)

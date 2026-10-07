@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use balerix_plugin_sdk::{Host, SdkError};
 use serde_json::Value;
+use tokio::time::Instant;
 
 use crate::question::{self, Question, Selection};
 
@@ -39,6 +40,11 @@ pub enum Stage {
         /// The echo message's id, where the ✅ goes once the answer is
         /// confirmed.
         echo: Option<String>,
+        /// When the reply that sent the keys arrived. In memory only, like
+        /// the rest of `Sent` (a restart resumes as `Open`, Spec J §7.4):
+        /// past `answer::SENT_GRACE` a reply is told to check the terminal
+        /// and `skip` is accepted (#48).
+        since: Instant,
     },
 }
 
@@ -49,7 +55,13 @@ impl Stage {
         match self {
             Stage::Open => Stage::Open,
             Stage::Confirming { selections, .. } => Stage::Confirming { selections, echo },
-            Stage::Sent { selections, .. } => Stage::Sent { selections, echo },
+            Stage::Sent {
+                selections, since, ..
+            } => Stage::Sent {
+                selections,
+                echo,
+                since,
+            },
         }
     }
 }
@@ -212,6 +224,7 @@ mod tests {
             Stage::Sent {
                 selections: None,
                 echo: None,
+                since: Instant::now(),
             },
         );
         let reloaded = Questions::load(&host).await.unwrap();

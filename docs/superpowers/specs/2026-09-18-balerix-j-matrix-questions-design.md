@@ -287,6 +287,7 @@ Open ── reply, inexact match ────────────▶ Confirm
 Confirming ── "yes" / "y" ───────────────▶ Sent
 Confirming ── "no" / "n" ────────────────▶ Open
 Confirming ── any other reply ───────────▶ matched again as a fresh answer
+Sent (≥ 30 s) ── "skip" / "skip!" ───────▶ Sent { skip }   (one Escape, §7.2)
 any ── PostToolUse(AskUserQuestion) | Stop | UserPromptSubmit | SessionStart | SessionEnd ──▶ None
 ```
 
@@ -305,7 +306,24 @@ The inbound filter of Spec G §9.1 runs first, unchanged. Then, instead of §9.2
   `**I read that as** Color → Blue · Size → Medium. Reply **yes** to send.`
   State `Confirming`. `yes` then follows the exact path without a second echo.
 - **`skip`, or `skip!`** (§6.2): echo `**declining the question**`, then one Escape.
-- **In `Sent`:** refused with "an answer is already on its way".
+- **In `Sent`, within 30 s of the reply that sent the keys:** refused with
+  "an answer is already on its way; wait for the agent."
+- **In `Sent`, 30 s or more after it** (#48; `answer::SENT_GRACE`): the keys
+  have most likely landed without submitting the dialog — a dropped key, a
+  layout change after a `claude` bump, the pane in an unexpected state — and
+  no clearing event will come while Claude waits on it. A reply is refused
+  with "the answer may not have landed; check the terminal, or reply `skip`
+  to clear this question.", and `skip` (or `skip!`, whatever the labels say)
+  is accepted: echo `**declining the question**`, one Escape, state `Sent`
+  again with a fresh clock. A counted plan is never sent again: once keys
+  have landed the highlighted row is unknown, and counting from row 1 is the
+  wrong answer this spec exists to remove (J-9 is the real fix). If that
+  echo or Escape fails, the state stays the `Sent` it was, never `Open`, for
+  the same reason (`Decision::fallback`). The stamp is in memory only, like
+  the rest of `Sent` (§7.4). 30 s is well past the longest legal key
+  sequence (8 s, `MAX_KEY_SEQUENCE_MS`). Nothing is posted when the 30 s
+  pass; only what the next reply is told changes, so the actor needs no
+  timer.
 
 ### 7.3 Ground truth
 

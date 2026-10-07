@@ -64,6 +64,9 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         return;
     };
     let root = support::temp_root("inspect");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
     let layout = support::layout(&root);
     let repo = bare_repo(&root);
     let id: AgentId = "f/c/a".parse().unwrap();
@@ -360,14 +363,26 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
     git(w, &["config", "--unset", "filter.pwn.clean"]);
     assert!(rt.diff(&id, "origin/main").is_ok(), "unset: diffs again");
 
-    // a filter in a file the repository config includes: the probe reads it
-    // (`--includes`) and names the filter key, not the include.
-    let included = root.join("included.config");
-    std::fs::write(
-        &included,
-        format!("[filter \"inc\"]\n\tclean = {}\n", hook.display()),
-    )
-    .unwrap();
+    // a filter in a file the repository config includes. Outside what the
+    // git profile reads, the include itself cannot be read and the probe
+    // fails (#108); in the clone, the probe reads it (`--includes`) and
+    // names the filter key, not the include.
+    let filter = format!("[filter \"inc\"]\n\tclean = {}\n", hook.display());
+    let outside = root.join("included.config");
+    std::fs::write(&outside, &filter).unwrap();
+    git(
+        w,
+        &["config", "include.path", &outside.display().to_string()],
+    );
+    let e = rt.diff(&id, "origin/main").unwrap_err();
+    assert!(
+        matches!(&e, WorkspaceError::Tool { subcommand, .. } if subcommand == "config"),
+        "{e}"
+    );
+    assert!(!marker.exists(), "the filter ran");
+    git(w, &["config", "--unset", "include.path"]);
+    let included = w.join(".git/included.config");
+    std::fs::write(&included, &filter).unwrap();
     git(
         w,
         &["config", "include.path", &included.display().to_string()],
@@ -462,5 +477,212 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
     assert!(
         matches!(&e, WorkspaceError::Tool { subcommand, .. } if subcommand == "config"),
         "{e}"
+    );
+}
+
+/// A clone ready for the reader: `bare_repo`'s, with one committed and one
+/// uncommitted change and an untracked file.
+fn clone_with_changes(
+    root: &Path,
+    tools: &balerix_runtime::ToolPaths,
+) -> (AgentId, balerix_runtime::StateLayout) {
+    let layout = support::layout(root);
+    let repo = bare_repo(root);
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools,
+        gh_config_dir: None,
+        cache_is_read_only: false,
+    };
+    ws.ensure_repo("f/c/a", &crew, &repo, "main").unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    let w = &paths.workspace;
+    std::fs::write(w.join("README"), "hi\ncommitted\n").unwrap();
+    git(w, &["commit", "-q", "-am", "agent work"]);
+    std::fs::write(w.join("LICENSE"), "mit\nedited\n").unwrap();
+    std::fs::write(w.join("notes.txt"), "todo\n").unwrap();
+    (id, layout)
+}
+
+/// #108: every git call the workspace reader makes runs under the git
+/// profile, as the clone step's do
+/// (`workspace_it::daemon_git_in_a_clone_runs_under_the_git_profile`).
+#[test]
+fn the_reader_runs_git_under_the_git_profile() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("inspect-sandboxed");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (id, layout) = clone_with_changes(&root, &tools);
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let log_path = crew.logs.join("git.log");
+    std::fs::write(&log_path, "").unwrap();
+    // a typechange, which git prints as two sections under one header
+    let w = &paths.workspace;
+    std::fs::remove_file(w.join("README")).unwrap();
+    std::os::unix::fs::symlink("LICENSE", w.join("README")).unwrap();
+
+    let rt = Runtime::new(layout.clone(), tools.clone());
+    let d = rt.diff(&id, "origin/main").unwrap();
+    let names: Vec<&str> = d.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(names, ["LICENSE", "README", "notes.txt"]);
+    assert_eq!(d.files[1].status, FileStatus::Typechange);
+    // the combined diff, split, is what one diff per file printed
+    for f in &d.files[..2] {
+        assert_eq!(
+            f.patch,
+            git(
+                w,
+                &[
+                    "diff",
+                    "--no-color",
+                    "-U3",
+                    "--find-renames",
+                    &d.merge_base,
+                    "--",
+                    &f.path
+                ]
+            ),
+            "{}",
+            f.path
+        );
+    }
+    assert_eq!(d.files[1].patch.matches("diff --git ").count(), 2);
+    assert!(
+        d.files[2].patch.contains("+todo"),
+        "an untracked file diffs against /dev/null: {}",
+        d.files[2].patch
+    );
+    rt.version(&id, "origin/main").unwrap();
+
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let profile_arg = format!("run --profile {}", paths.git_profile.display());
+    let calls: Vec<&str> = log.lines().filter(|l| l.starts_with("$ ")).collect();
+    assert_eq!(
+        calls.len(),
+        10,
+        "diff: the filter probe, status, merge-base, name-status, one combined \
+         patch, one --no-index; version: probe, status, merge-base, name-only (#108): {log}"
+    );
+    for line in &calls {
+        assert!(
+            line.contains(&profile_arg),
+            "a reader git call ran outside the git profile: {line}"
+        );
+    }
+    assert!(
+        !log.contains("+todo") && !log.contains("committed"),
+        "the log keeps argv, not the diff: {log}"
+    );
+}
+
+/// #108: a clone pointed at another repository's objects (an `alternates`
+/// line the agent wrote) shows the operator nothing of that repository
+/// through the reader: under the git profile its objects cannot be read.
+/// Positive control: plain git in the same clone reads them.
+#[test]
+fn the_reader_cannot_read_another_repositorys_objects() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("inspect-foreign");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (id, layout) = clone_with_changes(&root, &tools);
+    let paths = layout.agent(&id);
+    let w = &paths.workspace;
+
+    // another repository with the same history, so the merge-base exists
+    // and only the secret commit's objects are foreign
+    let foreign = root.join("foreign");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            &root.join("upstream.git").display().to_string(),
+            &foreign.display().to_string(),
+        ],
+    );
+    std::fs::write(foreign.join("secret.txt"), "TOP SECRET\n").unwrap();
+    git(&foreign, &["add", "."]);
+    git(&foreign, &["commit", "-q", "-m", "secret"]);
+    let secret = git(&foreign, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let alternates = w.join(".git/objects/info/alternates");
+    let mut lines = std::fs::read_to_string(&alternates).unwrap_or_default();
+    lines.push_str(&format!("{}\n", foreign.join(".git/objects").display()));
+    std::fs::write(&alternates, lines).unwrap();
+    git(w, &["update-ref", "refs/heads/stolen", &secret]);
+    assert!(
+        git(w, &["diff", "--no-color", "origin/main", "stolen"]).contains("+TOP SECRET"),
+        "plain git reads the foreign objects through the alternates line"
+    );
+
+    let rt = Runtime::new(layout.clone(), tools.clone());
+    git(w, &["reset", "-q", "--hard", "stolen"]);
+    // deleted in the worktree, so a diff would print the blob
+    std::fs::remove_file(w.join("secret.txt")).unwrap();
+    let e = rt.diff(&id, "origin/main").unwrap_err();
+    assert!(!format!("{e:?}").contains("TOP SECRET"), "{e:?}");
+    assert!(rt.version(&id, "origin/main").is_err());
+}
+
+/// Past `WORKSPACE_FILE_COUNT_LIMIT` the kept files still get their
+/// patches from the one combined diff, restricted to them by pathspec.
+#[test]
+fn a_truncated_diff_still_patches_every_file_it_keeps() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("inspect-truncated");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (id, layout) = clone_with_changes(&root, &tools);
+    let paths = layout.agent(&id);
+    let w = &paths.workspace;
+    for i in 0..balerix_api::WORKSPACE_FILE_COUNT_LIMIT + 5 {
+        std::fs::write(w.join(format!("f{i:04}")), format!("{i}\n")).unwrap();
+    }
+    git(w, &["add", "."]);
+    git(w, &["commit", "-q", "-m", "many"]);
+    let log_path = layout.crew(&id.crew_ref()).logs.join("git.log");
+    std::fs::write(&log_path, "").unwrap();
+    let rt = Runtime::new(layout.clone(), tools.clone());
+    let d = rt.diff(&id, "origin/main").unwrap();
+    assert!(d.truncated);
+    assert_eq!(d.files.len(), balerix_api::WORKSPACE_FILE_COUNT_LIMIT);
+    for f in &d.files {
+        assert!(
+            f.patch
+                .starts_with(&format!("diff --git a/{0} b/{0}\n", f.path)),
+            "{}: {}",
+            f.path,
+            f.patch
+        );
+    }
+    assert!(
+        !d.files.iter().any(|f| f.path == "notes.txt"),
+        "the untracked file sorts past the cap"
+    );
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let calls: Vec<&str> = log.lines().filter(|l| l.starts_with("$ ")).collect();
+    assert_eq!(calls.len(), 5, "no per-file diff: {log}");
+    assert!(
+        calls[4].contains(" --literal-pathspecs diff "),
+        "{}",
+        calls[4]
     );
 }

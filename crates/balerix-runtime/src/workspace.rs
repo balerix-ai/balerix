@@ -22,7 +22,7 @@ use crate::tools::{Cmd, CmdOutput, ToolPaths};
 /// set, over whatever the daemon inherited: a `0` in its environment
 /// would otherwise reach the harvest's `upload-pack` (#67). Harmless on
 /// the cache and a fresh clone, which have no promisor remote; what it
-/// guards is described at `harden_agent_git`.
+/// guards is described at `PROMISOR_KEYS`.
 pub(crate) fn scrub_git_env(mut cmd: Cmd) -> Cmd {
     for var in [
         "GIT_DIR",
@@ -36,49 +36,17 @@ pub(crate) fn scrub_git_env(mut cmd: Cmd) -> Cmd {
     cmd.env("GIT_NO_LAZY_FETCH", "1")
 }
 
-/// Config and environment for a git call in a repository the agent can
-/// write to (its private clone), for the workspace reader (`inspect.rs`);
-/// the clone step runs under the git profile instead, whose `set_vars`
-/// carry the same variables (`sandbox::render_git_profile`). Command-line
-/// config beats every config file, so nothing the agent wrote into its
-/// `.git/config` runs as the daemon: fsmonitor off, hooks pointed at an
-/// empty directory, no optional locks, no prompt, and the `GIT_*` scrub.
-/// `GIT_CEILING_DIRECTORIES` is the agent's own root, the parent of
-/// `workspace/`: the agent owns the clone and can delete its `.git`, and
-/// repository discovery would then walk up and run the command in whatever
-/// repository contains the state root. git only honours a ceiling that
-/// matches the resolved path, so it is canonical.
-/// `GIT_NO_LAZY_FETCH=1` (from `scrub_git_env`): a promisor remote in the
-/// clone's config (`extensions.partialClone`, or any `remote.<x>.promisor`)
-/// would otherwise make any call that reads a missing object (`status`,
-/// `diff`) fetch it from `remote.<x>.url` as the daemon, into the clone's
-/// own object store where the next harvest carries it into the cache, and
-/// run `remote.<x>.uploadpack` as the daemon on the way. git honours the
-/// variable from 2.45.1 (and the patched maintenance releases from
-/// 2.39.4), so it is the second layer: both callers refuse such a config
-/// by key before any call that reads an object (`check_clone_config` for
-/// the clone step, `refuse_filters` for the workspace reader, #67), on
-/// any git.
-pub(crate) fn harden_agent_git(cmd: Cmd, crew: &CrewPaths, agent_root: &Path) -> Cmd {
-    let no_hooks = crew.no_hooks();
-    let _ = std::fs::create_dir_all(&no_hooks);
-    let ceiling = agent_root
-        .canonicalize()
-        .unwrap_or_else(|_| agent_root.to_path_buf());
-    scrub_git_env(cmd)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CEILING_DIRECTORIES", ceiling.display().to_string())
-        .args(["-c", "core.fsmonitor=false"])
-        .args([
-            "-c".to_string(),
-            format!("core.hooksPath={}", no_hooks.display()),
-        ])
-}
-
 /// Config keys that declare a promisor remote, in the form `git config
 /// --name-only` prints them (lowercased). `inspect.rs`'s `FILTER_KEYS`
-/// carries the same alternation for the workspace reader.
+/// carries the same alternation for the workspace reader. A promisor
+/// remote in the clone's config would make any call that reads a missing
+/// object (`status`, `diff`) fetch it from `remote.<x>.url`, and run
+/// `remote.<x>.uploadpack` on the way. `GIT_NO_LAZY_FETCH=1` (the git
+/// profile's `set_vars`, and `scrub_git_env`) closes that from git 2.45.1
+/// (and the patched maintenance releases from 2.39.4); the git profile's
+/// blocked network is what holds on any git, and the refusal by key
+/// (`check_clone_config`, `refuse_filters`) is the operator's message
+/// (#67).
 pub(crate) const PROMISOR_KEYS: &str = r"^(extensions\.partialclone|remote\..*\.promisor)$";
 
 /// What to do with an existing clone (Spec N §4 step 1): Spec L §12's
@@ -385,18 +353,20 @@ pub(crate) enum GitLog {
     Full,
     /// argv, stderr and the exit status: for a call whose stdout is a
     /// request's payload (the workspace reader's diffs).
-    #[expect(dead_code, reason = "the workspace reader moves onto it next (#108)")]
     ArgvOnly,
 }
 
 /// A failed `sandboxed_git`, reported as git's: git's subcommand (its
-/// first argument), and the argv nono ran, or git's own arguments when the
-/// call ran and its answer was not git's.
+/// first argument past the options), and the argv nono ran, or git's own
+/// arguments when the call exited with an accepted non-zero code but
+/// printed on stderr (`is_gits_answer`). That last case keeps the output
+/// in `unanswered`, for a caller to whom such an exit is harmless.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitFailure {
     pub subcommand: String,
     pub args: Vec<String>,
     pub stderr: String,
+    pub unanswered: Option<Box<CmdOutput>>,
 }
 
 /// One git call inside the agent's existing clone, run under the git
@@ -409,8 +379,10 @@ pub(crate) struct GitFailure {
 ///
 /// nono starts from an empty environment (`HOME` is the agent's `nono/`,
 /// as for `launch.sh`), and the profile's `set_vars` carry the hardening
-/// `harden_agent_git` sets for a command's environment; the `-c` pairs
-/// are the same. `--git-dir` names `workspace/.git` exactly: with `-C`
+/// (`GIT_OPTIONAL_LOCKS=0`, `GIT_NO_LAZY_FETCH=1`, no prompt, no system
+/// config, the ceiling at the agent's root); the `-c` pairs turn off
+/// fsmonitor and point hooks at an empty directory, over any config the
+/// agent wrote. `--git-dir` names `workspace/.git` exactly: with `-C`
 /// alone, a `.git` git rejects (say, its `HEAD` deleted) makes git take
 /// `workspace/` itself for a bare repository. `accepted` are the exit
 /// codes that count as success (0 included). A failure is reported as
@@ -445,17 +417,29 @@ pub(crate) fn sandboxed_git(
         format!("--work-tree={}", agent.workspace.display()),
     ])
     .args(args.iter().copied());
-    let subcommand = args.first().copied().unwrap_or_default().to_string();
+    // git's own: the first word that is neither an option nor a `-c` value
+    let mut words = args.iter().copied();
+    let mut subcommand = String::new();
+    while let Some(word) = words.next() {
+        if word == "-c" {
+            words.next();
+        } else if !word.starts_with('-') {
+            subcommand = word.to_string();
+            break;
+        }
+    }
     let out = cmd.run_with_exit_codes(accepted).map_err(|f| GitFailure {
         subcommand: subcommand.clone(),
         args: f.args,
         stderr: f.stderr,
+        unanswered: None,
     })?;
     if !is_gits_answer(&out) {
         return Err(GitFailure {
             subcommand,
             args: args.iter().map(|a| (*a).to_string()).collect(),
-            stderr: out.stderr,
+            stderr: out.stderr.clone(),
+            unanswered: Some(Box::new(out)),
         });
     }
     Ok(out)
@@ -1206,8 +1190,7 @@ impl Workspace<'_> {
 mod tests {
     use crate::tools::{Cmd, CmdOutput};
     use crate::workspace::{
-        CloneDecision, decide_clone, file_url, first_symlink_with, harden_agent_git,
-        is_gits_answer, scrub_git_env,
+        CloneDecision, decide_clone, file_url, first_symlink_with, is_gits_answer, scrub_git_env,
     };
 
     /// #136: git's own maintenance removes `objects/maintenance.lock`
@@ -1281,8 +1264,6 @@ mod tests {
     /// #67: the variable is set on every git call balerix makes, over
     /// whatever the daemon inherited (`GIT_NO_LAZY_FETCH=0` in its
     /// environment would otherwise reach the harvest's `upload-pack`).
-    /// The probe is a script that ignores its arguments, since the
-    /// hardened builder adds `-c` pairs a shell would read as a command.
     #[test]
     fn every_git_call_sets_git_no_lazy_fetch() {
         use std::os::unix::fs::PermissionsExt;
@@ -1296,10 +1277,6 @@ mod tests {
 
         assert_eq!(sees(scrub_git_env(inherited())), "1");
         assert_eq!(sees(scrub_git_env(Cmd::new(&probe))), "1");
-
-        let layout = crate::StateLayout::from_env(dir.path(), |_| None);
-        let crew = layout.crew(&"f/c".parse().unwrap());
-        assert_eq!(sees(harden_agent_git(inherited(), &crew, dir.path())), "1");
     }
 
     /// #70: the harvest names the clone by URL; git percent-decodes it,

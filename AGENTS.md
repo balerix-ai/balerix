@@ -256,17 +256,21 @@ credentials, hook input, or sandbox rules.
   line that dates readiness; the tick after it logs the phase.
 - `Workspace::git` (`crates/balerix-runtime/src/workspace.rs`) (`scrub_git_env`)
   scrubs `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_PREFIX`/`GIT_COMMON_DIR`
-  from every git call; `harden_agent_git` adds the rest of the hardening for a
-  call in an agent's clone. The integration-test `git`
+  from every git call; a call in an agent's clone runs under the git
+  profile instead (`workspace::sandboxed_git`, next item). The integration-test `git`
   fixtures do the same — the pre-commit hook exports them, and a git
   subprocess that inherits them operates on this repository instead of the
   test's.
-- The clone step's git (`Workspace::agent_git` and the harvest's
-  `upload-pack`) runs inside `nono run --profile nono-git-profile.json`
-  from an empty environment. Its hardening variables live in that
-  profile's `set_vars` (`sandbox::render_git_profile`), not on the
-  command: a variable added to `harden_agent_git` alone reaches the
-  workspace reader and not these calls. Tests that run git in an existing
+- Every daemon git call in an agent's existing clone — the clone step's
+  (`Workspace::agent_git`, the harvest's `upload-pack`) and the workspace
+  reader's (`inspect.rs`, #108) — goes through `workspace::sandboxed_git`
+  and runs inside `nono run --profile nono-git-profile.json` from an empty
+  environment. Its hardening variables live in that profile's `set_vars`
+  (`sandbox::render_git_profile`), not on the command: nono drops every
+  other variable. Each call is a sandbox start (about 55 ms idle, far
+  more on a loaded host), so the reader's `version` is four calls and its
+  `diff` one combined `git diff -U3` split per file (`split_patch`), plus
+  one `--no-index` per untracked file; keep it that way. Tests that run git in an existing
   clone need Landlock and gate on `support::landlock_works`. Go through
   `Workspace::prepare_sandbox` before the first sandboxed call: it writes
   the profile, then runs one `git version` that must exit 0. The yes/no
@@ -488,8 +492,9 @@ credentials, hook input, or sandbox rules.
   `fake-claude` records a paste line by line; the real `claude` is expected
   to arrive as one message — verify with `mise run verify-claude`
   (Spec C §8, pending).
-- Workspace git calls (`balerix-runtime/src/inspect.rs`) set
-  `GIT_OPTIONAL_LOCKS=0` and `-c core.fsmonitor=false -c core.hooksPath=<empty>`
+- Workspace git calls (`balerix-runtime/src/inspect.rs`) run under the git
+  profile (`GIT_OPTIONAL_LOCKS=0` and the rest in its `set_vars`), with
+  `-c core.fsmonitor=false -c core.hooksPath=<empty>`
   and pass `--no-ext-diff --no-textconv --no-color --submodule=short
   --ignore-submodules=dirty` to every `diff`: the clone's `.git/config` is
   agent-writable, and the last two keep git out of a nested repository the

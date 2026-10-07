@@ -121,8 +121,8 @@ pub fn render_profile(
 /// Not derived from the agent's profile: that one carries write access,
 /// open network, the user's `sandbox` block and the agent's `env`, none
 /// of which the daemon's git should have. `set_vars` holds the hardening
-/// `harden_agent_git` puts on a command's environment, since nono drops
-/// every variable this list does not name. `git` comes from the host:
+/// for git's environment, since nono drops every variable this list does
+/// not name. `git` comes from the host:
 /// the binary is granted as a single file, canonical since Landlock rules
 /// bind to what the path resolves to, and `exec_path` (`git_exec_path`)
 /// as a directory, since `upload-pack` spawns `pack-objects` through it

@@ -59,7 +59,7 @@ pub(crate) struct Cmd {
     timeout: Option<std::time::Duration>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CmdOutput {
     pub stdout: String,
     /// What the child printed on stderr. A caller that accepts a non-zero

@@ -311,7 +311,8 @@ makes an existing remote branch its clone's branch and start point
   `env`. Not the agent's own profile, which grants more than git needs.
   `check_clone` stays for the message it gives; the profile is what
   holds when the clone changes after the check (#70). The workspace
-  reader is not yet under it.
+  reader's `diff` and `version` run under it too (#108), in as few calls
+  as their output allows: each is a sandbox start.
 - **The planner is pure; the executor is dumb.** Every decision is in
   `reconcile::plan` (a total function) so the model-based test compares plans
   structurally and `cargo mutants` has something to bite.

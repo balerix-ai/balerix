@@ -97,6 +97,7 @@ sleep 1
 COLOR="'Which color?' header 'Color' options Red, Green, Blue"
 SIZE="'Which size?' header 'Size' options Small, Medium, Large"
 COLORS="'Which colors?' header 'Colors' options Red, Green, Blue"
+NEXT="'What now?' header 'Next' options Skip, Retry"
 fails=0      # the dialog did not answer as planned: question.rs's business
 unrelated=0  # the prompt never reached the model, or the model asked something else
 
@@ -208,6 +209,9 @@ run_case multi-other true "ONE question with multiSelect true, $COLORS" "green, 
 run_case mixed true,false "TWO questions in the same call: first, with multiSelect true, $COLORS; second, single-select, $SIZE" $'red, blue\nmedium' \
   '{"Which colors?":"Red, Blue","Which size?":"Medium"}'
 run_case skip false "ONE single-select question $COLOR" "skip" declined
+# #49: `skip!` declines everywhere, the dialog where `skip` picks a Skip option included
+run_case skip-bang false "ONE single-select question $COLOR" "skip!" declined
+run_case skip-bang-label false "ONE single-select question $NEXT" "skip!" declined
 
 if [ "$fails" -eq 0 ] && [ "$unrelated" -eq 0 ]; then
   say "verify-questions: every dialog shape answered as planned"

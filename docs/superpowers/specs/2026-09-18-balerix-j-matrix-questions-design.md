@@ -163,7 +163,11 @@ Reply with a number or a label. `other: …` gives your own answer, `skip` decli
 ```
 
 Several questions are titled `question 1 of 2`, `question 2 of 2` with their
-headers, and the footer says one line per question, in order. A multi-select question says "choose any, separated
+headers, and the footer says one line per question, in order. A lone question
+with an option whose normalised label is `skip` (§6.2) ends instead with
+``…, `skip` chooses the option labelled skip, `skip!` declines.``: there
+`skip` picks the option, so the footer names the word that still declines
+(#49). Every other footer is as above and does not mention `skip!`. A multi-select question says "choose any, separated
 by commas". A payload that does not parse as questions renders as today's
 `running AskUserQuestion` line and opens no pending state.
 
@@ -231,7 +235,9 @@ settled here rather than guessed at (J-4).
   takes the reply `skip`: it selects that option, *inexactly*, so the echo
   asks for a `yes` and the other reading is one `no` away. In every other
   dialog `skip` still declines; one word cannot be a positional answer to
-  several questions in any case. The footer is unchanged.
+  several questions in any case. `skip!` declines in every dialog, this one
+  included, so the thread can always decline (#49); the footer names it
+  only on this dialog (§5).
 - A number on rung 1 is the row it counts to, but *inexact* when some other
   option's label normalises to that number: with options `2 / 4 / 8` the
   reply `2` selects the second option and asks first. A number that is not a
@@ -243,7 +249,11 @@ where `Selection { options: Vec<usize>, other: Option<String> }` holds the
 chosen options, ascending, and the free text if any. `exact` is true only when
 every item came from rung 1 or 3.
 
-`skip` alone, in any case, is `Matched::Skip`: one Escape, exact.
+`skip` alone, in any case, is `Matched::Skip`: one Escape, exact — save the
+lone-`skip`-option dialog above. `skip!` alone, in any case, is always
+`Matched::Skip`. It is tested on the raw trimmed reply before anything is
+normalised: `normalise` strips punctuation, so after it `skip!` would read as
+a `Skip` label; an option literally labelled `skip!` is reached by its number.
 
 ### 6.3 `plan(&[Question], &[Selection]) -> Vec<KeyStep>`
 
@@ -294,7 +304,7 @@ The inbound filter of Spec G §9.1 runs first, unchanged. Then, instead of §9.2
 - **Inexact match:** post the echo as a question,
   `**I read that as** Color → Blue · Size → Medium. Reply **yes** to send.`
   State `Confirming`. `yes` then follows the exact path without a second echo.
-- **`skip`:** echo `**declining the question**`, then one Escape.
+- **`skip`, or `skip!`** (§6.2): echo `**declining the question**`, then one Escape.
 - **In `Sent`:** refused with "an answer is already on its way".
 
 ### 7.3 Ground truth

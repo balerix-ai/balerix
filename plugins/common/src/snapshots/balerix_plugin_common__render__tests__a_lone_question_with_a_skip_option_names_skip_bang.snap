@@ -1,0 +1,12 @@
+---
+source: src/render.rs
+expression: "question_message(&questions(&[retry]))"
+---
+**question** · Color
+
+Which color?
+
+1. **Skip** — leave it
+2. **Retry**
+
+Reply with a number or a label. `other: …` gives your own answer, `skip` chooses the option labelled skip, `skip!` declines.

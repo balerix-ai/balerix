@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::header::{CONTENT_TYPE, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::auth::{RateLimiter, bearer, constant_time_eq};
+use crate::body_limit::limited;
 use crate::daemon::{Caller, Daemon, DaemonError};
 use crate::hooks;
 use crate::plugins::{PluginAddr, PluginError};
@@ -152,8 +153,8 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route("/v1/managed-fleets", get(managed_fleets))
         .route("/v1/plugins/{name}", delete(purge_plugin))
         .route("/v1/sessions", post(create_session))
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
-        .layer(DefaultBodyLimit::max(4 << 20));
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
+    let admin = limited(admin, 4 << 20);
     let agents = Router::new()
         .route(
             "/v1/agents/{fleet}/{crew}/{agent}/events",
@@ -166,12 +167,14 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route(
             "/v1/agents/{fleet}/{crew}/{agent}/link/attach/{session}",
             get(crate::kube::link::link_attach),
-        )
-        .layer(DefaultBodyLimit::max(1 << 20));
-    let plugins = Router::new()
-        .route("/v1/plugin-host/hello", post(plugin_hello))
-        .layer(DefaultBodyLimit::max(64 << 10));
-    let plugin_host = crate::plugin_api::router().layer(DefaultBodyLimit::max(1 << 20));
+        );
+    // Each limit drains an over-limit body before the answer (#116).
+    let agents = limited(agents, 1 << 20);
+    let plugins = limited(
+        Router::new().route("/v1/plugin-host/hello", post(plugin_hello)),
+        64 << 10,
+    );
+    let plugin_host = limited(crate::plugin_api::router(), 1 << 20);
     // The plugin mount authenticates itself (bearer or session cookie),
     // so it sits outside the admin middleware. `/v1/plugins/{name}` with
     // no slash stays the purge route for DELETE; a GET there is a browser

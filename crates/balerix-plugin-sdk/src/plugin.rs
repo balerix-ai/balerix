@@ -5,7 +5,7 @@
 use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -126,12 +126,15 @@ pub fn router<P: Plugin>(plugin: Arc<P>, token: &str) -> Router {
         Some(routes) => base.nest("/v1/routes", routes),
         None => base,
     };
-    base.layer(middleware::from_fn_with_state(token, require_daemon_bearer))
-        // daemon → plugin request bodies are capped at 1 MiB (plugin-protocol
-        // §1), matching the daemon's own `plugin_api::router` layer
-        // (`balerix-server/src/api.rs`); axum's default (2 MiB) is otherwise
-        // silently more permissive than the spec promises.
-        .layer(DefaultBodyLimit::max(1 << 20))
+    // daemon → plugin request bodies are capped at 1 MiB (plugin-protocol
+    // §1), matching the daemon's own `plugin_api::router` layer
+    // (`balerix-server/src/api.rs`); axum's default (2 MiB) is otherwise
+    // silently more permissive than the spec promises. An over-limit body
+    // is drained before the answer, as on the daemon (#116).
+    crate::body_limit::limited(
+        base.layer(middleware::from_fn_with_state(token, require_daemon_bearer)),
+        1 << 20,
+    )
 }
 
 async fn require_daemon_bearer(
@@ -784,5 +787,68 @@ mod tests {
     #[tokio::test]
     async fn the_default_configure_accepts_anything() {
         assert_eq!(Silent.configure(json!({ "anything": 1 })).await, Ok(()));
+    }
+
+    /// #116, as on the daemon: a body over the 1 MiB limit is read to the
+    /// end (up to 4 MiB) before the answer, so a client that writes all of
+    /// it first reads the route's answer (`activate` maps a body
+    /// rejection to 400) instead of a reset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_over_limit_body_sent_whole_reads_its_answer() {
+        // A small receive buffer, so the kernel cannot absorb what the
+        // server leaves unread: without the drain the client's write fails.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(16).unwrap();
+        let listen = listener.local_addr().unwrap().to_string();
+        let app = router(Arc::new(Silent), "tok");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        for len in [(1 << 20) + 1, 4 << 20] {
+            let listen = listen.clone();
+            let (status, body) = tokio::task::spawn_blocking(move || {
+                use std::io::{Read, Write};
+                let mut s = std::net::TcpStream::connect(&listen).unwrap();
+                s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                write!(
+                    s,
+                    "POST /v1/activate HTTP/1.1\r\nHost: {listen}\r\nAuthorization: Bearer tok\r\n\
+                     Content-Type: application/json\r\nContent-Length: {len}\r\n\r\n"
+                )
+                .unwrap();
+                s.write_all(&vec![b'x'; len])
+                    .unwrap_or_else(|e| panic!("{len} bytes: {e}"));
+                let mut answer = Vec::new();
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let n = s.read(&mut buf).unwrap();
+                    assert!(n > 0, "closed before a whole answer");
+                    answer.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&answer).to_string();
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let length: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if body.len() >= length {
+                        let status: u16 = head.split(' ').nth(1).unwrap().parse().unwrap();
+                        break (status, body.to_string());
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(status, 400, "{len} bytes: {body}");
+            let e: ErrorBody =
+                serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+            assert!(e.error.contains("length limit"), "{}", e.error);
+        }
     }
 }

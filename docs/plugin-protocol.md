@@ -22,7 +22,13 @@ Body size caps differ by direction and route: plugin → daemon bodies are
 capped at 1 MiB, except `hello`, capped at 64 KiB
 (`balerix-server/src/api.rs`'s `plugins`/`plugin_host` router layers);
 daemon → plugin request bodies are capped at 1 MiB by the SDK's `router`
-(`balerix-plugin-sdk/src/plugin.rs`); a plugin's response body over 1 MiB is
+(`balerix-plugin-sdk/src/plugin.rs`). On both sides a body over its cap is
+read to its end, up to four times the cap, before it is answered (the
+route's usual over-cap answer: 413, or 400 where the route folds every
+body error into one), so a client that writes the whole body before
+reading gets that answer rather than a reset; a body declared or found
+larger than four times the cap is answered without being read and the
+connection closed. A plugin's response body over 1 MiB is
 rejected by the daemon before it is parsed and counted as a `body` failure
 — for `intercept`, the interceptor chain's fail-open (§4) —
 (`balerix-server/src/plugins/client.rs`).

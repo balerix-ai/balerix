@@ -77,12 +77,11 @@ impl Api {
 /// A `POST` whose body crosses `limit` by its last byte, on a connection
 /// of its own; the status and the body of the answer.
 ///
-/// The server answers 413 the moment it has read past the limit and then
-/// closes with the rest of the body unread. A client still writing then
-/// gets EPIPE in place of the answer, and a pooled client that did get it
-/// hands the dead connection to its next request (#79, #113). So the
-/// request declares 2 MiB and sends `limit + 1` bytes: the server cannot
-/// refuse before the last of them has arrived, and nothing is left unread.
+/// The request declares and sends `limit + 1` bytes (#79, #113). Since
+/// #116 the server reads an over-limit body to its end (up to four times
+/// the limit) before answering, so a body declared longer than it is
+/// sent would wait for bytes that never come; `events_it.rs` covers
+/// clients that send larger bodies whole.
 fn one_byte_over(port: u16, path: &str, token: &str, limit: usize) -> (u16, Value) {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -91,7 +90,7 @@ fn one_byte_over(port: u16, path: &str, token: &str, limit: usize) -> (u16, Valu
         s,
         "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        2 << 20
+        limit + 1
     )
     .unwrap();
     s.write_all(&vec![b'x'; limit + 1]).unwrap();

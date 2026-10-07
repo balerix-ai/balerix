@@ -670,12 +670,14 @@ impl AgentRunner for TmuxRunner {
             self.run_optional(&id, &["kill-window", "-t", &Self::window_target(agent)])?;
             return Ok(());
         }
+        // An unreadable stat fails the stop, but only after the window is
+        // killed: the stop must still happen (#148).
         let pane = match state {
-            Some(ProcessState::Running { pid }) => self.identity(&id, pid)?,
-            _ => None,
+            Some(ProcessState::Running { pid }) => self.identity(&id, pid),
+            _ => Ok(None),
         };
         self.run_optional(&id, &["kill-window", "-t", &Self::window_target(agent)])?;
-        self.wait_gone(&id, pane.as_slice())
+        self.wait_gone(&id, pane?.as_slice())
     }
 
     fn stop_crew(&self, crew: &CrewRef) -> Result<(), RunnerError> {
@@ -728,6 +730,9 @@ impl AgentRunner for TmuxRunner {
         // of every session of the group, each process once, are what the
         // stop waits on.
         let mut panes: Vec<ProcIdentity> = Vec::new();
+        // a pane whose stat cannot be read fails the stop, after the
+        // sessions are killed and the readable panes waited on (#148)
+        let mut unreadable = None;
         for session in &sessions {
             let found = self
                 .run_optional(
@@ -744,18 +749,20 @@ impl AgentRunner for TmuxRunner {
                 .map(|text| parse_live_panes(&text))
                 .unwrap_or_default();
             for pid in found {
-                let Some(p) = self.identity(&name, pid)? else {
-                    continue;
-                };
-                if !panes.contains(&p) {
-                    panes.push(p);
+                match self.identity(&name, pid) {
+                    Ok(Some(p)) if !panes.contains(&p) => panes.push(p),
+                    Ok(_) => {}
+                    Err(e) => {
+                        unreadable.get_or_insert(e);
+                    }
                 }
             }
         }
         for session in &sessions {
             self.run_optional(&name, &["kill-session", "-t", &format!("={session}")])?;
         }
-        self.wait_gone(&name, &panes)
+        self.wait_gone(&name, &panes)?;
+        unreadable.map_or(Ok(()), Err)
     }
 
     fn observe(&self, fleet: &FleetName) -> Result<ObservedState, RunnerError> {

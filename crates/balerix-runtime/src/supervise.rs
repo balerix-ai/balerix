@@ -101,9 +101,11 @@ impl Procfs {
 
     /// `(pid, ppid)` of every process this shows. A process that exits
     /// while this reads is skipped, and so is one whose stat cannot be
-    /// read (another uid's, under `hidepid=1`): a descendant of the
-    /// wrapper runs as its uid. Not being able to list at all is an error
-    /// (#120): the kill loop would see nothing and never end.
+    /// read (another uid's, under `hidepid`): descendants normally run as
+    /// the wrapper's uid, and a setuid one it cannot see is left to the
+    /// stop's bound, which reports it (§13.5). Not being able to list at
+    /// all is an error (#120): the kill loop would see nothing and never
+    /// end.
     pub(crate) fn parents(&self) -> io::Result<Vec<(u32, u32)>> {
         let entries = std::fs::read_dir(&self.root)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", self.root.display())))?;

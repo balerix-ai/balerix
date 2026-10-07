@@ -6,7 +6,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
-use balerix_core::{AgentId, AgentRunner, LaunchPlan, ProcessState};
+use balerix_core::{AgentId, AgentRunner, LaunchPlan, ProcessState, RunnerError};
+use balerix_runtime::supervise::Procfs;
 use balerix_runtime::testing::pid_alive;
 use balerix_runtime::tmux::ATTACH_SESSION_PREFIX;
 use balerix_runtime::{ANCHOR_WINDOW, TmuxRunner};
@@ -835,6 +836,42 @@ fn stop_waits_for_the_pane_process_and_a_dead_pane_stops_at_once() {
         "{:?}",
         start.elapsed()
     );
+}
+
+/// #148: when the pane's stat cannot be read (every read fails under
+/// `/dev/null`), the window is still killed and the stop then fails,
+/// since whether the process is gone is unknown.
+#[test]
+fn an_unreadable_stat_still_kills_the_window_then_fails_the_stop() {
+    let Some(mut p) = pane("stopproc", "while :; do sleep 0.2; done") else {
+        return;
+    };
+    let pid = running_pid(&p);
+    p.r.proc = Procfs::at("/dev/null");
+    let err = p.r.stop_agent(&p.id).unwrap_err();
+    assert!(matches!(err, RunnerError::Proc { .. }), "{err:?}");
+    assert_eq!(
+        p.r.observe(&p.id.fleet).unwrap().get(&p.id),
+        None,
+        "the window is gone"
+    );
+    wait_for(|| !pid_alive(pid));
+}
+
+#[test]
+fn an_unreadable_stat_still_ends_the_crew_then_fails_the_stop() {
+    let Some(mut p) = pane("stopcrewproc", "while :; do sleep 0.2; done") else {
+        return;
+    };
+    let pid = running_pid(&p);
+    p.r.proc = Procfs::at("/dev/null");
+    let err = p.r.stop_crew(&p.id.crew_ref()).unwrap_err();
+    assert!(matches!(err, RunnerError::Proc { .. }), "{err:?}");
+    assert!(
+        p.r.observe(&p.id.fleet).unwrap().crews.is_empty(),
+        "the session is gone"
+    );
+    wait_for(|| !pid_alive(pid));
 }
 
 #[test]

@@ -306,7 +306,14 @@ fn the_git_profile_reads_the_clone_and_the_cache_and_writes_nothing() {
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::write(outside.join("secret"), "outside\n").unwrap();
 
+    // a temp nono home a SIGKILLed daemon left behind (#108)
+    let stale = paths.root.join(".nono-git-4194304999-7-0");
+    std::fs::create_dir_all(stale.join(".local/state/nono/sessions")).unwrap();
     balerix_runtime::write_git_profile(&tools, "f/c/a", &paths, &crew, &[]).unwrap();
+    assert!(
+        !stale.exists(),
+        "writing the profile sweeps another pid's temp homes"
+    );
     assert_eq!(
         std::fs::metadata(&paths.git_profile)
             .unwrap()

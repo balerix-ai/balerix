@@ -404,6 +404,30 @@ impl ScratchHome {
     }
 }
 
+/// Removes the `ScratchHome`s another process left beside `agent`'s
+/// `nono/`: a daemon that was SIGKILLed mid-call never ran their guards.
+/// Only one daemon runs against a state root, so a directory named for
+/// another pid is never in use; this process's own are left alone.
+pub(crate) fn sweep_stale_homes(agent: &AgentPaths) {
+    let Some(parent) = agent.nono_home.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let ours = std::process::id().to_string();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(".nono-git-")) else {
+            continue;
+        };
+        let pid = rest.split('-').next().unwrap_or_default();
+        if pid != ours && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 impl Drop for ScratchHome {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -1340,7 +1364,8 @@ impl Workspace<'_> {
 mod tests {
     use crate::tools::{Cmd, CmdOutput};
     use crate::workspace::{
-        CloneDecision, decide_clone, file_url, first_symlink_with, is_gits_answer, scrub_git_env,
+        CloneDecision, ScratchHome, decide_clone, file_url, first_symlink_with, is_gits_answer,
+        scrub_git_env, sweep_stale_homes,
     };
 
     /// #136: git's own maintenance removes `objects/maintenance.lock`
@@ -1376,6 +1401,32 @@ mod tests {
         assert_eq!(err.0, missing);
         assert_eq!(err.1.kind(), std::io::ErrorKind::NotFound);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// #108 review: a SIGKILLed daemon's temp homes are swept; this
+    /// process's own, and anything else, are left.
+    #[test]
+    fn stale_scratch_homes_of_another_pid_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = crate::StateLayout::from_env(dir.path(), |_| None);
+        let agent = layout.agent(&"f/c/a".parse().unwrap());
+        let root = agent.nono_home.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&root).unwrap();
+        let other = root.join(".nono-git-4194304999-0-1");
+        std::fs::create_dir_all(other.join(".local/state/nono/sessions")).unwrap();
+        let ours = ScratchHome::new(&agent).unwrap();
+        let unrelated = root.join(".nono-gitx");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let file = root.join(".nono-git-1-0-0");
+        std::fs::write(&file, "").unwrap();
+
+        sweep_stale_homes(&agent);
+        assert!(!other.exists(), "another pid's home is swept");
+        assert!(ours.path().exists(), "this process's own is in use");
+        assert!(unrelated.exists() && file.exists(), "only our directories");
+        let path = ours.path().to_path_buf();
+        drop(ours);
+        assert!(!path.exists());
     }
 
     /// Spec N amendment §12.2 (#109): git's yes/no probes are silent on

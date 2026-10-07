@@ -214,7 +214,8 @@ fn git_exec_path(tools: &ToolPaths, id: &str) -> Result<PathBuf, MaterializeErro
 /// Writes the git profile just before the daemon uses it, so nothing
 /// depends on the order of the materialize steps or on a file an earlier
 /// pass (or anything else) left there. Validated only when the bytes
-/// changed. Creates what nono needs to exist: the hooks directory the
+/// changed. Sweeps the temp nono homes another, killed, daemon left
+/// (`workspace::sweep_stale_homes`). Creates what nono needs to exist: the hooks directory the
 /// profile names, nono's `$HOME` and the log directory.
 pub fn write_git_profile(
     tools: &ToolPaths,
@@ -234,6 +235,8 @@ pub fn write_git_profile(
             message: e.to_string(),
         })?;
     }
+    // the temp nono homes a SIGKILLed daemon could not remove
+    crate::workspace::sweep_stale_homes(paths);
     let exec_path = git_exec_path(tools, id)?;
     let profile = render_git_profile(&agent_id, paths, crew, &tools.git, &exec_path, git_read);
     let path = paths.git_profile.clone();

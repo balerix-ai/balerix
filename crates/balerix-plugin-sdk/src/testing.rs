@@ -824,6 +824,10 @@ async fn post_action(
         Ok(b) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
+    // the daemon's `execute_action` refuses these before anything runs
+    if let Err(message) = action.validate() {
+        return error(StatusCode::BAD_REQUEST, message);
+    }
     inner
         .actions
         .lock()
@@ -833,20 +837,32 @@ async fn post_action(
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct KvQuery {
     prefix: String,
     secret: bool,
 }
 
+/// The query, or the message of the daemon's JSON 400 for one it cannot
+/// read (unknown fields too).
+fn kv_query(
+    q: Result<Query<KvQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<KvQuery, String> {
+    q.map(|Query(q)| q).map_err(|e| e.body_text())
+}
+
 async fn list_keys(
     State(inner): State<Arc<Inner>>,
     headers: HeaderMap,
-    Query(q): Query<KvQuery>,
+    q: Result<Query<KvQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if let Some(resp) = unauthorized(&inner, &headers) {
         return resp;
     }
+    let q = match kv_query(q) {
+        Ok(q) => q,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let keys = inner
         .kv
         .lock()
@@ -858,12 +874,19 @@ async fn list_keys(
     Json(KvKeys { keys }).into_response()
 }
 
+/// The daemon's answer to a key outside the grammar.
+fn invalid_key(key: &str) -> Option<Response> {
+    balerix_api::check_kv_key(key)
+        .err()
+        .map(|why| error(StatusCode::BAD_REQUEST, format!("kv: invalid key: {why}")))
+}
+
 async fn get_key(
     State(inner): State<Arc<Inner>>,
     headers: HeaderMap,
     AxumPath(key): AxumPath<String>,
 ) -> Response {
-    if let Some(resp) = unauthorized(&inner, &headers) {
+    if let Some(resp) = unauthorized(&inner, &headers).or_else(|| invalid_key(&key)) {
         return resp;
     }
     match inner
@@ -882,12 +905,16 @@ async fn put_key(
     State(inner): State<Arc<Inner>>,
     headers: HeaderMap,
     AxumPath(key): AxumPath<String>,
-    Query(q): Query<KvQuery>,
+    q: Result<Query<KvQuery>, axum::extract::rejection::QueryRejection>,
     body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
-    if let Some(resp) = unauthorized(&inner, &headers) {
+    if let Some(resp) = unauthorized(&inner, &headers).or_else(|| invalid_key(&key)) {
         return resp;
     }
+    let q = match kv_query(q) {
+        Ok(q) => q,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let body = match body {
         Ok(b) => b,
         Err(e) => return error(e.status(), e.body_text()),
@@ -905,7 +932,7 @@ async fn delete_key(
     headers: HeaderMap,
     AxumPath(key): AxumPath<String>,
 ) -> Response {
-    if let Some(resp) = unauthorized(&inner, &headers) {
+    if let Some(resp) = unauthorized(&inner, &headers).or_else(|| invalid_key(&key)) {
         return resp;
     }
     inner

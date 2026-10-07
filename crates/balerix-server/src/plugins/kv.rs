@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use balerix_api::check_kv_key;
 use balerix_core::AgentName;
 
 use super::PluginError;
@@ -14,31 +15,6 @@ use crate::vault::Vault;
 
 const PLAIN: u8 = b'p';
 const SEALED: u8 = b's';
-pub const MAX_KEY: usize = 200;
-
-/// `[A-Za-z0-9._/-]{1,200}`, no empty segment, no `.` or `..` segment.
-pub fn validate_key(key: &str) -> Result<(), String> {
-    if key.is_empty() {
-        return Err("empty".into());
-    }
-    if key.len() > MAX_KEY {
-        return Err(format!("longer than {MAX_KEY} bytes"));
-    }
-    if let Some(c) = key
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')))
-    {
-        return Err(format!("character {c:?} is not in [A-Za-z0-9._/-]"));
-    }
-    for seg in key.split('/') {
-        match seg {
-            "" => return Err("empty path segment".into()),
-            "." | ".." => return Err(format!("segment {seg:?} is not allowed")),
-            _ => {}
-        }
-    }
-    Ok(())
-}
 
 pub struct PluginKv {
     state_root: PathBuf,
@@ -56,7 +32,7 @@ impl PluginKv {
     }
 
     fn path(&self, name: &AgentName, key: &str) -> Result<PathBuf, PluginError> {
-        validate_key(key).map_err(PluginError::KvKey)?;
+        check_kv_key(key).map_err(PluginError::KvKey)?;
         Ok(self.dir(name).join(key))
     }
 
@@ -162,10 +138,10 @@ impl PluginKv {
     }
 
     /// `write_private`'s leftover temp file is named `.{name}.tmp~{pid}`.
-    /// A leading `.` alone is not enough to tell: `validate_key` allows a
+    /// A leading `.` alone is not enough to tell: `check_kv_key` allows a
     /// segment to start with `.` (only a bare `.` or `..` segment is
     /// rejected), so a key like `._` is a real key, not a temp file. `~`
-    /// is outside `validate_key`'s alphabet (`[A-Za-z0-9._/-]`), so no
+    /// is outside `check_kv_key`'s alphabet (`[A-Za-z0-9._/-]`), so no
     /// valid key segment can ever contain `.tmp~`; the match is exact.
     fn is_temp(file_name: &str) -> bool {
         file_name.starts_with('.') && file_name.contains(".tmp~")
@@ -188,22 +164,7 @@ mod tests {
 
     #[test]
     fn keys_are_validated_before_any_path_is_built() {
-        for ok in ["a", "state/f/c/a", "x.y-z_1", "A/B", &"k".repeat(200)] {
-            assert_eq!(validate_key(ok), Ok(()), "{ok}");
-        }
-        for bad in [
-            "",
-            "/a",
-            "a/",
-            "a//b",
-            "..",
-            "a/../b",
-            "a b",
-            "ä",
-            &"k".repeat(201),
-        ] {
-            assert!(validate_key(bad).is_err(), "{bad:?} accepted");
-        }
+        // the grammar itself is `balerix_api::check_kv_key`'s test
         let dir = tempfile::tempdir().unwrap();
         let e = kv(dir.path(), 1).get(&flow(), "../x").unwrap_err();
         assert!(e.to_string().starts_with("kv: invalid key:"), "{e}");
@@ -270,7 +231,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = kv(dir.path(), 1);
         // Neither key contains write_private's `~` marker, so both are real
-        // keys per `validate_key`, not leftover temp files.
+        // keys per `check_kv_key`, not leftover temp files.
         store.put(&flow(), ".x.tmp-1", b"a", false).unwrap();
         store.put(&flow(), "a/.tmp-42", b"b", false).unwrap();
         assert_eq!(
@@ -303,7 +264,7 @@ mod tests {
             bytes in proptest::collection::vec(any::<u8>(), 0..2048),
             secret in any::<bool>(),
         ) {
-            prop_assume!(validate_key(&key).is_ok());
+            prop_assume!(check_kv_key(&key).is_ok());
             let dir = tempfile::tempdir().unwrap();
             let store = kv(dir.path(), 3);
             store.put(&flow(), &key, &bytes, secret).unwrap();

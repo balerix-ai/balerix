@@ -254,6 +254,37 @@ pub struct KvKeys {
     pub keys: Vec<String>,
 }
 
+/// The longest kv key, in bytes.
+pub const MAX_KV_KEY: usize = 200;
+
+/// The kv key grammar (plugins spec §4.1), shared by the daemon's store,
+/// the SDK's `Host` (which refuses a bad key without a round trip) and
+/// its `FakeHost`: `[A-Za-z0-9._/-]{1,200}`, no empty segment, no `.` or
+/// `..` segment. The error is the reason, without the `kv: invalid key: `
+/// prefix the daemon answers with.
+pub fn check_kv_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("empty".into());
+    }
+    if key.len() > MAX_KV_KEY {
+        return Err(format!("longer than {MAX_KV_KEY} bytes"));
+    }
+    if let Some(c) = key
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')))
+    {
+        return Err(format!("character {c:?} is not in [A-Za-z0-9._/-]"));
+    }
+    for seg in key.split('/') {
+        match seg {
+            "" => return Err("empty path segment".into()),
+            "." | ".." => return Err(format!("segment {seg:?} is not allowed")),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// The one text frame an attach socket accepts, both directions of the
 /// protocol (plugins spec §18.4): `{ "resize": { "cols", "rows" } }`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +340,33 @@ mod tests {
     use super::*;
     use crate::Timestamp;
     use serde_json::json;
+
+    #[test]
+    fn kv_keys_follow_the_one_grammar() {
+        for ok in ["a", "state/f/c/a", "x.y-z_1", "A/B", "._", &"k".repeat(200)] {
+            assert_eq!(check_kv_key(ok), Ok(()), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "/a",
+            "a/",
+            "a//b",
+            "a/./b",
+            "a/../b",
+            "a b",
+            "ä",
+            "a~b",
+            &"k".repeat(MAX_KV_KEY + 1),
+        ] {
+            assert!(check_kv_key(bad).is_err(), "{bad:?} accepted");
+        }
+        assert_eq!(
+            check_kv_key("..").unwrap_err(),
+            "segment \"..\" is not allowed"
+        );
+    }
 
     #[test]
     fn actions_are_tagged_by_kind_and_labelled() {

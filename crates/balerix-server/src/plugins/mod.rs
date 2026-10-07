@@ -19,7 +19,7 @@ pub use chain::{ObserverQueue, PluginEventHandler};
 pub use client::{CallFailure, PluginClient};
 pub use config::{Source, load_plugins_file, resolve_source};
 pub use host::{PluginHost, PluginHostConfig};
-pub use kv::{PluginKv, validate_key};
+pub use kv::PluginKv;
 pub use manifest::read_manifest;
 pub use materializer::{NullStore, PluginMaterializer};
 pub use registry::{ActivationRow, PluginAddr, PluginInfo, PluginRegistry};

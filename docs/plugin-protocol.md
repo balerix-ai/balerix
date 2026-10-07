@@ -145,7 +145,10 @@ shape for one fleet. `owner` is present when a plugin manages the fleet
 - `{ "action": "stop" }`
 
 **KV**: keys match `[A-Za-z0-9._/-]{1,200}`, with no empty segment and no
-bare `.` or `..` segment. `PUT` and
+bare `.` or `..` segment (`balerix_api::check_kv_key`); the SDK's `Host`
+refuses any other key itself with the daemon's 400 `kv: invalid key:
+<reason>`. A key travels as one path segment, `/` encoded as `%2F`, so a
+reverse proxy in front of the daemon must keep encoded slashes. `PUT` and
 `GET` bodies are raw bytes, content-type `application/octet-stream`;
 `?secret=true` on `PUT` stores the value through the daemon's vault.
 `?prefix=` on the list route filters returned `keys` by prefix

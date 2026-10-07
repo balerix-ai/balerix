@@ -678,7 +678,21 @@ fn the_reader_cannot_read_another_repositorys_objects() {
     std::fs::remove_file(w.join("secret.txt")).unwrap();
     let e = rt.diff(&id, "origin/main").unwrap_err();
     assert!(!format!("{e:?}").contains("TOP SECRET"), "{e:?}");
-    assert!(rt.version(&id, "origin/main").is_err());
+    // refused by the sandbox at the object read, not by some other error
+    let object_read_denied = |e: &WorkspaceError| match e {
+        WorkspaceError::Tool { stderr, .. } => {
+            stderr.contains(&format!(
+                "unable to open loose object {secret}: Permission denied"
+            )) && stderr.contains(&format!(
+                "{}: Permission denied",
+                foreign.join(".git/objects/pack").display()
+            ))
+        }
+        _ => false,
+    };
+    assert!(object_read_denied(&e), "{e:?}");
+    let e = rt.version(&id, "origin/main").unwrap_err();
+    assert!(object_read_denied(&e), "{e:?}");
 }
 
 /// Past `WORKSPACE_FILE_COUNT_LIMIT` the kept files still get their

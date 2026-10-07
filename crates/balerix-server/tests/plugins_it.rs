@@ -587,7 +587,13 @@ async fn purge_deletes_nothing_while_no_pass_can_run() {
         .purge(&"hello".parse().unwrap())
         .await
         .unwrap_err();
+    assert!(
+        matches!(e, balerix_server::PluginError::Unavailable(_)),
+        "a 503, retryable: {e:?}"
+    );
     assert!(e.to_string().contains("no reconcile pass ran"), "{e}");
+    let resp = axum::response::IntoResponse::into_response(balerix_server::ApiError::from(e));
+    assert_eq!(resp.status(), 503);
     assert!(!stopped_hello(&h.runner.calls()));
     assert!(
         !h.materializer

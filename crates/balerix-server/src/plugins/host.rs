@@ -397,8 +397,8 @@ impl PluginHost {
             .map_err(|_| stopping())?
             .map_err(|_| gone())?;
         if !ran {
-            return Err(PluginError::Internal(format!(
-                "plugin {name}: no reconcile pass ran (the daemon's tool pool is not ready), so its window may still be running; nothing was deleted"
+            return Err(PluginError::Unavailable(format!(
+                "plugin {name}: the daemon's tool pool is not ready, so no reconcile pass ran and its window may still be running; nothing was deleted, try again once the pool is ready"
             )));
         }
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());

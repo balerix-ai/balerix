@@ -103,6 +103,7 @@ impl From<PluginError> for ApiError {
             PluginError::Capability(_) => StatusCode::FORBIDDEN,
             PluginError::NotActive(_) => StatusCode::NOT_FOUND,
             PluginError::Managed(_) | PluginError::KvConflict(_) => StatusCode::CONFLICT,
+            PluginError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             PluginError::Io { .. } | PluginError::Internal(_) | PluginError::Kv { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }

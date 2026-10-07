@@ -172,7 +172,7 @@ pub struct PluginRemoveArgs {
     pub purge: bool,
     /// With --purge: how long to wait, across all the fleets the plugin
     /// owns, for each fleet's purge to finish (as `down --purge`).
-    #[arg(long, default_value = "5m")]
+    #[arg(long, default_value = "5m", requires = "purge")]
     pub timeout: String,
     #[arg(long)]
     pub api_url: Option<String>,

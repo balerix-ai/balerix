@@ -66,6 +66,9 @@ pub enum PluginError {
     NotActive(String),
     #[error("{path}: {message}")]
     Kv { path: PathBuf, message: String },
+    /// A 503: the daemon cannot do it yet; the same call later can.
+    #[error("{0}")]
+    Unavailable(String),
     /// A 409: the plugin set is not this path's to change (Spec O §23.2).
     #[error("{0}")]
     Managed(String),

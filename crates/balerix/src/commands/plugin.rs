@@ -248,18 +248,23 @@ pub fn list_command(args: &ListArgs) -> Result<String> {
 }
 
 pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
+    // parsed before anything changes: a bad value leaves plugins.yaml be
+    let timeout = parse_duration(&args.timeout)?;
     let path = plugins_file_path()?;
     let mut file = load_file(&path)?;
-    if should_bail(remove_entry(&mut file, &args.name), args.purge) {
+    let removed = remove_entry(&mut file, &args.name);
+    if should_bail(removed, args.purge) {
         bail!(
             "plugin {:?} is not declared in {}",
             args.name,
             path.display()
         );
     }
-    save_file(&path, &file)?;
+    if removed {
+        save_file(&path, &file)?;
+    }
     if args.purge {
-        let deadline = Instant::now() + parse_duration(&args.timeout)?;
+        let deadline = Instant::now() + timeout;
         let client = Client::connect(args.api_url.as_deref())
             .map_err(|e| anyhow!("{e}; --purge needs a running daemon (the entry was removed)"))?;
         // Spec L-6: the daemon downs the plugin's up fleets during the
@@ -272,7 +277,14 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
         // sync's `downed` would (it downs every undeclared owner's).
         let report = client.sync_plugins()?;
         let owned = owned_fleets(&client.list()?, &args.name);
-        let mut out = render_sync(&report);
+        // a retry (a plain `remove` first, or a purge that failed half
+        // way) finds the entry gone and purges what it left all the same
+        let mut out = if removed {
+            String::new()
+        } else {
+            format!("{} was already absent from plugins.yaml\n", args.name)
+        };
+        out.push_str(&render_sync(&report));
         for fleet in &owned {
             let result = client
                 .down(

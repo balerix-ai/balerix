@@ -523,6 +523,80 @@ async fn hello_is_rate_limited_per_plugin_after_authentication() {
     fx.finish().await;
 }
 
+/// #1: a daemon that restarts with a plugin's window still running and
+/// no record entry for it (the plugin was removed from `plugins.yaml`).
+/// `purge` waits for a pass after its own request, so it never deletes
+/// under a window the record never held; with no pass possible, it
+/// deletes nothing.
+async fn orphan_daemon(
+    toolchain: Arc<dyn balerix_core::SystemToolchain>,
+) -> (tempfile::TempDir, Harness, Arc<Daemon>) {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("plugins.yaml"), "plugins: []\n").unwrap();
+    let h = Harness::new(Duration::from_secs(3600));
+    h.runner.set_state(
+        &plugin_id(&"hello".parse().unwrap()),
+        balerix_core::ProcessState::Running { pid: 4242 },
+    );
+    let daemon = h.daemon_with_existing(Arc::new(PassThrough), dir.path(), Vec::new(), toolchain);
+    (dir, h, daemon)
+}
+
+fn stopped_hello(calls: &[String]) -> bool {
+    calls
+        .iter()
+        .any(|c| c.starts_with("stop_") && c.contains("balerix/plugins"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purge_of_a_window_the_record_never_held_waits_for_a_pass() {
+    let (_dir, h, daemon) = orphan_daemon(balerix_server::testing::ready_toolchain()).await;
+    // passes run once the pool is ready (Spec F §5); the first may or may
+    // not have stopped the window yet, which is the race
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while daemon.system_pool_state() != balerix_server::SystemPoolState::Ready {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    daemon
+        .plugin_host()
+        .unwrap()
+        .purge(&"hello".parse().unwrap())
+        .await
+        .unwrap();
+    // a pass ran after the purge's request and before the deletion
+    assert!(stopped_hello(&h.runner.calls()), "{:?}", h.runner.calls());
+    assert!(
+        h.materializer
+            .calls()
+            .contains(&"purge_plugin hello".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purge_deletes_nothing_while_no_pass_can_run() {
+    let (_dir, h, daemon) = orphan_daemon(Arc::new(
+        balerix_core::fakes::FakeSystemToolchain::always_failing(),
+    ))
+    .await;
+    let e = daemon
+        .plugin_host()
+        .unwrap()
+        .purge(&"hello".parse().unwrap())
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("no reconcile pass ran"), "{e}");
+    assert!(!stopped_hello(&h.runner.calls()));
+    assert!(
+        !h.materializer
+            .calls()
+            .contains(&"purge_plugin hello".to_string()),
+        "nothing deleted under a running window"
+    );
+}
+
 /// A `fleet.json` under the reserved name — written before the name was
 /// reserved, or by hand — must not get an actor: the plugin host already
 /// owns `balerix`, its tmux session and its state root.

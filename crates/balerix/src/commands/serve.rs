@@ -89,6 +89,26 @@ impl ServerConfig {
     }
 }
 
+/// `path` canonicalised through its longest existing ancestor, the rest
+/// appended: a root `serve` has not created yet compares as the directory
+/// it will be, symlinked parents resolved.
+fn resolve_as_far_as_exists(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut probe = path;
+    loop {
+        if let Ok(found) = std::fs::canonicalize(probe) {
+            return rest.iter().rev().fold(found, |acc, part| acc.join(part));
+        }
+        match (probe.parent(), probe.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                probe = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// One `git_read` entry (#111): an absolute path to an existing
 /// directory, not `/`, and clear of balerix's own state, data and config
 /// roots, which the git profile must never read wholesale. Canonical,
@@ -109,7 +129,7 @@ fn check_git_read(entry: &Path, layout: &StateLayout) -> Result<PathBuf> {
         ("data", &layout.data_root),
         ("config", &layout.config_root),
     ] {
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        let root = resolve_as_far_as_exists(root);
         if dir.starts_with(&root) || root.starts_with(&dir) {
             bail!(
                 "{} overlaps balerix's {name} root {}",
@@ -640,6 +660,41 @@ mod tests {
         );
         let e = err("[sandbox]\nagent_read = []\n");
         assert!(e.contains("config.toml") && e.contains("agent_read"), "{e}");
+    }
+
+    /// A root that does not exist yet is compared through its longest
+    /// existing ancestor, resolved: under a symlinked parent it is still
+    /// the directory it will be.
+    #[test]
+    fn git_read_overlap_resolves_a_root_that_does_not_exist_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+        let layout = StateLayout::xdg(
+            base.join("link/state/balerix"),
+            base.join("link/data/balerix"),
+            base.join("config"),
+        );
+        std::fs::create_dir_all(&layout.config_root).unwrap();
+        let path = layout.config_root.join("config.toml");
+        std::fs::write(
+            &path,
+            format!("[sandbox]\ngit_read = [\"{}\"]\n", real.display()),
+        )
+        .unwrap();
+        let e = ServerConfig::load_for(&path, &layout)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            format!(
+                "config.toml: sandbox.git_read[0]: {} overlaps balerix's state root {}",
+                real.display(),
+                real.join("state/balerix").display()
+            )
+        );
     }
 
     #[test]

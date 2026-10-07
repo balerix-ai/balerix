@@ -264,19 +264,24 @@ impl PluginRegistry {
             .insert((agent.clone(), plugin.clone()), row);
     }
 
-    /// `false` when there is no such row.
+    /// The plugin's answer to `config`, written only while the row still
+    /// holds that config: a caller outside the fleet's apply lock (a
+    /// `hello`'s re-activation, #10) must not put an answer about one
+    /// config onto a row an apply has since moved to another. `false` when
+    /// there is no such row or its config changed.
     pub fn set_state(
         &self,
         agent: &AgentId,
         plugin: &AgentName,
+        config: &Value,
         activation: PluginActivation,
     ) -> bool {
         match self.write().rows.get_mut(&(agent.clone(), plugin.clone())) {
-            Some(row) => {
+            Some(row) if &row.config == config => {
                 row.activation = activation;
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -558,8 +563,28 @@ mod tests {
             ),
             (1, 1)
         );
-        assert!(r.set_state(&a, &name("web"), PluginActivation::active()));
-        assert!(!r.set_state(&id("f/c/z"), &name("web"), PluginActivation::active()));
+        assert!(
+            !r.set_state(
+                &a,
+                &name("web"),
+                &json!({ "k": 2 }),
+                PluginActivation::active()
+            ),
+            "an answer about another config"
+        );
+        assert!(!r.is_active(&a, &name("web")));
+        assert!(r.set_state(
+            &a,
+            &name("web"),
+            &json!({ "k": 1 }),
+            PluginActivation::active()
+        ));
+        assert!(!r.set_state(
+            &id("f/c/z"),
+            &name("web"),
+            &json!({ "k": 1 }),
+            PluginActivation::active()
+        ));
         assert_eq!(r.active_agents(&name("web")), 2);
         assert_eq!(r.rows_for_plugin(&name("web")).len(), 2);
         assert_eq!(r.row(&a, &name("flow")).unwrap().config["k"], 1);

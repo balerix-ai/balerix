@@ -312,6 +312,90 @@ impl Cmd {
         };
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        self.finish(accepted, out.status, stdout, stderr)
+    }
+
+    /// `run_with_exit_codes`, handing stdout to `sink` in chunks as it
+    /// arrives instead of collecting it: for output only its consumer can
+    /// bound (`inspect.rs`'s combined diff keeps 256 KiB per file of a
+    /// diff that may be far larger). `CmdOutput::stdout` is empty, and
+    /// the log never carries stdout. stderr is drained on its own thread
+    /// so a chatty child cannot deadlock on a full pipe.
+    pub(crate) fn run_streaming(
+        &self,
+        accepted: &[i32],
+        sink: &mut dyn FnMut(&[u8]),
+    ) -> Result<CmdOutput, CmdFailure> {
+        let mut c = Command::new(&self.program);
+        c.args(&self.args);
+        if self.env_clear {
+            c.env_clear();
+        }
+        c.envs(&self.env);
+        for k in &self.env_removals {
+            c.env_remove(k);
+        }
+        if let Some(d) = &self.cwd {
+            c.current_dir(d);
+        }
+        let failure = |stderr: String| CmdFailure {
+            tool: self.tool(),
+            subcommand: self.subcommand(),
+            args: self.args.clone(),
+            stderr,
+        };
+        let mut child = c
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| failure(format!("cannot execute {}: {e}", self.program.display())))?;
+        let (Some(mut stdout_pipe), Some(mut stderr_pipe)) =
+            (child.stdout.take(), child.stderr.take())
+        else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(failure(
+                "cannot capture output: stdout/stderr pipe missing after spawn".to_string(),
+            ));
+        };
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf);
+            buf
+        });
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            match stdout_pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => sink(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        drop(stdout_pipe);
+        let status = child
+            .wait()
+            .map_err(|e| failure(format!("cannot wait for {}: {e}", self.program.display())))?;
+        let stderr =
+            String::from_utf8_lossy(&stderr_thread.join().unwrap_or_default()).into_owned();
+        self.finish(accepted, status, String::new(), stderr)
+    }
+
+    /// The log line and the exit-code check every run ends with.
+    fn finish(
+        &self,
+        accepted: &[i32],
+        status: std::process::ExitStatus,
+        stdout: String,
+        stderr: String,
+    ) -> Result<CmdOutput, CmdFailure> {
+        let failure = |stderr: String| CmdFailure {
+            tool: self.tool(),
+            subcommand: self.subcommand(),
+            args: self.args.clone(),
+            stderr,
+        };
         if let Some(log) = &self.log {
             if let Some(dir) = log.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -323,14 +407,14 @@ impl Cmd {
                     "$ {} {}\n{logged_stdout}{stderr}[exit {}]",
                     self.tool(),
                     self.args.join(" "),
-                    out.status
+                    status
                 );
             }
         }
-        let code = out.status.code().filter(|c| accepted.contains(c));
+        let code = status.code().filter(|c| accepted.contains(c));
         let Some(code) = code else {
             return Err(failure(if stderr.trim().is_empty() {
-                format!("exit status {}", out.status)
+                format!("exit status {}", status)
             } else {
                 stderr
             }));

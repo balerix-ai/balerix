@@ -461,6 +461,33 @@ pub(crate) fn sandboxed_git(
     accepted: &[i32],
     log: GitLog,
 ) -> Result<CmdOutput, GitFailure> {
+    run_sandboxed_git(tools, crew, agent, args, accepted, log, None)
+}
+
+/// `sandboxed_git` with stdout handed to `sink` as it arrives instead of
+/// collected (`Cmd::run_streaming`): exit 0 only, logged without stdout.
+pub(crate) fn sandboxed_git_streaming(
+    tools: &ToolPaths,
+    crew: &CrewPaths,
+    agent: &AgentPaths,
+    args: &[&str],
+    sink: &mut dyn FnMut(&[u8]),
+) -> Result<CmdOutput, GitFailure> {
+    run_sandboxed_git(tools, crew, agent, args, &[0], GitLog::ArgvOnly, Some(sink))
+}
+
+/// Where a streamed call's stdout goes, chunk by chunk.
+type StdoutSink<'a> = &'a mut dyn FnMut(&[u8]);
+
+fn run_sandboxed_git(
+    tools: &ToolPaths,
+    crew: &CrewPaths,
+    agent: &AgentPaths,
+    args: &[&str],
+    accepted: &[i32],
+    log: GitLog,
+    sink: Option<StdoutSink<'_>>,
+) -> Result<CmdOutput, GitFailure> {
     let log_file = crew.logs.join("git.log");
     let home = ScratchHome::new(agent).map_err(|e| GitFailure {
         subcommand: String::new(),
@@ -501,7 +528,11 @@ pub(crate) fn sandboxed_git(
             break;
         }
     }
-    let out = cmd.run_with_exit_codes(accepted).map_err(|f| GitFailure {
+    let out = match sink {
+        Some(sink) => cmd.run_streaming(accepted, sink),
+        None => cmd.run_with_exit_codes(accepted),
+    }
+    .map_err(|f| GitFailure {
         subcommand: subcommand.clone(),
         args: f.args,
         stderr: f.stderr,

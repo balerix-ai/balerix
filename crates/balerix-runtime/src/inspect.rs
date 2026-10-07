@@ -19,12 +19,25 @@ use balerix_core::{AgentId, MaterializeError, WorkspaceError, WorkspaceReader};
 use crate::layout::{AgentPaths, CrewPaths};
 use crate::materializer::Runtime;
 use crate::sandbox::write_git_profile;
-use crate::workspace::{GitLog, sandboxed_git};
+use crate::workspace::{GitLog, sandboxed_git, sandboxed_git_streaming};
 
 /// Command-line config beats every config file: whatever an agent wrote
 /// into its clone's `.git/config`, no program runs from it here (the rest
 /// of the hardening is `workspace::sandboxed_git`'s and the git profile's).
-const CONFIG: &[&str] = &["-c", "core.quotePath=true", "-c", "diff.noprefix=false"];
+/// The prefixes are pinned so the combined diff's `diff --git a/… b/…`
+/// lines are the ones `patch_header` expects, whatever the clone sets.
+const CONFIG: &[&str] = &[
+    "-c",
+    "core.quotePath=true",
+    "-c",
+    "diff.noprefix=false",
+    "-c",
+    "diff.mnemonicPrefix=false",
+    "-c",
+    "diff.srcPrefix=a/",
+    "-c",
+    "diff.dstPrefix=b/",
+];
 /// On every `diff`: no external diff driver, no textconv, no colour, and no
 /// descent into a nested repository. An explicit `--submodule=short` beats a
 /// `diff.submodule = diff` an agent wrote into the shared config, so a
@@ -129,6 +142,28 @@ impl Runtime {
         self.inspect_git_answer(id, crew, paths, args, accepted, false)
     }
 
+    /// `inspect_git` for a call whose stdout goes to `sink` as it arrives
+    /// (the combined diff); exit 0 only.
+    fn inspect_git_streaming(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        paths: &AgentPaths,
+        args: &[&str],
+        sink: &mut dyn FnMut(&[u8]),
+    ) -> Result<(), WorkspaceError> {
+        let mut argv: Vec<&str> = CONFIG.to_vec();
+        argv.extend(args);
+        sandboxed_git_streaming(&self.tools, crew, paths, &argv, sink)
+            .map(|_| ())
+            .map_err(|f| WorkspaceError::Tool {
+                id: id.to_string(),
+                subcommand: f.subcommand,
+                args: f.args,
+                stderr: f.stderr,
+            })
+    }
+
     /// `inspect_git`; with `lenient`, an accepted exit that printed on
     /// stderr is still the answer. Only for the `--no-index` diff of an
     /// untracked file: git exits 1 with `error: Could not access
@@ -216,33 +251,134 @@ pub fn parse_status(z: &str) -> Status {
     status
 }
 
-/// A combined patch split per file, keyed by its `diff --git` line. A
+/// A combined patch split per file as it streams in, keyed by its
+/// `diff --git` line, keeping at most `cap` bytes of each section. A
 /// typechange is two sections under one header (a deletion, then a
 /// creation), kept together as `git diff -- <path>` prints them. No
 /// content line can start `diff --git `: every one carries a ` `, `+`,
-/// `-` or `\` first.
-pub fn split_patch(raw: &str) -> BTreeMap<String, String> {
-    let mut out: BTreeMap<String, String> = BTreeMap::new();
-    let mut current: Option<String> = None;
-    for line in raw.split_inclusive('\n') {
-        if line.starts_with("diff --git ") {
-            current = Some(line.trim_end_matches('\n').to_string());
-        }
-        if let Some(header) = &current {
-            out.entry(header.clone()).or_default().push_str(line);
-        }
-    }
-    out
+/// `-` or `\` first. A header met again after another one is ambiguous
+/// (two files that print the same line) and is dropped, so both fall back
+/// to a diff of their own.
+pub struct PatchSplitter {
+    cap: usize,
+    sections: BTreeMap<String, Vec<u8>>,
+    ambiguous: BTreeSet<String>,
+    current: Option<String>,
+    at_line_start: bool,
+    /// The start of the current line while it may still be a header.
+    probe: Option<Vec<u8>>,
 }
 
-/// The `diff --git` line git prints for `file` with the default `a/` and
-/// `b/` prefixes; `None` when git would quote either path (`core.quotePath`),
-/// where the caller diffs the file on its own instead.
+/// A header line is a path pair; one longer than this is kept as content.
+const HEADER_MAX: usize = 64 * 1024;
+const HEADER: &[u8] = b"diff --git ";
+
+impl PatchSplitter {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            sections: BTreeMap::new(),
+            ambiguous: BTreeSet::new(),
+            current: None,
+            at_line_start: true,
+            probe: None,
+        }
+    }
+
+    pub fn feed(&mut self, mut chunk: &[u8]) {
+        while !chunk.is_empty() {
+            let (segment, rest) = match chunk.iter().position(|b| *b == b'\n') {
+                Some(i) => chunk.split_at(i + 1),
+                None => (chunk, &[][..]),
+            };
+            chunk = rest;
+            let ends_line = segment.last() == Some(&b'\n');
+            if self.at_line_start {
+                self.probe = Some(Vec::new());
+            }
+            self.at_line_start = ends_line;
+            let Some(mut probe) = self.probe.take() else {
+                self.append(segment);
+                continue;
+            };
+            probe.extend_from_slice(segment);
+            let could_be = probe.len() < HEADER.len() && HEADER.starts_with(&probe)
+                || probe.starts_with(HEADER) && probe.len() <= HEADER_MAX;
+            if !could_be {
+                self.append(&probe);
+            } else if ends_line {
+                if probe.starts_with(HEADER) {
+                    self.start_section(&probe);
+                } else {
+                    self.append(&probe);
+                }
+            } else {
+                self.probe = Some(probe);
+            }
+        }
+    }
+
+    fn start_section(&mut self, line: &[u8]) {
+        let key = String::from_utf8_lossy(line.strip_suffix(b"\n").unwrap_or(line)).into_owned();
+        if self.current.as_ref() != Some(&key) && self.sections.contains_key(&key) {
+            self.ambiguous.insert(key.clone());
+        }
+        self.current = Some(key);
+        self.append(line);
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        let Some(key) = &self.current else {
+            return;
+        };
+        let section = self.sections.entry(key.clone()).or_default();
+        let room = self.cap.saturating_sub(section.len());
+        section.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+
+    /// The sections, each at most `cap` bytes, ambiguous ones left out.
+    pub fn finish(mut self) -> BTreeMap<String, String> {
+        if let Some(probe) = self.probe.take() {
+            if probe.starts_with(HEADER) {
+                self.start_section(&probe);
+            } else {
+                self.append(&probe);
+            }
+        }
+        let ambiguous = self.ambiguous;
+        self.sections
+            .into_iter()
+            .filter(|(k, _)| !ambiguous.contains(k))
+            .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
+            .collect()
+    }
+}
+
+/// `PatchSplitter` over a whole patch held in memory, with no cap.
+pub fn split_patch(raw: &str) -> BTreeMap<String, String> {
+    let mut splitter = PatchSplitter::new(usize::MAX);
+    splitter.feed(raw.as_bytes());
+    splitter.finish()
+}
+
+/// Bytes of a section the combined diff keeps: `shape_patch` cuts at the
+/// last line end within `WORKSPACE_PATCH_LIMIT`, so what lies past the
+/// limit only tells it that the patch was longer. The three extra bytes
+/// keep a UTF-8 character the cap splits out of that window.
+const SECTION_CAP: usize = WORKSPACE_PATCH_LIMIT + 4;
+
+/// The `diff --git` line git prints for `file` with the `a/` and `b/`
+/// prefixes `CONFIG` pins; `None` when git would quote either path
+/// (`core.quotePath`), or when either holds ` b/`, which makes the line
+/// ambiguous (`p` → `q b/r` and `p b/q` → `r` both print `diff --git a/p
+/// b/q b/r`): the caller diffs that file on its own instead.
 fn patch_header(file: &FileDiff) -> Option<String> {
     let old = file.old_path.as_deref().unwrap_or(&file.path);
     let plain = |p: &str| {
-        !p.bytes()
-            .any(|b| !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\')
+        !p.contains(" b/")
+            && !p
+                .bytes()
+                .any(|b| !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\')
     };
     (plain(old) && plain(&file.path)).then(|| format!("diff --git a/{old} b/{}", file.path))
 }
@@ -470,7 +606,11 @@ impl WorkspaceReader for Runtime {
                     args.push(&f.path);
                 }
             }
-            sections = split_patch(&git(&args, &[0])?);
+            let mut splitter = PatchSplitter::new(SECTION_CAP);
+            self.inspect_git_streaming(&id, &crew, &paths, &args, &mut |chunk| {
+                splitter.feed(chunk)
+            })?;
+            sections = splitter.finish();
         }
 
         for f in &mut files {
@@ -711,6 +851,62 @@ mod tests {
         assert!(split_patch("").is_empty());
     }
 
+    /// The splitter reads a stream: any chunking gives the same sections,
+    /// a header split across chunks included.
+    #[test]
+    fn the_splitter_is_indifferent_to_chunk_boundaries_and_caps_each_section() {
+        let raw = "diff --git a/a b/a\n@@ -1 +1 @@\n-x\n+y\n\
+                   diff --git a/l b/l\ndeleted file mode 100644\n-x\n\
+                   diff --git a/l b/l\nnew file mode 120000\n+a\n\\ No newline at end of file\n\
+                   diff --git a/b b/b\n+tail without newline";
+        let whole = split_patch(raw);
+        assert_eq!(whole.len(), 3);
+        assert!(whole["diff --git a/b b/b"].ends_with("tail without newline"));
+        for size in [1, 2, 5, 11, 12, 64] {
+            let mut s = PatchSplitter::new(usize::MAX);
+            for chunk in raw.as_bytes().chunks(size) {
+                s.feed(chunk);
+            }
+            assert_eq!(s.finish(), whole, "chunks of {size}");
+        }
+        let mut capped = PatchSplitter::new(20);
+        capped.feed(raw.as_bytes());
+        let capped = capped.finish();
+        assert!(capped.values().all(|v| v.len() <= 20), "{capped:?}");
+        assert_eq!(capped["diff --git a/a b/a"], "diff --git a/a b/a\n@");
+    }
+
+    /// Two files that print the same header are left to diffs of their own.
+    #[test]
+    fn a_header_met_again_after_another_is_dropped() {
+        let raw = "diff --git a/p b/q b/r\n+one\n\
+                   diff --git a/s b/s\n+s\n\
+                   diff --git a/p b/q b/r\n+two\n";
+        let sections = split_patch(raw);
+        assert_eq!(
+            sections.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["diff --git a/s b/s"]
+        );
+    }
+
+    /// Past the cap only the first `WORKSPACE_PATCH_LIMIT` bytes matter:
+    /// a capped section shapes exactly as the whole one does.
+    #[test]
+    fn a_capped_section_shapes_as_the_whole_patch() {
+        let line = format!("+{}é\n", "y".repeat(97));
+        let whole = format!(
+            "diff --git a/x b/x\n{}",
+            line.repeat(WORKSPACE_PATCH_LIMIT / line.len() * 3)
+        );
+        let mut s = PatchSplitter::new(SECTION_CAP);
+        for chunk in whole.as_bytes().chunks(7919) {
+            s.feed(chunk);
+        }
+        let capped = s.finish().remove("diff --git a/x b/x").unwrap();
+        assert!(capped.len() <= SECTION_CAP + 2, "{}", capped.len());
+        assert_eq!(shape_patch(capped), shape_patch(whole));
+    }
+
     #[test]
     fn a_header_is_expected_only_for_paths_git_does_not_quote() {
         let file = |path: &str, old: Option<&str>| FileDiff {
@@ -733,6 +929,8 @@ mod tests {
         assert_eq!(patch_header(&file("é", None)), None);
         assert_eq!(patch_header(&file("q\"", None)), None);
         assert_eq!(patch_header(&file("new", Some("t\tab"))), None);
+        assert_eq!(patch_header(&file("q b/r", Some("p"))), None, "ambiguous");
+        assert_eq!(patch_header(&file("r", Some("p b/q"))), None, "ambiguous");
     }
 
     #[test]

@@ -729,3 +729,130 @@ fn a_truncated_diff_still_patches_every_file_it_keeps() {
         calls[4]
     );
 }
+
+/// What the agent's clone may hold that would mislead the split of the one
+/// combined diff (#108 review): prefixes its config changes, two renames
+/// that print the same `diff --git` line, and patches far over the
+/// per-file cap.
+#[test]
+fn the_combined_diff_holds_up_against_what_the_clone_can_do() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("inspect-combined");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (id, layout) = clone_with_changes(&root, &tools);
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let w = &paths.workspace;
+    let rt = Runtime::new(layout.clone(), tools.clone());
+    let log_path = crew.logs.join("git.log");
+    let diff_calls = |log: &str| {
+        log.lines()
+            .filter(|l| l.starts_with("$ ") && l.contains(" diff "))
+            .count()
+    };
+
+    // mnemonic and custom prefixes in the clone's config: still one
+    // combined diff (and one --no-index for the untracked file)
+    git(w, &["config", "diff.mnemonicPrefix", "true"]);
+    git(w, &["config", "diff.srcPrefix", "x/"]);
+    std::fs::write(&log_path, "").unwrap();
+    let d = rt.diff(&id, "origin/main").unwrap();
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(
+        diff_calls(&log),
+        3,
+        "name-status, combined, --no-index: {log}"
+    );
+    assert!(
+        d.files[0]
+            .patch
+            .starts_with("diff --git a/LICENSE b/LICENSE\n"),
+        "{}",
+        d.files[0].patch
+    );
+    git(w, &["config", "--unset", "diff.mnemonicPrefix"]);
+    git(w, &["config", "--unset", "diff.srcPrefix"]);
+
+    // `p` → `q b/r` and `p b/q` → `r` both print `diff --git a/p b/q b/r`
+    std::fs::write(w.join("p"), "first file\n".repeat(20)).unwrap();
+    std::fs::create_dir_all(w.join("p b")).unwrap();
+    std::fs::write(w.join("p b/q"), "second file\n".repeat(20)).unwrap();
+    git(w, &["add", "-A"]);
+    git(w, &["commit", "-q", "-m", "two files"]);
+    git(
+        &root,
+        &[
+            "-C",
+            &w.display().to_string(),
+            "push",
+            "-q",
+            "origin",
+            "HEAD:main",
+        ],
+    );
+    git(w, &["fetch", "-q", "origin"]);
+    std::fs::create_dir_all(w.join("q b")).unwrap();
+    git(w, &["mv", "p", "q b/r"]);
+    git(w, &["mv", "p b/q", "r"]);
+    git(w, &["commit", "-q", "-m", "swap"]);
+    let d = rt.diff(&id, "origin/main").unwrap();
+    let by = |p: &str| d.files.iter().find(|f| f.path == p).unwrap().clone();
+    let one = by("q b/r");
+    let two = by("r");
+    assert_eq!(one.old_path.as_deref(), Some("p"));
+    assert_eq!(two.old_path.as_deref(), Some("p b/q"));
+    assert!(
+        one.patch.contains("rename to q b/r") && !one.patch.contains("rename to r\n"),
+        "{}",
+        one.patch
+    );
+    assert!(
+        two.patch.contains("rename to r\n") && !two.patch.contains("rename to q b/r"),
+        "{}",
+        two.patch
+    );
+
+    // three files, each ~2 MiB of change: each patch is capped and shaped
+    // exactly as git's own diff of that file alone would be
+    let big = "+".repeat(99) + "\n";
+    for name in ["big1", "big2", "big3"] {
+        std::fs::write(w.join(name), big.repeat(20_000)).unwrap();
+    }
+    git(w, &["add", "big1", "big2", "big3"]);
+    git(w, &["commit", "-q", "-m", "big"]);
+    std::fs::write(&log_path, "").unwrap();
+    let d = rt.diff(&id, "origin/main").unwrap();
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        diff_calls(&log) <= 5,
+        "one combined diff; per-file only for notes.txt and the ambiguous renames: {log}"
+    );
+    assert!(!log.contains(" -- big"), "{log}");
+    for name in ["big1", "big2", "big3"] {
+        let f = d.files.iter().find(|f| f.path == name).unwrap();
+        assert!(f.truncated && !f.binary, "{name}");
+        assert!(f.patch.len() <= balerix_api::WORKSPACE_PATCH_LIMIT);
+        let own = git(
+            w,
+            &[
+                "diff",
+                "--no-color",
+                "-U3",
+                "--find-renames",
+                &d.merge_base,
+                "--",
+                name,
+            ],
+        );
+        let line_end = own.as_bytes()[..balerix_api::WORKSPACE_PATCH_LIMIT]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .unwrap();
+        assert_eq!(f.patch, own[..=line_end], "{name}");
+    }
+}

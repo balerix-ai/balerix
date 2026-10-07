@@ -548,11 +548,142 @@ fn stopped_hello(calls: &[String]) -> bool {
         .any(|c| c.starts_with("stop_") && c.contains("balerix/plugins"))
 }
 
+/// One ordered log two fakes share: whether the window's stop came
+/// before the purge's deletion.
+#[derive(Default)]
+struct Journal(std::sync::Mutex<Vec<String>>);
+
+impl Journal {
+    fn push(&self, entry: String) {
+        self.0.lock().unwrap().push(entry);
+    }
+    fn entries(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+use balerix_core::fakes::{FakeMaterializer, FakeRunner};
+use balerix_core::{
+    AgentName, AgentRunner, CrewRef, CrewTools, FleetName, HookTarget, Keep, LaunchPlan,
+    MaterializeError, Materializer, ObservedState, PtyStream, RepoRef, ResolvedAgent,
+    ResolvedPlugin, RunnerError,
+};
+
+/// The harness runner, its stops written to the journal.
+struct JournalRunner(Arc<FakeRunner>, Arc<Journal>);
+
+impl AgentRunner for JournalRunner {
+    fn ensure_crew(&self, crew: &CrewRef) -> Result<(), RunnerError> {
+        self.0.ensure_crew(crew)
+    }
+    fn ensure_agent(&self, agent: &AgentId, plan: &LaunchPlan) -> Result<(), RunnerError> {
+        self.0.ensure_agent(agent, plan)
+    }
+    fn stop_agent(&self, agent: &AgentId) -> Result<(), RunnerError> {
+        self.1.push(format!("stop_agent {agent}"));
+        self.0.stop_agent(agent)
+    }
+    fn stop_crew(&self, crew: &CrewRef) -> Result<(), RunnerError> {
+        self.1.push(format!("stop_crew {crew}"));
+        self.0.stop_crew(crew)
+    }
+    fn observe(&self, fleet: &FleetName) -> Result<ObservedState, RunnerError> {
+        self.0.observe(fleet)
+    }
+    fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
+        self.0.send_text(agent, text, submit)
+    }
+    fn send_keys(
+        &self,
+        agent: &AgentId,
+        steps: &[balerix_api::KeyStep],
+        delay: Duration,
+    ) -> Result<(), RunnerError> {
+        self.0.send_keys(agent, steps, delay)
+    }
+    fn attach(&self, agent: &AgentId) -> Result<Box<dyn PtyStream>, RunnerError> {
+        self.0.attach(agent)
+    }
+}
+
+/// The harness materializer, its `purge_plugin` written to the journal.
+struct JournalMaterializer(Arc<FakeMaterializer>, Arc<Journal>);
+
+impl Materializer for JournalMaterializer {
+    fn ensure_crew(
+        &self,
+        crew: &CrewRef,
+        repo: &RepoRef,
+        git_ref: &str,
+        git: &GitSettings,
+        creds: &balerix_api::CredentialBundle,
+        tools: CrewTools<'_>,
+    ) -> Result<(), MaterializeError> {
+        self.0.ensure_crew(crew, repo, git_ref, git, creds, tools)
+    }
+    fn materialize(
+        &self,
+        agent: &ResolvedAgent,
+        creds: &balerix_api::CredentialBundle,
+        hooks: &HookTarget,
+    ) -> Result<LaunchPlan, MaterializeError> {
+        self.0.materialize(agent, creds, hooks)
+    }
+    fn remove_agent(&self, agent: &AgentId) -> Result<(), MaterializeError> {
+        self.0.remove_agent(agent)
+    }
+    fn remove_crew(&self, crew: &CrewRef, keep: Keep) -> Result<(), MaterializeError> {
+        self.0.remove_crew(crew, keep)
+    }
+    fn materialize_plugin(
+        &self,
+        plugin: &ResolvedPlugin,
+        host: &HookTarget,
+    ) -> Result<LaunchPlan, MaterializeError> {
+        self.0.materialize_plugin(plugin, host)
+    }
+    fn purge_plugin(&self, name: &AgentName) -> Result<(), MaterializeError> {
+        self.1.push(format!("purge_plugin {name}"));
+        self.0.purge_plugin(name)
+    }
+}
+
+/// #1, lane H review: the window appears only once the actor is idle
+/// (its start-up and pool passes done, the resync an hour off), so no
+/// pass can stop it before `purge` asks for one. With the barrier the
+/// stop is journalled before the deletion; without it the deletion runs
+/// with the window still up and nothing stops it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn purge_of_a_window_the_record_never_held_waits_for_a_pass() {
-    let (_dir, h, daemon) = orphan_daemon(balerix_server::testing::ready_toolchain()).await;
-    // passes run once the pool is ready (Spec F §5); the first may or may
-    // not have stopped the window yet, which is the race
+async fn purge_of_a_window_the_record_never_held_stops_it_before_deleting() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("plugins.yaml"), "plugins: []\n").unwrap();
+    let h = Harness::new(Duration::from_secs(3600));
+    let journal = Arc::new(Journal::default());
+    let ports = balerix_server::Ports {
+        materializer: Arc::new(JournalMaterializer(h.materializer.clone(), journal.clone())),
+        runner: Arc::new(JournalRunner(h.runner.clone(), journal.clone())),
+        clock: h.clock.clone(),
+        store: h.store.clone(),
+        workspace: h.workspace.clone(),
+        resolver: h.resolver.clone(),
+        credentials: h.credentials.clone(),
+        policy: Default::default(),
+        hook_url: "http://127.0.0.1:1".into(),
+        resync: Duration::from_secs(3600),
+        kube: None,
+    };
+    let daemon = Daemon::start(
+        ports,
+        Arc::new(PassThrough),
+        Metrics::new().unwrap(),
+        "admin-tok".into(),
+        Vec::new(),
+        balerix_server::PluginSetup::Packages(plugin_config_in(dir.path())),
+        h.registry.clone(),
+        h.client.clone(),
+        h.kv.clone(),
+        balerix_server::testing::ready_toolchain(),
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         while daemon.system_pool_state() != balerix_server::SystemPoolState::Ready {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -560,18 +691,28 @@ async fn purge_of_a_window_the_record_never_held_waits_for_a_pass() {
     })
     .await
     .unwrap();
-    daemon
-        .plugin_host()
-        .unwrap()
-        .purge(&"hello".parse().unwrap())
+    // every pass queued so far has run: the actor is idle from here on
+    let host = daemon.plugin_host().unwrap();
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    host.handle()
+        .tx
+        .send(balerix_server::Msg::Barrier { reply })
         .await
         .unwrap();
-    // a pass ran after the purge's request and before the deletion
-    assert!(stopped_hello(&h.runner.calls()), "{:?}", h.runner.calls());
+    assert!(rx.await.unwrap(), "a pass ran");
+    h.runner.set_state(
+        &plugin_id(&"hello".parse().unwrap()),
+        balerix_core::ProcessState::Running { pid: 4242 },
+    );
+    host.purge(&"hello".parse().unwrap()).await.unwrap();
+    let entries = journal.entries();
+    let stop = entries
+        .iter()
+        .position(|e| e.starts_with("stop_") && e.contains("balerix/plugins"));
+    let purge = entries.iter().position(|e| e == "purge_plugin hello");
     assert!(
-        h.materializer
-            .calls()
-            .contains(&"purge_plugin hello".to_string())
+        matches!((stop, purge), (Some(s), Some(p)) if s < p),
+        "the stop before the deletion: {entries:?}"
     );
 }
 

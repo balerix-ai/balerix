@@ -55,6 +55,9 @@ pub fn execute(plan: &Plan, status: &mut FleetStatus, ctx: &ReconcileContext) ->
         .unwrap_or_default();
     let mut report = ExecuteReport::default();
     let mut failed_agents: Vec<AgentId> = Vec::new();
+    // the agents whose removal (harvest) failed: their unharvested clone
+    // is what holds the crew back until fixed or purged
+    let mut failed_removals: Vec<AgentId> = Vec::new();
     let mut failed_crews: BTreeMap<CrewRef, String> = BTreeMap::new();
     let mut plans: BTreeMap<AgentId, LaunchPlan> = BTreeMap::new();
 
@@ -73,12 +76,12 @@ pub fn execute(plan: &Plan, status: &mut FleetStatus, ctx: &ReconcileContext) ->
         // Any failed step of one of the crew's agents holds its removal
         // back (#122): a timed-out stop may leave the agent alive in the
         // workspace, and a failed removal means a harvest was refused, so
-        // deleting the clone would lose the work. The failed agents' status
+        // deleting the clone would lose the work. A failed removal's status
         // says so and names the way out; the crew is retried every pass.
         if let Step::RemoveCrew(crew, _) = step
             && failed_agents.iter().any(|id| id.crew_ref() == *crew)
         {
-            for id in failed_agents.iter().filter(|id| id.crew_ref() == *crew) {
+            for id in failed_removals.iter().filter(|id| id.crew_ref() == *crew) {
                 status.entry(&id.to_string()).message.push_str(&format!(
                     "; crew {crew} is kept until this is fixed, or \
                      `balerix down {} --purge` deletes it unharvested",
@@ -127,6 +130,9 @@ pub fn execute(plan: &Plan, status: &mut FleetStatus, ctx: &ReconcileContext) ->
                 _ => {
                     if let Some(id) = step.agent_id() {
                         failed_agents.push(id.clone());
+                        if matches!(step, Step::RemoveAgent(_)) {
+                            failed_removals.push(id.clone());
+                        }
                     }
                 }
             }
@@ -468,6 +474,11 @@ mod tests {
             ]
         );
         assert_eq!(rep.failures.len(), 1, "{rep:?}");
+        assert!(
+            !st.agents["f/c/a"].message.contains("--purge"),
+            "a failed stop's crew is removed on a later pass; purge is no remedy: {}",
+            st.agents["f/c/a"].message
+        );
         assert_eq!(
             rep.skipped
                 .iter()

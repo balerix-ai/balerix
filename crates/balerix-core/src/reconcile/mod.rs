@@ -102,7 +102,7 @@ pub fn backoff_secs(policy: &ReconcilePolicy, restarts: u32) -> u64 {
 ///
 /// | observed | condition | steps |
 /// |---|---|---|
-/// | any | in `stopped` | `Stop` if observed, else — |
+/// | any | in `stopped` | `Stop` if observed or its phase is not `Stopped`, else — |
 /// | `Running` | `!changed` | — |
 /// | `Running` | `changed` | `Stop`, `Materialize`, `Start` |
 /// | `Exited` | `changed` | `Materialize`, `Start` |
@@ -115,7 +115,11 @@ pub fn backoff_secs(policy: &ReconcilePolicy, restarts: u32) -> u64 {
 ///
 /// A desired agent in `stopped` (plugins spec §16.4) gets `Stop` if it is
 /// observed at all and nothing else: no restart, no `NoteExit`, even when
-/// its hash changed. Leaving the set is an ordinary "absent → restart".
+/// its hash changed. Unobserved, it still gets `Stop` while it has a status
+/// entry whose phase is not `Stopped`, which settles that phase (#123): a
+/// timed-out stop leaves `Ready` behind, and an exited, failed or dead
+/// agent that is stopped shows `Stopped` too, its last message kept.
+/// Leaving the set is an ordinary "absent → restart".
 ///
 /// Known-but-not-desired agents get `Stop` (if observed) and `RemoveAgent`;
 /// their crews, if no longer desired, `RemoveCrew` with the caller's `keep`.

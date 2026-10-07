@@ -380,9 +380,14 @@ credentials, hook input, or sandbox rules.
   re-attempt it: `Daemon::apply` diffs against the fleet's *active* rows
   only, so a pending or rejected pair is offered again even though its
   config did not change (R24). Only to a ready plugin, though: while it
-  is not ready an unchanged rejected row stays rejected, so `update` fails
-  again with the same message until the plugin's next `hello` re-offers
-  it, and a changed config is `pending` with the old message kept (#11).
+  is not ready an unchanged rejected row stays rejected, and `update`'s
+  wait (`fleet.rs::ready_check`) fails at once with the old
+  `crews.<c>.agents.<a>.plugins.<p>: <message>` (the daemon accepted the
+  update; `--no-wait` returns the record) until the plugin's next `hello`
+  re-offers the pair. A changed config is `pending` with the old message
+  kept on the row (`GET /v1/fleets/{f}`'s `plugins.<p>.message`; the
+  CLI's status table shows only the state), and the wait waits for it like any
+  pending pair (#11).
 - The activation table is not persisted: after a daemon restart every pair
   is `pending` until the plugin's next `hello`, which re-activates all of
   them.

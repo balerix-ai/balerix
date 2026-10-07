@@ -344,9 +344,9 @@ credentials, hook input, or sandbox rules.
   sidecar's hook ingress keep copies, #168): axum alone
   answers 413 the moment it has read past the limit and the connection
   closes with the rest unread, so a client still writing got EPIPE in
-  place of the answer. Past four times the limit, or the time, the answer
-  comes at once with `Connection: close`, and a client still writing can
-  miss it. Authentication sits *outside* the drain (the auth
+  place of the answer. Past four times the limit the answer (413), and
+  after the time a 408, comes at once with `Connection: close`, and a
+  client still writing can miss it. Authentication sits *outside* the drain (the auth
   `route_layer` goes on after `limited`; the events route has
   `hooks::require_secret`, the plugin routes `require_plugin`): a caller
   that fails it is answered 401 having had at most 64 KiB of its body read

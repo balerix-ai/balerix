@@ -30,7 +30,8 @@ writes the whole body before reading gets that answer rather than a
 reset; the plugin mount (`/v1/plugins/<name>/…`, 1 MiB, §6) does the
 same after it has authenticated the caller; a body declared or found
 larger than four times the cap is answered without being read and the
-connection closed. A plugin's response body over 1 MiB is
+connection closed, and one still arriving after the 10 s is answered 408
+`body not received within 10s` and the connection closed. A plugin's response body over 1 MiB is
 rejected by the daemon before it is parsed and counted as a `body` failure
 — for `intercept`, the interceptor chain's fail-open (§4) —
 (`balerix-server/src/plugins/client.rs`).

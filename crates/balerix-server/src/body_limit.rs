@@ -16,8 +16,8 @@
 //!   answers it as over the limit, so the client reads that answer after
 //!   its last byte; a body without a length that turns out to fit is
 //!   handed on as read, and one that runs past the ceiling, or is still
-//!   arriving after [`DRAIN_TIME`], is answered then and the connection
-//!   closed.
+//!   arriving after [`DRAIN_TIME`], is answered then (408 for the time)
+//!   and the connection closed.
 //!
 //! "Answered as over the limit" means the route's own handler runs on a
 //! stand-in body one byte over the limit: whatever the route answers an
@@ -97,7 +97,9 @@ pub async fn drain_over_limit(State(drain): State<Drain>, req: Request, next: Ne
     match tokio::time::timeout(drain.time, read(body, limit, ceiling, keep)).await {
         Ok(Read::Fits(kept)) => next.run(Request::from_parts(parts, Body::from(kept))).await,
         Ok(Read::Over) => next.run(over_limit(parts, limit)).await,
-        Ok(Read::PastCeiling) | Err(_) => closing(next.run(over_limit(parts, limit)).await),
+        Ok(Read::PastCeiling) => closing(next.run(over_limit(parts, limit)).await),
+        // still arriving, under the ceiling so far: not the route's 413
+        Err(_) => timed_out(drain.time),
         Ok(Read::Broken(e)) => closing(
             ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -170,6 +172,13 @@ fn over_limit(mut parts: Parts, limit: usize) -> Request {
     Request::from_parts(parts, Body::from(Bytes::from(vec![b' '; len])))
 }
 
+/// A body still arriving when the drain time is up (lane H review): a
+/// 408 that says so, the rest left unread.
+pub(crate) fn timed_out(time: Duration) -> Response {
+    let error = format!("body not received within {time:?}");
+    closing(ApiError::new(StatusCode::REQUEST_TIMEOUT, error).into_response())
+}
+
 /// The rest of the body is not read: the connection cannot be reused.
 pub(crate) fn closing(mut resp: Response) -> Response {
     resp.headers_mut()
@@ -184,7 +193,8 @@ mod tests {
     use std::io::{Read as _, Write};
 
     /// A body that trickles in slower than the drain allows is answered
-    /// when the time is up, as over the limit, and the connection closed.
+    /// when the time is up, 408 (not a 413: it never got past the limit),
+    /// and the connection closed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_trickle_is_answered_when_the_drain_time_is_up() {
         let app = limited(
@@ -214,7 +224,8 @@ mod tests {
         .await
         .unwrap();
         let (took, text) = answer;
-        assert!(text.starts_with("HTTP/1.1 413"), "{text}");
+        assert!(text.starts_with("HTTP/1.1 408"), "{text}");
+        assert!(text.contains("body not received within 300ms"), "{text}");
         assert!(
             text.to_ascii_lowercase().contains("connection: close"),
             "{text}"

@@ -19,6 +19,7 @@ use crate::api::ApiError;
 use crate::body_limit::{self, DRAIN_FACTOR, DRAIN_TIME, Read};
 use crate::plugins::PluginAddr;
 use crate::sessions::MOUNT_PREFIX;
+use std::time::Duration;
 
 pub type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 
@@ -139,6 +140,9 @@ pub(crate) enum BodyError {
     /// The connection failed under the body: nobody's request to
     /// forward, 400.
     Transport(String),
+    /// Still arriving when the drain time was up, under the cap so far:
+    /// 408, and the rest left unread.
+    TimedOut(Duration),
 }
 
 /// The whole body, capped at `MAX_BODY`, read frame by frame so the two
@@ -149,9 +153,15 @@ pub(crate) enum BodyError {
 /// so it drains here the way `body_limit::drain_over_limit` does (#168):
 /// a body that says it fits is read however long it takes; any other is
 /// read to its end, up to `DRAIN_FACTOR` times the cap and within
-/// `DRAIN_TIME`, so a client that writes it all reads the 413; past
-/// either, or declared past the ceiling, the rest stays unread.
+/// `DRAIN_TIME`, so a client that writes it all reads the 413; past the
+/// ceiling, or declared past it, the 413 leaves the rest unread, and a
+/// body still arriving at `DRAIN_TIME` is a 408 that leaves it unread.
 pub(crate) async fn read_body(body: Body) -> Result<Bytes, BodyError> {
+    read_body_within(body, DRAIN_TIME).await
+}
+
+/// `read_body` with the drain time given.
+async fn read_body_within(body: Body, time: Duration) -> Result<Bytes, BodyError> {
     use hyper::body::Body as _;
     let hint = body.size_hint();
     let ceiling = MAX_BODY.saturating_mul(DRAIN_FACTOR);
@@ -162,9 +172,9 @@ pub(crate) async fn read_body(body: Body) -> Result<Bytes, BodyError> {
     let read = if hint.upper().is_some_and(|n| n <= MAX_BODY as u64) {
         reading.await
     } else {
-        match tokio::time::timeout(DRAIN_TIME, reading).await {
+        match tokio::time::timeout(time, reading).await {
             Ok(read) => read,
-            Err(_) => return Err(BodyError::TooLarge { close: true }),
+            Err(_) => return Err(BodyError::TimedOut(time)),
         }
     };
     match read {
@@ -240,6 +250,9 @@ pub async fn forward(
             } else {
                 resp
             };
+        }
+        Err(BodyError::TimedOut(time)) => {
+            return body_limit::timed_out(time);
         }
         Err(BodyError::Transport(e)) => {
             return ApiError::new(StatusCode::BAD_REQUEST, format!("body: {e}")).into_response();
@@ -576,6 +589,32 @@ mod tests {
         ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
             std::task::Poll::Ready(Some(Err(std::io::Error::other("connection reset"))))
         }
+    }
+
+    /// A body of unknown length that never ends.
+    struct Stalled;
+
+    impl hyper::body::Body for Stalled {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Lane H review: a body still arriving when the drain time is up is
+    /// a 408 that says so, not a 413 for a size it never reached.
+    #[tokio::test]
+    async fn a_body_that_misses_the_drain_time_is_a_timeout_not_too_large() {
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            read_body_within(Body::new(Stalled), Duration::from_millis(50)).await,
+            Err(BodyError::TimedOut(t)) if t == Duration::from_millis(50)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]

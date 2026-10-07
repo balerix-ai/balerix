@@ -16,10 +16,11 @@ use balerix_runtime::testing::pid_alive;
 const BALERIX: &str = env!("CARGO_BIN_EXE_balerix");
 
 /// A `sleep` duration no other process on the host uses: the test
-/// process's pid and a number per test. Every process a test starts
-/// carries it on its command line.
+/// process's pid and a number per test, both fixed width, so no marker is
+/// a substring of another, in this process or another test binary's.
+/// Every process a test starts carries it on its command line.
 fn marker(n: u32) -> String {
-    format!("9999.{}{n}", std::process::id())
+    format!("9999.{:07}{n:02}", std::process::id())
 }
 
 /// Live (not zombie) processes whose command line contains `needle`,
@@ -108,10 +109,19 @@ impl Drop for Wrapper {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        for (pid, _) in with_cmdline(&self.marker) {
-            let _ = Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
+        // repeated: a process that forks can outrun one pass
+        let start = Instant::now();
+        loop {
+            let left = with_cmdline(&self.marker);
+            if left.is_empty() || start.elapsed() > Duration::from_secs(2) {
+                break;
+            }
+            for (pid, _) in left {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -126,6 +136,18 @@ fn supervise(m: &str, script: &str) -> Wrapper {
     Wrapper {
         child,
         marker: m.to_string(),
+    }
+}
+
+/// A marker must never match another test's: the guard SIGKILLs every
+/// process whose command line contains its own.
+#[test]
+fn no_marker_contains_another() {
+    let all: Vec<String> = (0..100).map(marker).collect();
+    for (i, a) in all.iter().enumerate() {
+        for (j, b) in all.iter().enumerate() {
+            assert!(i == j || !a.contains(b.as_str()), "{a} contains {b}");
+        }
     }
 }
 

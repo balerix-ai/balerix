@@ -58,7 +58,11 @@ pub const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 /// How long `apply` and the purge listener wait for an actor that has
 /// purged its fleet to end (#10); it returns right after, so this is a
 /// bound on a bug, not a timing.
-const PURGE_EXIT_WAIT: Duration = Duration::from_secs(10);
+const PURGE_EXIT_WAIT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
 /// How many times `hello`'s re-activation offers one row while applies
 /// keep changing it under it (#10).
 const REACTIVATE_TRIES: usize = 5;
@@ -356,10 +360,26 @@ impl Daemon {
             .await
             .is_err()
         {
-            tracing::error!(fleet = %name, "purged fleet's actor did not end");
+            tracing::error!(fleet = %name, "purged fleet's actor did not end within {PURGE_EXIT_WAIT:?}");
             return false;
         }
         true
+    }
+
+    /// For `apply` and `down`, under the fleet's lock: a fleet whose actor
+    /// is purging is waited out, so it then counts as absent; one whose
+    /// actor outlasts the wait is an error rather than a message sent to
+    /// an actor about to drop it (#10).
+    async fn settle_purge(&self, name: &FleetName) -> Result<(), DaemonError> {
+        let Some(h) = self.fleets.read().await.get(name).cloned() else {
+            return Ok(());
+        };
+        if Self::is_purging(&h) && !Self::wait_purged(name, &h).await {
+            return Err(DaemonError::Internal(format!(
+                "fleet {name}: its purge has not finished; try again"
+            )));
+        }
+        Ok(())
     }
 
     /// `h`'s last record is a settled `Down` with `purge`: the actor has
@@ -1031,10 +1051,7 @@ impl Daemon {
         // place (#10). `apply` and `down` hold this lock and the listener
         // removes only a dead handle, so the write lock below sees the
         // same answer.
-        let entry = self.fleets.read().await.get(name).cloned();
-        if let Some(h) = entry {
-            Self::wait_purged(name, &h).await;
-        }
+        self.settle_purge(name).await?;
         {
             let fleets = self.fleets.read().await;
             match fleets.get(name).filter(|h| !Self::is_purged(h)) {
@@ -1246,6 +1263,7 @@ impl Daemon {
         Self::reject_reserved(name)?;
         let lock = self.fleet_lock(name);
         let _guard = lock.lock().await;
+        self.settle_purge(name).await?;
         // A purged fleet whose handle the purge listener has not dropped
         // yet is gone already (#10); any other dead actor is not.
         let handle = self
@@ -3100,6 +3118,53 @@ mod tests {
             .unwrap();
         assert_eq!(rec.generation, 1);
         wait_gen(&w.daemon, 1).await;
+    }
+
+    /// #10 review: `down` of a fleet whose actor is purging waits for it
+    /// like `apply` does, then finds no fleet (404), rather than handing
+    /// the dying actor a message it drops (500).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_down_waits_for_a_purging_actor_to_end() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let (purging, rx) = purging_handle();
+        w.daemon.fleets.write().await.insert(name.clone(), purging);
+        let d = w.daemon.clone();
+        let n = name.clone();
+        let down = tokio::spawn(async move { d.down(&n, Keep::default(), false).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!down.is_finished(), "waits for the actor to end");
+        drop(rx);
+        let e = tokio::time::timeout(Duration::from_secs(5), down)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(e, DaemonError::NotFound);
+    }
+
+    /// #10 review: an actor that settles a purge and never ends is a clear
+    /// error for `apply` and `down` once the wait runs out, not a message
+    /// sent to it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_purging_actor_that_never_ends_is_a_clear_error() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let (purging, _rx) = purging_handle();
+        w.daemon.fleets.write().await.insert(name.clone(), purging);
+        let want = DaemonError::Internal("fleet f: its purge has not finished; try again".into());
+        let e = w
+            .daemon
+            .apply(&name, spec(&[("a", &[])]), Default::default(), false)
+            .await
+            .unwrap_err();
+        assert_eq!(e, want);
+        let e = w
+            .daemon
+            .down(&name, Keep::default(), false)
+            .await
+            .unwrap_err();
+        assert_eq!(e, want);
     }
 
     /// A plugin that holds its answer to the *first* `activate` matching

@@ -250,10 +250,14 @@ jobs:
     # A run that also releases a unit the charts pin installs that unit's
     # new image tags, so it waits for merge-images to create them;
     # merge-images is skipped on a dry run and on a run with no images, but
-    # also when images failed, so images must not have failed either (#149).
-    needs: [plan, images, merge-images]
+    # also when images failed, and images in turn is skipped when build
+    # failed, so neither may have failed (#149). build and images are
+    # skipped legitimately only on a run with no binaries (charts-only or
+    # library-only).
+    needs: [plan, build, images, merge-images]
     if: >-
       ${{ !cancelled() && needs.plan.outputs.charts == 'true'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
       && (needs.images.result == 'success' || needs.images.result == 'skipped')
       && (needs.merge-images.result == 'success' || needs.merge-images.result == 'skipped') }}
     runs-on: ubuntu-24.04

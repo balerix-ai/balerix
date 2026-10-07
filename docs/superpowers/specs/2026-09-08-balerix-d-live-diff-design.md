@@ -132,7 +132,11 @@ Applying:
 
 `diff_refreshes_total` (counter, applies) and `version_failures_total`
 (counter, `workspace_version` errors during a poll), through the SDK's
-`Metrics`.
+`Metrics`. The daemon's 404 `no workspace for agent …` is not counted:
+it is the routine answer before `up` has made the worktree, and a page
+left open on such an agent would otherwise add one every poll and drown
+the transport failures and refusals the counter is for (#17). The poll
+still answers `workspace: null` for it.
 
 ## 4. Security
 

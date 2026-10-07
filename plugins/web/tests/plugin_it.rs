@@ -520,7 +520,8 @@ async fn events_json_carries_the_workspace_version_when_there_is_one() {
     );
     assert_eq!(
         metric(&text, "balerix_plugin_web_version_failures_total", &[]),
-        Some(1.0)
+        Some(0.0),
+        "carol's routine no-workspace 404 is not a failure (#17)"
     );
 }
 

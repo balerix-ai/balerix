@@ -706,10 +706,23 @@ async fn events_json(
         Ok(v) => events.workspace = Some(v),
         Err(e) => {
             tracing::debug!(agent = %id, "workspace version: {e}");
-            shared.version_failures_total.inc();
+            if is_version_failure(&e) {
+                shared.version_failures_total.inc();
+            }
         }
     }
     Json(events).into_response()
+}
+
+/// Whether a `workspace_version` error counts in `version_failures_total`
+/// (Spec D §3.3): everything but the daemon's routine 404 `no workspace
+/// for agent …`, which an open page sees on every poll until `up` has made
+/// the worktree (#17).
+fn is_version_failure(e: &SdkError) -> bool {
+    !matches!(
+        e,
+        SdkError::Status { status: 404, message } if message.starts_with("no workspace for agent")
+    )
 }
 
 async fn bridge_route(
@@ -900,6 +913,27 @@ mod tests {
         assert_eq!(with("javascript:alert(1)"), "");
         assert_eq!(with(""), "");
         assert_eq!(prefix(&HeaderMap::new()), "");
+    }
+
+    /// Only the daemon's routine "no worktree yet" answer is quiet; every
+    /// other refusal and every transport failure counts (#17).
+    #[test]
+    fn only_the_no_workspace_404_is_not_a_version_failure() {
+        let status = |status, message: &str| SdkError::Status {
+            status,
+            message: message.into(),
+        };
+        assert!(!is_version_failure(&status(
+            404,
+            "no workspace for agent f/c/a"
+        )));
+        assert!(is_version_failure(&status(404, "no such agent f/c/a")));
+        assert!(is_version_failure(&status(
+            500,
+            "no workspace for agent f/c/a"
+        )));
+        assert!(is_version_failure(&status(403, "forbidden")));
+        assert!(is_version_failure(&SdkError::Transport("refused".into())));
     }
 
     #[test]

@@ -364,7 +364,10 @@ credentials, hook input, or sandbox rules.
   plugin's message. Re-running `update` after fixing the plugin does
   re-attempt it: `Daemon::apply` diffs against the fleet's *active* rows
   only, so a pending or rejected pair is offered again even though its
-  config did not change (R24).
+  config did not change (R24). Only to a ready plugin, though: while it
+  is not ready an unchanged rejected row stays rejected, so `update` fails
+  again with the same message until the plugin's next `hello` re-offers
+  it, and a changed config is `pending` with the old message kept (#11).
 - The activation table is not persisted: after a daemon restart every pair
   is `pending` until the plugin's next `hello`, which re-activates all of
   them.

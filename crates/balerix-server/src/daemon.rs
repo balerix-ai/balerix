@@ -1005,7 +1005,27 @@ impl Daemon {
                         }
                     }
                 }
-                None => rows.push((p.clone(), PluginActivation::pending())),
+                // Not ready (#11): an unchanged row stays as it is — a
+                // rejection keeps its message for `status`, a pending row
+                // is not reset — and a changed config goes pending with
+                // the last message carried over until a plugin answers.
+                None => {
+                    let was = rows_now
+                        .iter()
+                        .find(|(a, pl, _)| a == &p.agent && pl == &p.plugin)
+                        .map(|(_, _, row)| row);
+                    match was {
+                        Some(row) if row.config == p.config => {}
+                        Some(row) => rows.push((
+                            p.clone(),
+                            PluginActivation {
+                                message: row.activation.message.clone(),
+                                ..PluginActivation::pending()
+                            },
+                        )),
+                        None => rows.push((p.clone(), PluginActivation::pending())),
+                    }
+                }
             }
         }
         let handle = {
@@ -2308,6 +2328,52 @@ mod tests {
             ActivationState::Rejected
         );
 
+        // The plugin goes away (#11): an apply that cannot reach it keeps
+        // the rejection, message and all, while the config is unchanged…
+        // (`unhello`, not `set_ready(false)`: the readiness watcher sets
+        // `ready` again on every record that shows the plugin agent
+        // `Ready`, and its `hello` above may still be on its way there.)
+        w.daemon.registry().unhello(&flow);
+        w.daemon
+            .apply(&name, s.clone(), Default::default(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            w.daemon.registry().row(&agent, &flow).unwrap().activation,
+            PluginActivation::rejected("states.x: unknown"),
+            "a not-ready plugin leaves an unchanged rejected row alone"
+        );
+        // …and a changed config is pending again, still carrying the last
+        // rejection for `status` until a plugin answers.
+        let s2 = spec(&[("a", &[("flow", json!({ "v": 2 }))])]);
+        w.daemon
+            .apply(&name, s2.clone(), Default::default(), true)
+            .await
+            .unwrap();
+        let row = w.daemon.registry().row(&agent, &flow).unwrap();
+        assert_eq!(row.config, json!({ "v": 2 }));
+        assert_eq!(
+            row.activation,
+            PluginActivation {
+                state: ActivationState::Pending,
+                message: "states.x: unknown".into(),
+            }
+        );
+        // An unchanged pending row is not reset by another apply either.
+        w.daemon
+            .apply(&name, s2.clone(), Default::default(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            w.daemon
+                .registry()
+                .row(&agent, &flow)
+                .unwrap()
+                .activation
+                .message,
+            "states.x: unknown"
+        );
+
         // The plugin is fixed and listening again. No `hello` here: the
         // apply itself must re-attempt the row, whose config is unchanged.
         let good = stub_plugin(StubScript {
@@ -2319,7 +2385,7 @@ mod tests {
             .registry()
             .set_listen(&flow, good.listen.clone(), "t".into());
         w.daemon
-            .apply(&name, s, Default::default(), true)
+            .apply(&name, s2, Default::default(), true)
             .await
             .unwrap();
         assert_eq!(
@@ -2333,13 +2399,9 @@ mod tests {
             "a re-attempt is not a config change"
         );
         assert_eq!(
-            w.daemon
-                .registry()
-                .row(&agent, &flow)
-                .unwrap()
-                .activation
-                .state,
-            ActivationState::Active
+            w.daemon.registry().row(&agent, &flow).unwrap().activation,
+            PluginActivation::active(),
+            "an accepted pair clears the old rejection"
         );
     }
 

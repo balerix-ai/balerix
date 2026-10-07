@@ -330,7 +330,11 @@ activations back without the daemon persisting anything about them. The
 answer to each is the pair's new state: a pair rejected before can become
 active, and one active before can be rejected. An `up` or `update` also
 re-offers every pair whose row is not `active`, even when its config did
-not change. A pair is deactivated when its fleet goes `down` or when an
+not change. When the plugin is not ready at that moment, a pair whose
+config did not change keeps its row as it is (a `rejected` row keeps its
+message, a `pending` one is not reset), and a changed config makes the row
+`pending` with the last `message` still on it; the message is replaced or
+cleared only by the plugin's next answer to that pair. A pair is deactivated when its fleet goes `down` or when an
 `up` or `update` drops the plugin from the agent's spec; a changed config
 arrives as a new `activate` in place, and a rejected one changes nothing
 for that pair. A `rejected`

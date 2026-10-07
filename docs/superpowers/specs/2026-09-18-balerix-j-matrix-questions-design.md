@@ -313,9 +313,14 @@ The inbound filter of Spec G §9.1 runs first, unchanged. Then, instead of §9.2
   layout change after a `claude` bump, the pane in an unexpected state — and
   no clearing event will come while Claude waits on it. A reply is refused
   with "the answer may not have landed; check the terminal, or reply `skip`
-  to clear this question.", and `skip` (or `skip!`, whatever the labels say)
-  is accepted: echo `**declining the question**`, one Escape, state `Sent`
-  again with a fresh clock. A counted plan is never sent again: once keys
+  to clear it (this sends Escape, which interrupts the agent if it is
+  running).", and `skip` (or `skip!`, whatever the labels say) is accepted:
+  echo `**declining the question**`, one Escape, state `Sent` again with a
+  fresh clock. **That Escape is the hazard of this path:** if the dialog did
+  submit and only the `PostToolUse` was lost, the agent is mid-turn and the
+  Escape interrupts that turn. The refusal says so, so the operator checks
+  the terminal first; nothing in the plugin can tell the two cases apart
+  until J-9. A counted plan is never sent again: once keys
   have landed the highlighted row is unknown, and counting from row 1 is the
   wrong answer this spec exists to remove (J-9 is the real fix). If that
   echo or Escape fails, the state stays the `Sent` it was, never `Open`, for

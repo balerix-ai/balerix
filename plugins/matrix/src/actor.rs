@@ -2873,7 +2873,7 @@ mod tests {
             sends(&port.calls()),
             vec![(
                 Some(root.clone()),
-                "the answer may not have landed; check the terminal, or reply `skip` to clear this question.".to_string()
+                "the answer may not have landed; check the terminal, or reply `skip` to clear it (this sends Escape, which interrupts the agent if it is running).".to_string()
             )]
         );
         assert_eq!(reactions(&port.calls()), vec![REFUSED.to_string()]);

@@ -124,7 +124,7 @@ pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64, now: Instan
             if !(reply.eq_ignore_ascii_case("skip") || reply.eq_ignore_ascii_case("skip!")) {
                 return refused(
                     open.stage.clone(),
-                    "the answer may not have landed; check the terminal, or reply `skip` to clear this question.".into(),
+                    "the answer may not have landed; check the terminal, or reply `skip` to clear it (this sends Escape, which interrupts the agent if it is running).".into(),
                 );
             }
             return match plan_action(questions, None, key_delay_ms) {
@@ -471,7 +471,7 @@ mod tests {
             assert_eq!(
                 d.post.as_deref(),
                 Some(
-                    "the answer may not have landed; check the terminal, or reply `skip` to clear this question."
+                    "the answer may not have landed; check the terminal, or reply `skip` to clear it (this sends Escape, which interrupts the agent if it is running)."
                 ),
                 "{reply}"
             );

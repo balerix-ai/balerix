@@ -143,14 +143,17 @@ pub struct Decision {
     /// The stage to commit after `send` succeeded (or after `post` when
     /// there is no `send`).
     pub stage: Stage,
+    /// The stage to commit when a gating `post` or the `send` fails (#48).
+    pub fallback: Stage,
     /// The reaction on the operator's message once the above is done.
     pub react: Reaction,
     /// The `inbound_total` outcome label.
     pub outcome: &'static str,
 }
 
-/// Spec J §7.2 for one reply while `open` is the agent's question.
-pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64) -> Decision;
+/// Spec J §7.2 for one reply, arriving at `now`, while `open` is the
+/// agent's question.
+pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64, now: Instant) -> Decision;
 
 pub enum Verdict {
     /// Recorded answers equal the intended ones: react on the echo.
@@ -168,7 +171,9 @@ pub fn on_closed(open: &OpenQuestion, answers: &Value) -> Verdict;
 ```
 
 `on_reply` covers every arm of J §7.2: `Sent` refuses with "an answer is
-already on its way"; `Confirming` takes `yes`/`y` (send the held plan),
+already on its way" — past J §7.2's 30 s it points at the terminal and
+takes `skip` instead (#48; `on_reply` takes the reply's `now` for that, and
+`Stage::Sent` carries `since`); `Confirming` takes `yes`/`y` (send the held plan),
 `no`/`n` (back to `Open`, ack), or matches anything else as a fresh
 answer; a refusal posts the reason; `skip` echoes "declining" and plans one
 Escape; an exact match echoes and plans; an inexact match asks and enters
@@ -179,11 +184,17 @@ snapshots and actor tests hold.
 
 **The executor contract**, stated in the module docs and honoured by
 matrix and GitHub alike: post `post` first; if it did not land, send
-nothing, commit `Stage::Open`, react `Failed` and count `send_failed`
+nothing, commit `fallback`, react `Failed` and count `send_failed`
 (J-5: never send what the operator cannot see, never enter `Confirming` on
 a reading nobody was shown). Otherwise send `send` if any; on success
 commit `stage` (with the echo id filled in) and react `react`; on failure
-post the daemon's error, commit `Stage::Open`, react `Failed`. Matrix's
+post the daemon's error, commit `fallback`, react `Failed`. `fallback`
+matters only on a decision that can send — a gating echo or keys — and
+is the stage the question was in before the reply: `Stage::Open` for an
+answer, a `skip` or a `yes` to a question nothing was sent to yet, and
+the `Sent` it was in for J §7.2's late `skip`, where keys have already
+landed (#48). A refusal sends nothing, and its `fallback` is simply its
+own stage. Matrix's
 `on_answer`, `deliver` and `echo_lost` collapse into that executor and its
 `question::match_reply` call moves inside `on_reply`.
 

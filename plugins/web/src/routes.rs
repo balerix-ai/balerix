@@ -238,6 +238,7 @@ main{{flex:1;display:flex;min-height:0}}
 .ev .t{{color:#888;margin-right:.4rem}}
 .ev .n{{color:#57606a;margin-right:.4rem}}
 .ev pre{{white-space:pre-wrap;margin:.2rem 0 0;color:#555;max-height:16em;overflow:auto}}
+.ev .x{{white-space:pre-wrap;margin:.2rem 0 0;font:12px system-ui,sans-serif;max-height:24em;overflow:auto}}
 .ev.divider{{background:#fff6d5;font-weight:600}}
 .file{{margin:1rem 0;border:1px solid #ddd;border-radius:4px}}
 .file h3{{margin:0;padding:.4rem .6rem;background:#f6f8fa;font-size:13px;font-weight:600;display:flex;gap:.6rem;align-items:center}}
@@ -461,7 +462,12 @@ let lastSeq = 0, unread = 0, fetching = false;
 const side = document.getElementById("side");
 function renderEvent(e) {{
   const row = el("div", "ev" + (e.name === "review_sent" ? " divider" : ""));
-  row.append(el("span", "t", new Date(e.at * 1000).toLocaleTimeString()), el("span", "n", e.name), el("span", "s", e.summary));
+  // A turn's text replaces its summary, which is only its first line or "turn ended".
+  const hasText = typeof e.text === "string";
+  row.append(el("span", "t", new Date(e.at * 1000).toLocaleTimeString()), el("span", "n", e.name));
+  if (!hasText) row.appendChild(el("span", "s", e.summary));
+  if (e.payload_truncated || e.text_truncated) row.appendChild(el("span", "badge", " · cut"));
+  if (hasText) row.appendChild(el("div", "x", e.text));
   const pre = el("pre", "", JSON.stringify(e.payload, null, 2) + (e.payload_truncated ? "\n(truncated)" : "")); pre.hidden = true;
   row.appendChild(pre); row.onclick = () => {{ pre.hidden = !pre.hidden; }};
   return row;
@@ -706,10 +712,23 @@ async fn events_json(
         Ok(v) => events.workspace = Some(v),
         Err(e) => {
             tracing::debug!(agent = %id, "workspace version: {e}");
-            shared.version_failures_total.inc();
+            if is_version_failure(&e) {
+                shared.version_failures_total.inc();
+            }
         }
     }
     Json(events).into_response()
+}
+
+/// Whether a `workspace_version` error counts in `version_failures_total`
+/// (Spec D §3.3): everything but the daemon's routine 404 `no workspace
+/// for agent …`, which an open page sees on every poll until `up` has made
+/// the worktree (#17).
+fn is_version_failure(e: &SdkError) -> bool {
+    !matches!(
+        e,
+        SdkError::Status { status: 404, message } if message.starts_with("no workspace for agent")
+    )
 }
 
 async fn bridge_route(
@@ -902,6 +921,27 @@ mod tests {
         assert_eq!(prefix(&HeaderMap::new()), "");
     }
 
+    /// Only the daemon's routine "no worktree yet" answer is quiet; every
+    /// other refusal and every transport failure counts (#17).
+    #[test]
+    fn only_the_no_workspace_404_is_not_a_version_failure() {
+        let status = |status, message: &str| SdkError::Status {
+            status,
+            message: message.into(),
+        };
+        assert!(!is_version_failure(&status(
+            404,
+            "no workspace for agent f/c/a"
+        )));
+        assert!(is_version_failure(&status(404, "no such agent f/c/a")));
+        assert!(is_version_failure(&status(
+            500,
+            "no workspace for agent f/c/a"
+        )));
+        assert!(is_version_failure(&status(403, "forbidden")));
+        assert!(is_version_failure(&SdkError::Transport("refused".into())));
+    }
+
     #[test]
     fn the_open_terminals_gauge_falls_with_the_guard() {
         let gauge = balerix_plugin_sdk::metrics::IntGauge::new("open", "open").unwrap();
@@ -937,6 +977,79 @@ mod tests {
         assert_eq!(forwardable(2000), 1011);
     }
 
+    /// Returns `true` if the test may run. Otherwise prints a skip reason,
+    /// or panics when `BALERIX_REQUIRE_TOOLS=1` (CI never skips) — the
+    /// pattern of `balerix-runtime`'s integration tests.
+    fn require_or_skip(name: &str, present: bool) -> bool {
+        if present {
+            return true;
+        }
+        if std::env::var_os("BALERIX_REQUIRE_TOOLS").is_some_and(|v| v == "1") {
+            panic!("{name} is required (BALERIX_REQUIRE_TOOLS=1) but not available");
+        }
+        eprintln!("skip: {name} not available");
+        false
+    }
+
+    /// Spec D PD-4 run as the page runs it (#20): the script is sliced out
+    /// of `review_html` itself — `anchorOf`, `parsePatch` and
+    /// `anchorComments` — and the four cases run under `node`, fed on stdin.
+    #[test]
+    fn anchor_comments_keeps_reanchors_or_stales_under_node() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let node = Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !require_or_skip("node", node) {
+            return;
+        }
+        let page = review_html("", "f/c/a");
+        let start = page.find("const anchorOf").expect("anchorOf in the page");
+        let func = page
+            .find("function anchorComments(")
+            .expect("anchorComments in the page");
+        let end = func + page[func..].find("\n}\n").expect("its closing brace") + 3;
+        let cases = r#"
+const assert = require("node:assert");
+// new: 1 " keep", 2 "+moved", 3 "+twin", 4 "+twin"; old: 1 " keep", 2 "-gone"
+const patch = "@@ -1,2 +1,4 @@\n keep\n-gone\n+moved\n+twin\n+twin\n";
+const d = { files: [{ path: "a.rs", patch }] };
+const exact = { path: "a.rs", side: "new", line: 1, text: " keep" };
+const unique = { path: "a.rs", side: "new", line: 9, text: "+moved" };
+const several = { path: "a.rs", side: "new", line: 9, text: "+twin" };
+const none = { path: "a.rs", side: "new", line: 2, text: "+vanished" };
+const stale = anchorComments(d, [exact, unique, several, none]);
+assert.strictEqual(exact.line, 1, "the exact anchor keeps");
+assert.strictEqual(unique.line, 2, "exactly one same path/side/text line re-anchors");
+assert.deepStrictEqual(stale, [several, none], "several or none: stale");
+assert.strictEqual(several.line, 9, "a stale comment keeps its line");
+console.log("anchor cases ok");
+"#;
+        let script = format!("{}\n{cases}", &page[start..end]);
+        let mut child = Command::new("node")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("node starts");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(script.as_bytes())
+            .expect("the script reaches node");
+        let out = child.wait_with_output().expect("node finishes");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("anchor cases ok"),
+            "node failed:\n{stdout}\n{}\nscript:\n{script}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn the_review_page_links_its_routes_through_the_prefix_and_escapes_the_id() {
         let page = review_html("/v1/plugins/web", "f/c/a");
@@ -960,6 +1073,19 @@ mod tests {
             "the apply rate limit"
         );
         assert!(page.contains("r.workspace"), "the poll reads the version");
+        assert!(
+            page.contains(r#"const hasText = typeof e.text === "string";"#)
+                && page.contains(r#"if (!hasText) row.appendChild(el("span", "s", e.summary));"#),
+            "a row with text shows the text, not the summary's first line again"
+        );
+        assert!(
+            page.contains(r#"el("div", "x", e.text)"#),
+            "a turn's text shows on its row, through textContent (#42)"
+        );
+        assert!(
+            page.contains("e.payload_truncated || e.text_truncated"),
+            "a cut entry is marked on its row (#42)"
+        );
         assert!(
             !page.contains("loadDiff();\npollEvents();"),
             "the first diff comes from the first poll"

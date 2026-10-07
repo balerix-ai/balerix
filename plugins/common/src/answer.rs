@@ -2,11 +2,21 @@
 //! No I/O and no port: a plugin's actor executes a `Decision` through its
 //! own channel, under the contract in `Decision`'s docs.
 
+use std::time::Duration;
+
 use balerix_api::{KeyStep, PluginAction};
 use serde_json::Value;
+use tokio::time::Instant;
 
 use crate::pending::{OpenQuestion, Stage};
 use crate::question::{self, Matched, Refusal, Selection};
+
+/// How long after the keys a reply to a question still in `Sent` is told
+/// to wait (Spec J §7.2, #48). The longest legal key sequence takes 8 s
+/// (`MAX_KEY_SEQUENCE_MS`) and `PostToolUse` follows the submit at once,
+/// so a `Sent` this old most likely means the keys landed and the dialog
+/// never submitted.
+pub const SENT_GRACE: Duration = Duration::from_secs(30);
 
 /// The reaction on the operator's message once a decision is executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,12 +37,12 @@ pub enum Reaction {
 ///
 /// **Executor contract** (every plugin honours it, Spec K §4): post `post`
 /// first. If it did not land and `gates_on_post()` is true, send nothing,
-/// commit `Stage::Open`, react `Failed` and count `send_failed` — J-5:
+/// commit `fallback`, react `Failed` and count `send_failed` — J-5:
 /// never send what the operator cannot see, never enter `Confirming` on a
 /// reading nobody was shown. Otherwise send `send` if any; on success
 /// commit `stage` (with the echo id filled in by `Stage::with_echo` when
 /// `gates_on_post()` is true), react `react` and count `outcome`; on
-/// failure post the daemon's error, commit `Stage::Open`, react `Failed`.
+/// failure post the daemon's error, commit `fallback`, react `Failed`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
     /// The message to post to the thread, if any.
@@ -41,6 +51,12 @@ pub struct Decision {
     pub send: Option<PluginAction>,
     /// The stage to commit once `post` and `send` (if any) have landed.
     pub stage: Stage,
+    /// The stage to commit when a gating `post` or the `send` fails:
+    /// `Open` for an answer to a question nothing was sent to yet, the
+    /// unchanged `Sent` for a `skip` past `SENT_GRACE` — keys have landed
+    /// there, so `Open` would let a counted plan run from an unknown row
+    /// (#48).
+    pub fallback: Stage,
     /// The reaction to leave on the operator's message.
     pub react: Option<Reaction>,
     /// The `inbound_total` outcome label, when this reply counts as one.
@@ -60,6 +76,7 @@ fn refused(stage: Stage, post: String) -> Decision {
     Decision {
         post: Some(post),
         send: None,
+        fallback: stage.clone(),
         stage,
         react: Some(Reaction::Refused),
         outcome: Some("answer_refused"),
@@ -87,15 +104,44 @@ fn plan_action(
     Ok(action)
 }
 
-/// Spec J §7.2 for one reply while `open` is the agent's question.
-pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64) -> Decision {
+/// Spec J §7.2 for one reply, arriving at `now`, while `open` is the
+/// agent's question.
+pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64, now: Instant) -> Decision {
     let questions = &open.questions;
     match &open.stage {
-        Stage::Sent { .. } => {
+        Stage::Sent { since, .. } if now.saturating_duration_since(*since) < SENT_GRACE => {
             return refused(
                 open.stage.clone(),
                 "an answer is already on its way; wait for the agent.".into(),
             );
+        }
+        Stage::Sent { .. } => {
+            // #48: the keys landed long ago and nothing closed the dialog.
+            // `skip` (or `skip!`, whatever the labels) clears it with one
+            // Escape; anything else points at the terminal. A counted plan
+            // is never sent again: the highlighted row is unknown now.
+            let reply = reply.trim();
+            if !(reply.eq_ignore_ascii_case("skip") || reply.eq_ignore_ascii_case("skip!")) {
+                return refused(
+                    open.stage.clone(),
+                    "the answer may not have landed; check the terminal, or reply `skip` to clear it (this sends Escape, which interrupts the agent if it is running).".into(),
+                );
+            }
+            return match plan_action(questions, None, key_delay_ms) {
+                Ok(action) => Decision {
+                    post: Some("**declining the question**".into()),
+                    send: Some(action),
+                    stage: Stage::Sent {
+                        selections: None,
+                        echo: None,
+                        since: now,
+                    },
+                    fallback: open.stage.clone(),
+                    react: Some(Reaction::Ack),
+                    outcome: Some("skipped"),
+                },
+                Err(message) => refused(open.stage.clone(), message),
+            };
         }
         Stage::Confirming { selections, echo } => {
             match reply.trim().to_ascii_lowercase().as_str() {
@@ -107,7 +153,9 @@ pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64) -> Decision
                             stage: Stage::Sent {
                                 selections: Some(selections.clone()),
                                 echo: echo.clone(),
+                                since: now,
                             },
+                            fallback: Stage::Open,
                             react: Some(Reaction::Ack),
                             outcome: Some("confirmed"),
                         },
@@ -119,6 +167,7 @@ pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64) -> Decision
                         post: None,
                         send: None,
                         stage: Stage::Open,
+                        fallback: Stage::Open,
                         react: Some(Reaction::Ack),
                         outcome: None,
                     };
@@ -138,7 +187,9 @@ pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64) -> Decision
                 stage: Stage::Sent {
                     selections: None,
                     echo: None,
+                    since: now,
                 },
+                fallback: Stage::Open,
                 react: Some(Reaction::Ack),
                 outcome: Some("skipped"),
             },
@@ -154,7 +205,9 @@ pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64) -> Decision
                         stage: Stage::Sent {
                             selections: Some(selections),
                             echo: None,
+                            since: now,
                         },
+                        fallback: Stage::Open,
                         react: Some(Reaction::Ack),
                         outcome: Some("answered"),
                     },
@@ -170,6 +223,7 @@ pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64) -> Decision
                         selections,
                         echo: None,
                     },
+                    fallback: Stage::Open,
                     react: None,
                     outcome: Some("confirm_asked"),
                 }
@@ -208,6 +262,7 @@ pub fn on_closed(open: &OpenQuestion, answers: &Value) -> Verdict {
         Stage::Sent {
             selections: Some(selections),
             echo,
+            ..
         } => {
             if question::recorded_matches(&open.questions, selections, answers) {
                 Verdict::Confirmed { echo: echo.clone() }
@@ -235,6 +290,13 @@ mod tests {
     use crate::question::fixtures::{color, colors_multi, input, size};
     use balerix_api::Key;
     use serde_json::json;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    /// A reply `secs` after `since`.
+    fn at(since: Instant, secs: u64) -> Instant {
+        since + Duration::from_secs(secs)
+    }
 
     fn open(questions: &[Value]) -> OpenQuestion {
         OpenQuestion {
@@ -254,7 +316,7 @@ mod tests {
 
     #[test]
     fn an_exact_reply_echoes_and_plans_the_keys() {
-        let d = on_reply(&open(&[color()]), "3", 100);
+        let d = on_reply(&open(&[color()]), "3", 100, Instant::now());
         assert_eq!(d.post.as_deref(), Some("**answering** Color → Blue"));
         assert_eq!(
             keys(&d),
@@ -272,7 +334,8 @@ mod tests {
             d.stage,
             Stage::Sent {
                 selections: Some(_),
-                echo: None
+                echo: None,
+                ..
             }
         ));
         assert_eq!(d.react, Some(Reaction::Ack));
@@ -282,7 +345,7 @@ mod tests {
 
     #[test]
     fn the_agents_key_delay_is_used() {
-        let d = on_reply(&open(&[color()]), "1", 250);
+        let d = on_reply(&open(&[color()]), "1", 250, Instant::now());
         assert!(matches!(
             d.send,
             Some(PluginAction::SendKeys { delay_ms: 250, .. })
@@ -291,7 +354,7 @@ mod tests {
 
     #[test]
     fn an_inexact_reply_asks_first() {
-        let d = on_reply(&open(&[color()]), "gre", 100);
+        let d = on_reply(&open(&[color()]), "gre", 100, Instant::now());
         assert_eq!(
             d.post.as_deref(),
             Some("**I read that as** Color → Green. Reply **yes** to send.")
@@ -306,9 +369,9 @@ mod tests {
     #[test]
     fn yes_sends_the_held_selection_without_a_second_echo() {
         let mut o = open(&[color()]);
-        let asked = on_reply(&o, "gre", 100);
+        let asked = on_reply(&o, "gre", 100, Instant::now());
         o.stage = asked.stage.with_echo(Some("$echo".into()));
-        let d = on_reply(&o, "YES", 100);
+        let d = on_reply(&o, "YES", 100, Instant::now());
         assert!(d.post.is_none());
         assert_eq!(
             keys(&d),
@@ -322,19 +385,19 @@ mod tests {
     #[test]
     fn no_drops_the_confirmation_and_another_reply_is_matched_fresh() {
         let mut o = open(&[color()]);
-        o.stage = on_reply(&o, "gre", 100).stage;
-        let d = on_reply(&o, "n", 100);
+        o.stage = on_reply(&o, "gre", 100, Instant::now()).stage;
+        let d = on_reply(&o, "n", 100, Instant::now());
         assert!(d.post.is_none() && d.send.is_none());
         assert_eq!(d.stage, Stage::Open);
         assert_eq!(d.react, Some(Reaction::Ack));
         assert_eq!(d.outcome, None);
-        let d = on_reply(&o, "2", 100);
+        let d = on_reply(&o, "2", 100, Instant::now());
         assert_eq!(d.post.as_deref(), Some("**answering** Color → Green"));
     }
 
     #[test]
     fn prose_is_refused_with_the_option_list() {
-        let d = on_reply(&open(&[color()]), "purple please", 100);
+        let d = on_reply(&open(&[color()]), "purple please", 100, Instant::now());
         let post = d.post.clone().unwrap();
         assert!(post.contains("Red") && post.contains("Blue"), "{post}");
         assert!(d.send.is_none());
@@ -349,14 +412,15 @@ mod tests {
 
     #[test]
     fn skip_declines_with_one_escape() {
-        let d = on_reply(&open(&[color()]), "skip", 100);
+        let d = on_reply(&open(&[color()]), "skip", 100, Instant::now());
         assert_eq!(d.post.as_deref(), Some("**declining the question**"));
         assert_eq!(keys(&d), vec![KeyStep::Key(Key::Escape)]);
         assert!(matches!(
             d.stage,
             Stage::Sent {
                 selections: None,
-                echo: None
+                echo: None,
+                ..
             }
         ));
         assert_eq!(d.outcome, Some("skipped"));
@@ -365,24 +429,99 @@ mod tests {
     #[test]
     fn a_reply_while_keys_are_on_their_way_is_refused_and_the_stage_kept() {
         let mut o = open(&[color()]);
+        let since = Instant::now();
         o.stage = Stage::Sent {
             selections: None,
             echo: Some("$e".into()),
+            since,
         };
-        let d = on_reply(&o, "2", 100);
-        assert_eq!(
-            d.post.as_deref(),
-            Some("an answer is already on its way; wait for the agent.")
-        );
-        assert!(d.send.is_none());
-        assert_eq!(d.stage, o.stage);
-        assert_eq!(d.react, Some(Reaction::Refused));
-        assert_eq!(d.outcome, Some("answer_refused"));
+        for reply in ["2", "skip", "skip!"] {
+            let d = on_reply(&o, reply, 100, at(since, 29));
+            assert_eq!(
+                d.post.as_deref(),
+                Some("an answer is already on its way; wait for the agent."),
+                "{reply}"
+            );
+            assert!(d.send.is_none());
+            assert_eq!(d.stage, o.stage);
+            assert_eq!(d.fallback, o.stage);
+            assert_eq!(d.react, Some(Reaction::Refused));
+            assert_eq!(d.outcome, Some("answer_refused"));
+        }
+    }
+
+    /// #48: keys that landed but never submitted leave `Sent` with no
+    /// clearing event. Past `SENT_GRACE` the refusal says so and `skip`
+    /// clears it with one Escape; a counted plan is never sent again, the
+    /// highlighted row being unknown once keys have landed.
+    #[test]
+    fn a_reply_long_after_the_keys_points_at_the_terminal_and_skip_clears() {
+        let mut o = open(&[color()]);
+        let since = Instant::now();
+        o.stage = Stage::Sent {
+            selections: Some(vec![Selection {
+                options: vec![1],
+                other: None,
+            }]),
+            echo: Some("$e".into()),
+            since,
+        };
+        for reply in ["2", "blue", "other: teal"] {
+            let d = on_reply(&o, reply, 100, at(since, 30));
+            assert_eq!(
+                d.post.as_deref(),
+                Some(
+                    "the answer may not have landed; check the terminal, or reply `skip` to clear it (this sends Escape, which interrupts the agent if it is running)."
+                ),
+                "{reply}"
+            );
+            assert!(d.send.is_none(), "never a second counted plan");
+            assert_eq!(d.stage, o.stage, "the stage and its clock are kept");
+            assert_eq!(d.react, Some(Reaction::Refused));
+            assert_eq!(d.outcome, Some("answer_refused"));
+        }
+        for reply in [" Skip ", "SKIP!"] {
+            let now = at(since, 45);
+            let d = on_reply(&o, reply, 100, now);
+            assert_eq!(d.post.as_deref(), Some("**declining the question**"));
+            assert_eq!(keys(&d), vec![KeyStep::Key(Key::Escape)]);
+            assert_eq!(
+                d.stage,
+                Stage::Sent {
+                    selections: None,
+                    echo: None,
+                    since: now
+                }
+            );
+            assert_eq!(
+                d.fallback, o.stage,
+                "a lost echo or Escape stays `Sent`, never `Open`"
+            );
+            assert_eq!(d.react, Some(Reaction::Ack));
+            assert_eq!(d.outcome, Some("skipped"));
+            assert!(d.gates_on_post());
+        }
+    }
+
+    #[test]
+    fn a_fresh_answer_falls_back_to_open() {
+        let o = open(&[color()]);
+        for reply in ["3", "gre", "skip", "purple please"] {
+            assert_eq!(
+                on_reply(&o, reply, 100, Instant::now()).fallback,
+                Stage::Open
+            );
+        }
     }
 
     #[test]
     fn one_reply_answers_several_questions() {
-        let d = on_reply(&open(&[colors_multi(), size()]), "1, 3\n2", 100);
+        let d = on_reply(
+            &open(&[colors_multi(), size()]),
+            "1, 3\n2",
+            100,
+            Instant::now(),
+        );
         assert_eq!(
             d.post.as_deref(),
             Some("**answering** Colors → Red, Blue · Size → Medium")
@@ -396,7 +535,7 @@ mod tests {
             .map(|i| json!({ "label": format!("o{i}"), "description": "" }))
             .collect();
         let q = json!({ "question": "Which?", "header": "H", "multiSelect": false, "options": options });
-        let d = on_reply(&open(&[q]), "70", 500);
+        let d = on_reply(&open(&[q]), "70", 500, Instant::now());
         assert!(
             d.post
                 .unwrap()
@@ -411,7 +550,9 @@ mod tests {
     #[test]
     fn a_sent_answer_is_confirmed_or_reported_when_it_differs() {
         let mut o = open(&[color()]);
-        o.stage = on_reply(&o, "3", 100).stage.with_echo(Some("$echo".into()));
+        o.stage = on_reply(&o, "3", 100, Instant::now())
+            .stage
+            .with_echo(Some("$echo".into()));
         assert_eq!(
             on_closed(&o, &json!({ "Which color?": "Blue" })),
             Verdict::Confirmed {
@@ -439,6 +580,7 @@ mod tests {
         skipped.stage = Stage::Sent {
             selections: None,
             echo: None,
+            since: Instant::now(),
         };
         assert_eq!(on_closed(&skipped, &json!({})), Verdict::Nothing);
     }

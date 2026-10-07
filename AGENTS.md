@@ -13,7 +13,8 @@ credentials, hook input, or sandbox rules.
 - `plugin <name>` — lint and test one standalone plugin project
   (`mise run plugin matrix`). `plugins` does all five (common is the shared
   library, Spec K). Neither is part of `check`; CI runs them as their own
-  concurrent jobs.
+  concurrent jobs. web's review-page test runs the page's script under the
+  pinned `node`, skipping without it unless `BALERIX_REQUIRE_TOOLS=1` (CI).
 - `agent` — lint and test the standalone `agent/` project (`balerix-agent`,
   Spec O §12); builds `balerix` first, since its two-process tests run
   `balerix serve --mode kubernetes` and `launch.sh`. Its own CI job; not part

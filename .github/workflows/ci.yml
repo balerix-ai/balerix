@@ -51,6 +51,10 @@ jobs:
   # 'refs/heads/main' }}` so pull requests restore but do not write.
   plugins:
     runs-on: ubuntu-latest
+    # web's review-page test runs the page's script under node (#20); with
+    # this set a missing node fails the leg instead of skipping the test.
+    env:
+      BALERIX_REQUIRE_TOOLS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -61,7 +65,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with: { version: 2026.9.2, install: false, cache: true }
-      - run: mise install rust cargo:cargo-nextest
+      - run: mise install rust cargo:cargo-nextest node
       # One cache per plugin project: each has its own lockfile and its own
       # target directory under plugins/<name>/target (scripts/plugin.sh).
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

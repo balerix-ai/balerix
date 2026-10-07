@@ -132,7 +132,11 @@ Applying:
 
 `diff_refreshes_total` (counter, applies) and `version_failures_total`
 (counter, `workspace_version` errors during a poll), through the SDK's
-`Metrics`.
+`Metrics`. The daemon's 404 `no workspace for agent …` is not counted:
+it is the routine answer before `up` has made the worktree, and a page
+left open on such an agent would otherwise add one every poll and drown
+the transport failures and refusals the counter is for (#17). The poll
+still answers `workspace: null` for it.
 
 ## 4. Security
 
@@ -159,7 +163,7 @@ the fingerprint through `textContent` like every other value.
 
 | Layer | What | Where |
 |---|---|---|
-| unit | `fingerprint_of`: deterministic; changes with `head`, the merge-base, any path, size, mtime, or a `missing` marker; the fake's fingerprint changes with a file's bytes; `anchorComments` (through `node`, as `parsePatch` was checked): exact keep, unique re-anchor, ambiguous and vanished → stale | in-module; `routes.rs` tests extract the script |
+| unit | `fingerprint_of`: deterministic; changes with `head`, the merge-base, any path, size, mtime, or a `missing` marker; the fake's fingerprint changes with a file's bytes; `anchorComments` (under `node`, with `parsePatch`; §11): exact keep, unique re-anchor, ambiguous and vanished → stale | in-module; `routes.rs` tests extract the script |
 | runtime (`inspect_it`) | stable across two calls; changes on an edit, a new untracked file, a commit, a deletion; unchanged on a byte-identical `git add`; refused by the filter check; `Missing` before the worktree | `balerix-runtime/tests` |
 | server (`workspace_it`) | the fourth route behind the gate; 403 and the two 404s | `balerix-server/tests` |
 | conformance | the fixture through `Host` against `FakeHost`; 22 | `balerix-plugin-sdk/tests/conformance.rs` |
@@ -207,6 +211,6 @@ rendering; no history of versions; no change to the submission.
 - **`diff_refreshes_total` counts `diff.json` responses**, the one server-side event per refresh; the browser's applies are not observable.
 - **The fakes' fingerprint** is `sha256(head \0 (path \0 bytes \0)*)` over the file map, in core and in the SDK alike, so `workspace-version.json` holds a derivable value.
 - **The first diff comes from the first poll**, which carries the fingerprint; `loadDiff()` is the manual reload and the path that shows a daemon refusal in the banner.
-- **`anchorComments` is checked with `node` by hand** (not a `mise.toml` tool); the Rust test asserts the function's presence.
+- **`anchorComments` runs under `node` in a committed test** (#20; it was checked by hand until then): `routes.rs`'s `anchor_comments_keeps_reanchors_or_stales_under_node` slices the script from `const anchorOf` through the end of `anchorComments` (so `parsePatch` too) out of `review_html`'s own output, appends the four cases — exact keep, unique re-anchor, several → stale, none → stale — as `node:assert` checks, and pipes it to `node -` on stdin. `node` is pinned in `mise.toml` (the LTS line); the test skips with a printed reason without it and fails under `BALERIX_REQUIRE_TOOLS=1`, which CI's `plugins` job sets.
 - **`save()` strips `editing` and `typing`**, so a reload never reopens a comment box (a Spec C deferred minor).
 - **The mtime is hashed as `{seconds}.{nanoseconds:09}`** (`(size, mtime, mtime_nsec)` from `symlink_metadata`), information-equivalent to §2.3's nanoseconds since the epoch.

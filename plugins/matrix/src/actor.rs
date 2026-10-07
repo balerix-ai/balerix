@@ -18,7 +18,7 @@ use tokio::time::Instant;
 
 use crate::config::{AgentConfig, DaemonConfig};
 use crate::matrix::{ACK, CONFIRMED, FAILED, Inbound, MatrixError, MatrixPort, REFUSED, SENT};
-use crate::pending::{OpenQuestion, Questions, Stage};
+use crate::pending::{OpenQuestion, Questions};
 use crate::question;
 use crate::render::{self, PhaseChange};
 use crate::routing::{Maps, Thread, crew_of};
@@ -790,7 +790,7 @@ impl<M: MatrixPort> Actor<M> {
             .get(agent)
             .map(|c| c.key_delay_ms)
             .unwrap_or(balerix_api::DEFAULT_KEY_DELAY_MS);
-        let decision = answer::on_reply(&open, &message.body, delay_ms);
+        let decision = answer::on_reply(&open, &message.body, delay_ms, Instant::now());
         self.execute(agent, root, message, decision).await;
     }
 
@@ -817,7 +817,7 @@ impl<M: MatrixPort> Actor<M> {
                     // take the path that just failed, so the reaction is
                     // the whole report.
                     count("send_failed");
-                    self.questions.set_stage(agent, Stage::Open);
+                    self.questions.set_stage(agent, d.fallback);
                     self.react(message, FAILED).await;
                     return;
                 }
@@ -829,7 +829,7 @@ impl<M: MatrixPort> Actor<M> {
         {
             count("send_failed");
             self.counters.errors.with_label_values(&["send_keys"]).inc();
-            self.questions.set_stage(agent, Stage::Open);
+            self.questions.set_stage(agent, d.fallback);
             let body = format!("**not delivered to {agent}:** {e}");
             self.send(&message.room, Some(root), &body, "notice").await;
             self.react(message, FAILED).await;
@@ -2044,6 +2044,7 @@ mod tests {
         let sent = |echo: &str| Stage::Sent {
             selections: Some(chosen.clone()),
             echo: Some(echo.to_string()),
+            since: Instant::now(),
         };
 
         let (_fake, port, mut a, room, _root) = with_question_thread().await;
@@ -2626,6 +2627,14 @@ mod tests {
         .await;
     }
 
+    /// When alice's question entered `Sent`; panics if it is not there.
+    fn since_of(a: &Actor<FakePort>) -> Instant {
+        match a.questions.get("f/c/alice").map(|o| &o.stage) {
+            Some(Stage::Sent { since, .. }) => *since,
+            other => panic!("not Sent: {other:?}"),
+        }
+    }
+
     fn down_enter(downs: usize) -> Vec<KeyStep> {
         let mut steps = vec![KeyStep::Key(Key::Down); downs];
         steps.push(KeyStep::Key(Key::Enter));
@@ -2656,6 +2665,7 @@ mod tests {
                     other: None
                 }]),
                 echo: Some("$evt4:fake".into()),
+                since: since_of(&a),
             }
         );
 
@@ -2733,6 +2743,7 @@ mod tests {
                     other: None
                 }]),
                 echo: Some("$evt4:fake".into()),
+                since: since_of(&a),
             },
             "the ✅ goes on the echo that asked"
         );
@@ -2790,6 +2801,7 @@ mod tests {
             Stage::Sent {
                 selections: None,
                 echo: Some("$evt4:fake".into()),
+                since: since_of(&a),
             }
         );
     }
@@ -2837,6 +2849,66 @@ mod tests {
             "{sent:?}"
         );
         reply(&mut a, &room, &root, "2").await;
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, sent);
+    }
+
+    /// #48: keys that landed but never submitted the dialog leave the
+    /// question `Sent` with no clearing event to come. Past
+    /// `answer::SENT_GRACE` a reply is pointed at the terminal and `skip`
+    /// clears it with one Escape — never a second counted plan.
+    #[tokio::test]
+    async fn a_stuck_answer_points_at_the_terminal_and_skip_clears_it() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "1").await;
+        tick_after(&mut a, Duration::from_secs(29)).await;
+        port.take_calls();
+        reply(&mut a, &room, &root, "skip").await;
+        assert!(sends(&port.calls())[0].1.contains("already on its way"));
+        assert_eq!(fake.actions_for("f/c/alice").len(), 1, "only the answer");
+
+        tick_after(&mut a, Duration::from_secs(1)).await;
+        port.take_calls();
+        reply(&mut a, &room, &root, "2").await;
+        assert_eq!(
+            sends(&port.calls()),
+            vec![(
+                Some(root.clone()),
+                "the answer may not have landed; check the terminal, or reply `skip` to clear it (this sends Escape, which interrupts the agent if it is running).".to_string()
+            )]
+        );
+        assert_eq!(reactions(&port.calls()), vec![REFUSED.to_string()]);
+        assert_eq!(fake.actions_for("f/c/alice").len(), 1, "no second plan");
+
+        port.take_calls();
+        reply(&mut a, &room, &root, "skip").await;
+        assert_eq!(sends(&port.calls())[0].1, "**declining the question**");
+        assert_eq!(reactions(&port.calls()), vec![ACK.to_string()]);
+        assert_eq!(
+            fake.actions_for("f/c/alice")[1],
+            PluginAction::SendKeys {
+                steps: vec![KeyStep::Key(Key::Escape)],
+                delay_ms: 100,
+            }
+        );
+        assert!(matches!(
+            a.questions.get("f/c/alice").unwrap().stage,
+            Stage::Sent {
+                selections: None,
+                ..
+            }
+        ));
+    }
+
+    /// The late `skip`'s Escape failing must leave the question `Sent`:
+    /// `Open` would let the next reply count rows from an unknown cursor.
+    #[tokio::test]
+    async fn a_failed_late_skip_stays_sent() {
+        let (fake, _port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "1").await;
+        let sent = a.questions.get("f/c/alice").unwrap().stage.clone();
+        tick_after(&mut a, Duration::from_secs(31)).await;
+        fake.fail_actions(Some("no window"));
+        reply(&mut a, &room, &root, "skip").await;
         assert_eq!(a.questions.get("f/c/alice").unwrap().stage, sent);
     }
 

@@ -138,20 +138,32 @@ fn options_list(q: &Question) -> String {
         .join(", ")
 }
 
-/// A thread reply against the open questions (Spec J §6.2).
-pub fn match_reply(questions: &[Question], reply: &str) -> Result<Matched, Refusal> {
-    let reply = reply.trim();
-    // `skip` declines — unless a lone question offers an option labelled
-    // `skip`, which this rule would otherwise make unreachable (J-4). Then
-    // it selects that option, but never exactly: the echo asks for a `yes`
-    // first, so the other reading is one `no` away. A several-question
-    // reply of one word could not be a positional answer anyway.
-    let labelled_skip = reply.eq_ignore_ascii_case("skip")
-        && questions.len() == 1
+/// The dialog is a lone question with an option whose label normalises to
+/// `skip`: there the reply `skip` picks that option, and only `skip!`
+/// declines (Spec J §6.2, #47, #49). The footer says so.
+pub fn labelled_skip(questions: &[Question]) -> bool {
+    questions.len() == 1
         && questions[0]
             .options
             .iter()
-            .any(|o| normalise(&o.label) == "skip");
+            .any(|o| normalise(&o.label) == "skip")
+}
+
+/// A thread reply against the open questions (Spec J §6.2).
+pub fn match_reply(questions: &[Question], reply: &str) -> Result<Matched, Refusal> {
+    let reply = reply.trim();
+    // `skip!` always declines (#49). Tested on the raw reply: `normalise`
+    // strips the `!`, so after it `skip!` would read as a `Skip` label.
+    if reply.eq_ignore_ascii_case("skip!") {
+        return Ok(Matched::Skip);
+    }
+    // `skip` declines — unless a lone question offers an option labelled
+    // `skip`, which this rule would otherwise make unreachable (J-4). Then
+    // it selects that option, but never exactly: the echo asks for a `yes`
+    // first, so the other reading is one `no` away; `skip!` declines. A
+    // several-question reply of one word could not be a positional answer
+    // anyway.
+    let labelled_skip = reply.eq_ignore_ascii_case("skip") && labelled_skip(questions);
     if reply.eq_ignore_ascii_case("skip") && !labelled_skip {
         return Ok(Matched::Skip);
     }
@@ -552,8 +564,8 @@ pub mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::{
-        Matched, Opt, Question, Refusal, Selection, describe, describe_recorded, match_reply,
-        parse, plan, recorded_matches, skip_plan,
+        Matched, Opt, Question, Refusal, Selection, describe, describe_recorded, labelled_skip,
+        match_reply, parse, plan, recorded_matches, skip_plan,
     };
     use balerix_api::{Key, KeyStep};
     use serde_json::json;
@@ -795,9 +807,42 @@ mod tests {
 
         assert_eq!(match_reply(&parsed(&[color()]), "skip"), Ok(Matched::Skip));
         assert_eq!(
-            match_reply(&parsed(&[retry, size()]), " SKIP "),
+            match_reply(&parsed(&[retry.clone(), size()]), " SKIP "),
             Ok(Matched::Skip),
             "one word cannot be a positional answer to two questions"
+        );
+        assert!(labelled_skip(&q));
+        assert!(!labelled_skip(&parsed(&[color()])));
+        assert!(!labelled_skip(&parsed(&[retry, size()])));
+    }
+
+    /// #49: `skip!` declines everywhere, the lone `Skip` option's dialog
+    /// included, where `skip` itself picks the option. Read before
+    /// `normalise`, which would strip the `!` and make it the label.
+    #[test]
+    fn skip_bang_always_declines() {
+        let mut retry = color();
+        retry["options"] = json!([
+            { "label": "Skip", "description": "" },
+            { "label": "Retry", "description": "" }
+        ]);
+        for q in [
+            parsed(&[retry.clone()]),
+            parsed(&[color()]),
+            parsed(&[retry, size()]),
+        ] {
+            assert_eq!(match_reply(&q, "skip!"), Ok(Matched::Skip));
+            assert_eq!(match_reply(&q, "  SKIP! \n"), Ok(Matched::Skip));
+        }
+        let mut bang = color();
+        bang["options"] = json!([
+            { "label": "skip!", "description": "" },
+            { "label": "Retry", "description": "" }
+        ]);
+        assert_eq!(
+            match_reply(&parsed(&[bang]), "skip!"),
+            Ok(Matched::Skip),
+            "even an option spelled `skip!` is reached by its number, not by `skip!`"
         );
     }
 

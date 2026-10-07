@@ -157,6 +157,11 @@ pub fn question_message(questions: &[Question]) -> String {
         "Reply with one line per question, in order: a number or a label. \
          `other: …` gives your own answer, `skip` declines."
             .to_string()
+    } else if crate::question::labelled_skip(questions) {
+        // #49: here `skip` picks the option, so name the word that declines
+        "Reply with a number or a label. `other: …` gives your own answer, `skip` chooses \
+         the option labelled skip, `skip!` declines."
+            .to_string()
     } else {
         "Reply with a number or a label. `other: …` gives your own answer, `skip` declines."
             .to_string()
@@ -496,6 +501,18 @@ mod tests {
             fixtures::colors_multi(),
             fixtures::size()
         ])));
+    }
+
+    /// #49: when the lone question offers a `Skip` option, `skip` picks it,
+    /// so the footer names `skip!` as the way to decline.
+    #[test]
+    fn a_lone_question_with_a_skip_option_names_skip_bang() {
+        let mut retry = fixtures::color();
+        retry["options"] = json!([
+            { "label": "Skip", "description": "leave it" },
+            { "label": "Retry", "description": "" }
+        ]);
+        insta::assert_snapshot!(question_message(&questions(&[retry])));
     }
 
     /// Header, question, label and description come from the agent and are

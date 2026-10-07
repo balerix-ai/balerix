@@ -469,6 +469,33 @@ async fn the_review_page_and_its_data_routes_pass_the_workspace_through() {
     );
 }
 
+/// A long turn reaches `events.json` whole (#42): the 9.7 KB reply that the
+/// old 4 KiB cut lost mid-key.
+#[tokio::test]
+async fn a_long_turn_keeps_its_text_in_events_json() {
+    let (_, _, h, _watch) = world().await;
+    h.activate(ALICE, json!({})).await.unwrap();
+    let said = format!("{}the end", "a sentence of the reply. ".repeat(388));
+    assert!(said.len() > 9_700);
+    h.observe(vec![event(
+        ALICE,
+        "Stop",
+        json!({ "background_tasks": [], "cwd": "/w", "hook_event_name": "Stop",
+                "last_assistant_message": said }),
+    )])
+    .await;
+    let (status, _, body) = h
+        .get_route("/agents/e2e/c/alice/events.json", "/v1/plugins/web")
+        .await;
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let e = &v["events"][0];
+    assert_eq!(e["text"], said.as_str(), "{e}");
+    assert_eq!(e["payload_truncated"], false);
+    assert!(e.get("text_truncated").is_none(), "only written when set");
+    assert_eq!(e["payload"]["cwd"], "/w");
+}
+
 #[tokio::test]
 async fn events_json_carries_the_workspace_version_when_there_is_one() {
     let (fake, _, h, _watch) = world().await;
@@ -520,7 +547,8 @@ async fn events_json_carries_the_workspace_version_when_there_is_one() {
     );
     assert_eq!(
         metric(&text, "balerix_plugin_web_version_failures_total", &[]),
-        Some(1.0)
+        Some(0.0),
+        "carol's routine no-workspace 404 is not a failure (#17)"
     );
 }
 

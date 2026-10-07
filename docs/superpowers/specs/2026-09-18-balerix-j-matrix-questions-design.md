@@ -163,7 +163,11 @@ Reply with a number or a label. `other: …` gives your own answer, `skip` decli
 ```
 
 Several questions are titled `question 1 of 2`, `question 2 of 2` with their
-headers, and the footer says one line per question, in order. A multi-select question says "choose any, separated
+headers, and the footer says one line per question, in order. A lone question
+with an option whose normalised label is `skip` (§6.2) ends instead with
+``…, `skip` chooses the option labelled skip, `skip!` declines.``: there
+`skip` picks the option, so the footer names the word that still declines
+(#49). Every other footer is as above and does not mention `skip!`. A multi-select question says "choose any, separated
 by commas". A payload that does not parse as questions renders as today's
 `running AskUserQuestion` line and opens no pending state.
 
@@ -231,7 +235,9 @@ settled here rather than guessed at (J-4).
   takes the reply `skip`: it selects that option, *inexactly*, so the echo
   asks for a `yes` and the other reading is one `no` away. In every other
   dialog `skip` still declines; one word cannot be a positional answer to
-  several questions in any case. The footer is unchanged.
+  several questions in any case. `skip!` declines in every dialog, this one
+  included, so the thread can always decline (#49); the footer names it
+  only on this dialog (§5).
 - A number on rung 1 is the row it counts to, but *inexact* when some other
   option's label normalises to that number: with options `2 / 4 / 8` the
   reply `2` selects the second option and asks first. A number that is not a
@@ -243,7 +249,11 @@ where `Selection { options: Vec<usize>, other: Option<String> }` holds the
 chosen options, ascending, and the free text if any. `exact` is true only when
 every item came from rung 1 or 3.
 
-`skip` alone, in any case, is `Matched::Skip`: one Escape, exact.
+`skip` alone, in any case, is `Matched::Skip`: one Escape, exact — save the
+lone-`skip`-option dialog above. `skip!` alone, in any case, is always
+`Matched::Skip`. It is tested on the raw trimmed reply before anything is
+normalised: `normalise` strips punctuation, so after it `skip!` would read as
+a `Skip` label; an option literally labelled `skip!` is reached by its number.
 
 ### 6.3 `plan(&[Question], &[Selection]) -> Vec<KeyStep>`
 
@@ -277,6 +287,7 @@ Open ── reply, inexact match ────────────▶ Confirm
 Confirming ── "yes" / "y" ───────────────▶ Sent
 Confirming ── "no" / "n" ────────────────▶ Open
 Confirming ── any other reply ───────────▶ matched again as a fresh answer
+Sent (≥ 30 s) ── "skip" / "skip!" ───────▶ Sent { skip }   (one Escape, §7.2)
 any ── PostToolUse(AskUserQuestion) | Stop | UserPromptSubmit | SessionStart | SessionEnd ──▶ None
 ```
 
@@ -294,8 +305,30 @@ The inbound filter of Spec G §9.1 runs first, unchanged. Then, instead of §9.2
 - **Inexact match:** post the echo as a question,
   `**I read that as** Color → Blue · Size → Medium. Reply **yes** to send.`
   State `Confirming`. `yes` then follows the exact path without a second echo.
-- **`skip`:** echo `**declining the question**`, then one Escape.
-- **In `Sent`:** refused with "an answer is already on its way".
+- **`skip`, or `skip!`** (§6.2): echo `**declining the question**`, then one Escape.
+- **In `Sent`, within 30 s of the reply that sent the keys:** refused with
+  "an answer is already on its way; wait for the agent."
+- **In `Sent`, 30 s or more after it** (#48; `answer::SENT_GRACE`): the keys
+  have most likely landed without submitting the dialog — a dropped key, a
+  layout change after a `claude` bump, the pane in an unexpected state — and
+  no clearing event will come while Claude waits on it. A reply is refused
+  with "the answer may not have landed; check the terminal, or reply `skip`
+  to clear it (this sends Escape, which interrupts the agent if it is
+  running).", and `skip` (or `skip!`, whatever the labels say) is accepted:
+  echo `**declining the question**`, one Escape, state `Sent` again with a
+  fresh clock. **That Escape is the hazard of this path:** if the dialog did
+  submit and only the `PostToolUse` was lost, the agent is mid-turn and the
+  Escape interrupts that turn. The refusal says so, so the operator checks
+  the terminal first; nothing in the plugin can tell the two cases apart
+  until J-9. A counted plan is never sent again: once keys
+  have landed the highlighted row is unknown, and counting from row 1 is the
+  wrong answer this spec exists to remove (J-9 is the real fix). If that
+  echo or Escape fails, the state stays the `Sent` it was, never `Open`, for
+  the same reason (`Decision::fallback`). The stamp is in memory only, like
+  the rest of `Sent` (§7.4). 30 s is well past the longest legal key
+  sequence (8 s, `MAX_KEY_SEQUENCE_MS`). Nothing is posted when the 30 s
+  pass; only what the next reply is told changes, so the actor needs no
+  timer.
 
 ### 7.3 Ground truth
 

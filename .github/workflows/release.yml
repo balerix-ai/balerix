@@ -249,10 +249,12 @@ jobs:
     # validated (§24.3), and installed on kind with the published images.
     # A run that also releases a unit the charts pin installs that unit's
     # new image tags, so it waits for merge-images to create them;
-    # merge-images is skipped on a dry run and on a run with no images.
-    needs: [plan, merge-images]
+    # merge-images is skipped on a dry run and on a run with no images, but
+    # also when images failed, so images must not have failed either (#149).
+    needs: [plan, images, merge-images]
     if: >-
       ${{ !cancelled() && needs.plan.outputs.charts == 'true'
+      && (needs.images.result == 'success' || needs.images.result == 'skipped')
       && (needs.merge-images.result == 'success' || needs.merge-images.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -298,8 +300,8 @@ jobs:
 
   charts-publish:
     # Step 3: OCI, signed by digest. Never on a dry run. charts may run
-    # after a skipped merge-images, which would skip this job too without
-    # !cancelled().
+    # after a skipped images or merge-images, which would skip this job too
+    # without !cancelled().
     needs: [plan, charts]
     if: ${{ !cancelled() && !inputs.dry-run && needs.charts.result == 'success' }}
     runs-on: ubuntu-24.04

@@ -90,17 +90,15 @@ async fn mirror_readiness(mut rx: watch::Receiver<FleetRecord>, reg: Arc<PluginR
                 stamps.insert(id.agent.clone(), st.plugin_hello);
                 if st.phase == AgentPhase::Ready {
                     reg.set_ready(&id.agent, true);
-                } else if st.plugin_hello >= reg.hello_generation(&id.agent) {
-                    reg.set_ready(&id.agent, false);
+                } else {
+                    reg.clear_ready_if(&id.agent, st.plugin_hello);
                 }
             }
             stamps.retain(|name, stamp| {
                 if seen.contains(name) {
                     return true;
                 }
-                if *stamp >= reg.hello_generation(name) {
-                    reg.set_ready(name, false);
-                }
+                reg.clear_ready_if(name, *stamp);
                 false
             });
         }

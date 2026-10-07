@@ -138,6 +138,10 @@ pub enum RunnerError {
     /// amendment §13.5).
     #[error("{id}: agent processes still running after stop (pid {pid})")]
     StillRunning { id: String, pid: u32 },
+    /// A pane process's `/proc` stat could not be read: whether it is
+    /// still running is unknown, so a stop fails rather than pass (#148).
+    #[error("{id}: cannot tell whether the agent's processes are gone: {message}")]
+    Proc { id: String, message: String },
     /// Spec O §7.2: the agent's sidecar link is down, timed out, or the
     /// sidecar answered with a failure.
     #[error("{id}: {message}")]

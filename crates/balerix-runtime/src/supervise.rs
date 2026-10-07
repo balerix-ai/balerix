@@ -6,6 +6,7 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -45,10 +46,6 @@ pub(crate) fn parse_stat(text: &str) -> Option<Stat> {
     Some(Stat { state, ppid, start })
 }
 
-fn read_stat(pid: u32) -> Option<Stat> {
-    parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
-}
-
 /// One process, told apart from a later one that reuses its pid by its
 /// start time. A zombie has no identity: it has exited, and only waits
 /// for its parent to reap it.
@@ -58,18 +55,60 @@ pub struct ProcIdentity {
     start: u64,
 }
 
-impl ProcIdentity {
-    pub fn of(pid: u32) -> Option<Self> {
-        let stat = read_stat(pid)?;
-        (stat.state != 'Z').then_some(Self {
-            pid,
-            start: stat.start,
-        })
+/// Where process stats are read: `/proc`, or a fake one in a test.
+#[derive(Debug, Clone)]
+pub struct Procfs {
+    root: PathBuf,
+}
+
+impl Default for Procfs {
+    fn default() -> Self {
+        Self::at("/proc")
+    }
+}
+
+impl Procfs {
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// `None` once the process has exited and its entry is gone. Any other
+    /// failure to read or parse the stat is an error, never an exit
+    /// (#148): under `hidepid`, or for another uid's process, a live
+    /// process would otherwise read as gone.
+    fn stat(&self, pid: u32) -> io::Result<Option<Stat>> {
+        let path = self.root.join(pid.to_string()).join("stat");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => parse_stat(&text).map(Some).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: cannot parse {text:?}", path.display()),
+                )
+            }),
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(Errno::SRCH.raw_os_error()) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+        }
+    }
+
+    /// `None` when `pid` has exited, a zombie included.
+    pub fn identity(&self, pid: u32) -> io::Result<Option<ProcIdentity>> {
+        Ok(self
+            .stat(pid)?
+            .filter(|s| s.state != 'Z')
+            .map(|s| ProcIdentity {
+                pid,
+                start: s.start,
+            }))
     }
 
     /// The process has exited, whether or not its pid is in use again.
-    pub fn gone(&self) -> bool {
-        Self::of(self.pid) != Some(*self)
+    pub fn gone(&self, id: &ProcIdentity) -> io::Result<bool> {
+        Ok(self.identity(id.pid)? != Some(*id))
     }
 }
 
@@ -98,7 +137,7 @@ fn proc_parents() -> Vec<(u32, u32)> {
     entries
         .flatten()
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter_map(|pid| Some((pid, read_stat(pid)?.ppid)))
+        .filter_map(|pid| Some((pid, Procfs::default().stat(pid).ok()??.ppid)))
         .collect()
 }
 
@@ -229,9 +268,10 @@ mod tests {
 
     #[test]
     fn a_live_process_has_an_identity_and_is_not_gone() {
-        let me = ProcIdentity::of(std::process::id()).unwrap();
+        let proc = Procfs::default();
+        let me = proc.identity(std::process::id()).unwrap().unwrap();
         assert_eq!(me.pid, std::process::id());
-        assert!(!me.gone());
+        assert!(!proc.gone(&me).unwrap());
     }
 
     #[test]
@@ -240,12 +280,13 @@ mod tests {
             .arg("60")
             .spawn()
             .unwrap();
-        let id = ProcIdentity::of(child.id()).unwrap();
-        assert!(!id.gone());
+        let proc = Procfs::default();
+        let id = proc.identity(child.id()).unwrap().unwrap();
+        assert!(!proc.gone(&id).unwrap());
         child.kill().unwrap();
         // not waited yet: a zombie, which has exited as far as a stop cares
         let start = std::time::Instant::now();
-        while !id.gone() {
+        while !proc.gone(&id).unwrap() {
             assert!(
                 start.elapsed() < std::time::Duration::from_secs(5),
                 "never a zombie"
@@ -253,21 +294,76 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            ProcIdentity::of(child.id()).is_none(),
+            proc.identity(child.id()).unwrap().is_none(),
             "a zombie has no identity"
         );
         child.wait().unwrap();
-        assert!(id.gone(), "and stays gone once reaped");
+        assert!(proc.gone(&id).unwrap(), "and stays gone once reaped");
     }
 
     #[test]
     fn a_reused_pid_is_a_different_process() {
-        let me = ProcIdentity::of(std::process::id()).unwrap();
+        let proc = Procfs::default();
+        let me = proc.identity(std::process::id()).unwrap().unwrap();
         let other = ProcIdentity {
             start: me.start + 1,
             ..me
         };
-        assert!(other.gone(), "same pid, another start time");
+        assert!(proc.gone(&other).unwrap(), "same pid, another start time");
+    }
+
+    /// A fake `/proc` holding one stat line for `pid`.
+    fn fake_stat(root: &std::path::Path, pid: u32, line: &str) {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), line).unwrap();
+    }
+
+    fn stat_line(pid: u32, state: char, start: u64) -> String {
+        format!("{pid} (x) {state} 1 {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {start} 1 1")
+    }
+
+    #[test]
+    fn a_missing_stat_is_an_exited_process_and_a_garbled_one_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = Procfs::at(dir.path());
+        assert!(
+            proc.identity(7).unwrap().is_none(),
+            "no /proc entry: exited"
+        );
+        fake_stat(dir.path(), 8, "8 (x) S");
+        let err = proc.identity(8).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        fake_stat(dir.path(), 9, &stat_line(9, 'Z', 5));
+        assert!(proc.identity(9).unwrap().is_none(), "a zombie has exited");
+    }
+
+    #[test]
+    fn an_unreadable_stat_is_an_error_not_an_exit() {
+        if rustix::process::geteuid().is_root() {
+            // root reads a mode-000 file; nothing to test
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fake_stat(dir.path(), 7, &stat_line(7, 'S', 5));
+        let stat = dir.path().join("7").join("stat");
+        std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = Procfs::at(dir.path()).identity(7).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    #[test]
+    fn gone_is_an_error_when_the_stat_turns_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = Procfs::at(dir.path());
+        fake_stat(dir.path(), 7, &stat_line(7, 'S', 5));
+        let id = proc.identity(7).unwrap().unwrap();
+        assert!(!proc.gone(&id).unwrap());
+        fake_stat(dir.path(), 7, "garbage");
+        assert!(proc.gone(&id).is_err(), "unreadable is not gone");
+        std::fs::remove_dir_all(dir.path().join("7")).unwrap();
+        assert!(proc.gone(&id).unwrap(), "no entry: gone");
     }
 
     #[test]

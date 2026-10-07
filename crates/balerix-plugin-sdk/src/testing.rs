@@ -376,14 +376,14 @@ fn router(inner: Arc<Inner>) -> Router {
 async fn hello(
     State(inner): State<Arc<Inner>>,
     headers: HeaderMap,
-    body: Result<Json<HelloRequest>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<HelloRequest>, JsonRejection>,
 ) -> Response {
     if let Some(resp) = unauthorized(&inner, &headers) {
         return resp;
     }
     let Json(req) = match body {
         Ok(b) => b,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+        Err(e) => return rejected(&e),
     };
     inner
         .hellos

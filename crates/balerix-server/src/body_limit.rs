@@ -71,7 +71,8 @@ where
         .layer(middleware::from_fn_with_state(drain, drain_over_limit))
 }
 
-enum Read {
+/// What [`read`] made of a body.
+pub(crate) enum Read {
     Fits(Vec<u8>),
     Over,
     PastCeiling,
@@ -105,7 +106,10 @@ pub async fn drain_over_limit(State(drain): State<Drain>, req: Request, next: Ne
     }
 }
 
-async fn read(mut body: Body, limit: usize, ceiling: usize, keep: bool) -> Read {
+/// Reads `body` to its end, keeping it (when `keep`) while it fits
+/// `limit` and stopping once past `ceiling`. The proxy reads its bodies
+/// with this too (#168).
+pub(crate) async fn read(mut body: Body, limit: usize, ceiling: usize, keep: bool) -> Read {
     let mut kept = keep.then(Vec::new);
     let mut read = 0usize;
     while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
@@ -165,7 +169,7 @@ fn over_limit(mut parts: Parts, limit: usize) -> Request {
 }
 
 /// The rest of the body is not read: the connection cannot be reused.
-fn closing(mut resp: Response) -> Response {
+pub(crate) fn closing(mut resp: Response) -> Response {
     resp.headers_mut()
         .insert(CONNECTION, HeaderValue::from_static("close"));
     resp

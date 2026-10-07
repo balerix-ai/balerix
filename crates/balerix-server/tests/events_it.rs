@@ -582,11 +582,11 @@ async fn an_over_cap_send_text_is_a_400_naming_the_field_and_types_nothing() {
     );
 }
 
-/// #116: a body over a route's limit is read to the end (up to four
-/// times the limit) before the answer, so a client that writes the
-/// whole body first still reads it — the answer each route gives today
-/// (`hello` maps every body rejection to 400). Past four times the limit
-/// the answer comes at once, without reading the body.
+/// #116, #168: a body over a route's limit is read to the end (up to
+/// four times the limit) before the answer, so a client that writes the
+/// whole body first still reads it: a 413 on every route, the plugin
+/// mount included. Past four times the limit the answer comes at once,
+/// without reading the body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_limited_route_answers_a_client_that_sends_the_whole_body() {
     // A small receive buffer: without the drain, the bytes the server
@@ -612,11 +612,34 @@ async fn every_limited_route_answers_a_client_that_sends_the_whole_body() {
         .unwrap();
     let flow = token(&w, "flow").await;
     let admin = w.api.token().to_string();
-    let routes: [(&str, &str, &str, usize, u16); 4] = [
+    // web serves routes: ready, so the mount reads the body itself
+    struct Bare;
+    impl Plugin for Bare {}
+    let web = token(&w, "web").await;
+    let (listener, listen) = bind().await.unwrap();
+    let web_token = web.clone();
+    tokio::spawn(async move { run(listener, Arc::new(Bare), &web_token, None).await });
+    let env = Env {
+        api_url: w.api.base.clone(),
+        name: "web".into(),
+        token: web,
+        scratch: w.dir.path().join("web-scratch"),
+        ca: None,
+        tls: None,
+        listen: "127.0.0.1:0".into(),
+        revision: None,
+    };
+    Host::new(env)
+        .unwrap()
+        .hello("0.1.0", &listen, None)
+        .await
+        .unwrap();
+    let routes: [(&str, &str, &str, usize, u16); 5] = [
         ("POST", "/v1/fleets", &admin, 4 << 20, 413),
         ("POST", "/v1/agents/f/c/a/events", &secret, 1 << 20, 413),
-        ("POST", "/v1/plugin-host/hello", &flow, 64 << 10, 400),
+        ("POST", "/v1/plugin-host/hello", &flow, 64 << 10, 413),
         ("PUT", "/v1/plugin-host/kv/big", &flow, 1 << 20, 413),
+        ("POST", "/v1/plugins/web/upload", &admin, 1 << 20, 413),
     ];
     for (method, path, token, limit, want) in routes {
         let cases = [
@@ -686,11 +709,12 @@ async fn every_limited_route_answers_a_client_that_sends_the_whole_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bad_token_is_answered_before_an_over_limit_body_is_read() {
     let w = world().await;
-    let routes: [(&str, &str, usize); 4] = [
+    let routes: [(&str, &str, usize); 5] = [
         ("POST", "/v1/fleets", 4 << 20),
         ("POST", "/v1/agents/f/c/a/events", 1 << 20),
         ("POST", "/v1/plugin-host/hello", 64 << 10),
         ("PUT", "/v1/plugin-host/kv/big", 1 << 20),
+        ("POST", "/v1/plugins/web/upload", 1 << 20),
     ];
     for (method, path, limit) in routes {
         let base = w.api.base.clone();

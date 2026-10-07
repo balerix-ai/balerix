@@ -467,9 +467,7 @@ async fn plugin_hello(
     let Some(token) = bearer(&headers) else {
         return Err(unauthorized());
     };
-    let req = b
-        .map(|Json(r)| r)
-        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    let req = body(b)?;
     let name: AgentName = req.name.parse().map_err(|_: NameError| unauthorized())?;
     state
         .daemon
@@ -597,14 +595,16 @@ async fn proxied(state: &AppState, name: &str, req: Request) -> Response {
                 proxy::forward(state.daemon.proxy_client(), &addr, plugin.as_str(), req).await;
             (plugin.to_string(), resp)
         }
+        // Both answered without the body: at most `REFUSAL_READ` of it
+        // is read, so a small request keeps its connection (#168).
         Mount::NotReady(plugin) => {
             let e = ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("plugin {:?} is not ready", plugin.as_str()),
             );
-            (plugin.to_string(), e.into_response())
+            (plugin.to_string(), refuse(req, e.into_response()).await)
         }
-        Mount::Refused(e) => ("unknown".to_string(), e.into_response()),
+        Mount::Refused(e) => ("unknown".to_string(), refuse(req, e.into_response()).await),
     };
     state
         .daemon

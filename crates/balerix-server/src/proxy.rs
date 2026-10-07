@@ -16,6 +16,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
 use crate::api::ApiError;
+use crate::body_limit::{self, DRAIN_FACTOR, DRAIN_TIME, Read};
 use crate::plugins::PluginAddr;
 use crate::sessions::MOUNT_PREFIX;
 
@@ -132,32 +133,46 @@ pub fn response_headers(src: &HeaderMap, upgraded: bool) -> HeaderMap {
 /// Why a request body could not be read whole.
 #[derive(Debug)]
 pub(crate) enum BodyError {
-    /// More than `MAX_BODY` bytes: the client's fault, 413.
-    TooLarge,
+    /// More than `MAX_BODY` bytes: the client's fault, 413. `close` when
+    /// the rest of it was left unread.
+    TooLarge { close: bool },
     /// The connection failed under the body: nobody's request to
     /// forward, 400.
     Transport(String),
 }
 
-/// The whole body, capped at `MAX_BODY`. Read frame by frame rather than
-/// through `axum::body::to_bytes` so the two ways it can fail stay apart:
-/// that helper folds a client that disconnected mid-body into the same
-/// error as one that sent too much.
+/// The whole body, capped at `MAX_BODY`, read frame by frame so the two
+/// ways it can fail stay apart (`axum::body::to_bytes` folds a client
+/// that disconnected mid-body into the same error as one that sent too
+/// much). The mount is not a `body_limit::limited` router, since it
+/// authenticates inside its handler and the drain must come after that,
+/// so it drains here the way `body_limit::drain_over_limit` does (#168):
+/// a body that says it fits is read however long it takes; any other is
+/// read to its end, up to `DRAIN_FACTOR` times the cap and within
+/// `DRAIN_TIME`, so a client that writes it all reads the 413; past
+/// either, or declared past the ceiling, the rest stays unread.
 pub(crate) async fn read_body(body: Body) -> Result<Bytes, BodyError> {
     use hyper::body::Body as _;
-    let mut body = std::pin::pin!(body);
-    let mut out = Vec::new();
-    while let Some(frame) = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
-        let frame = frame.map_err(|e| BodyError::Transport(e.to_string()))?;
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
-        if out.len() + data.len() > MAX_BODY {
-            return Err(BodyError::TooLarge);
-        }
-        out.extend_from_slice(&data);
+    let hint = body.size_hint();
+    let ceiling = MAX_BODY.saturating_mul(DRAIN_FACTOR);
+    if hint.lower() > ceiling as u64 {
+        return Err(BodyError::TooLarge { close: true });
     }
-    Ok(Bytes::from(out))
+    let reading = body_limit::read(body, MAX_BODY, ceiling, true);
+    let read = if hint.upper().is_some_and(|n| n <= MAX_BODY as u64) {
+        reading.await
+    } else {
+        match tokio::time::timeout(DRAIN_TIME, reading).await {
+            Ok(read) => read,
+            Err(_) => return Err(BodyError::TooLarge { close: true }),
+        }
+    };
+    match read {
+        Read::Fits(kept) => Ok(Bytes::from(kept)),
+        Read::Over => Err(BodyError::TooLarge { close: false }),
+        Read::PastCeiling => Err(BodyError::TooLarge { close: true }),
+        Read::Broken(e) => Err(BodyError::Transport(e)),
+    }
 }
 
 /// The `<rest>` of `/v1/plugins/<name>/<rest>`, taken from the request's
@@ -217,9 +232,14 @@ pub async fn forward(
     let (parts, body) = req.into_parts();
     let bytes = match read_body(body).await {
         Ok(b) => b,
-        Err(BodyError::TooLarge) => {
-            return ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "body exceeds 1 MiB")
-                .into_response();
+        Err(BodyError::TooLarge { close }) => {
+            let resp =
+                ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "body exceeds 1 MiB").into_response();
+            return if close {
+                body_limit::closing(resp)
+            } else {
+                resp
+            };
         }
         Err(BodyError::Transport(e)) => {
             return ApiError::new(StatusCode::BAD_REQUEST, format!("body: {e}")).into_response();
@@ -563,7 +583,16 @@ mod tests {
         let exact = Body::from(vec![b'x'; MAX_BODY]);
         assert_eq!(read_body(exact).await.unwrap().len(), MAX_BODY);
         let big = Body::from(vec![b'x'; MAX_BODY + 1]);
-        assert!(matches!(read_body(big).await, Err(BodyError::TooLarge)));
+        assert!(matches!(
+            read_body(big).await,
+            Err(BodyError::TooLarge { close: false })
+        ));
+        // past the drain ceiling the rest is left unread
+        let huge = Body::from(vec![b'x'; DRAIN_FACTOR * MAX_BODY + 1]);
+        assert!(matches!(
+            read_body(huge).await,
+            Err(BodyError::TooLarge { close: true })
+        ));
         match read_body(Body::new(Failing)).await {
             Err(BodyError::Transport(e)) => assert!(e.contains("connection reset"), "{e}"),
             other => panic!("a broken body is not a 413: {other:?}"),

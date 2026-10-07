@@ -352,8 +352,11 @@ credentials, hook input, or sandbox rules.
   (`body_limit::refuse`; more than that and the connection is closed
   unread). A limited router goes through `limited`, never a bare
   `DefaultBodyLimit`. The answer is the route's own: the middleware hands
-  the handler a stand-in body one byte over the limit, so `hello` still
-  answers 400. `api_it.rs::one_byte_over` sends exactly one byte over, on
+  the handler a stand-in body one byte over the limit, so a route's own 413 (and
+  its JSON body) is what the client reads. The plugin mount
+  (`proxy.rs::read_body`) is not a limited router, since it
+  authenticates inside its handler, and drains the same way itself
+  (#168); a refused or not-ready mount goes through `refuse`. `api_it.rs::one_byte_over` sends exactly one byte over, on
   a connection of its own (#79, #113), and
   `events_it.rs::every_limited_route_answers_a_client_that_sends_the_whole_body`
   sends it all.

@@ -695,6 +695,13 @@ scenario_charts_pins_at_release() {
   else
     fail "pins: github untagged but in the run: failed"
   fi
+  # A dry run pushes no images: the pins this run moves are listed on
+  # stdout, so the charts job can skip the kind install (#150).
+  expect_eq "pins, dry run: lists the pin moved by the run" \
+    "$("$dir/scripts/release/check-pins.sh" --dry-run charts github 2>>"$log")" \
+    "balerix-plugin-github-v$pin (plugins.github.image.tag)"
+  expect_eq "pins, not a dry run: lists nothing" \
+    "$("$dir/scripts/release/check-pins.sh" charts github 2>>"$log")" ""
   set_chart_pin_of "$dir" github 9.9.9
   if "$dir/scripts/release/check-pins.sh" charts github 2>"$err"; then
     fail "pins: in the run at another version: passed"
@@ -710,6 +717,8 @@ scenario_charts_pins_at_release() {
   else
     fail "pins: all tagged: failed"
   fi
+  expect_eq "pins, dry run, all tagged: lists nothing" \
+    "$("$dir/scripts/release/check-pins.sh" --dry-run charts 2>>"$log")" ""
 }
 
 # A plugin release moves its pin and nothing else in the daemon values;

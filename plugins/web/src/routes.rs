@@ -462,9 +462,12 @@ let lastSeq = 0, unread = 0, fetching = false;
 const side = document.getElementById("side");
 function renderEvent(e) {{
   const row = el("div", "ev" + (e.name === "review_sent" ? " divider" : ""));
-  row.append(el("span", "t", new Date(e.at * 1000).toLocaleTimeString()), el("span", "n", e.name), el("span", "s", e.summary));
+  // A turn's text replaces its summary, which is only its first line or "turn ended".
+  const hasText = typeof e.text === "string";
+  row.append(el("span", "t", new Date(e.at * 1000).toLocaleTimeString()), el("span", "n", e.name));
+  if (!hasText) row.appendChild(el("span", "s", e.summary));
   if (e.payload_truncated || e.text_truncated) row.appendChild(el("span", "badge", " · cut"));
-  if (typeof e.text === "string") row.appendChild(el("div", "x", e.text));
+  if (hasText) row.appendChild(el("div", "x", e.text));
   const pre = el("pre", "", JSON.stringify(e.payload, null, 2) + (e.payload_truncated ? "\n(truncated)" : "")); pre.hidden = true;
   row.appendChild(pre); row.onclick = () => {{ pre.hidden = !pre.hidden; }};
   return row;
@@ -1070,6 +1073,11 @@ console.log("anchor cases ok");
             "the apply rate limit"
         );
         assert!(page.contains("r.workspace"), "the poll reads the version");
+        assert!(
+            page.contains(r#"const hasText = typeof e.text === "string";"#)
+                && page.contains(r#"if (!hasText) row.appendChild(el("span", "s", e.summary));"#),
+            "a row with text shows the text, not the summary's first line again"
+        );
         assert!(
             page.contains(r#"el("div", "x", e.text)"#),
             "a turn's text shows on its row, through textContent (#42)"

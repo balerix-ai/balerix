@@ -27,7 +27,7 @@ spec:
   template:
     metadata:
       annotations:
-        balerix.ai/not-after: "1807776000"
+        balerix.ai/serving-cert: 6bd6cb04413cb690ed62cbc198086af76f92fe697eee2d188be6ea15f6257bea
       labels:
         app.kubernetes.io/managed-by: balerix-operator
         balerix.ai/component: daemon

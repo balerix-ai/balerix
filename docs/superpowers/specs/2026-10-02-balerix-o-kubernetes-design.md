@@ -1340,7 +1340,9 @@ Secret, cached per Daemon and rebuilt when either changes.
 **Daemon.** Mint what is missing first: the authority (Secret and
 ConfigMap), the serving certificate when absent or `needs_renewal`
 against the real clock, the admin token. Then `daemon_objects` with the
-certificate's `not-after`, applied in one wave, and the pool Job under
+serving certificate, whose sha256 is the pod template's
+`balerix.ai/serving-cert` annotation (not its `not-after`: two
+certificates issued in one second share that, #142), applied in one wave, and the pool Job under
 the Job rule. Status is `daemon_status` over the shared claim, the
 StatefulSet and the pool Job, and `Ready` additionally needs one
 `GET /readyz` answered 200 once the StatefulSet has a ready replica.

@@ -109,13 +109,13 @@ pub async fn authority_and_token(
 }
 
 /// Reads the material back, minting what is absent or due (§21.2), and
-/// applies the four Secret-like objects. Returns the serving expiry.
+/// applies the four Secret-like objects. Returns the serving certificate.
 async fn ensure_material(
     ctx: &Context,
     daemon: &Daemon,
     namespace: &str,
     name: &str,
-) -> Result<i64, Error> {
+) -> Result<Issued, Error> {
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
     let now = ctx.now();
     let read = read_issued(
@@ -180,7 +180,7 @@ async fn ensure_material(
     apply(&ctx.client, &objects.authority_config).await?;
     apply(&ctx.client, &objects.serving).await?;
     apply(&ctx.client, &objects.admin).await?;
-    Ok(serving.not_after)
+    Ok(serving)
 }
 
 /// Replaces `cond`'s entry in `computed`, judged against the Daemon's
@@ -206,8 +206,8 @@ pub async fn reconcile(daemon: Arc<Daemon>, ctx: Arc<Context>) -> Result<Action,
     let statefulsets: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), &namespace);
 
     let (observed_pool, again) = if version_ok(&daemon, &ctx.cfg) {
-        let not_after = ensure_material(&ctx, &daemon, &namespace, &name).await?;
-        let objects = daemon_objects(&daemon, &ctx.cfg, not_after)?;
+        let serving = ensure_material(&ctx, &daemon, &namespace, &name).await?;
+        let objects = daemon_objects(&daemon, &ctx.cfg, &serving.cert_pem)?;
         // a claim is immutable once bound: created when absent, never re-applied
         for claim in &objects.claims {
             if claims.get_opt(&claim.name_any()).await?.is_none() {

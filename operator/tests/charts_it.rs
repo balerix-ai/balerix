@@ -34,6 +34,13 @@ fn chart(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// A YAML file under `chart(name)`, as JSON. The tests read versions from
+/// here rather than repeating them: a release PR moves them (#87–#94).
+fn chart_file(name: &str, file: &str) -> Value {
+    let text = std::fs::read_to_string(chart(name).join(file)).unwrap();
+    serde_norway::from_str(&text).unwrap()
+}
+
 /// `helm template <release> <chart> -n <namespace> -f <values>`, one JSON
 /// value per non-empty document.
 fn render(chart: &Path, release: &str, namespace: &str, values: Value) -> Vec<Value> {
@@ -139,7 +146,14 @@ fn one_replica_recreated_hardened_and_told_its_namespace() {
         "RuntimeDefault"
     );
     let c = container(&docs);
-    assert_eq!(c["image"], "ghcr.io/balerix-ai/balerix-operator:0.2.0");
+    let core = chart_file("balerix-operator", "Chart.yaml")["appVersion"].clone();
+    assert_eq!(
+        c["image"],
+        format!(
+            "ghcr.io/balerix-ai/balerix-operator:{}",
+            core.as_str().unwrap()
+        )
+    );
     assert_eq!(c["securityContext"]["allowPrivilegeEscalation"], false);
     assert_eq!(c["securityContext"]["readOnlyRootFilesystem"], true);
     assert_eq!(c["securityContext"]["capabilities"]["drop"], json!(["ALL"]));
@@ -631,9 +645,13 @@ fn enabled_plugins_are_objects_listed_in_order_then_the_extra_ones() {
     let flow: Plugin = serde_json::from_value(find(&docs, "Plugin", "flow").clone()).unwrap();
     assert_eq!(flow.spec.image, "balerix-plugin-flow:e2e");
     let web: Plugin = serde_json::from_value(find(&docs, "Plugin", "web").clone()).unwrap();
+    let pin = chart_file("balerix-daemon", "values.yaml")["plugins"]["web"]["image"]["tag"].clone();
     assert_eq!(
         web.spec.image,
-        "ghcr.io/balerix-ai/balerix-plugin-web:0.2.1"
+        format!(
+            "ghcr.io/balerix-ai/balerix-plugin-web:{}",
+            pin.as_str().unwrap()
+        )
     );
     assert_eq!(web.spec.config, json!({ "enabled": true }));
     let github: Plugin = serde_json::from_value(find(&docs, "Plugin", "github").clone()).unwrap();

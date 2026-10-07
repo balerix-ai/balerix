@@ -324,14 +324,36 @@ fn file_url(path: &Path) -> String {
 /// The first symlink at or under `root`, found without following any.
 /// A work list, not recursion: the agent decides how deep the tree goes.
 fn first_symlink(root: &Path) -> Result<Option<PathBuf>, (PathBuf, std::io::Error)> {
+    first_symlink_with(root, |p| std::fs::symlink_metadata(p))
+}
+
+/// `first_symlink` with the `lstat` given. An entry under `root` that is
+/// gone by the time it is read is skipped (#136): git's own maintenance
+/// removes its lock files mid-scan, and what no longer exists cannot be a
+/// symlink. `root` itself missing is still an error.
+fn first_symlink_with(
+    root: &Path,
+    mut lstat: impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Option<PathBuf>, (PathBuf, std::io::Error)> {
+    let vanished =
+        |path: &Path, e: &std::io::Error| path != root && e.kind() == std::io::ErrorKind::NotFound;
     let mut todo = vec![root.to_path_buf()];
     while let Some(path) = todo.pop() {
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| (path.clone(), e))?;
+        let meta = match lstat(&path) {
+            Ok(m) => m,
+            Err(e) if vanished(&path, &e) => continue,
+            Err(e) => return Err((path, e)),
+        };
         if meta.file_type().is_symlink() {
             return Ok(Some(path));
         }
         if meta.is_dir() {
-            for entry in std::fs::read_dir(&path).map_err(|e| (path.clone(), e))? {
+            let entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(e) if vanished(&path, &e) => continue,
+                Err(e) => return Err((path, e)),
+            };
+            for entry in entries {
                 todo.push(entry.map_err(|e| (path.clone(), e))?.path());
             }
         }
@@ -1139,8 +1161,44 @@ impl Workspace<'_> {
 mod tests {
     use crate::tools::{Cmd, CmdOutput};
     use crate::workspace::{
-        CloneDecision, decide_clone, file_url, harden_agent_git, is_gits_answer, scrub_git_env,
+        CloneDecision, decide_clone, file_url, first_symlink_with, harden_agent_git,
+        is_gits_answer, scrub_git_env,
     };
+
+    /// #136: git's own maintenance removes `objects/maintenance.lock`
+    /// between the listing and the read. An entry gone by then is skipped;
+    /// a symlink beside it is still found, and a missing root still fails.
+    #[test]
+    fn an_entry_that_vanishes_mid_scan_is_skipped() {
+        let root = std::env::temp_dir().join(format!("balerix-vanish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pack")).unwrap();
+        std::fs::write(root.join("maintenance.lock"), b"").unwrap();
+        std::fs::create_dir(root.join("gone-dir")).unwrap();
+        let racing_maintenance = |p: &std::path::Path| {
+            if p.ends_with("maintenance.lock") {
+                let _ = std::fs::remove_file(p);
+            }
+            if p.ends_with("gone-dir") {
+                let _ = std::fs::remove_dir(p);
+            }
+            std::fs::symlink_metadata(p)
+        };
+        assert_eq!(first_symlink_with(&root, racing_maintenance).unwrap(), None);
+
+        std::os::unix::fs::symlink("/etc", root.join("pack").join("x")).unwrap();
+        std::fs::write(root.join("maintenance.lock"), b"").unwrap();
+        assert_eq!(
+            first_symlink_with(&root, racing_maintenance).unwrap(),
+            Some(root.join("pack").join("x"))
+        );
+
+        let missing = root.join("absent");
+        let err = first_symlink_with(&missing, racing_maintenance).unwrap_err();
+        assert_eq!(err.0, missing);
+        assert_eq!(err.1.kind(), std::io::ErrorKind::NotFound);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     /// Spec N amendment §12.2 (#109): git's yes/no probes are silent on
     /// exit 1; nono's own failure also exits 1 and prints `nono: …`.

@@ -12,6 +12,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::common::{
     Cond, DAEMON_PORT, DesiredError, JobOutcome, MANAGER, OperatorConfig, claim, conditions,
@@ -22,10 +23,19 @@ use super::names;
 use crate::api::{Daemon, DaemonStatus};
 use crate::pki::Issued;
 
-/// On a certificate's Secret: when it expires, unix seconds. On the
-/// daemon's pod template: its serving certificate's, so a renewal rolls
-/// the pod (the daemon reads its certificate at start).
+/// On a certificate's Secret: when it expires, unix seconds.
 pub const NOT_AFTER_ANNOTATION: &str = "balerix.ai/not-after";
+
+/// On the daemon's pod template: `serving_cert_hash` of its serving
+/// certificate, so any reissue rolls the pod (the daemon reads its
+/// certificate at start). Not the expiry: two issued in one second share
+/// it (#142).
+pub const SERVING_CERT_ANNOTATION: &str = "balerix.ai/serving-cert";
+
+/// sha256 of the serving certificate's PEM, hex.
+pub fn serving_cert_hash(cert_pem: &str) -> String {
+    hex::encode(Sha256::digest(cert_pem.as_bytes()))
+}
 
 /// What the controller minted or read back for one Daemon.
 pub struct Material<'a> {
@@ -155,7 +165,7 @@ pub fn daemon_secrets(
 pub fn daemon_objects(
     daemon: &Daemon,
     cfg: &OperatorConfig,
-    serving_not_after: i64,
+    serving_cert_pem: &str,
 ) -> Result<DaemonObjects, DesiredError> {
     let (name, namespace) = name_of(daemon)?;
     let owner = owner_of(daemon)?;
@@ -207,7 +217,7 @@ pub fn daemon_objects(
                 "template": {
                     "metadata": {
                         "labels": labels,
-                        "annotations": { NOT_AFTER_ANNOTATION: serving_not_after.to_string() },
+                        "annotations": { SERVING_CERT_ANNOTATION: serving_cert_hash(serving_cert_pem) },
                     },
                     "spec": {
                         "automountServiceAccountToken": false,
@@ -454,7 +464,7 @@ mod tests {
         let long = "d".repeat(70);
         let mut d = daemon(json!({}));
         d.metadata.name = Some(long.clone());
-        let o = daemon_objects(&d, &cfg(), 1_807_776_000).unwrap();
+        let o = daemon_objects(&d, &cfg(), "SERVING CERT").unwrap();
         let set = o.statefulset.metadata.name.clone().unwrap();
         assert!(set.len() <= 52, "{set}");
         let label = names::daemon_label(&long);
@@ -489,7 +499,7 @@ mod tests {
 
     #[test]
     fn the_daemons_objects() {
-        let o = daemon_objects(&daemon(json!({})), &cfg(), 1_807_776_000).unwrap();
+        let o = daemon_objects(&daemon(json!({})), &cfg(), "SERVING CERT").unwrap();
         insta::assert_yaml_snapshot!("daemon_claims", o.claims);
         insta::assert_yaml_snapshot!("daemon_service", o.service);
         insta::assert_yaml_snapshot!("daemon_statefulset", o.statefulset);
@@ -498,12 +508,21 @@ mod tests {
             o.pool_job.metadata.name.as_deref(),
             Some("balerix-default-pool")
         );
-        // a renewed certificate rolls the pod, which reads it only at start
-        let renewed = daemon_objects(&daemon(json!({})), &cfg(), 1_815_552_000).unwrap();
-        assert_ne!(
-            serde_json::to_value(&renewed.statefulset).unwrap()["spec"]["template"]["metadata"]["annotations"],
-            serde_json::to_value(&o.statefulset).unwrap()["spec"]["template"]["metadata"]["annotations"]
+        // any other certificate rolls the pod, which reads it only at
+        // start, whatever its expiry (#142); the same one does not
+        let template = |o: &DaemonObjects| {
+            serde_json::to_value(&o.statefulset).unwrap()["spec"]["template"]["metadata"]
+                ["annotations"]
+                .clone()
+        };
+        let renewed = daemon_objects(&daemon(json!({})), &cfg(), "OTHER CERT").unwrap();
+        assert_ne!(template(&renewed), template(&o));
+        assert_eq!(
+            template(&renewed)[SERVING_CERT_ANNOTATION],
+            json!(serving_cert_hash("OTHER CERT"))
         );
+        let same = daemon_objects(&daemon(json!({})), &cfg(), "SERVING CERT").unwrap();
+        assert_eq!(template(&same), template(&o));
     }
 
     #[test]
@@ -603,7 +622,7 @@ mod tests {
     fn resources_that_are_not_resource_requirements_are_a_condition() {
         let d = daemon(json!({ "resources": { "requests": "lots" } }));
         assert!(matches!(
-            daemon_objects(&d, &cfg(), 1_807_776_000),
+            daemon_objects(&d, &cfg(), "SERVING CERT"),
             Err(DesiredError::Shape(_))
         ));
         let s = status_of(&d, Some("Bound"), 1, JobOutcome::Succeeded(String::new()));
@@ -630,7 +649,7 @@ mod tests {
 
     #[test]
     fn the_daemon_trusts_its_own_authority_for_its_plugins() {
-        let o = daemon_objects(&daemon(json!({})), &cfg(), 1_807_776_000).unwrap();
+        let o = daemon_objects(&daemon(json!({})), &cfg(), "SERVING CERT").unwrap();
         let pod = serde_json::to_value(&o.statefulset).unwrap()["spec"]["template"]["spec"].clone();
         let args = pod["containers"][0]["args"].as_array().unwrap();
         let at = args.iter().position(|a| a == "--tls-ca").expect("--tls-ca");

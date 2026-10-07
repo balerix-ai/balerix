@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use balerix_api::{AgentPhase, AgentStatus as DaemonAgentStatus};
 use balerix_operator::api::{Agent, Crew, Daemon, DaemonSpec, Fleet, FleetSpec};
+use balerix_operator::desired::daemon::{SERVING_CERT_ANNOTATION, serving_cert_hash};
 use balerix_operator::pki;
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::batch::v1::Job;
@@ -20,6 +21,23 @@ use support::{
     TestClock, expire_job, finish_job, hold_for, make_daemon_ready, namespace, reap_claim,
     reap_pod, reap_pod_uid, spawn_operator, wait_for,
 };
+
+/// What the Daemon's pod template rolls on: its serving certificate.
+fn template_cert(s: StatefulSet) -> String {
+    s.spec
+        .unwrap()
+        .template
+        .metadata
+        .unwrap()
+        .annotations
+        .unwrap()[SERVING_CERT_ANNOTATION]
+        .clone()
+}
+
+/// `template_cert`'s value for the serving certificate in `tls`.
+fn cert_of(tls: &Secret) -> String {
+    serving_cert_hash(std::str::from_utf8(&tls.data.as_ref().unwrap()["tls.crt"].0).unwrap())
+}
 
 fn daemon_spec() -> DaemonSpec {
     serde_json::from_value(serde_json::json!({
@@ -98,7 +116,8 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
     );
     let tls = secrets.get("balerix-default-tls").await.unwrap();
     assert_eq!(tls.type_.as_deref(), Some("kubernetes.io/tls"));
-    let not_after: i64 = tls.metadata.annotations.as_ref().unwrap()["balerix.ai/not-after"]
+    // the Secret keeps the expiry the renewal check reads
+    let _: i64 = tls.metadata.annotations.as_ref().unwrap()["balerix.ai/not-after"]
         .parse()
         .unwrap();
     let admin = secrets.get("balerix-default-admin").await.unwrap();
@@ -129,19 +148,7 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
     let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
     claims.get("balerix-default-state").await.unwrap();
     claims.get("balerix-default-shared").await.unwrap();
-    assert_eq!(
-        sts.spec
-            .as_ref()
-            .unwrap()
-            .template
-            .metadata
-            .as_ref()
-            .unwrap()
-            .annotations
-            .as_ref()
-            .unwrap()["balerix.ai/not-after"],
-        not_after.to_string()
-    );
+    assert_eq!(template_cert(sts.clone()), cert_of(&tls));
 
     let status = wait_for("status", Duration::from_secs(10), || async {
         daemons
@@ -208,15 +215,7 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
                 .get("balerix-default")
                 .await
                 .unwrap();
-            (s.spec
-                .unwrap()
-                .template
-                .metadata
-                .unwrap()
-                .annotations
-                .unwrap()["balerix.ai/not-after"]
-                == renewed.0.to_string())
-            .then_some(())
+            (template_cert(s) == cert_of(&renewed.1)).then_some(())
         },
     )
     .await;
@@ -259,8 +258,6 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
         },
     )
     .await;
-    let reissued_not_after =
-        reissued.metadata.annotations.as_ref().unwrap()["balerix.ai/not-after"].clone();
     wait_for(
         "the pod template to follow",
         Duration::from_secs(60),
@@ -269,15 +266,7 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
                 .get("balerix-default")
                 .await
                 .unwrap();
-            (s.spec
-                .unwrap()
-                .template
-                .metadata
-                .unwrap()
-                .annotations
-                .unwrap()["balerix.ai/not-after"]
-                == reissued_not_after)
-                .then_some(())
+            (template_cert(s) == cert_of(&reissued)).then_some(())
         },
     )
     .await;
@@ -346,25 +335,15 @@ async fn a_serving_certificate_the_authority_cannot_verify_is_reissued() {
         },
     )
     .await;
-    let not_after = reissued.metadata.annotations.as_ref().unwrap()["balerix.ai/not-after"].clone();
-    assert_ne!(
-        not_after,
-        tls.metadata.annotations.as_ref().unwrap()["balerix.ai/not-after"]
-    );
+    // the roll follows the certificate, not its expiry: a reissue in the
+    // same second as its predecessor shares its not-after (#142)
+    assert_ne!(cert_of(&reissued), cert_of(&tls));
     wait_for(
         "the pod template to roll",
         Duration::from_secs(60),
         || async {
             let s = statefulsets.get("balerix-default").await.unwrap();
-            (s.spec
-                .unwrap()
-                .template
-                .metadata
-                .unwrap()
-                .annotations
-                .unwrap()["balerix.ai/not-after"]
-                == not_after)
-                .then_some(())
+            (template_cert(s) == cert_of(&reissued)).then_some(())
         },
     )
     .await;
@@ -426,7 +405,7 @@ async fn a_ca_secret_whose_key_is_not_its_certificates_is_reminted_once() {
     assert_ne!(new_crt, other.cert_pem);
     let now = clock.clock()();
     let names = pki::daemon_names(&ns, "default");
-    let not_after = wait_for(
+    let cert = wait_for(
         "a serving certificate from the new authority in the pod template",
         Duration::from_secs(60),
         || async {
@@ -434,18 +413,9 @@ async fn a_ca_secret_whose_key_is_not_its_certificates_is_reminted_once() {
             if !pki::verifies(&new_crt, &text(&tls, "tls.crt"), &names[0], now) {
                 return None;
             }
-            let not_after = tls.metadata.annotations.unwrap()["balerix.ai/not-after"].clone();
+            let cert = cert_of(&tls);
             let template = statefulsets.get("balerix-default").await.unwrap();
-            (template
-                .spec
-                .unwrap()
-                .template
-                .metadata
-                .unwrap()
-                .annotations
-                .unwrap()["balerix.ai/not-after"]
-                == not_after)
-                .then_some(not_after)
+            (template_cert(template) == cert).then_some(cert)
         },
     )
     .await;
@@ -456,15 +426,7 @@ async fn a_ca_secret_whose_key_is_not_its_certificates_is_reminted_once() {
         || async {
             let ca = secrets.get("balerix-default-ca").await.unwrap();
             let template = statefulsets.get("balerix-default").await.unwrap();
-            let rolled = template
-                .spec
-                .unwrap()
-                .template
-                .metadata
-                .unwrap()
-                .annotations
-                .unwrap()["balerix.ai/not-after"]
-                != not_after;
+            let rolled = template_cert(template) != cert;
             (text(&ca, "ca.crt") != new_crt || rolled).then_some(())
         },
     )

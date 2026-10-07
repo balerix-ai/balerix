@@ -764,6 +764,19 @@ fn pane(label: &str, body: &str) -> Option<Pane> {
     };
     r.ensure_crew(&id.crew_ref()).unwrap();
     r.ensure_agent(&id, &plan).unwrap();
+    // a body with a trap marks when it is installed: a stop sent before
+    // would find the shell's default hangup (#137)
+    if body.contains(": >ready") {
+        let ready = plan.cwd.join("ready");
+        let t = Instant::now();
+        while !ready.exists() {
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "the pane never set its trap"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     Some(Pane {
         r,
         id,
@@ -782,7 +795,10 @@ fn running_pid(p: &Pane) -> u32 {
 
 /// A pane process that takes half a second to die after the hangup: a
 /// stand-in for the supervisor emptying its tree.
-const SLOW_TO_DIE: &str = "trap 'sleep 0.5; exit 0' HUP\nwhile :; do sleep 0.1; done";
+const SLOW_TO_DIE: &str = "trap 'sleep 0.5; exit 0' HUP\n: >ready\nwhile :; do sleep 0.1; done";
+
+/// A pane process that ignores the hangup: it outlives any stop bound.
+const IGNORES_HUP: &str = "trap '' HUP\n: >ready\nwhile :; do sleep 0.2; done";
 
 /// Spec N amendment §13.5: `stop_agent` returns when the pane's process
 /// is gone, not when tmux has dropped the window.
@@ -882,7 +898,7 @@ fn a_restart_waits_for_the_old_pane_process() {
 /// NS-12: past the bound the call fails and names the pid.
 #[test]
 fn a_pane_process_that_ignores_the_hangup_fails_the_stop_after_the_bound() {
-    let Some(mut p) = pane("stopbound", "trap '' HUP\nwhile :; do sleep 0.2; done") else {
+    let Some(mut p) = pane("stopbound", IGNORES_HUP) else {
         return;
     };
     p.r.stop_wait = Duration::from_millis(300);

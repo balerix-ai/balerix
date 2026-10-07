@@ -287,6 +287,18 @@ pub async fn world_with(extra: &[(&str, &str)]) -> World {
 /// appended under the entry, four-space indented (`"    fleetDefaults:
 /// { env: { A: b } }\n"`), or "".
 pub async fn world_with_entries(extra: &[(&str, &str, &str)]) -> World {
+    world_full(extra, None).await
+}
+
+/// `world`, its listener's receive buffer set to `bytes` (inherited by
+/// every accepted connection): the kernel cannot absorb a body the server
+/// leaves unread, so a client that writes all of it sees what the server
+/// did with it (#116).
+pub async fn world_with_recv_buffer(bytes: u32) -> World {
+    world_full(&[], Some(bytes)).await
+}
+
+async fn world_full(extra: &[(&str, &str, &str)], recv_buffer: Option<u32>) -> World {
     let h = Harness::new(Duration::from_secs(3600));
     let dir = tempfile::tempdir().unwrap();
     write_plugin_package(
@@ -317,7 +329,12 @@ pub async fn world_with_entries(extra: &[(&str, &str, &str)]) -> World {
     // A test may want the failure itself; the ones that need plugins up
     // call `start_silent`, which fails loudly if they are not.
     let _ = daemon.sync_plugins().await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    if let Some(bytes) = recv_buffer {
+        socket.set_recv_buffer_size(bytes).unwrap();
+    }
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(1024).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (stop, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(serve(listener, router(daemon.clone()), async {

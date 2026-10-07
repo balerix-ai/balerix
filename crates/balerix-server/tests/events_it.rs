@@ -524,7 +524,9 @@ async fn an_over_cap_send_text_is_a_400_naming_the_field_and_types_nothing() {
 /// the answer comes at once, without reading the body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_limited_route_answers_a_client_that_sends_the_whole_body() {
-    let w = world().await;
+    // A small receive buffer: without the drain, the bytes the server
+    // leaves unread cannot sit in the kernel and the client's write fails.
+    let w = support::world_with_recv_buffer(4096).await;
     let (_plugin, host) = start_flow(&w).await;
     let (s, _) = w.api.admin(
         "POST",

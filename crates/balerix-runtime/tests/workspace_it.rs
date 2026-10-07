@@ -9,6 +9,9 @@ use balerix_runtime::Workspace;
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
+        // no detached auto-maintenance: it writes and removes lock files
+        // under objects/ while a test's scan reads them (#136)
+        .args(["-c", "maintenance.auto=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "t")

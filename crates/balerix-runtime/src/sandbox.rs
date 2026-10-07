@@ -100,10 +100,16 @@ pub fn render_profile(
         // Written, not left to nono's default: the agent supervisor sits
         // outside the sandbox as the same user, and an agent that could
         // signal it would orphan its own tree out of `stop`'s reach
-        // (Spec N amendment §13.6, #118). Explicit so that a profile the
-        // user block `extends` cannot loosen it either; the key itself is
-        // refused in the user block (`check_conflicts`).
+        // (Spec N amendment §13.6, #118). The top-level key beats a
+        // profile the user block `extends`, but nono applies the parent's
+        // `platform_overrides` for the running OS after that, so the
+        // per-OS patches pin it too. The key is refused in the user block
+        // at both levels (`check_conflicts`).
         "security": { "signal_mode": "isolated" },
+        "platform_overrides": {
+            "linux": { "security": { "signal_mode": "isolated" } },
+            "macos": { "security": { "signal_mode": "isolated" } },
+        },
     });
     Ok(merge_profile(base, user))
 }
@@ -630,6 +636,14 @@ mod tests {
             p["security"],
             json!({ "signal_mode": "isolated" }),
             "pinned, not left to nono's default: the supervisor outside must not be signalled (#118)"
+        );
+        assert_eq!(
+            p["platform_overrides"],
+            json!({
+                "linux": { "security": { "signal_mode": "isolated" } },
+                "macos": { "security": { "signal_mode": "isolated" } },
+            }),
+            "an `extends` parent's per-OS override is applied after the top level"
         );
         assert_eq!(
             p["network"],

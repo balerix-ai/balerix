@@ -260,9 +260,16 @@ fn a_user_block_cannot_loosen_signal_isolation() {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
     assert_eq!(signal(&pinned), "signal-denied");
-    let loosened = balerix_runtime::merge_profile(pinned, &loosen);
+    // the per-OS pin outlasts a top-level loosening merged by hand, as it
+    // outlasts an `extends` parent's
+    let top_only = balerix_runtime::merge_profile(pinned.clone(), &loosen);
+    assert_eq!(signal(&top_only), "signal-denied");
+    let both = serde_json::json!({
+        "security": { "signal_mode": "allow_all" },
+        "platform_overrides": { "linux": { "security": { "signal_mode": "allow_all" } } },
+    });
     assert_eq!(
-        signal(&loosened),
+        signal(&balerix_runtime::merge_profile(pinned, &both)),
         "SIGNALLED",
         "without the refusal the block would reach the supervisor"
     );

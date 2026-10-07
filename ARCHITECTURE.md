@@ -276,7 +276,9 @@ makes an existing remote branch its clone's branch and start point
   (allowed) for the fleet's `sandbox.network` to tighten, and still holds under
   a user `block: true`, so hooks keep flowing when egress is cut off.
 - **Signal isolation is pinned, not inherited.** The agent and plugin
-  profiles write `security.signal_mode: isolated` and refuse the key in the
+  profiles write `security.signal_mode: isolated`, at the top level and
+  in `platform_overrides.{linux,macos}` (an `extends` parent's per-OS
+  override is applied after the top level), and refuse the key in the
   `sandbox` block, at the top level and under `platform_overrides.<os>`
   (nono applies those after `extends`): `agent-supervise` sits outside the
   sandbox as the same user, and an agent that could kill it would orphan

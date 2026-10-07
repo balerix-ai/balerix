@@ -232,11 +232,17 @@ pub fn write_git_profile(
     let profile = render_git_profile(&agent_id, paths, crew, &tools.git, &exec_path, git_read);
     let path = paths.git_profile.clone();
     if write_profile_at(&agent_id, &path, &profile)? {
+        // nono's state stays out of the agent's own `nono/` (#108)
+        let home = crate::workspace::ScratchHome::new(paths).map_err(|e| MaterializeError::Io {
+            id: id.to_string(),
+            path: paths.nono_home.clone(),
+            message: format!("cannot create nono's home beside it: {e}"),
+        })?;
         validate_profile_at(
             tools,
             &agent_id,
             &path,
-            &paths.nono_home,
+            home.path(),
             &paths.logs.join("nono.validate.log"),
         )?;
     }

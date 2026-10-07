@@ -2364,7 +2364,7 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
     assert_eq!(profile["network"]["block"], true);
 
     let log = std::fs::read_to_string(crew.root.join("logs/git.log")).unwrap();
-    let profile_arg = format!("run --profile {}", paths.git_profile.display());
+    let profile_arg = format!("run --no-audit --profile {}", paths.git_profile.display());
     let in_clone: Vec<&str> = log
         .lines()
         .filter(|l| l.starts_with("$ ") && l.contains(&paths.workspace.display().to_string()))
@@ -2381,6 +2381,17 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
         log.contains("--upload-pack=env -i ") && log.contains("upload-pack --strict"),
         "{log}"
     );
+    // nono's per-run state went to temp homes, all removed (#108)
+    assert!(
+        !paths.nono_home.join(".local/state/nono").exists(),
+        "nono wrote state into the agent's own nono home"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&paths.root)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".nono-git-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
 /// Review focus 1: the `--upload-pack` string is run by a shell, and the

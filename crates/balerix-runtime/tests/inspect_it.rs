@@ -532,6 +532,23 @@ fn the_reader_runs_git_under_the_git_profile() {
     std::fs::remove_file(w.join("README")).unwrap();
     std::os::unix::fs::symlink("LICENSE", w.join("README")).unwrap();
 
+    let files_under = |dir: &Path| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                out.push(e.path().display().to_string());
+                if e.file_type().unwrap().is_dir() {
+                    stack.push(e.path());
+                }
+            }
+        }
+        out.sort();
+        out
+    };
+    let nono_before = files_under(&paths.nono_home);
+    let root_before = files_under(&paths.root);
+
     let rt = Runtime::new(layout.clone(), tools.clone());
     let d = rt.diff(&id, "origin/main").unwrap();
     let names: Vec<&str> = d.files.iter().map(|f| f.path.as_str()).collect();
@@ -565,8 +582,32 @@ fn the_reader_runs_git_under_the_git_profile() {
     );
     rt.version(&id, "origin/main").unwrap();
 
+    // nono's per-run state goes to a per-call home that is removed again:
+    // nothing new under the agent's own nono home (its live session's),
+    // and no temp home left beside it. The profile and the logs are the
+    // only new files.
+    assert_eq!(files_under(&paths.nono_home), nono_before);
+    let new_files: Vec<String> = files_under(&paths.root)
+        .into_iter()
+        .filter(|f| !root_before.contains(f))
+        .collect();
+    let expected = [
+        paths.git_profile.clone(),
+        paths.logs.clone(),
+        paths.logs.join("nono-git.log"),
+        paths.logs.join("nono.validate.log"),
+        paths.nono_home.clone(),
+    ];
+    for f in &new_files {
+        assert!(
+            expected.iter().any(|e| e.display().to_string() == *f),
+            "{f} is new (a temp home left behind?): {new_files:#?}"
+        );
+    }
+
     let log = std::fs::read_to_string(&log_path).unwrap();
-    let profile_arg = format!("run --profile {}", paths.git_profile.display());
+    // no audit trail per call either (#108)
+    let profile_arg = format!("run --no-audit --profile {}", paths.git_profile.display());
     let calls: Vec<&str> = log.lines().filter(|l| l.starts_with("$ ")).collect();
     assert_eq!(
         calls.len(),

@@ -346,7 +346,9 @@ fn system_prefixes() -> String {
 
 /// `nono`'s arguments up to and including the git binary, for a git
 /// call in `agent`'s existing clone: `-s --log-file <logs>/nono-git.log
-/// run --profile <git profile> -- <git>`. The profile is
+/// run --no-audit --profile <git profile> -- <git>`. No audit trail: one
+/// per call, at the web plugin's poll, would grow nono's state without
+/// bound (the session record `--no-audit` keeps goes to a `ScratchHome`). The profile is
 /// `sandbox::render_git_profile`; `write_git_profile` must have run.
 fn sandbox_args(tools: &ToolPaths, agent: &AgentPaths) -> Vec<String> {
     vec![
@@ -354,11 +356,58 @@ fn sandbox_args(tools: &ToolPaths, agent: &AgentPaths) -> Vec<String> {
         "--log-file".into(),
         agent.logs.join("nono-git.log").display().to_string(),
         "run".into(),
+        "--no-audit".into(),
         "--profile".into(),
         agent.git_profile.display().to_string(),
         "--".into(),
         tools.git.display().to_string(),
     ]
+}
+
+/// nono's `$HOME` for one daemon call under the git profile: a fresh
+/// directory beside the agent's `nono/`, removed when the guard drops,
+/// success or failure. nono writes a session record under `$HOME` on every
+/// `run` (`.local/state/nono/sessions/`), even with `--no-audit`; in the
+/// agent's own `nono/`, where its live session's record also is, those
+/// could not be swept without risking that one. nono writes it as the
+/// supervisor, outside the sandbox, so the profile grants nothing on it;
+/// git inside sees no `HOME` at all (`deny_vars`), as before, so no
+/// global config either way.
+pub(crate) struct ScratchHome(PathBuf);
+
+impl ScratchHome {
+    pub(crate) fn new(agent: &AgentPaths) -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = agent
+            .nono_home
+            .parent()
+            .unwrap_or(&agent.nono_home)
+            .to_path_buf();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or_default();
+        let path = parent.join(format!(
+            ".nono-git-{}-{}-{nanos}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // `create_dir`, not `create_dir_all`: a name already there is
+        // someone else's, never reused
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// What `sandboxed_git` writes to the crew's `git.log`.
@@ -413,9 +462,18 @@ pub(crate) fn sandboxed_git(
     log: GitLog,
 ) -> Result<CmdOutput, GitFailure> {
     let log_file = crew.logs.join("git.log");
+    let home = ScratchHome::new(agent).map_err(|e| GitFailure {
+        subcommand: String::new(),
+        args: Vec::new(),
+        stderr: format!(
+            "cannot create nono's home beside {}: {e}",
+            agent.nono_home.display()
+        ),
+        unanswered: None,
+    })?;
     let cmd = Cmd::new(&tools.nono)
         .env_clear()
-        .env("HOME", agent.nono_home.display().to_string())
+        .env("HOME", home.path().display().to_string())
         .env("PATH", outer_path(tools));
     let cmd = match log {
         GitLog::Full => cmd.log(&log_file),
@@ -773,9 +831,12 @@ impl Workspace<'_> {
         let mut args = sandbox_args(self.tools, agent);
         args.pop();
         args.push("/bin/true".into());
+        let Ok(home) = ScratchHome::new(agent) else {
+            return false;
+        };
         Cmd::new(&self.tools.nono)
             .env_clear()
-            .env("HOME", agent.nono_home.display().to_string())
+            .env("HOME", home.path().display().to_string())
             .env("PATH", outer_path(self.tools))
             .args(args)
             .run()
@@ -1074,9 +1135,15 @@ impl Workspace<'_> {
         }
         // Run by a shell on the fetch's serving side: every word quoted.
         // `env -i` for the same reason `agent_git` clears its environment.
+        // `home` lives until the fetch below has returned.
+        let home = ScratchHome::new(agent).map_err(|e| MaterializeError::Io {
+            id: id.to_string(),
+            path: agent.nono_home.clone(),
+            message: format!("cannot create nono's home beside it: {e}"),
+        })?;
         let mut upload_pack = format!(
             "--upload-pack=env -i HOME={} PATH={} {}",
-            sh_quote(&agent.nono_home.display().to_string()),
+            sh_quote(&home.path().display().to_string()),
             sh_quote(&outer_path(self.tools)),
             sh_quote(&self.tools.nono.display().to_string()),
         );
@@ -1086,21 +1153,24 @@ impl Workspace<'_> {
         }
         upload_pack.push_str(" upload-pack --strict");
         before_fetch();
-        self.git(
-            id,
-            crew,
-            &[
-                "-C",
-                &crew.repo.display().to_string(),
-                "fetch",
-                "--quiet",
-                "--no-auto-gc",
-                &upload_pack,
-                &file_url(&agent.workspace.join(".git")),
-                &format!("+{refname}:{refname}"),
-            ],
-        )
-        .map(|_| true)
+        let fetched = self
+            .git(
+                id,
+                crew,
+                &[
+                    "-C",
+                    &crew.repo.display().to_string(),
+                    "fetch",
+                    "--quiet",
+                    "--no-auto-gc",
+                    &upload_pack,
+                    &file_url(&agent.workspace.join(".git")),
+                    &format!("+{refname}:{refname}"),
+                ],
+            )
+            .map(|_| true);
+        drop(home);
+        fetched
     }
 
     fn record_branch(id: &str, agent: &AgentPaths, branch: &str) -> Result<(), MaterializeError> {

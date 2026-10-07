@@ -267,7 +267,11 @@ credentials, hook input, or sandbox rules.
   and runs inside `nono run --profile nono-git-profile.json` from an empty
   environment. Its hardening variables live in that profile's `set_vars`
   (`sandbox::render_git_profile`), not on the command: nono drops every
-  other variable. Each call is a sandbox start (about 55 ms idle, far
+  other variable. Each call runs `--no-audit` with `HOME` a fresh
+  `.nono-git-*` directory beside the agent's `nono/`, removed when the
+  call ends (`workspace::ScratchHome`): nono writes a session record per
+  `run` under `$HOME`, and the agent's own `nono/` holds its live
+  session's, so those could never be swept there. Each call is a sandbox start (about 55 ms idle, far
   more on a loaded host), so the reader's `version` is four calls and its
   `diff` one combined `git diff -U3` split per file (`split_patch`), plus
   one `--no-index` per untracked file; keep it that way. Tests that run git in an existing

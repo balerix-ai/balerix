@@ -2838,6 +2838,37 @@ mod tests {
         );
     }
 
+    /// #48: past `SENT_GRACE` a reply is pointed at the terminal, and a
+    /// `skip` whose Escape fails leaves the question `Sent`: `Open` would
+    /// let the next comment count rows from an unknown cursor.
+    #[tokio::test]
+    async fn a_failed_late_skip_stays_sent() {
+        use balerix_plugin_common::pending::Stage;
+        use balerix_plugin_common::question::fixtures::{color, input};
+        let (fake, port, mut a) = started().await;
+        a.handle(Command::Events(vec![during(
+            "PreToolUse",
+            json!({ "tool_name": "AskUserQuestion", "tool_input": input(&[color()]) }),
+        )]))
+        .await;
+        a.handle(comment(12, "alice", 20, "3")).await;
+        let sent = a.questions.get(AGENT).unwrap().stage.clone();
+        assert!(matches!(sent, Stage::Sent { .. }), "{sent:?}");
+        tick_after(&mut a, Duration::from_secs(31)).await;
+        port.take_calls();
+        let before = fake.actions_for(AGENT).len();
+        a.handle(comment(12, "alice", 21, "2")).await;
+        assert!(
+            comments(&port.calls())[0].1.contains("may not have landed"),
+            "{:?}",
+            comments(&port.calls())
+        );
+        assert_eq!(fake.actions_for(AGENT).len(), before, "no second plan");
+        fake.fail_actions(Some("window gone"));
+        a.handle(comment(12, "alice", 22, "skip")).await;
+        assert_eq!(a.questions.get(AGENT).unwrap().stage, sent);
+    }
+
     /// A PR session on acme/api#34 with one inline comment on review 9,
     /// the way the review tests need it.
     const PR_AGENT: &str = "gh-acme-api/repo/pr-34";

@@ -335,9 +335,8 @@ fn first_symlink_with(
     root: &Path,
     mut lstat: impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
 ) -> Result<Option<PathBuf>, (PathBuf, std::io::Error)> {
-    let vanished = |path: &Path, e: &std::io::Error| {
-        path != root && e.kind() == std::io::ErrorKind::NotFound
-    };
+    let vanished =
+        |path: &Path, e: &std::io::Error| path != root && e.kind() == std::io::ErrorKind::NotFound;
     let mut todo = vec![root.to_path_buf()];
     while let Some(path) = todo.pop() {
         let meta = match lstat(&path) {

@@ -98,6 +98,19 @@ struct Inner {
     order: Vec<AgentName>,
     plugins: BTreeMap<AgentName, PluginInfo>,
     rows: BTreeMap<(AgentId, AgentName), ActivationRow>,
+    /// Every accepted `hello` takes the next number; never reset, so a
+    /// generation is newer than every one handed out before it, whatever
+    /// syncs happened in between (#12).
+    hello_seq: u64,
+    hellos: BTreeMap<AgentName, u64>,
+}
+
+impl Inner {
+    fn next_hello(&mut self, name: &AgentName) -> u64 {
+        self.hello_seq += 1;
+        self.hellos.insert(name.clone(), self.hello_seq);
+        self.hello_seq
+    }
 }
 
 #[derive(Default)]
@@ -144,13 +157,23 @@ impl PluginRegistry {
         w.rows.retain(|(_, p), _| names.contains(p));
     }
 
-    pub fn set_listen(&self, name: &AgentName, listen: String, token: String) {
-        if let Some(p) = self.write().plugins.get_mut(name) {
+    /// A `hello`: where the plugin listens, ready. Returns the hello's
+    /// generation (`hello_generation`).
+    pub fn set_listen(&self, name: &AgentName, listen: String, token: String) -> u64 {
+        let mut w = self.write();
+        let generation = w.next_hello(name);
+        if let Some(p) = w.plugins.get_mut(name) {
             p.listen = Some(listen);
             p.token = Some(token);
             p.ready = true;
             p.degraded = None;
         }
+        generation
+    }
+
+    /// The generation of the plugin's newest `hello`; `0` before its first.
+    pub fn hello_generation(&self, name: &AgentName) -> u64 {
+        self.read().hellos.get(name).copied().unwrap_or(0)
     }
 
     /// Spec O §23.2: the operator's list. Every entry is registered at once
@@ -192,7 +215,9 @@ impl PluginRegistry {
         url: String,
         token: String,
     ) {
-        if let Some(p) = self.write().plugins.get_mut(name) {
+        let mut w = self.write();
+        w.next_hello(name);
+        if let Some(p) = w.plugins.get_mut(name) {
             p.manifest = manifest;
             p.listen = Some(url);
             p.token = Some(token);

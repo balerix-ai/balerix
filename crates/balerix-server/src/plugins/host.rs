@@ -25,7 +25,7 @@ use super::manifest::read_manifest;
 use super::materializer::{NullStore, PluginMaterializer};
 use super::package;
 use super::registry::PluginRegistry;
-use crate::actor::{self, FleetHandle, Msg, Ports, READY_EVENT, Shared};
+use crate::actor::{self, FleetHandle, Msg, Ports, Shared};
 use crate::daemon::DaemonError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +57,55 @@ async fn wait_until_stopped(
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Ok(()),
             Err(_) => return Err(()),
+        }
+    }
+}
+
+/// The way down: a plugin that exits, restarts or is removed stops being
+/// called.
+///
+/// `hello` sets `ready` synchronously and only then tells the actor, so a
+/// record can predate a `hello` that already marked the plugin ready, and
+/// taking readiness back on one of those would silence a plugin that is
+/// up. `watch` also coalesces publishes, so a `Ready` record and the death
+/// after it can arrive as one observation of the death (#12). Neither
+/// depends on what this loop saw before: the actor stamps each agent's
+/// status with the generation of the newest `hello` it has taken
+/// (`Msg::PluginHello`, in the same publish that makes it `Ready`), and a
+/// record whose phase is anything but `Ready` takes readiness back only
+/// when that stamp is at least the registry's current generation — i.e.
+/// the record is newer than the plugin's last `hello`. A plugin the record
+/// no longer holds is judged by the stamp it last carried here.
+async fn mirror_readiness(mut rx: watch::Receiver<FleetRecord>, reg: Arc<PluginRegistry>) {
+    let mut stamps: BTreeMap<AgentName, u64> = BTreeMap::new();
+    loop {
+        {
+            let record = rx.borrow_and_update();
+            let mut seen = BTreeSet::new();
+            for (id, st) in &record.status.agents {
+                let Ok(id) = id.parse::<AgentId>() else {
+                    continue;
+                };
+                seen.insert(id.agent.clone());
+                stamps.insert(id.agent.clone(), st.plugin_hello);
+                if st.phase == AgentPhase::Ready {
+                    reg.set_ready(&id.agent, true);
+                } else if st.plugin_hello >= reg.hello_generation(&id.agent) {
+                    reg.set_ready(&id.agent, false);
+                }
+            }
+            stamps.retain(|name, stamp| {
+                if seen.contains(name) {
+                    return true;
+                }
+                if *stamp >= reg.hello_generation(name) {
+                    reg.set_ready(name, false);
+                }
+                false
+            });
+        }
+        if rx.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -99,44 +148,7 @@ impl PluginHost {
         let name = RESERVED_FLEET.parse().unwrap_or_else(|_| unreachable!());
         let record = FleetRecord::new(plugin_fleet(&[]).into());
         let handle = actor::spawn(name, record, FleetSecrets::default(), ports, shared, false);
-        // The way down: a plugin that exits, restarts or is removed stops
-        // being called. Only *transitions* count — a record the actor
-        // publishes can still predate a `hello` that already marked the
-        // plugin ready (the `hello` event reaches the actor behind the
-        // pass), and taking readiness back on one of those would silence
-        // a plugin that is up.
-        let mut rx = handle.status.clone();
-        let reg = registry.clone();
-        tokio::spawn(async move {
-            let mut ready: BTreeSet<AgentName> = BTreeSet::new();
-            loop {
-                {
-                    let record = rx.borrow_and_update();
-                    let mut seen = BTreeSet::new();
-                    for (id, st) in &record.status.agents {
-                        let Ok(id) = id.parse::<AgentId>() else {
-                            continue;
-                        };
-                        seen.insert(id.agent.clone());
-                        if st.phase == AgentPhase::Ready {
-                            reg.set_ready(&id.agent, true);
-                            ready.insert(id.agent);
-                        } else if ready.remove(&id.agent) {
-                            reg.set_ready(&id.agent, false);
-                        }
-                    }
-                    // A plugin the record no longer holds is gone too.
-                    let gone: Vec<AgentName> = ready.difference(&seen).cloned().collect();
-                    for name in gone {
-                        ready.remove(&name);
-                        reg.set_ready(&name, false);
-                    }
-                }
-                if rx.changed().await.is_err() {
-                    return;
-                }
-            }
-        });
+        tokio::spawn(mirror_readiness(handle.status.clone(), registry.clone()));
         Arc::new(Self {
             config,
             materializer,
@@ -303,13 +315,14 @@ impl PluginHost {
                 "hello.listen: must be a loopback address".into(),
             ));
         }
-        self.registry
+        let generation = self
+            .registry
             .set_listen(name, req.listen.clone(), token.to_string());
         self.handle
             .tx
-            .send(Msg::Event {
+            .send(Msg::PluginHello {
                 agent: plugin.id(),
-                name: READY_EVENT.into(),
+                generation,
                 at: self.clock.now(),
             })
             .await
@@ -472,5 +485,73 @@ mod tests {
             wait_until_stopped(&mut rx, id, Duration::from_millis(50)).await,
             Ok(())
         );
+    }
+
+    /// The plugin agent `balerix/plugins/hello` in `phase`, its record
+    /// stamped with the `hello` generation the actor last took.
+    fn plugin_record(phase: Option<AgentPhase>, hello: u64) -> FleetRecord {
+        let id = "balerix/plugins/hello";
+        let mut record = record_with(phase.map(|_| id));
+        if let Some(phase) = phase {
+            let a = record.status.entry(id);
+            a.phase = phase;
+            a.plugin_hello = hello;
+        }
+        record
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    async fn ready_becomes(reg: &PluginRegistry, name: &AgentName, want: bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reg.plugin(name).is_some_and(|p| p.ready) != want {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("ready never became {want}"));
+    }
+
+    /// #12: `watch` coalesces publishes, so the watcher can see a plugin
+    /// dead without ever having seen it `Ready`. A terminal record that
+    /// carries the newest `hello` takes readiness back; one that predates
+    /// the newest `hello` (a restarted plugin that already said hello
+    /// again) does not.
+    #[tokio::test]
+    async fn a_dead_plugin_seen_only_after_a_coalesced_ready_is_not_ready() {
+        let reg = PluginRegistry::new();
+        let name: AgentName = "hello".parse().unwrap();
+        reg.declare(&[(name.clone(), serde_json::json!({}))], &[]);
+        let g1 = reg.set_listen(&name, "127.0.0.1:1".into(), "t".into());
+        assert!(reg.plugin(&name).unwrap().ready);
+        // Ready (stamped g1), then Dead: only the Dead is ever observed.
+        let (tx, rx) = watch::channel(plugin_record(Some(AgentPhase::Dead), g1));
+        tokio::spawn(mirror_readiness(rx, reg.clone()));
+        ready_becomes(&reg, &name, false).await;
+
+        // A new process said hello (g2) before the actor published past
+        // the old death: that record must not silence it.
+        let g2 = reg.set_listen(&name, "127.0.0.1:2".into(), "t".into());
+        assert!(g2 > g1);
+        tx.send_replace(plugin_record(Some(AgentPhase::Dead), g1));
+        settle().await;
+        assert!(reg.plugin(&name).unwrap().ready, "a stale death is ignored");
+        tx.send_replace(plugin_record(Some(AgentPhase::Starting), g1));
+        settle().await;
+        assert!(reg.plugin(&name).unwrap().ready);
+
+        // The actor took g2 and the plugin died again; coalesced again.
+        tx.send_replace(plugin_record(Some(AgentPhase::Stopped), g2));
+        ready_becomes(&reg, &name, false).await;
+
+        // Ready then gone from the record, coalesced into the removal.
+        let g3 = reg.set_listen(&name, "127.0.0.1:3".into(), "t".into());
+        tx.send_replace(plugin_record(Some(AgentPhase::Ready), g3));
+        settle().await;
+        assert!(reg.plugin(&name).unwrap().ready);
+        tx.send_replace(plugin_record(None, 0));
+        ready_becomes(&reg, &name, false).await;
     }
 }

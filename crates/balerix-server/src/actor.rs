@@ -59,6 +59,14 @@ pub enum Msg {
         name: String,
         at: Timestamp,
     },
+    /// A plugin's accepted `hello` (plugin fleet only): `READY_EVENT` for
+    /// its agent, and the hello's generation stamped on the agent's
+    /// status in the same publish (#12).
+    PluginHello {
+        agent: AgentId,
+        generation: u64,
+        at: Timestamp,
+    },
     /// Spec O §7.2: a sidecar's `status` frame; the Daemon mirrors it.
     /// `first` marks a link's first frame (a connect or a reconnect), the
     /// only one reconciled against the stopped set.
@@ -274,6 +282,16 @@ impl Actor {
                     let _ = reply.send(self.record.clone());
                 }
                 Some(Msg::Event { agent, name, at }) => self.event(agent, name, at).await,
+                Some(Msg::PluginHello {
+                    agent,
+                    generation,
+                    at,
+                }) => {
+                    if let Some(a) = self.record.status.agents.get_mut(&agent.to_string()) {
+                        a.plugin_hello = a.plugin_hello.max(generation);
+                    }
+                    self.event(agent, READY_EVENT.into(), at).await;
+                }
                 Some(Msg::LinkStatus {
                     agent,
                     status,

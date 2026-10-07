@@ -188,9 +188,13 @@ nothing, commit `fallback`, react `Failed` and count `send_failed`
 (J-5: never send what the operator cannot see, never enter `Confirming` on
 a reading nobody was shown). Otherwise send `send` if any; on success
 commit `stage` (with the echo id filled in) and react `react`; on failure
-post the daemon's error, commit `fallback`, react `Failed`. `fallback` is
-`Stage::Open` everywhere but J §7.2's late `skip`, where it is the `Sent`
-the question was in (#48). Matrix's
+post the daemon's error, commit `fallback`, react `Failed`. `fallback`
+matters only on a decision that can send — a gating echo or keys — and
+is the stage the question was in before the reply: `Stage::Open` for an
+answer, a `skip` or a `yes` to a question nothing was sent to yet, and
+the `Sent` it was in for J §7.2's late `skip`, where keys have already
+landed (#48). A refusal sends nothing, and its `fallback` is simply its
+own stage. Matrix's
 `on_answer`, `deliver` and `echo_lost` collapse into that executor and its
 `question::match_reply` call moves inside `on_reply`.
 

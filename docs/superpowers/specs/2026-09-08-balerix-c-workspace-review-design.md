@@ -28,7 +28,7 @@ Where this document and the plugins spec disagree, this document wins.
 | PC-6 | **Comments are anchored by file, side and line, and each carries the diff line it was made on.** No 409 on a changed tree. | The agent is working while you review; a hard conflict would fire constantly. The quoted line lets the agent (and the reviewer after a reload) locate the comment when lines moved. |
 | PC-7 | **Drafts live in the browser; nothing is kept after submit.** `localStorage` under the agent id; cleared on a successful send. No `kv` for web. | No new capability, nothing to purge, the terminal and the activity column show what was sent. A history is a later spec if wanted. |
 | PC-8 | **The activity column is the hook event timeline**, from web observing all nine events into a per-agent ring buffer; not an embedded terminal. | Structured, PR-timeline-like, and not a keyboard into the agent from the review page. The terminal page stays one click away. |
-| PC-9 | **Event buffers are in memory only.** 500 events per agent, payloads cut at 4 KiB; a turn's text is kept apart from that cut, up to 40 000 characters (§4.1, #42). | The daemon offers no catch-up for observers (protocol §4); persisting a partial stream would promise more than it holds. |
+| PC-9 | **Event buffers are in memory only.** 500 events per agent, payloads cut at 4 KiB; a turn's text is kept apart from that cut, up to 40 000 characters (§4.1, #42). That raises the per-agent bound: 500 entries × (40 000 characters + 4 KiB) is about 22 MB when the text is ASCII and up to about 82 MB with 4-byte characters, and the first `events.json` poll (`after=0`) sends all of it. No byte budget beyond the entry count; real turns are far shorter. | The daemon offers no catch-up for observers (protocol §4); persisting a partial stream would promise more than it holds. |
 
 ## 2. The `workspace` capability
 
@@ -273,7 +273,7 @@ successful send. `localStorage` failures are caught and ignored.
 
 **The activity column** polls `events.json?after=<last seq>` every two
 seconds, appends, and keeps itself scrolled to the bottom unless the reader
-scrolled up. An entry is the time, the name and the summary, then the
+scrolled up. An entry is the time, the name and the summary — or, instead of the summary, the
 turn's `text` in full when it has one (a scrolling block, through
 `textContent` like everything else), and a `cut` badge when
 `payload_truncated` or `text_truncated` is set, so a cut entry never reads

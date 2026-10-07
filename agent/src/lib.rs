@@ -6,6 +6,7 @@
 //! says the agent is ready to launch.
 
 pub mod attach;
+mod body_limit;
 pub mod bundle;
 pub mod cli;
 pub mod hooks;

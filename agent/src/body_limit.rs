@@ -1,7 +1,8 @@
-//! Over-limit request bodies (#116): the same drain as the daemon's
-//! `balerix_server::body_limit`, for the plugin's own listener (the SDK
-//! depends on `balerix-api` only, so it keeps its own copy; so does the
-//! agent sidecar, `agent/src/body_limit.rs`).
+//! Over-limit request bodies (#116, #168): the same drain as the daemon's
+//! `balerix_server::body_limit` and the SDK's
+//! `balerix_plugin_sdk::body_limit`, for the sidecar's hook ingress.
+//! `agent/` depends on neither the server nor the SDK, so it keeps its
+//! own copy; change the three together.
 //!
 //! axum refuses a body the moment it has read past the route's
 //! `DefaultBodyLimit`, and the connection is then closed with the rest of
@@ -39,7 +40,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 
 use axum::Json;
-use balerix_api::ErrorBody;
+use serde_json::json;
 
 /// How far past a route's limit a body is still read to its end.
 pub(crate) const DRAIN_FACTOR: usize = 4;
@@ -105,7 +106,7 @@ pub(crate) async fn drain_over_limit(
         Ok(Read::PastCeiling) | Err(_) => closing(next.run(over_limit(parts, limit)).await),
         Ok(Read::Broken(e)) => {
             let error = format!("Failed to read the request body: {e}");
-            closing((StatusCode::BAD_REQUEST, Json(ErrorBody { error })).into_response())
+            closing((StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response())
         }
     }
 }

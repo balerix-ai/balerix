@@ -1,4 +1,6 @@
-//! Over-limit request bodies (#116).
+//! Over-limit request bodies (#116). The SDK
+//! (`balerix-plugin-sdk/src/body_limit.rs`) and the agent sidecar
+//! (`agent/src/body_limit.rs`) keep copies; change them together.
 //!
 //! axum refuses a body the moment it has read past the route's
 //! `DefaultBodyLimit`, and the connection is then closed with the rest of

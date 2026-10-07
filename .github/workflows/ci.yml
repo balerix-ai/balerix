@@ -236,3 +236,20 @@ jobs:
         with: { version: 2026.9.2, install: false, cache: true }
       - run: mise install rust cargo:cargo-audit aqua:EmbarkStudios/cargo-deny
       - run: mise run audit
+  # A release PR (release-pr.yml's `release/<unit>` branch) runs the audit
+  # release.yml's plan job will run for its unit, so a refusal shows before
+  # the merge rather than as a failed release after it (#156). The nightly
+  # audit above still catches advisories published later.
+  release-audit:
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with: { version: 2026.9.2, install: false, cache: true }
+      - run: mise install rust cargo:cargo-audit aqua:EmbarkStudios/cargo-deny
+      - env:
+          HEAD: ${{ github.head_ref }}
+        run: mise x -- scripts/release/audit.sh "${HEAD#release/}"

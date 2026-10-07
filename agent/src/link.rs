@@ -199,6 +199,7 @@ pub(crate) fn runner_message(e: &RunnerError) -> String {
         RunnerError::Tool { id, .. }
         | RunnerError::Parse { id, .. }
         | RunnerError::StillRunning { id, .. }
+        | RunnerError::Proc { id, .. }
         | RunnerError::Link { id, .. } => id,
     };
     match text.strip_prefix(&format!("{id}: ")) {
@@ -418,6 +419,13 @@ mod tests {
                     pid: 42,
                 },
                 "agent processes still running after stop (pid 42)",
+            ),
+            (
+                RunnerError::Proc {
+                    id: id.to_string(),
+                    message: "/proc/42/stat: Permission denied".into(),
+                },
+                "cannot tell whether the agent's processes are gone: /proc/42/stat: Permission denied",
             ),
         ];
         for (e, message) in cases {

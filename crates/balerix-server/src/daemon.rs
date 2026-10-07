@@ -59,6 +59,9 @@ pub const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 /// purged its fleet to end (#10); it returns right after, so this is a
 /// bound on a bug, not a timing.
 const PURGE_EXIT_WAIT: Duration = Duration::from_secs(10);
+/// How many times `hello`'s re-activation offers one row while applies
+/// keep changing it under it (#10).
+const REACTIVATE_TRIES: usize = 5;
 
 pub struct Daemon {
     fleets: RwLock<BTreeMap<FleetName, FleetHandle>>,
@@ -652,16 +655,32 @@ impl Daemon {
     ///
     /// Not under the fleets' apply locks: a plugin whose `activate` calls
     /// `PUT fleets/{f}` would wait on its own `hello`. An apply can
-    /// therefore change a row while its `activate` is in flight, so each
-    /// answer is written only onto a row that still holds the config it
-    /// answered (`set_state`), and the apply's own row stands (#10).
+    /// therefore change a row while this runs (#10). Each row is read
+    /// again right before its `activate`, so it is offered its config of
+    /// now, and an answer is written only onto a row that still holds the
+    /// config it answered (`set_state`). When that fails, the apply's
+    /// `activate` may have reached the plugin before this one did, so the
+    /// row's current config is offered again — `activate` replaces in
+    /// place, so this converges — and a row the apply removed is
+    /// deactivated, at most `REACTIVATE_TRIES` offers per row.
     async fn reactivate(&self, name: &AgentName) {
-        if let Some(addr) = self.registry.ready_addr(name) {
-            for (agent, row) in self.registry.rows_for_plugin(name) {
+        let Some(addr) = self.registry.ready_addr(name) else {
+            return;
+        };
+        for (agent, _) in self.registry.rows_for_plugin(name) {
+            let mut offered = false;
+            for _ in 0..REACTIVATE_TRIES {
+                let Some(row) = self.registry.row(&agent, name) else {
+                    if offered {
+                        self.deactivate_pair(&agent, name).await;
+                    }
+                    break;
+                };
                 let req = ActivateRequest {
                     agent: agent.to_string(),
                     config: row.config.clone(),
                 };
+                offered = true;
                 let activation = match self.client.activate(&addr, &req).await {
                     Ok(()) => PluginActivation::active(),
                     Err(e) => {
@@ -669,12 +688,17 @@ impl Daemon {
                         PluginActivation::rejected(Self::activation_message(&e))
                     }
                 };
-                if !self
+                if self
                     .registry
                     .set_state(&agent, name, &row.config, activation)
                 {
-                    tracing::info!(plugin = %name, agent = %agent, "row changed during re-activation; the apply's answer stands");
+                    offered = false;
+                    break;
                 }
+                tracing::info!(plugin = %name, agent = %agent, "row changed during re-activation; offering its current config");
+            }
+            if offered {
+                tracing::warn!(plugin = %name, agent = %agent, "row kept changing during re-activation; the next hello offers it again");
             }
         }
     }
@@ -3013,14 +3037,121 @@ mod tests {
         wait_gen(&w.daemon, 1).await;
     }
 
-    /// #10: `hello`'s re-activation runs outside the fleet's lock (a
-    /// plugin whose `activate` calls back into `PUT fleets/{f}` would wait
-    /// on it). Its answer is written only onto the row it acted on: an
-    /// apply that changed the config meanwhile keeps its own row.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_hello_answer_does_not_clobber_a_concurrent_apply() {
+    /// A plugin that holds its answer to the *first* `activate` matching
+    /// `gated` until `open` is notified, then answers it (400 when
+    /// `reject_gated`, else 200); every other `activate` is accepted at
+    /// once. `seen` is every `(agent, config)` in arrival order,
+    /// `answered` in the order the plugin took them (what it holds last).
+    #[derive(Clone)]
+    struct Gate {
+        seen: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        answered: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        open: Arc<tokio::sync::Notify>,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Gate {
+        fn arrived(&self, agent: &str, config: &serde_json::Value) -> bool {
+            self.seen
+                .lock()
+                .unwrap()
+                .contains(&(agent.to_string(), config.clone()))
+        }
+        fn last_for(&self, agent: &str) -> Option<serde_json::Value> {
+            self.answered
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(a, _)| a == agent)
+                .map(|(_, c)| c.clone())
+        }
+    }
+
+    async fn gated_plugin(
+        gated: (&'static str, serde_json::Value),
+        reject_gated: bool,
+    ) -> (Gate, String) {
         use axum::extract::State;
         use axum::routing::{get, post};
+        let gate = Gate {
+            seen: Arc::default(),
+            answered: Arc::default(),
+            open: Arc::default(),
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/v1/activate",
+                post(
+                    move |State(g): State<Gate>, axum::Json(req): axum::Json<serde_json::Value>| {
+                        let gated = gated.clone();
+                        async move {
+                            let agent = req["agent"].as_str().unwrap_or_default().to_string();
+                            g.seen
+                                .lock()
+                                .unwrap()
+                                .push((agent.clone(), req["config"].clone()));
+                            if agent == gated.0
+                                && req["config"] == gated.1
+                                && g.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                g.open.notified().await;
+                                if reject_gated {
+                                    // a refusal leaves the plugin as it was
+                                    return (
+                                        axum::http::StatusCode::BAD_REQUEST,
+                                        axum::Json(json!({ "error": "stale" })),
+                                    );
+                                }
+                            }
+                            g.answered
+                                .lock()
+                                .unwrap()
+                                .push((agent, req["config"].clone()));
+                            (axum::http::StatusCode::OK, axum::Json(json!({})))
+                        }
+                    },
+                ),
+            )
+            .route("/v1/health", get(|| async { axum::Json(json!({})) }))
+            .with_state(gate.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (gate, listen)
+    }
+
+    fn spawn_hello(w: &World, listen: String) -> tokio::task::JoinHandle<()> {
+        let d = w.daemon.clone();
+        tokio::spawn(async move {
+            let flow: AgentName = "flow".parse().unwrap();
+            let token = d.hook_secret(&plugin_id(&flow)).await.unwrap();
+            d.plugin_hello(
+                &flow,
+                &token,
+                HelloRequest {
+                    name: "flow".into(),
+                    version: "0.1.0".into(),
+                    protocol: balerix_api::PLUGIN_PROTOCOL,
+                    listen,
+                    manifest: None,
+                    revision: None,
+                },
+            )
+            .await
+            .unwrap();
+        })
+    }
+
+    /// #10: `hello`'s re-activation runs outside the fleet's lock (a
+    /// plugin whose `activate` calls back into `PUT fleets/{f}` would wait
+    /// on it). An apply that changes the row while hello's `activate` is
+    /// in flight wins: the stale answer is not written onto its row, and
+    /// the plugin is offered the row's current config again, so it does
+    /// not end up holding the old one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hello_answer_does_not_clobber_a_concurrent_apply() {
         let w = world().await;
         let name: FleetName = "f".parse().unwrap();
         let flow: AgentName = "flow".parse().unwrap();
@@ -3038,90 +3169,114 @@ mod tests {
             w.daemon.registry().row(&agent, &flow).unwrap().activation,
             PluginActivation::pending()
         );
-
-        // A plugin that holds its answer to `v: 1` until released, then
-        // rejects it; any other config is accepted at once.
-        #[derive(Clone)]
-        struct Gate {
-            seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-            open: Arc<tokio::sync::Notify>,
+        for reject_gated in [true, false] {
+            // back to v1, pending, and a plugin not yet listening
+            w.daemon.registry().unhello(&flow);
+            w.daemon
+                .apply(
+                    &name,
+                    spec(&[("a", &[("flow", json!({ "v": 1 }))])]),
+                    Default::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            let (gate, listen) = gated_plugin(("f/c/a", json!({ "v": 1 })), reject_gated).await;
+            let said_hello = spawn_hello(&w, listen);
+            eventually("hello's activate of v1 is in flight", || {
+                gate.arrived("f/c/a", &json!({ "v": 1 }))
+            })
+            .await;
+            w.daemon
+                .apply(
+                    &name,
+                    spec(&[("a", &[("flow", json!({ "v": 2 }))])]),
+                    Default::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(gate.last_for("f/c/a"), Some(json!({ "v": 2 })));
+            gate.open.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), said_hello)
+                .await
+                .unwrap()
+                .unwrap();
+            let row = w.daemon.registry().row(&agent, &flow).unwrap();
+            assert_eq!(
+                (row.config, row.activation),
+                (json!({ "v": 2 }), PluginActivation::active()),
+                "reject_gated={reject_gated}: the answer about v1 is not written onto v2's row"
+            );
+            assert_eq!(
+                gate.last_for("f/c/a"),
+                Some(json!({ "v": 2 })),
+                "reject_gated={reject_gated}: the plugin holds the row's config"
+            );
         }
-        let gate = Gate {
-            seen: Arc::default(),
-            open: Arc::default(),
-        };
-        let app = axum::Router::new()
-            .route(
-                "/v1/activate",
-                post(
-                    |State(g): State<Gate>, axum::Json(req): axum::Json<serde_json::Value>| async move {
-                        g.seen.lock().unwrap().push(req["config"].clone());
-                        if req["config"] == json!({ "v": 1 }) {
-                            g.open.notified().await;
-                            return (
-                                axum::http::StatusCode::BAD_REQUEST,
-                                axum::Json(json!({ "error": "v1: stale" })),
-                            );
-                        }
-                        (axum::http::StatusCode::OK, axum::Json(json!({})))
-                    },
-                ),
-            )
-            .route("/v1/health", get(|| async { axum::Json(json!({})) }))
-            .with_state(gate.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let listen = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move { axum::serve(listener, app).await });
+    }
 
-        let hello_w = (w.daemon.clone(), listen.clone());
-        let token = w.daemon.hook_secret(&plugin_id(&flow)).await.unwrap();
-        let said_hello = tokio::spawn(async move {
-            let (d, listen) = hello_w;
-            d.plugin_hello(
-                &"flow".parse().unwrap(),
-                &token,
-                HelloRequest {
-                    name: "flow".into(),
-                    version: "0.1.0".into(),
-                    protocol: balerix_api::PLUGIN_PROTOCOL,
-                    listen,
-                    manifest: None,
-                    revision: None,
-                },
-            )
-            .await
-            .unwrap();
-        });
-        eventually("hello's activate of v1 is in flight", || {
-            gate.seen.lock().unwrap().contains(&json!({ "v": 1 }))
-        })
-        .await;
-
+    /// #10: hello re-activates its rows one after another; a row an apply
+    /// moved on while an earlier row's `activate` was in flight is offered
+    /// with its config *now*, not the one the loop started with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hello_offers_each_row_its_current_config() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let flow: AgentName = "flow".parse().unwrap();
         w.daemon
             .apply(
                 &name,
-                spec(&[("a", &[("flow", json!({ "v": 2 }))])]),
+                spec(&[
+                    ("a", &[("flow", json!({ "a": 1 }))]),
+                    ("b", &[("flow", json!({ "b": 1 }))]),
+                ]),
+                Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let (gate, listen) = gated_plugin(("f/c/a", json!({ "a": 1 })), false).await;
+        let said_hello = spawn_hello(&w, listen);
+        eventually("hello's activate of a is in flight", || {
+            gate.arrived("f/c/a", &json!({ "a": 1 }))
+        })
+        .await;
+        w.daemon
+            .apply(
+                &name,
+                spec(&[
+                    ("a", &[("flow", json!({ "a": 1 }))]),
+                    ("b", &[("flow", json!({ "b": 2 }))]),
+                ]),
                 Default::default(),
                 true,
             )
             .await
             .unwrap();
-        let row = w.daemon.registry().row(&agent, &flow).unwrap();
-        assert_eq!(
-            (row.config.clone(), row.activation.clone()),
-            (json!({ "v": 2 }), PluginActivation::active())
-        );
-
         gate.open.notify_one();
         tokio::time::timeout(Duration::from_secs(5), said_hello)
             .await
             .unwrap()
             .unwrap();
-        let row = w.daemon.registry().row(&agent, &flow).unwrap();
+        assert_eq!(gate.last_for("f/c/b"), Some(json!({ "b": 2 })));
+        assert!(
+            !gate
+                .seen
+                .lock()
+                .unwrap()
+                .contains(&("f/c/b".to_string(), json!({ "b": 1 }))),
+            "b's old config was never offered: {:?}",
+            gate.seen.lock().unwrap()
+        );
+        let row = w
+            .daemon
+            .registry()
+            .row(&"f/c/b".parse().unwrap(), &flow)
+            .unwrap();
         assert_eq!(
             (row.config, row.activation),
-            (json!({ "v": 2 }), PluginActivation::active()),
-            "the stale answer about v1 is not written onto v2's row"
+            (json!({ "b": 2 }), PluginActivation::active())
         );
     }
 }

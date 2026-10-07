@@ -93,6 +93,17 @@ set_chart_pin_of() {
   )
 }
 
+# <version> bumped by <level>. Scenarios that start from the versions the
+# tree names compute what follows from them: a release PR's tree names
+# the next ones (#87–#94).
+bumped() {
+  (
+    # shellcheck source=scripts/release/lib.sh
+    source "$repo/scripts/release/lib.sh"
+    bump_version "$1" "$2"
+  )
+}
+
 # Releases every version the charts name, as they name them: what the
 # charts gate waits for (Spec O §24.5).
 release_charts_deps() {
@@ -706,10 +717,10 @@ scenario_charts_pins_at_release() {
 scenario_plugin_moves_pin() {
   local dir
   dir=$(fixture plugin-pin)
-  release "$dir" github 0.1.0
+  release "$dir" github 0.4.0
   change "$dir" plugins/github/src/release-test.rs "fix: a github fix"
   prepare "$dir" github >/dev/null
-  expect_eq "github release: pin moved" "$(chart_pin_of "$dir" github)" 0.1.1
+  expect_eq "github release: pin moved" "$(chart_pin_of "$dir" github)" 0.4.1
   expect_eq "github release: only the pin line changed" \
     "$(git -C "$dir" diff --numstat -- charts/balerix-daemon/values.yaml | cut -f1,2)" "$(printf '1\t1')"
   expect_grep "github release: credentials.github untouched" '    secretName: ""' "$dir/charts/balerix-daemon/values.yaml"
@@ -727,22 +738,22 @@ scenario_core_moves_app_version() {
 # A moved pin is a change even with no commit under charts/; its notes
 # list the image, not "Initial release".
 scenario_charts_pin_only() {
-  local dir out version
+  local dir out version pin
   dir=$(fixture charts-pin-only)
   release_charts_deps "$dir"
   version=$(charts_field_of "$dir" version)
+  pin=$(chart_pin_of "$dir" flow)
   release "$dir" charts "$version"
   out=$(prepare "$dir" charts)
   expect_eq "charts, nothing moved: status" "$(field status "$out")" none
   change "$dir" plugins/flow/src/release-test.rs "fix: a flow fix"
-  release "$dir" flow 0.1.2
+  release "$dir" flow "$(bumped "$pin" patch)"
   out=$(prepare "$dir" charts)
   expect_eq "charts, flow pin moved: status" "$(field status "$out")" release
-  expect_eq "charts, flow pin moved: patch" "$(field version "$out")" 0.1.1
-  expect_eq "charts, flow pin moved: both charts" "$(charts_field_of "$dir" version)" 0.1.1
+  expect_eq "charts, flow pin moved: patch" "$(field version "$out")" "$(bumped "$version" patch)"
+  expect_eq "charts, flow pin moved: both charts" "$(charts_field_of "$dir" version)" "$(bumped "$version" patch)"
   expect_grep "charts, flow pin moved: Images section" '### Images' "$dir/$(field notes "$out")"
-  # shellcheck disable=SC2016 # literal backticks: markdown code
-  expect_grep "charts, flow pin moved: the image" '`balerix-plugin-flow` 0.1.1 → 0.1.2' "$dir/$(field notes "$out")"
+  expect_grep "charts, flow pin moved: the image" "\`balerix-plugin-flow\` $pin → $(bumped "$pin" patch)" "$dir/$(field notes "$out")"
   if grep -q 'Initial release' "$dir/$(field notes "$out")"; then
     fail "charts, flow pin moved: notes say Initial release"
   else
@@ -752,18 +763,19 @@ scenario_charts_pin_only() {
 
 # A core minor is a chart minor, whatever the chart's own commits ask.
 scenario_charts_core_minor() {
-  local dir out
+  local dir out version core
   dir=$(fixture charts-core-minor)
   release_charts_deps "$dir"
-  release "$dir" charts "$(charts_field_of "$dir" version)"
+  version=$(charts_field_of "$dir" version)
+  core=$(charts_field_of "$dir" appVersion)
+  release "$dir" charts "$version"
   change "$dir" charts/balerix-daemon/release-test.txt "fix(charts): a chart fix"
   change "$dir" crates/balerix-server/release-test.txt "feat!: a breaking daemon change"
-  release "$dir" core 0.3.0
+  release "$dir" core "$(bumped "$core" minor)"
   out=$(prepare "$dir" charts)
-  expect_eq "charts after core 0.3.0: minor" "$(field version "$out")" 0.2.0
-  expect_grep "charts after core 0.3.0: the fix listed" 'A chart fix' "$dir/$(field notes "$out")"
-  # shellcheck disable=SC2016 # literal backticks: markdown code
-  expect_grep "charts after core 0.3.0: the image listed" '`balerix` 0.2.0 → 0.3.0' "$dir/$(field notes "$out")"
+  expect_eq "charts after a core minor: minor" "$(field version "$out")" "$(bumped "$version" minor)"
+  expect_grep "charts after a core minor: the fix listed" 'A chart fix' "$dir/$(field notes "$out")"
+  expect_grep "charts after a core minor: the image listed" "\`balerix\` $core → $(bumped "$core" minor)" "$dir/$(field notes "$out")"
 }
 
 # Staged as published: upstream's charts are the tree's, byte for byte.

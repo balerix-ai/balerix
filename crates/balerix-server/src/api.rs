@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::{CONTENT_TYPE, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::auth::{RateLimiter, bearer, constant_time_eq};
-use crate::body_limit::limited;
+use crate::body_limit::{Drain, drain_over_limit, limited, refuse};
 use crate::daemon::{Caller, Daemon, DaemonError};
 use crate::hooks;
 use crate::plugins::{PluginAddr, PluginError};
@@ -142,6 +142,10 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         daemon,
         limiter: Arc::new(RateLimiter::new(HOOK_RATE, HOOK_BURST)),
     };
+    // Each limited router drains an over-limit body before it answers it
+    // (#116), and authenticates first: the auth `route_layer` goes on
+    // after `limited`, so it wraps outside the drain and a caller without
+    // a valid token gets its 401 before a byte of the body is read.
     let admin = Router::new()
         .route("/v1/fleets", get(list_fleets).post(create_fleet))
         .route(
@@ -152,14 +156,23 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route("/v1/plugins/sync", post(sync_plugins))
         .route("/v1/managed-fleets", get(managed_fleets))
         .route("/v1/plugins/{name}", delete(purge_plugin))
-        .route("/v1/sessions", post(create_session))
+        .route("/v1/sessions", post(create_session));
+    let admin = limited(admin, Drain::new(4 << 20))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
-    let admin = limited(admin, 4 << 20);
+    // The events route checks the agent's secret before the drain (the
+    // handler checks it again, then the rate limit); the link routes carry
+    // no body and authenticate themselves.
+    let events = post(hooks::events)
+        .layer(middleware::from_fn_with_state(
+            Drain::new(1 << 20),
+            drain_over_limit,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            hooks::require_secret,
+        ));
     let agents = Router::new()
-        .route(
-            "/v1/agents/{fleet}/{crew}/{agent}/events",
-            post(hooks::events),
-        )
+        .route("/v1/agents/{fleet}/{crew}/{agent}/events", events)
         .route(
             "/v1/agents/{fleet}/{crew}/{agent}/link",
             get(crate::kube::link::link),
@@ -167,14 +180,21 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route(
             "/v1/agents/{fleet}/{crew}/{agent}/link/attach/{session}",
             get(crate::kube::link::link_attach),
-        );
-    // Each limit drains an over-limit body before the answer (#116).
-    let agents = limited(agents, 1 << 20);
+        )
+        .layer(DefaultBodyLimit::max(1 << 20));
+    // `hello` names the plugin in its body, but its token must be *some*
+    // plugin's before the body is read.
     let plugins = limited(
         Router::new().route("/v1/plugin-host/hello", post(plugin_hello)),
-        64 << 10,
+        Drain::new(64 << 10),
+    )
+    .route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        require_plugin,
+    ));
+    let plugin_host = limited(crate::plugin_api::router(), Drain::new(1 << 20)).route_layer(
+        middleware::from_fn_with_state(state.clone(), require_plugin),
     );
-    let plugin_host = limited(crate::plugin_api::router(), 1 << 20);
     // The plugin mount authenticates itself (bearer or session cookie),
     // so it sits outside the admin middleware. `/v1/plugins/{name}` with
     // no slash stays the purge route for DELETE; a GET there is a browser
@@ -212,8 +232,26 @@ async fn require_admin(State(state): State<AppState>, req: Request, next: Next) 
         Some(t) if constant_time_eq(t.as_bytes(), state.daemon.token().as_bytes()) => {
             next.run(req).await
         }
-        _ => ApiError::new(StatusCode::UNAUTHORIZED, "missing or invalid admin token")
-            .into_response(),
+        _ => {
+            let no = ApiError::new(StatusCode::UNAUTHORIZED, "missing or invalid admin token");
+            refuse(req, no.into_response()).await
+        }
+    }
+}
+
+/// The plugin routes: the bearer must be some plugin's token, checked
+/// before the body is read (#116). Each route checks it again for the
+/// plugin it names and its capabilities.
+async fn require_plugin(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let known = match bearer(req.headers()) {
+        Some(t) => state.daemon.plugin_for_token(t).await.is_some(),
+        None => false,
+    };
+    if known {
+        next.run(req).await
+    } else {
+        let no = ApiError::new(StatusCode::UNAUTHORIZED, "unknown plugin or bad token");
+        refuse(req, no.into_response()).await
     }
 }
 

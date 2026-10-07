@@ -327,17 +327,21 @@ credentials, hook input, or sandbox rules.
   whose argv carries that `--tmux-socket` (the plugin e2e uses socket
   `balerix-e2e-plugins-<pid>`, the flow e2e `balerix-e2e-flow-<pid>`).
 - A body over a route's limit is read to its end, up to four times the
-  limit, before the route answers it (`body_limit::limited`, #116; the SDK
-  keeps a copy): axum alone answers 413 the moment it has read past the
-  limit and the connection closes with the rest unread, so a client still
-  writing got EPIPE in place of the answer. Past four times the limit the
-  answer still comes at once with `Connection: close`, and a client still
-  writing can miss it. A limited router goes through `limited`, never a
-  bare `DefaultBodyLimit`. The answer is the route's own: the middleware
-  hands the handler a stand-in body one byte over the limit, so a 401
-  still wins over a 413 and `hello` still answers 400. A pooled client
-  that reads a 413 after the 4x cut-off hands the dead connection to its
-  next request; `api_it.rs::one_byte_over` sends exactly one byte over, on
+  limit and for at most 10 s, before the route answers it
+  (`body_limit::drain_over_limit`, #116; the SDK keeps a copy): axum alone
+  answers 413 the moment it has read past the limit and the connection
+  closes with the rest unread, so a client still writing got EPIPE in
+  place of the answer. Past four times the limit, or the time, the answer
+  comes at once with `Connection: close`, and a client still writing can
+  miss it. Authentication sits *outside* the drain (the auth
+  `route_layer` goes on after `limited`; the events route has
+  `hooks::require_secret`, the plugin routes `require_plugin`): a caller
+  that fails it is answered 401 having had at most 64 KiB of its body read
+  (`body_limit::refuse`; more than that and the connection is closed
+  unread). A limited router goes through `limited`, never a bare
+  `DefaultBodyLimit`. The answer is the route's own: the middleware hands
+  the handler a stand-in body one byte over the limit, so `hello` still
+  answers 400. `api_it.rs::one_byte_over` sends exactly one byte over, on
   a connection of its own (#79, #113), and
   `events_it.rs::every_limited_route_answers_a_client_that_sends_the_whole_body`
   sends it all.

@@ -131,10 +131,10 @@ pub fn router<P: Plugin>(plugin: Arc<P>, token: &str) -> Router {
     // (`balerix-server/src/api.rs`); axum's default (2 MiB) is otherwise
     // silently more permissive than the spec promises. An over-limit body
     // is drained before the answer, as on the daemon (#116).
-    crate::body_limit::limited(
-        base.layer(middleware::from_fn_with_state(token, require_daemon_bearer)),
-        1 << 20,
-    )
+    // The bearer is checked outside the drain: a caller without it is
+    // answered before the body is read.
+    crate::body_limit::limited(base, crate::body_limit::Drain::new(1 << 20))
+        .layer(middleware::from_fn_with_state(token, require_daemon_bearer))
 }
 
 async fn require_daemon_bearer(
@@ -144,7 +144,10 @@ async fn require_daemon_bearer(
 ) -> Response {
     match bearer(req.headers()) {
         Some(t) if constant_time_eq(t.as_bytes(), token.as_bytes()) => next.run(req).await,
-        _ => error(StatusCode::UNAUTHORIZED, "bad daemon token"),
+        _ => {
+            let no = error(StatusCode::UNAUTHORIZED, "bad daemon token");
+            crate::body_limit::refuse(req, no).await
+        }
     }
 }
 
@@ -850,5 +853,35 @@ mod tests {
                 serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
             assert!(e.error.contains("length limit"), "{}", e.error);
         }
+    }
+
+    /// #116 review: a caller without the daemon's token is answered 401
+    /// before its body is read, however long it says the body is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bad_token_is_answered_before_the_body_is_read() {
+        let (listener, listen) = bind().await.unwrap();
+        let app = router(Arc::new(Silent), "tok");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let started = std::time::Instant::now();
+        let head = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(&listen).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            write!(
+                s,
+                "POST /v1/activate HTTP/1.1\r\nHost: {listen}\r\nAuthorization: Bearer nope\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                2 << 20
+            )
+            .unwrap();
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        })
+        .await
+        .unwrap();
+        assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 }

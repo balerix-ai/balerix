@@ -208,7 +208,7 @@ pub fn headers_only(
     token: &str,
     declared: usize,
 ) -> (u16, Value) {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let authority = base.trim_start_matches("http://");
     let mut s = std::net::TcpStream::connect(authority).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -218,15 +218,37 @@ pub fn headers_only(
          Content-Type: application/json\r\nContent-Length: {declared}\r\n\r\n"
     )
     .unwrap();
+    read_answer(&mut s)
+}
+
+/// One HTTP/1.1 answer from `s`, read up to its `Content-Length`: its
+/// status and its body (JSON when it parses).
+pub fn read_answer(s: &mut std::net::TcpStream) -> (u16, Value) {
+    use std::io::Read;
     let mut answer = Vec::new();
-    let _ = s.read_to_end(&mut answer);
-    let text = String::from_utf8_lossy(&answer).to_string();
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .unwrap_or_else(|| panic!("no whole answer: {text:?}"));
-    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
-    let v = serde_json::from_str(body).unwrap_or(Value::String(body.to_string()));
-    (status, v)
+    loop {
+        let mut buf = [0u8; 4096];
+        let n = s.read(&mut buf).unwrap();
+        assert!(n > 0, "closed before a whole answer");
+        answer.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&answer).to_string();
+        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+            continue;
+        };
+        let length: usize = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse().unwrap())
+            })
+            .expect("an answer with a content-length");
+        if body.len() >= length {
+            let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+            let v = serde_json::from_str(body).unwrap_or(Value::String(body.to_string()));
+            return (status, v);
+        }
+    }
 }
 
 pub struct World {

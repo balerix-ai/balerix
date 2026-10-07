@@ -23,7 +23,9 @@ capped at 1 MiB, except `hello`, capped at 64 KiB
 (`balerix-server/src/api.rs`'s `plugins`/`plugin_host` router layers);
 daemon → plugin request bodies are capped at 1 MiB by the SDK's `router`
 (`balerix-plugin-sdk/src/plugin.rs`). On both sides a body over its cap is
-read to its end, up to four times the cap, before it is answered (the
+read to its end, up to four times the cap and for at most 10 s, after the
+token is checked (a bad token is a 401 before the body is read), before
+it is answered (the
 route's usual over-cap answer: 413, or 400 where the route folds every
 body error into one), so a client that writes the whole body before
 reading gets that answer rather than a reset; a body declared or found

@@ -612,6 +612,36 @@ async fn every_limited_route_answers_a_client_that_sends_the_whole_body() {
     assert_eq!(host.kv_get("small").await.unwrap(), Some(vec![b'x'; 100]));
 }
 
+/// #116 review: authentication answers before the body is read. A
+/// request with a bad token that declares an over-limit body (within the
+/// drain ceiling) and sends none of it gets its 401 at once; the drain
+/// would otherwise wait for bytes that never come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bad_token_is_answered_before_an_over_limit_body_is_read() {
+    let w = world().await;
+    let routes: [(&str, &str, usize); 4] = [
+        ("POST", "/v1/fleets", 4 << 20),
+        ("POST", "/v1/agents/f/c/a/events", 1 << 20),
+        ("POST", "/v1/plugin-host/hello", 64 << 10),
+        ("PUT", "/v1/plugin-host/kv/big", 1 << 20),
+    ];
+    for (method, path, limit) in routes {
+        let base = w.api.base.clone();
+        let started = std::time::Instant::now();
+        let (status, v) = tokio::task::spawn_blocking(move || {
+            support::headers_only(&base, method, path, "wrong", 2 * limit)
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, 401, "{method} {path}: {v}");
+        assert!(v["error"].is_string(), "{v}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{method} {path}: answered without waiting for the body"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plugin_metrics_are_re_exported_under_the_prefix_rule() {
     let w = world().await;

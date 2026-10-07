@@ -44,12 +44,26 @@ impl PluginKv {
     }
 
     /// A key against the tree the other keys made (#14): it is a
-    /// directory of other keys (`a` beside `a/b`), or a path segment of
-    /// it is a value (`a/b` beside `a`). `create_dir_all` answers the
-    /// second with `AlreadyExists` or `NotADirectory`.
+    /// directory of other keys (`a` beside `a/b`, `IsADirectory`), or a
+    /// path segment of it is a value (`a/b` beside `a`, `NotADirectory`).
+    /// These are Linux's errnos (EISDIR, ENOTDIR): elsewhere (macOS
+    /// `unlink` of a directory answers EPERM) a clash surfaces as a
+    /// storage error, a 500, instead.
     fn collides(e: &std::io::Error) -> bool {
-        use std::io::ErrorKind::{AlreadyExists, IsADirectory, NotADirectory};
-        matches!(e.kind(), AlreadyExists | IsADirectory | NotADirectory)
+        use std::io::ErrorKind::{IsADirectory, NotADirectory};
+        matches!(e.kind(), IsADirectory | NotADirectory)
+    }
+
+    /// `put`'s clash: `collides`, or the `AlreadyExists` that
+    /// `create_dir_all` answers when the key's parent is a value (`a/b`
+    /// beside `a`). Only then: `AlreadyExists` from anything else (a temp
+    /// file) is no key's fault.
+    fn put_collides(&self, name: &AgentName, key: &str, e: &std::io::Error) -> bool {
+        Self::collides(e)
+            || (e.kind() == std::io::ErrorKind::AlreadyExists
+                && key
+                    .match_indices('/')
+                    .any(|(i, _)| self.dir(name).join(&key[..i]).is_file()))
     }
 
     /// Read and delete treat a missing key and a colliding one alike:
@@ -110,7 +124,7 @@ impl PluginKv {
             out.extend_from_slice(bytes);
         }
         write_private(&path, &out).map_err(|e| {
-            if Self::collides(&e) {
+            if self.put_collides(name, key, &e) {
                 PluginError::KvConflict(key.to_string())
             } else {
                 Self::io(&path, e)
@@ -129,7 +143,7 @@ impl PluginKv {
     }
 
     /// Every key under the prefix, sorted. `write_private`'s leftover temp
-    /// files (`.{name}.tmp~{pid}`) are never keys, so they are skipped.
+    /// files (`.{name}.tmp~{pid}-{n}`) are never keys, so they are skipped.
     pub fn list(&self, name: &AgentName, prefix: &str) -> Result<Vec<String>, PluginError> {
         let dir = self.dir(name);
         let mut keys = Vec::new();
@@ -158,7 +172,7 @@ impl PluginKv {
         Ok(())
     }
 
-    /// `write_private`'s leftover temp file is named `.{name}.tmp~{pid}`.
+    /// `write_private`'s leftover temp file is named `.{name}.tmp~{pid}-{n}`.
     /// A leading `.` alone is not enough to tell: `check_kv_key` allows a
     /// segment to start with `.` (only a bare `.` or `..` segment is
     /// rejected), so a key like `._` is a real key, not a temp file. `~`
@@ -275,6 +289,42 @@ mod tests {
             .chain(std::fs::read_dir(dir.path().join("plugins/flow/kv/b")).unwrap())
             .count();
         assert_eq!(leftovers, 3, "a, b, b/c only");
+    }
+
+    /// Concurrent puts to one key all succeed and leave one whole write:
+    /// each has its own temp file, so none takes another's for its own or
+    /// reads its `EEXIST` as a key conflict.
+    #[test]
+    fn concurrent_puts_to_one_key_all_succeed_and_leave_one_whole_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(kv(dir.path(), 1));
+        for round in 0..20 {
+            let writers: Vec<_> = (0..16u8)
+                .map(|i| {
+                    let store = store.clone();
+                    std::thread::spawn(move || {
+                        store.put(&flow(), "state/x", &vec![i; 64 << 10], i % 2 == 0)
+                    })
+                })
+                .collect();
+            for w in writers {
+                w.join()
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+            }
+            let v = store.get(&flow(), "state/x").unwrap().unwrap();
+            assert_eq!(v.len(), 64 << 10, "round {round}");
+            assert!(v.iter().all(|b| *b == v[0]), "round {round}: torn value");
+        }
+        assert_eq!(
+            store.list(&flow(), "").unwrap(),
+            vec!["state/x".to_string()],
+            "no temp file left"
+        );
+        let left = std::fs::read_dir(dir.path().join("plugins/flow/kv/state"))
+            .unwrap()
+            .count();
+        assert_eq!(left, 1, "no temp file left on disk");
     }
 
     #[test]

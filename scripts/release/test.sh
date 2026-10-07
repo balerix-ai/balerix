@@ -695,6 +695,13 @@ scenario_charts_pins_at_release() {
   else
     fail "pins: github untagged but in the run: failed"
   fi
+  # A dry run pushes no images: the pins this run moves are listed on
+  # stdout, so the charts job can skip the kind install (#150).
+  expect_eq "pins, dry run: lists the pin moved by the run" \
+    "$("$dir/scripts/release/check-pins.sh" --dry-run charts github 2>>"$log")" \
+    "balerix-plugin-github-v$pin (plugins.github.image.tag)"
+  expect_eq "pins, not a dry run: lists nothing" \
+    "$("$dir/scripts/release/check-pins.sh" charts github 2>>"$log")" ""
   set_chart_pin_of "$dir" github 9.9.9
   if "$dir/scripts/release/check-pins.sh" charts github 2>"$err"; then
     fail "pins: in the run at another version: passed"
@@ -710,6 +717,8 @@ scenario_charts_pins_at_release() {
   else
     fail "pins: all tagged: failed"
   fi
+  expect_eq "pins, dry run, all tagged: lists nothing" \
+    "$("$dir/scripts/release/check-pins.sh" --dry-run charts 2>>"$log")" ""
 }
 
 # A plugin release moves its pin and nothing else in the daemon values;
@@ -759,6 +768,32 @@ scenario_charts_pin_only() {
   else
     pass "charts, flow pin moved: no Initial release line"
   fi
+}
+
+# A plugin first pinned after the last charts release adds a feature: a
+# chart minor, never a major (#151), and its notes say "added at".
+scenario_charts_pin_added() {
+  local dir out version pin tag
+  dir=$(fixture charts-pin-added)
+  release_charts_deps "$dir"
+  version=$(charts_field_of "$dir" version)
+  pin=$(chart_pin_of "$dir" flow)
+  release "$dir" charts "$version"
+  # Move the charts tag to a tree whose values.yaml has no flow pin, then
+  # pin flow again the way a plugin release does: chore(release), which
+  # git-cliff does not count.
+  tag=$(git -C "$dir" tag --points-at HEAD)
+  sed -i '/repository: ghcr.io\/balerix-ai\/balerix-plugin-flow$/{n;d}' "$dir/charts/balerix-daemon/values.yaml"
+  expect_eq "charts, flow pin absent at the tag: no pin" "$(chart_pin_of "$dir" flow)" ""
+  gitc "$dir" commit -qam "chore: drop the flow pin"
+  gitc "$dir" tag -f "$tag" >/dev/null
+  gitc "$dir" revert --no-edit HEAD >/dev/null
+  gitc "$dir" commit -q --amend -m "chore(release): flow v$pin"
+  expect_eq "charts, flow pin added: pinned again" "$(chart_pin_of "$dir" flow)" "$pin"
+  out=$(prepare "$dir" charts)
+  expect_eq "charts, flow pin added: status" "$(field status "$out")" release
+  expect_eq "charts, flow pin added: minor" "$(field version "$out")" "$(bumped "$version" minor)"
+  expect_grep "charts, flow pin added: the image" "\`balerix-plugin-flow\` added at $pin" "$dir/$(field notes "$out")"
 }
 
 # A core minor is a chart minor, whatever the chart's own commits ask.
@@ -851,6 +886,7 @@ scenario_charts_pins_at_release
 scenario_plugin_moves_pin
 scenario_core_moves_app_version
 scenario_charts_pin_only
+scenario_charts_pin_added
 scenario_charts_core_minor
 scenario_plan_charts
 scenario_stage_charts

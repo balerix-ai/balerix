@@ -76,7 +76,9 @@ charts_blocked() {
 
 # The pins that moved since <tag>, one `<image> <old> <new>` line each: a
 # core or plugin release moves them in a chore(release) commit, which
-# git-cliff does not count, so they count here (Spec O §24.5).
+# git-cliff does not count, so they count here (Spec O §24.5). <old> is `-`
+# for a plugin with no pin at <tag>: an empty field would collapse under
+# `read` and shift <new> into its place (#151).
 charts_pin_changes() {
   local tag=$1 plugin old new
   old=$(git show "$tag:charts/balerix-operator/Chart.yaml" | yaml_field - appVersion)
@@ -85,12 +87,13 @@ charts_pin_changes() {
   for plugin in "${PLUGIN_UNITS[@]}"; do
     old=$(chart_pin "$plugin" <(git show "$tag:$DAEMON_VALUES"))
     new=$(chart_pin "$plugin")
-    [[ $old == "$new" ]] || echo "$(unit_crate "$plugin") $old $new"
+    [[ $old == "$new" ]] || echo "$(unit_crate "$plugin") ${old:--} $new"
   done
 }
 
 # The charts' next version: the largest of the bump their own commits ask
-# and each moved pin's. A core minor is a chart minor.
+# and each moved pin's. A core minor is a chart minor; a newly pinned
+# plugin adds a feature, a chart minor too.
 charts_next() {
   local lastversion=$1 count=$2 pins=$3 level='' candidate image old new
   if ((count)); then
@@ -99,7 +102,7 @@ charts_next() {
   fi
   while read -r image old new; do
     [[ -n $image ]] || continue
-    candidate=$(bump_level "$old" "$new")
+    if [[ $old == - ]]; then candidate=minor; else candidate=$(bump_level "$old" "$new"); fi
     if (($(level_rank "$candidate") > $(level_rank "$level"))); then level=$candidate; fi
   done <<<"$pins"
   bump_version "$lastversion" "$level"
@@ -229,7 +232,11 @@ if [[ $unit == charts ]]; then
       printf '\n### Images\n\n'
       while read -r image old new; do
         # shellcheck disable=SC2016 # literal backticks: markdown code
-        printf -- '- `%s` %s → %s\n' "$image" "$old" "$new"
+        if [[ $old == - ]]; then
+          printf -- '- `%s` added at %s\n' "$image" "$new"
+        else
+          printf -- '- `%s` %s → %s\n' "$image" "$old" "$new"
+        fi
       done <<<"$pins"
     } >>"$notes"
   fi

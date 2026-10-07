@@ -128,7 +128,9 @@ For whatever it plans, a dry run audits, builds, smoke-tests, packages,
 builds and scans images, and runs `cargo publish --dry-run`, then uploads
 every artifact to the run. Nothing is pushed, published or tagged. For the
 charts unit, that is packaging, the check on kind and uploading the
-archives.
+archives. A mixed dry run, one that also releases core or a plugin the
+charts pin, skips the kind install: those pins' images are never pushed on
+a dry run. The job summary lists the pins moved by the run.
 
 ## Recovery
 

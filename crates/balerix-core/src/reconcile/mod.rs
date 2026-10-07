@@ -182,7 +182,14 @@ pub fn plan(
 
     for (id, agent) in &desired_agents {
         if stopped.contains(id) {
-            if observed.get(id).is_some() {
+            // An unobserved agent not yet Stopped had a stop that timed
+            // out after killing its window (#123): stopping it again is a
+            // no-op that settles its phase, the timeout's message kept.
+            let unsettled = status
+                .agents
+                .get(&id.to_string())
+                .is_some_and(|s| s.phase != AgentPhase::Stopped);
+            if observed.get(id).is_some() || unsettled {
                 stops.push(Step::Stop(id.clone()));
             }
             continue;
@@ -574,10 +581,16 @@ mod tests {
             plan_for(Some(&f), &["f/c/b"], &st, &obs, 5),
             vec!["stop f/c/b", "ensure-crew f/c"]
         );
-        // window gone, phase Stopped: nothing at all
-        st.entry("f/c/b").phase = AgentPhase::Stopped;
+        // window gone but not yet Stopped (a timed-out stop kills the
+        // window first, #123): the stop again, a no-op that settles it
         st.entry("f/c/b").next_restart_at = None;
         obs.remove(&id("f/c/b"));
+        assert_eq!(
+            plan_for(Some(&f), &["f/c/b"], &st, &obs, 5),
+            vec!["stop f/c/b", "ensure-crew f/c"]
+        );
+        // window gone, phase Stopped: nothing at all
+        st.entry("f/c/b").phase = AgentPhase::Stopped;
         assert_eq!(
             plan_for(Some(&f), &["f/c/b"], &st, &obs, 5),
             vec!["ensure-crew f/c"]

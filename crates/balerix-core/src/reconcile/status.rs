@@ -76,6 +76,8 @@ pub fn apply(
             a.phase = AgentPhase::Failed;
             a.message.clone_from(e);
         }
+        // A failed stop keeps the phase; when it timed out after killing
+        // the window, the plan's next stop settles it (#123).
         (Step::Stop(id) | Step::RemoveAgent(id) | Step::NoteExit(id, _), Err(e)) => {
             status.entry(&id.to_string()).message.clone_from(e);
         }
@@ -216,8 +218,9 @@ mod tests {
         assert_eq!(s.agents["f/c/a"].phase, AgentPhase::Failed);
     }
 
-    /// Other failed steps only set the message: a failed `Stop` leaves the
-    /// session running, so the phase still describes it.
+    /// Other failed steps only set the message. A failed `Stop` keeps the
+    /// phase for this pass: either the window is still up, or (a timed-out
+    /// stop, #123) it is gone and the next pass's stop settles the phase.
     #[test]
     fn a_failed_stop_sets_the_message_and_keeps_the_phase() {
         let mut s = FleetStatus::default();

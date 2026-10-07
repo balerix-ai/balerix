@@ -322,6 +322,12 @@ impl FakeRunner {
             .or_default()
             .set(id, s);
     }
+    /// The agent's window goes, as a stop that timed out leaves it.
+    pub fn remove(&self, id: &AgentId) {
+        if let Some(fleet) = lock(&self.state).get_mut(&id.fleet) {
+            fleet.remove(id);
+        }
+    }
     /// Every fleet's crews in one view; a test with a single fleet reads
     /// its state here without naming it.
     pub fn observed(&self) -> ObservedState {

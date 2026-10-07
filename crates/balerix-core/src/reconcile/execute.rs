@@ -481,6 +481,41 @@ mod tests {
         );
     }
 
+    /// #123: a stop that timed out has killed the window already, so the
+    /// agent is no longer observed; the next pass still shows it stopped,
+    /// with the timed-out stop's message kept.
+    #[test]
+    fn a_timed_out_stop_settles_as_stopped_on_the_next_pass() {
+        let mut h = Harness::new();
+        let f = fleet(&["a"]);
+        let mut st = FleetStatus::default();
+        reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        st.agents.get_mut("f/c/a").unwrap().phase = AgentPhase::Ready;
+        h.stopped.insert("f/c/a".parse().unwrap());
+        let timed_out = "f/c/a: agent processes still running after stop (pid 42)";
+        h.r.fail_next("stop_agent", "f/c/a", timed_out);
+        let (_, rep) = reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        assert!(!rep.all_ok());
+        // what StillRunning leaves behind: the window is gone
+        h.r.remove(&"f/c/a".parse().unwrap());
+
+        let (p, rep) = reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        assert!(rep.all_ok(), "{:?}", rep.failures);
+        assert_eq!(
+            p.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["stop f/c/a", "ensure-crew f/c"]
+        );
+        assert_eq!(st.agents["f/c/a"].phase, AgentPhase::Stopped);
+        assert!(
+            st.agents["f/c/a"].message.contains("pid 42"),
+            "{:?}",
+            st.agents["f/c/a"].message
+        );
+        // and then idle
+        let (p, _) = reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        assert_eq!(p.len(), 1);
+    }
+
     #[test]
     fn stop_then_resume_keeps_the_restart_count() {
         let mut h = Harness::new();

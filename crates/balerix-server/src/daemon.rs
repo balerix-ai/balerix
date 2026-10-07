@@ -349,11 +349,7 @@ impl Daemon {
     /// one is about to close: this waits for it (bounded, in case it never
     /// does) rather than hand that actor a message it would drop.
     async fn wait_purged(name: &FleetName, h: &FleetHandle) -> bool {
-        let purging = {
-            let r = h.status.borrow();
-            matches!(r.desired, Desired::Down { purge: true, .. }) && r.is_down()
-        };
-        if !purging && !h.tx.is_closed() {
+        if !Self::is_purging(h) {
             return false;
         }
         if tokio::time::timeout(PURGE_EXIT_WAIT, h.tx.closed())
@@ -364,6 +360,20 @@ impl Daemon {
             return false;
         }
         true
+    }
+
+    /// `h`'s last record is a settled `Down` with `purge`: the actor has
+    /// purged the fleet, or is about to and then end.
+    fn is_purging(h: &FleetHandle) -> bool {
+        let r = h.status.borrow();
+        matches!(r.desired, Desired::Down { purge: true, .. }) && r.is_down()
+    }
+
+    /// A handle that stands for no fleet: its actor purged it and ended.
+    /// An actor that ended any other way (a panic) still holds its fleet,
+    /// which answers `fleet task is gone` rather than being replaced.
+    fn is_purged(h: &FleetHandle) -> bool {
+        h.tx.is_closed() && Self::is_purging(h)
     }
 
     pub fn token(&self) -> &str {
@@ -1027,7 +1037,7 @@ impl Daemon {
         }
         {
             let fleets = self.fleets.read().await;
-            match fleets.get(name).filter(|h| !h.tx.is_closed()) {
+            match fleets.get(name).filter(|h| !Self::is_purged(h)) {
                 Some(h) => {
                     let current = h.status.borrow();
                     Self::check_owner(name, current.owner.as_deref(), caller, false)?;
@@ -1122,7 +1132,7 @@ impl Daemon {
         }
         let handle = {
             let mut fleets = self.fleets.write().await;
-            match fleets.get(name).filter(|h| !h.tx.is_closed()) {
+            match fleets.get(name).filter(|h| !Self::is_purged(h)) {
                 Some(h) => {
                     if mode == ApplyMode::Create && !h.status.borrow().is_down() {
                         return Err(DaemonError::Conflict);
@@ -1237,13 +1247,13 @@ impl Daemon {
         let lock = self.fleet_lock(name);
         let _guard = lock.lock().await;
         // A purged fleet whose handle the purge listener has not dropped
-        // yet is gone already (#10).
+        // yet is gone already (#10); any other dead actor is not.
         let handle = self
             .fleets
             .read()
             .await
             .get(name)
-            .filter(|h| !h.tx.is_closed())
+            .filter(|h| !Self::is_purged(h))
             .cloned()
             .ok_or(DaemonError::NotFound)?;
         Self::check_owner(name, handle.status.borrow().owner.as_deref(), caller, true)?;
@@ -3007,6 +3017,61 @@ mod tests {
         w.daemon.fleets.write().await.insert(g.clone(), dead);
         w.daemon.forget_one(&g).await;
         assert!(w.daemon.get(&g).await.is_none());
+    }
+
+    /// #10 review: only a *purged* actor's closed handle counts as absent.
+    /// An actor that ended any other way (a panic) leaves its fleet in the
+    /// map: an apply must not slip past the owner check and replace the
+    /// record, and both apply and down answer the old internal error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_actor_that_did_not_purge_still_holds_its_fleet() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let mut record = FleetRecord::with_owner(spec(&[("a", &[])]), Some("flow".into()));
+        record.desired = Desired::Down {
+            keep: Keep::default(),
+            purge: false,
+        };
+        record.status.phase = balerix_api::FleetPhase::Down;
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let (_publish, status) = watch::channel(record);
+        w.daemon
+            .fleets
+            .write()
+            .await
+            .insert(name.clone(), FleetHandle { tx, status });
+
+        let e = w
+            .daemon
+            .apply(&name, spec(&[("a", &[])]), Default::default(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, DaemonError::Managed(_)), "{e:?}");
+        let e = w
+            .daemon
+            .apply_as(
+                &name,
+                spec(&[("a", &[])]),
+                Default::default(),
+                ApplyMode::Create,
+                &Caller::Plugin("flow".parse().unwrap()),
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e, DaemonError::Internal("fleet task is gone".into()));
+        let e = w
+            .daemon
+            .down_as(&name, Keep::default(), true, &Caller::Admin { force: true })
+            .await
+            .unwrap_err();
+        assert_eq!(e, DaemonError::Internal("fleet task is gone".into()));
+        assert_eq!(
+            w.daemon.get(&name).await.unwrap().owner.as_deref(),
+            Some("flow"),
+            "the record is the old one"
+        );
     }
 
     /// #10: the purge is decided but the actor has not ended yet — an

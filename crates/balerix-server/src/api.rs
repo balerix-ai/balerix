@@ -102,7 +102,7 @@ impl From<PluginError> for ApiError {
             PluginError::Fetch { .. } => StatusCode::BAD_GATEWAY,
             PluginError::Capability(_) => StatusCode::FORBIDDEN,
             PluginError::NotActive(_) => StatusCode::NOT_FOUND,
-            PluginError::Managed(_) => StatusCode::CONFLICT,
+            PluginError::Managed(_) | PluginError::KvConflict(_) => StatusCode::CONFLICT,
             PluginError::Io { .. } | PluginError::Internal(_) | PluginError::Kv { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -304,13 +304,13 @@ fn fleet_name(s: &str) -> Result<FleetName, ApiError> {
         .map_err(|e: balerix_core::NameError| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))
 }
 
-/// Malformed JSON and a body that doesn't match `FleetRequest` (including
+/// Malformed JSON and a body that doesn't match its type (including
 /// an unknown field: `deny_unknown_fields`) are both a plain 400 — the
 /// spec's error table only names 400 for a bad request body. Only the
 /// rejections whose status carries information the client actually needs
 /// pass through axum's own: a missing/wrong `Content-Type` (415) and a
 /// body over the limit (413, via `BytesRejection`).
-fn body(b: Result<Json<FleetRequest>, JsonRejection>) -> Result<FleetRequest, ApiError> {
+pub(crate) fn body<T>(b: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     b.map(|Json(r)| r).map_err(|e| {
         let status = match &e {
             JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_) => {

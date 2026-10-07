@@ -301,6 +301,19 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
         .into_response()
 }
 
+/// The daemon's answer to a body it cannot read (`api.rs::body`): bad
+/// JSON or the wrong shape is a 400, a missing content type keeps
+/// axum's 415 and an oversized body its 413.
+fn rejected(e: &JsonRejection) -> Response {
+    let status = match e {
+        JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        _ => e.status(),
+    };
+    error(status, e.body_text())
+}
+
 /// `None` if the bearer matches; otherwise the 401 to return.
 fn unauthorized(inner: &Inner, headers: &HeaderMap) -> Option<Response> {
     let ok = headers
@@ -352,6 +365,7 @@ fn router(inner: Arc<Inner>) -> Router {
             get(workspace_version),
         )
         .route("/v1/plugin-host/kv", get(list_keys))
+        .route("/v1/plugin-host/kv/", axum::routing::any(empty_key))
         .route(
             "/v1/plugin-host/kv/{*key}",
             get(get_key).put(put_key).delete(delete_key),
@@ -465,7 +479,7 @@ async fn put_fleet(
     }
     let Json(body) = match body {
         Ok(b) => b,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+        Err(e) => return rejected(&e),
     };
     inner
         .applied
@@ -807,7 +821,7 @@ async fn post_action(
     State(inner): State<Arc<Inner>>,
     headers: HeaderMap,
     AxumPath((f, c, a)): AxumPath<(String, String, String)>,
-    body: Result<Json<PluginAction>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<PluginAction>, JsonRejection>,
 ) -> Response {
     if let Some(resp) = unauthorized(&inner, &headers) {
         return resp;
@@ -822,7 +836,7 @@ async fn post_action(
     }
     let Json(action) = match body {
         Ok(b) => b,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+        Err(e) => return rejected(&e),
     };
     // the daemon's `execute_action` refuses these before anything runs
     if let Err(message) = action.validate() {
@@ -881,6 +895,34 @@ fn invalid_key(key: &str) -> Option<Response> {
         .map(|why| error(StatusCode::BAD_REQUEST, format!("kv: invalid key: {why}")))
 }
 
+/// `kv/` with any method: the empty key, as the daemon refuses it.
+async fn empty_key(State(inner): State<Arc<Inner>>, headers: HeaderMap) -> Response {
+    unauthorized(&inner, &headers)
+        .or_else(|| invalid_key(""))
+        .unwrap_or_else(|| error(StatusCode::INTERNAL_SERVER_ERROR, "the empty key passed"))
+}
+
+/// The daemon's 409 for a key that is a directory of other keys, or
+/// under a key that is a value (its store is one file per key).
+fn conflicting(kv: &BTreeMap<String, (Vec<u8>, bool)>, key: &str) -> Option<Response> {
+    let dir = format!("{key}/");
+    let under_a_value = key
+        .match_indices('/')
+        .any(|(i, _)| kv.contains_key(&key[..i]));
+    let a_directory = kv
+        .range(dir.clone()..)
+        .next()
+        .is_some_and(|(k, _)| k.starts_with(&dir));
+    (under_a_value || a_directory).then(|| {
+        error(
+            StatusCode::CONFLICT,
+            format!(
+                "kv: key {key:?} conflicts with an existing key: a key cannot be both a value and a directory of other keys"
+            ),
+        )
+    })
+}
+
 async fn get_key(
     State(inner): State<Arc<Inner>>,
     headers: HeaderMap,
@@ -919,11 +961,11 @@ async fn put_key(
         Ok(b) => b,
         Err(e) => return error(e.status(), e.body_text()),
     };
-    inner
-        .kv
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, (body.to_vec(), q.secret));
+    let mut kv = inner.kv.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(resp) = conflicting(&kv, &key) {
+        return resp;
+    }
+    kv.insert(key, (body.to_vec(), q.secret));
     Json(json!({})).into_response()
 }
 

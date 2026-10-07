@@ -43,6 +43,21 @@ impl PluginKv {
         }
     }
 
+    /// A key against the tree the other keys made (#14): it is a
+    /// directory of other keys (`a` beside `a/b`), or a path segment of
+    /// it is a value (`a/b` beside `a`). `create_dir_all` answers the
+    /// second with `AlreadyExists` or `NotADirectory`.
+    fn collides(e: &std::io::Error) -> bool {
+        use std::io::ErrorKind::{AlreadyExists, IsADirectory, NotADirectory};
+        matches!(e.kind(), AlreadyExists | IsADirectory | NotADirectory)
+    }
+
+    /// Read and delete treat a missing key and a colliding one alike:
+    /// either way no value is stored under it.
+    fn absent(e: &std::io::Error) -> bool {
+        e.kind() == std::io::ErrorKind::NotFound || Self::collides(e)
+    }
+
     fn aad(name: &AgentName, key: &str) -> String {
         format!("{name}/{key}")
     }
@@ -51,7 +66,7 @@ impl PluginKv {
         let path = self.path(name, key)?;
         let raw = match fs::read(&path) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if Self::absent(&e) => return Ok(None),
             Err(e) => return Err(Self::io(&path, e)),
         };
         match raw.split_first() {
@@ -94,7 +109,13 @@ impl PluginKv {
             out.push(PLAIN);
             out.extend_from_slice(bytes);
         }
-        write_private(&path, &out).map_err(|e| Self::io(&path, e))
+        write_private(&path, &out).map_err(|e| {
+            if Self::collides(&e) {
+                PluginError::KvConflict(key.to_string())
+            } else {
+                Self::io(&path, e)
+            }
+        })
     }
 
     /// `Ok(false)` when there was nothing to delete.
@@ -102,7 +123,7 @@ impl PluginKv {
         let path = self.path(name, key)?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) if Self::absent(&e) => Ok(false),
             Err(e) => Err(Self::io(&path, e)),
         }
     }
@@ -224,6 +245,36 @@ mod tests {
             1,
             "no temp files left"
         );
+    }
+
+    #[test]
+    fn a_key_that_is_a_directory_or_under_a_value_conflicts_and_reads_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = kv(dir.path(), 1);
+        store.put(&flow(), "a", b"v", false).unwrap();
+        store.put(&flow(), "b/c", b"v", false).unwrap();
+        for key in ["a/x", "a/x/y", "b"] {
+            let e = store.put(&flow(), key, b"x", false).unwrap_err();
+            assert!(matches!(e, PluginError::KvConflict(_)), "{key}: {e:?}");
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "kv: key {key:?} conflicts with an existing key: a key cannot be both a value and a directory of other keys"
+                )
+            );
+            assert_eq!(store.get(&flow(), key).unwrap(), None, "{key}");
+            assert!(!store.delete(&flow(), key).unwrap(), "{key}");
+        }
+        assert_eq!(
+            store.list(&flow(), "").unwrap(),
+            vec!["a".to_string(), "b/c".to_string()],
+            "nothing written, no temp file left"
+        );
+        let leftovers = std::fs::read_dir(dir.path().join("plugins/flow/kv"))
+            .unwrap()
+            .chain(std::fs::read_dir(dir.path().join("plugins/flow/kv/b")).unwrap())
+            .count();
+        assert_eq!(leftovers, 3, "a, b, b/c only");
     }
 
     #[test]

@@ -32,7 +32,11 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     f.sync_all()?;
     drop(f);
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, path)
+    // a rename onto a directory fails (the kv store's collisions, #14);
+    // the temp file must not stay behind
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 #[cfg(test)]

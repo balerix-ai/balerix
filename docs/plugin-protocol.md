@@ -108,6 +108,8 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 | `GET kv/{key}`, unknown key | `kv` | — | `{ "error": "no such key" }` | 404 | (same status as `fleet-missing.json`) |
 | `PUT kv/{key}?secret=<bool>` | `kv` | raw bytes | `{}` | 200 | `kv-put.json` |
 | `DELETE kv/{key}` | `kv` | — | `{}` | 200 | (same success shape as `PUT`) |
+| any `kv/{key}`, key outside the grammar (`kv/` with no key included, any method) | `kv` | — | `{ "error": "kv: invalid key: <reason>" }` | 400 | (asserted by `events_it.rs`, §6) |
+| `PUT kv/{key}`, key is a directory of other keys (`a` beside `a/b`) or under a key that is a value (`a/b` beside `a`) | `kv` | raw bytes | `{ "error": "kv: key \"<key>\" conflicts with an existing key: …" }` | 409 | (asserted by `events_it.rs`, §6); `GET` answers such a key 404 and `DELETE` 200, as for an unknown key |
 
 `manifest` is the plugin's `balerix-plugin.yaml` as JSON. The SDK sends it
 only when it was given an authority (`BALERIX_CA_FILE`): `hello` rejects

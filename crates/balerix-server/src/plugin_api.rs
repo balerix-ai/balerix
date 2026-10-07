@@ -7,7 +7,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{any, get};
 use axum::{Json, Router};
 use balerix_api::{
     Capability, DownQuery, KvKeys, PluginAction, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
@@ -38,6 +38,9 @@ pub(crate) fn router() -> Router<AppState> {
             get(attach),
         )
         .route("/v1/plugin-host/kv", get(list_keys))
+        // `{*key}` never matches an empty key; without this the bare
+        // `kv/` would be axum's empty 404, unauthenticated (#14)
+        .route("/v1/plugin-host/kv/", any(empty_key))
         .route(
             "/v1/plugin-host/kv/{*key}",
             get(get_key).put(put_key).delete(delete_key),
@@ -119,7 +122,11 @@ struct FleetFileBody {
 
 /// The fleet of a manage route. A bad name is a 400 that names it: the
 /// daemon has nothing to be "not found" for a name it never accepts, and
-/// the plugin built it.
+/// the plugin built it. The read routes (`get_fleet`, `post_action`,
+/// `attach`, the workspace routes) answer 404 for the same name on
+/// purpose: there it names something to look up, and no fleet or agent
+/// can exist under a name the grammar refuses, so "not found" is true
+/// and tells a plugin nothing a valid name would not (#14).
 fn manage_name(name: Result<Path<String>, PathRejection>) -> Result<FleetName, ApiError> {
     let Path(name) = name.map_err(|e| ApiError::new(e.status(), e.body_text()))?;
     name.parse().map_err(|e: balerix_core::NameError| {
@@ -138,7 +145,7 @@ async fn put_fleet(
 ) -> Result<Response, ApiError> {
     let plugin = caller(&state, &headers, Capability::Manage).await?;
     let name = manage_name(name)?;
-    let Json(body) = body.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    let body = crate::api::body(body)?;
     if !body.file.is_object() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -233,7 +240,7 @@ async fn post_action(
     let agent: AgentId = format!("{f}/{c}/{a}")
         .parse()
         .map_err(|_: balerix_core::NameError| ApiError::from(DaemonError::NotFound))?;
-    let Json(action) = body.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    let action = crate::api::body(body)?;
     if !state.daemon.registry().is_active(&agent, &plugin) {
         return Err(PluginError::NotActive(agent.to_string()).into());
     }
@@ -358,6 +365,16 @@ fn kv_query(q: Result<Query<KvQuery>, QueryRejection>) -> Result<KvQuery, ApiErr
 fn key_of(p: Result<Path<String>, PathRejection>) -> Result<String, ApiError> {
     p.map(|Path(k)| k)
         .map_err(|e| ApiError::new(e.status(), e.body_text()))
+}
+
+/// `kv/` with any method: the empty key, refused like any other bad one.
+async fn empty_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    caller(&state, &headers, Capability::Kv).await?;
+    let why = balerix_api::check_kv_key("").err().unwrap_or_default();
+    Err(PluginError::KvKey(why).into())
 }
 
 async fn list_keys(

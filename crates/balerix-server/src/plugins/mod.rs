@@ -56,6 +56,12 @@ pub enum PluginError {
     Capability(String),
     #[error("kv: invalid key: {0}")]
     KvKey(String),
+    /// A 409: the key is a directory of other keys, or under a key that
+    /// is a value (#14). The string is the key.
+    #[error(
+        "kv: key {0:?} conflicts with an existing key: a key cannot be both a value and a directory of other keys"
+    )]
+    KvConflict(String),
     #[error("plugin is not active for agent {0}")]
     NotActive(String),
     #[error("{path}: {message}")]

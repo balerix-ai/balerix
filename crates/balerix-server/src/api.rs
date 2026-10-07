@@ -17,7 +17,7 @@ use balerix_api::{
     DownQuery, ErrorBody, FleetRequest, FleetSummary, HelloRequest, HelloResponse, PluginStatus,
     SessionRequest, SessionResponse, SyncReport,
 };
-use balerix_core::{AgentName, FleetName, FleetRecord, Keep, NameError};
+use balerix_core::{AgentName, FleetName, FleetRecord, Keep, NameError, plugin_id};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -469,6 +469,18 @@ async fn plugin_hello(
     };
     let req = body(b)?;
     let name: AgentName = req.name.parse().map_err(|_: NameError| unauthorized())?;
+    // The hook route's bucket, per plugin, once the caller is known to be
+    // this plugin (#6): an authenticated plugin cannot flood the actor
+    // with hellos. `plugin_hello` checks the token again.
+    if state.daemon.plugin_for_token(token).await.as_ref() != Some(&name) {
+        return Err(unauthorized());
+    }
+    if !state.limiter.allow(&plugin_id(&name).to_string()) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded",
+        ));
+    }
     state
         .daemon
         .plugin_hello(&name, token, req)

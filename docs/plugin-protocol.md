@@ -83,6 +83,7 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 | `POST hello` | always | `{ name, version, protocol, listen, manifest? }` | `{ config }` | 200 | `hello.json` |
 | `POST hello`, Kubernetes mode, no manifest or one outside the grant | always | same | `{ error }`: `hello.manifest: required in kubernetes mode`, `hello.manifest.name: "<m>" does not match the plugin "<p>"` or `hello.manifest.needs: <cap> is not granted` | 400 | (asserted by `crates/balerix-server/tests/kube_plugins_it.rs`, §6) |
 | `POST hello`, bad/missing token | always | same | `{ error }` | 401 | `hello-bad-token.json` |
+| `POST hello`, over the plugin's rate (the hook route's bucket: 20/s, burst 50, per plugin, counted after the token) | always | same | `{ "error": "rate limit exceeded" }` | 429 | (asserted by `crates/balerix-server/tests/plugins_it.rs`, §6) |
 | `GET fleets` | `fleets` | — | `[FleetRecord]` | 200 | `fleets.json` |
 | `GET fleets/{name}` | `fleets` | — | `FleetRecord` | 200 | (shape as in `fleets.json`'s `response[0]`) |
 | `GET fleets/{name}`, unknown name | `fleets` | — | `{ error }` | 404 | `fleet-missing.json` |

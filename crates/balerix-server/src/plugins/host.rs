@@ -292,6 +292,10 @@ impl PluginHost {
             .materializer
             .get(name)
             .ok_or(DaemonError::Unauthorized)?;
+        // Unreachable over HTTP: `plugin_hello` takes `name` from
+        // `req.name` itself (the token is then checked against that
+        // plugin), and names are not normalised. It guards a direct
+        // caller that passes a name and a request that disagree.
         if req.name != name.as_str() {
             return Err(DaemonError::Invalid(format!(
                 "hello.name: {:?} does not match the token's plugin {:?}",

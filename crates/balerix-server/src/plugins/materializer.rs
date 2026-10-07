@@ -76,6 +76,11 @@ impl Materializer for PluginMaterializer {
     fn remove_agent(&self, _: &AgentId) -> Result<(), MaterializeError> {
         Ok(())
     }
+    /// Load-bearing no-op: the planner derives the desired crews from the
+    /// agents, so the sync that removes the last plugin drops the
+    /// `plugins` crew and the actor runs `RemoveCrew` on it. Plugin state
+    /// survives removal (`remove_agent` above); only `purge_plugin`
+    /// deletes. Do not forward this to the inner materializer.
     fn remove_crew(&self, _: &CrewRef, _: Keep) -> Result<(), MaterializeError> {
         Ok(())
     }

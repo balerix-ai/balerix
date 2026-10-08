@@ -466,7 +466,12 @@ pub const VERSION_PATH_CAP: usize = 2000;
 /// among them (sorted), so a large untracked tree cannot push an edit to a
 /// tracked file out of the fingerprint. The kept entries are sorted by path
 /// whichever side they came from, so a `git add` that moves a path from
-/// untracked to tracked, and changes no bytes, still changes nothing.
+/// untracked to tracked, and changes no bytes, still changes nothing. A
+/// path git named is held to `check_path` first, as every other read's is
+/// (#19): one that fails is neither stat'ed nor counted. That includes a
+/// valid Linux file name with a `\` in it (`check_path` refuses
+/// backslashes): such a file is left out of the fingerprint, so an edit to
+/// it alone does not refresh the review page.
 pub fn stat_paths(
     workspace: &Path,
     tracked: BTreeSet<String>,
@@ -476,7 +481,11 @@ pub fn stat_paths(
         .into_iter()
         .filter(|p| !tracked.contains(p))
         .collect();
-    let paths: Vec<String> = tracked.into_iter().chain(untracked).collect();
+    let paths: Vec<String> = tracked
+        .into_iter()
+        .chain(untracked)
+        .filter(|p| check_path(p).is_ok())
+        .collect();
     let total = paths.len();
     let mut entries: Vec<PathStat> = paths
         .into_iter()
@@ -1139,6 +1148,37 @@ mod tests {
         assert!(VERSION_SCRIPT.contains(&format!("exit {VERSION_FILTER}")));
         assert_eq!(version_stage(0), None);
         assert_eq!(version_stage(1), None);
+    }
+
+    /// #19: a git-supplied path is held to `check_path` before the `stat`,
+    /// like every other read: one that would leave the worktree, or reach
+    /// into `.git`, is neither stat'ed nor counted.
+    #[test]
+    fn version_drops_paths_that_fail_check_path_before_the_stat() {
+        let root = std::env::temp_dir().join(format!("balerix-stat-paths-{}", std::process::id()));
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        std::fs::write(ws.join("ok"), "x").unwrap();
+        std::fs::write(ws.join(".git/HEAD"), "x").unwrap();
+        std::fs::write(root.join("outside"), "x").unwrap();
+        let outside = root.join("outside").display().to_string();
+        let paths = BTreeSet::from(
+            [
+                "ok",
+                "../outside",
+                outside.as_str(),
+                ".git/HEAD",
+                "a/./b",
+                "a\\b",
+            ]
+            .map(String::from),
+        );
+        let (entries, total) = stat_paths(&ws, paths, BTreeSet::new());
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(total, 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "ok");
+        assert!(entries[0].stat.is_some());
     }
 
     /// The key is the first line that is one; a warning before it is not.

@@ -531,8 +531,8 @@ credentials, hook input, or sandbox rules.
   `uncommitted` (and the `version` fingerprint) now come from `git status`,
   so an index-only change (staged, with the worktree back at `HEAD`'s
   content) counts as uncommitted, where `diff HEAD` used to miss it.
-- A workspace `diff` refuses with `repository config sets <key>; workspace
-  diff refused` when the clone's `.git/config` declares a
+- A workspace `diff` or `version` refuses with `repository config sets
+  <key>; workspace read refused` when the clone's `.git/config` declares a
   `filter.<x>.<clean|smudge|process>`, or when it sets
   `extensions.worktreeconfig` (a `config.worktree` file could then hold a
   filter the check's `--local` read cannot see, so the extension alone is
@@ -552,8 +552,10 @@ credentials, hook input, or sandbox rules.
   first and untracked paths after them (each sorted), so a large untracked
   tree cannot hide an edit to a tracked file; past the cap a marker and
   the total count are hashed too, so a path coming or going still shows
-  but an edit to one left out does not (#18). A path whose `stat` fails
-  for any reason hashes as `missing`.
+  but an edit to one left out does not (#18). A path that fails
+  `check_path` — a valid Linux name with a `\` in it, say — is left out
+  of the fingerprint altogether (#19). A path whose `stat` fails for any
+  reason hashes as `missing`.
   The web plugin's `events.json` waits 1.5 s for it, then answers
   `workspace: null` and counts a `version_failures_total`.
   The review page applies a changed diff automatically (3 s rate limit),

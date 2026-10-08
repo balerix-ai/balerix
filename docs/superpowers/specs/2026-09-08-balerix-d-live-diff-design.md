@@ -59,7 +59,10 @@ control and the `FILTER_KEYS` check first:
    #174 the probe, `merge-base`, the name-only diff and `status` run in one
    sandboxed `/bin/sh`; see AGENTS.md.)
 2. The path set: `diff --name-only -z <merge_base>` ∪ the status's changed
-   ∪ untracked paths, sorted, deduplicated.
+   ∪ untracked paths, sorted, deduplicated; a path that fails
+   `check_path` is dropped before any `stat` (#19) — including a valid
+   Linux file name with a `\` in it, which is then left out of the
+   fingerprint.
 3. For at most `VERSION_PATH_CAP` (2000) paths (#18) — the tracked
    changes (the name-only diff ∪ the status's changed) first, sorted, then
    the untracked paths, sorted, so a large untracked tree cannot hide an

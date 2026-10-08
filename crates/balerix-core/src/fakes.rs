@@ -1183,7 +1183,7 @@ mod tests {
                 key: "filter.lfs.clean".into()
             }
             .to_string(),
-            "repository config sets filter.lfs.clean; workspace diff refused"
+            "repository config sets filter.lfs.clean; workspace read refused"
         );
         let v = w.version(&id("f/c/a"), "origin/main").unwrap();
         assert_eq!(v.head, "h");

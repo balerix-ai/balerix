@@ -176,8 +176,9 @@ pub enum WorkspaceError {
     },
     /// The repository's config names a clean/smudge/process filter, or a
     /// promisor remote; a diff would run a program, or fetch from
-    /// elsewhere, as the daemon.
-    #[error("repository config sets {key}; workspace diff refused")]
+    /// elsewhere, as the daemon. Raised by `diff` and `version` alike, so
+    /// the message names neither.
+    #[error("repository config sets {key}; workspace read refused")]
     Filter { key: String },
     #[error("{path}: {message}")]
     Io { path: PathBuf, message: String },

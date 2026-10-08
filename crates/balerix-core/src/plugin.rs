@@ -77,7 +77,9 @@ pub struct ResolvedPlugin {
     /// of `hash()`: an edit takes effect at the plugin's next apply, and
     /// restarting the plugin for it would gain nothing.
     pub fleet_defaults: Value,
-    /// sha256 hex of the tarball; `None` for a directory source.
+    /// sha256 hex of the tarball; for a directory source the daemon's
+    /// sha256 of its `mise.toml` and `balerix-plugin.yaml` (#4), so an edit
+    /// to either changes `hash()`.
     pub digest: Option<String>,
 }
 
@@ -117,6 +119,9 @@ impl ResolvedPlugin {
             config: &self.config,
             digest: &self.digest,
         };
+        // Serialization of these plain data types cannot fail: strings, a
+        // `Value` and a derived `Serialize` with string map keys (as
+        // `ResolvedAgent::hash`).
         let bytes = serde_json::to_vec(&input).unwrap_or_default();
         SpecHash::new(hex::encode(Sha256::digest(bytes)))
     }
@@ -127,8 +132,18 @@ impl ResolvedPlugin {
 pub enum ManifestError {
     #[error("balerix-plugin.yaml: {path}: {message}")]
     Manifest { path: String, message: String },
-    #[error("mise.toml: {}{message}", if path.is_empty() { String::new() } else { format!("{path}: ") })]
+    /// `path` is empty for an error about the whole file (it does not parse).
+    #[error("mise.toml: {}{message}", path_prefix(path))]
     MiseToml { path: String, message: String },
+}
+
+/// `"<path>: "`, or nothing for an empty path.
+fn path_prefix(path: &str) -> String {
+    if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}: ")
+    }
 }
 
 /// Plugins spec §2 rules, applied to a parsed manifest and the text of the
@@ -200,7 +215,16 @@ fn validate_mise_toml(text: &str, start: &str) -> Result<(), ManifestError> {
             path: String::new(),
             message: e.message().to_string(),
         })?;
-    if let Some(toml::Value::Table(tools)) = doc.get("tools") {
+    let not_a_table = |key: &str| ManifestError::MiseToml {
+        path: key.to_string(),
+        message: "expected a table".into(),
+    };
+    let tools = match doc.get("tools") {
+        None => None,
+        Some(toml::Value::Table(t)) => Some(t),
+        Some(_) => return Err(not_a_table("tools")),
+    };
+    if let Some(tools) = tools {
         for (k, v) in tools {
             let version = match v {
                 toml::Value::String(s) => s.clone(),
@@ -228,7 +252,11 @@ fn validate_mise_toml(text: &str, start: &str) -> Result<(), ManifestError> {
             }
         }
     }
-    let defined = matches!(doc.get("tasks"), Some(toml::Value::Table(t)) if t.contains_key(start));
+    let defined = match doc.get("tasks") {
+        None => false,
+        Some(toml::Value::Table(t)) => t.contains_key(start),
+        Some(_) => return Err(not_a_table("tasks")),
+    };
     if !defined {
         return Err(ManifestError::MiseToml {
             path: format!("tasks.{start}"),
@@ -438,6 +466,24 @@ mod tests {
                 .to_string(),
             "mise.toml: tasks.serve: the manifest's `start` task is not defined"
         );
+        // #5: a value of the wrong kind is reported as such, not skipped
+        for (text, expected) in [
+            (
+                "tools = \"x\"\n[tasks.serve]\nrun = \"x\"\n",
+                "mise.toml: tools: expected a table",
+            ),
+            (
+                "tasks = [\"serve\"]\n",
+                "mise.toml: tasks: expected a table",
+            ),
+        ] {
+            assert_eq!(
+                validate_manifest(&manifest("web"), text)
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
         // inline table form of tasks is accepted too
         validate_manifest(&manifest("web"), "tasks = { serve = \"python3 p.py\" }\n").unwrap();
         // a tools entry in table form with a version key

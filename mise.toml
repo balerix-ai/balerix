@@ -2,7 +2,7 @@
 # git is a system prerequisite (not in the mise registry); the devcontainer ships 2.47.3.
 [tools]
 rust = { version = "1.99.0", components = ["rustfmt", "clippy"] }
-"cargo:cargo-nextest" = "0.9.146"
+"cargo:cargo-nextest" = "0.9.148"
 cargo-insta = "1.49.0"
 "cargo:cargo-audit" = "0.22.2"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
@@ -11,11 +11,11 @@ gitleaks = "8.30.1"
 tmux = "3.7c"
 gh = "2.102.0"
 nono = "0.79.0"
-claude = "2.1.293"
+claude = "2.1.294"
 # The web plugin's review-page script runs under node in its tests
 # (plugins/web/src/routes.rs, #20). The 26 line, LTS from late October
 # 2026; never inherited by agents (INHERITED is claude and gh only).
-node = "26.11.0"
+node = "26.11.1"
 
 # Release and workflow tooling (Spec I). Only `claude` and `gh` from this
 # table reach agents (balerix-runtime's INHERITED list).

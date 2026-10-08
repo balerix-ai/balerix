@@ -366,6 +366,18 @@ crews:
     }
 
     #[test]
+    fn an_absent_defaults_key_leaves_every_tool_table_empty() {
+        let f = file(
+            "apiVersion: balerix/v1\nkind: Fleet\nname: f\n\
+             crews:\n  c:\n    repo: o/r\n    agents:\n      a: {}\n",
+        );
+        let spec = resolve(&f, &ResolveOptions::default()).unwrap();
+        assert_eq!(spec.tools, BTreeMap::new());
+        assert_eq!(spec.crews["c"].tools, BTreeMap::new());
+        assert_eq!(spec.crews["c"].agents["a"].tools, BTreeMap::new());
+    }
+
+    #[test]
     fn a_fuzzy_version_in_a_defaults_layer_is_rejected_with_its_path() {
         let f = file(
             "apiVersion: balerix/v1\nkind: Fleet\nname: f\n\

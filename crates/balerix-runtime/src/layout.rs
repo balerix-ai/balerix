@@ -152,14 +152,35 @@ pub struct PluginPaths {
     pub logs: PathBuf,
 }
 
+/// One pool level's files under that level's root, shared by the fleet
+/// and crew levels so their layout cannot drift apart (#25).
+struct PoolPaths {
+    /// A complete mise data dir; only `installs/` is exported to children.
+    pool: PathBuf,
+    /// sha256 of the `mise.toml` this pool was last installed from.
+    marker: PathBuf,
+}
+
+fn pool_paths(root: &Path) -> PoolPaths {
+    PoolPaths {
+        pool: root.join("mise"),
+        marker: root.join("mise.installed"),
+    }
+}
+
 impl FleetPaths {
     /// A complete mise data dir; only `installs/` is exported to children.
     pub fn mise_pool(&self) -> PathBuf {
-        self.root.join("mise")
+        pool_paths(&self.root).pool
     }
     /// sha256 of the `mise.toml` this pool was last installed from.
     pub fn installed_marker(&self) -> PathBuf {
-        self.root.join("mise.installed")
+        pool_paths(&self.root).marker
+    }
+    /// Where the fleet pool's installs are logged (#23): beside the
+    /// pool, never under whichever crew's pass triggered the install.
+    pub fn logs(&self) -> PathBuf {
+        self.root.join("logs")
     }
 }
 
@@ -168,10 +189,10 @@ impl CrewPaths {
         self.root.join("mise.toml")
     }
     pub fn mise_pool(&self) -> PathBuf {
-        self.root.join("mise")
+        pool_paths(&self.root).pool
     }
     pub fn installed_marker(&self) -> PathBuf {
-        self.root.join("mise.installed")
+        pool_paths(&self.root).marker
     }
     /// The object cache the agents' private clones borrow from (Spec N-3):
     /// the only path under `repo/` an agent's sandbox sees, read-only. An

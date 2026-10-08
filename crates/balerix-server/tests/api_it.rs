@@ -456,3 +456,57 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
 }
+
+/// #24: the admin `POST` re-checks every tool table, so a client that
+/// skips `balerix_config::resolve` cannot hand mise a fuzzy version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_inexact_tool_version_is_a_400_naming_its_path() {
+    let h = Harness::new(Duration::from_secs(3600));
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let daemon = h.daemon(Arc::new(PassThrough), plugin_dir.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(listener, router(daemon.clone()), async {
+        let _ = stop_rx.await;
+    }));
+    let api = Api {
+        base: format!("http://127.0.0.1:{port}"),
+        token: "admin-tok".into(),
+        agent: ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .http_status_as_error(false)
+            .build()
+            .into(),
+    };
+
+    let mut s = spec(&["a"]);
+    s.crews
+        .get_mut("c")
+        .unwrap()
+        .agents
+        .get_mut("a")
+        .unwrap()
+        .tools
+        .insert("node".into(), "latest".into());
+    let req = json!(FleetRequest {
+        spec: s,
+        credentials: Default::default(),
+        agent_tokens: None,
+        managed_by: None,
+    });
+    let (st, v) = tokio::task::spawn_blocking(move || api.admin("POST", "/v1/fleets", Some(&req)))
+        .await
+        .unwrap();
+    assert_eq!(st, 400, "{v}");
+    let e: ErrorBody = serde_json::from_value(v).unwrap();
+    assert_eq!(
+        e.error,
+        "crews.c.agents.a.tools.node: expected an exact version, got \"latest\" \
+         (try: mise latest node@latest)"
+    );
+    assert!(daemon.get(&"f".parse().unwrap()).await.is_none());
+
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+}

@@ -1,5 +1,6 @@
-//! Tool version exactness, shared by manifest validation (`plugin.rs`) and
-//! fleet-config validation (`balerix_config::validate`).
+//! Tool version exactness, shared by manifest validation (`plugin.rs`),
+//! fleet-config validation (`balerix_config::validate`) and the daemon's
+//! own check in `Fleet::try_from`.
 
 /// Rejects mise's fuzzy forms: `prefix:`/`ref:`/`path:`/`sub-` specs,
 /// wildcards, bare `major` / `major.minor` numbers, and anything without a
@@ -19,6 +20,13 @@ pub fn is_exact_version(v: &str) -> bool {
     let total_parts = v.split('.').count();
     // "22" and "22.11" are fuzzy; "3.7c", "1.0.0-rc.1", "v1.2.3" are exact.
     !(numeric_parts == total_parts && total_parts < 3)
+}
+
+/// The message for a tool version `is_exact_version` refuses. The client
+/// (`balerix_config`) and the daemon (`Fleet::try_from`) both use it, so a
+/// refusal reads the same whichever side caught it.
+pub fn exact_version_message(tool: &str, version: &str) -> String {
+    format!("expected an exact version, got {version:?} (try: mise latest {tool}@{version})")
 }
 
 #[cfg(test)]

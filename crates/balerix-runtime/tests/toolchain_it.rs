@@ -453,6 +453,46 @@ fn pool_contents(root: &std::path::Path) -> Vec<String> {
     out
 }
 
+/// Serves `body` to every request on a loopback port, in a thread that
+/// lives as long as the test process; the tarball's URL and a count of the
+/// `GET`s answered. A `HEAD` gets the headers alone.
+fn serve_tarball(body: Vec<u8>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://{}/balerix-probe-1.0.0.tar",
+        listener.local_addr().unwrap()
+    );
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                continue;
+            }
+            // the rest of the head; the body of a GET or HEAD is empty
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                line.clear();
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            if request_line.starts_with("GET ") {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.write_all(&body);
+            }
+        }
+    });
+    (url, hits)
+}
+
 // Spec E §10's second acceptance criterion: "`mise install` in the agent's
 // worktree installs a repo-declared tool into `home/.local/share/mise`
 // without touching any pool." Nothing else in the branch exercises this —
@@ -460,6 +500,12 @@ fn pool_contents(root: &std::path::Path) -> Vec<String> {
 // an env string (env.rs) and the golden snapshot — so this is the only
 // test that would catch a regression in the
 // `MISE_CEILING_PATHS`/`MISE_AUTO_INSTALL`/private-data-dir triple.
+//
+// The install is a real cache miss (#22): the worktree declares a tool
+// through mise's `http` backend at a tarball the test builds and serves
+// from a loopback listener, so `mise install` has to fetch and unpack it
+// with no outside network, and the private dir is asserted empty
+// beforehand. Not `file://`: CI's mise (2026.9.2) refuses that scheme.
 #[test]
 fn mise_install_in_the_worktree_lands_privately_and_leaves_every_pool_alone() {
     let Some(tools) = support::tools() else {
@@ -474,19 +520,23 @@ fn mise_install_in_the_worktree_lands_privately_and_leaves_every_pool_alone() {
     let paths = layout.agent(&id);
     std::fs::create_dir_all(&paths.workspace).unwrap();
 
-    // Seeded straight into the agent's own private data dir, never a pool:
-    // this test is about the worktree install path, not the pool chain
-    // (covered above), so nothing here may hit the network. The agent's
-    // generated global table (`tc.write`, below) names nothing, so the
-    // only way `tmux` can resolve is through the worktree's own
-    // `mise.toml`, discovered via `MISE_CEILING_PATHS`.
-    let tmux = repo_pin("tmux");
-    if !support::require_or_skip(
-        "a host tmux install to seed from",
-        seed_into(&tools, &paths.mise_data_dir(), "tmux", &tmux),
-    ) {
-        return;
-    }
+    // A one-line tool, packed outside every balerix directory.
+    let src = root.join("probe-src");
+    std::fs::create_dir_all(src.join("bin")).unwrap();
+    let script = src.join("bin").join("balerix-probe");
+    std::fs::write(&script, "#!/bin/sh\necho balerix-probe\n").unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let tarball = root.join("balerix-probe-1.0.0.tar");
+    let packed = Command::new("tar")
+        .arg("-C")
+        .arg(&src)
+        .arg("-cf")
+        .arg(&tarball)
+        .arg("bin")
+        .status()
+        .unwrap();
+    assert!(packed.success(), "tar");
+    let (url, hits) = serve_tarball(std::fs::read(&tarball).unwrap());
 
     let tc = Toolchain {
         tools: &tools,
@@ -494,12 +544,21 @@ fn mise_install_in_the_worktree_lands_privately_and_leaves_every_pool_alone() {
     };
     tc.write(&id, &paths, &BTreeMap::new(), &BTreeMap::new(), false)
         .unwrap();
+    // The agent's generated global table names nothing, so the only way
+    // the probe can install or resolve is through the worktree's own
+    // `mise.toml`, discovered via `MISE_CEILING_PATHS`.
     std::fs::write(
         paths.workspace.join("mise.toml"),
-        format!("[tools]\ntmux = {tmux:?}\n"),
+        format!("[tools]\n\"http:balerix-probe\" = {{ version = \"1.0.0\", url = \"{url}\" }}\n"),
     )
     .unwrap();
 
+    let private = paths.mise_data_dir();
+    assert_eq!(
+        pool_contents(&private),
+        Vec::<String>::new(),
+        "the private dir starts empty, so the install below is a cache miss"
+    );
     let daemon_pool = layout.mise_data_dir();
     let before = (
         pool_contents(&daemon_pool),
@@ -538,32 +597,34 @@ fn mise_install_in_the_worktree_lands_privately_and_leaves_every_pool_alone() {
         "mise install: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-
     assert!(
-        paths
-            .mise_data_dir()
-            .join("installs")
-            .join("tmux")
-            .join(&tmux)
-            .exists(),
-        "tmux landed under the agent's private data dir"
+        hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "mise fetched the probe from the loopback server"
+    );
+    let installed = pool_contents(&private.join("installs"));
+    assert!(
+        installed
+            .iter()
+            .any(|p| p.starts_with("http-balerix-probe/1.0.0/")),
+        "the probe landed under the agent's private data dir: {installed:?}"
     );
 
-    // Resolution, not just presence: the agent's own global table names
-    // nothing, and no pool holds tmux either, so this only succeeds if
-    // `mise which` actually discovered the worktree's own `mise.toml`
-    // through `MISE_CEILING_PATHS`.
-    let out = run(&["which", "tmux"]);
+    // Resolution, not just presence: no pool holds the probe, so this
+    // only succeeds if `mise which` discovered the worktree's own
+    // `mise.toml` and found the install in the private dir.
+    let out = run(&["which", "balerix-probe"]);
     assert!(
         out.status.success(),
-        "mise which tmux: {}",
+        "mise which balerix-probe: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let resolved = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(
-        resolved.starts_with(&paths.mise_data_dir().display().to_string()),
-        "tmux resolved to {resolved}, expected the private dir"
+        resolved.starts_with(&private.display().to_string()),
+        "balerix-probe resolved to {resolved}, expected the private dir"
     );
+    let out = Command::new(&resolved).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "balerix-probe\n");
 
     let after = (
         pool_contents(&daemon_pool),

@@ -316,6 +316,30 @@ fn ensure_crew_no_longer_writes_the_daemon_pool() {
         before,
         "install_pools must not touch the daemon pool any more (Spec F §3)"
     );
+
+    // #23: each level logs under its own directory, so the fleet's trace
+    // does not land under whichever crew's pass happened to install it.
+    let fleet_toml = layout.fleet(&crew.fleet).mise_toml;
+    let fleet_log = layout
+        .fleet_dir(&crew.fleet)
+        .join("logs")
+        .join("mise.pools.log");
+    let crew_log = layout.crew(&crew).logs.join("mise.pools.log");
+    let read = |p: &std::path::Path| {
+        std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+    };
+    let fleet_toml = fleet_toml.display().to_string();
+    assert!(
+        read(&fleet_log).contains(&fleet_toml),
+        "{}",
+        read(&fleet_log)
+    );
+    assert!(
+        !read(&crew_log).contains(&fleet_toml),
+        "{}",
+        read(&crew_log)
+    );
+    assert!(read(&crew_log).contains(&layout.crew(&crew).mise_toml().display().to_string()));
 }
 
 /// Every path under `dir`, sorted, so an unchanged pool compares equal.

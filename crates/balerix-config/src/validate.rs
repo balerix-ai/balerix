@@ -2,7 +2,7 @@
 //! repos are validated by `balerix_core::Fleet`; this covers everything else.
 
 use balerix_api::AgentSettings;
-use balerix_core::is_exact_version;
+use balerix_core::{exact_version_message, is_exact_version};
 use serde_json::Value;
 
 use crate::ConfigError;
@@ -22,13 +22,6 @@ pub const RESERVED_ENV_PREFIXES: &[&str] = &[
     "TMPDIR",
     "CLAUDE_CODE_TMPDIR",
 ];
-
-/// The message for a tool version `is_exact_version` refuses; shared by
-/// `validate_agent` and `tools_layer` so the two stay identical by
-/// construction rather than by two hand-kept copies.
-fn exact_version_message(tool: &str, version: &str) -> String {
-    format!("expected an exact version, got {version:?} (try: mise latest {tool}@{version})")
-}
 
 /// Validates one resolved settings block; `path` prefixes every message.
 pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), ConfigError> {
@@ -107,7 +100,7 @@ pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), Config
 /// marker and is dropped, and every surviving version must be exact.
 /// `path` is the layer's config path, e.g. `defaults` or
 /// `crews.web.defaults`.
-pub fn tools_layer(
+pub(crate) fn tools_layer(
     path: &str,
     layer: &Value,
 ) -> Result<std::collections::BTreeMap<String, String>, ConfigError> {
@@ -267,6 +260,46 @@ mod tests {
         assert_eq!(
             tools_layer("crews.web.defaults", &json!({"tools": null})).unwrap(),
             BTreeMap::new()
+        );
+    }
+
+    #[test]
+    fn tools_layer_treats_an_absent_table_as_empty() {
+        assert_eq!(
+            tools_layer("defaults", &json!({"env": {}})).unwrap(),
+            BTreeMap::new()
+        );
+    }
+
+    #[test]
+    fn tools_layer_rejects_a_non_mapping_table_at_the_tools_path() {
+        assert_eq!(
+            tools_layer("crews.web.defaults", &json!({"tools": ["node"]}))
+                .unwrap_err()
+                .to_string(),
+            "crews.web.defaults.tools: expected a mapping"
+        );
+    }
+
+    #[test]
+    fn tools_layer_drops_a_null_value_and_keeps_the_rest() {
+        assert_eq!(
+            tools_layer(
+                "defaults",
+                &json!({"tools": {"node": "22.11.0", "python": null}})
+            )
+            .unwrap(),
+            BTreeMap::from([("node".to_string(), "22.11.0".to_string())])
+        );
+    }
+
+    #[test]
+    fn tools_layer_rejects_a_fuzzy_version_at_the_tool_path() {
+        assert_eq!(
+            tools_layer("defaults", &json!({"tools": {"node": "lts"}}))
+                .unwrap_err()
+                .to_string(),
+            "defaults.tools.node: expected an exact version, got \"lts\" (try: mise latest node@lts)"
         );
     }
 

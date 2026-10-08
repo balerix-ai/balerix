@@ -116,7 +116,7 @@ pub fn sync_pool(
                 &[slice.daemon_pool()],
                 &fleet.installed_marker(),
                 table,
-                &fleet.root.join("logs").join("mise.pools.log"),
+                &fleet.logs().join("mise.pools.log"),
             )
         }
     }

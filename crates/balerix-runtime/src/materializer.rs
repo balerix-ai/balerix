@@ -188,8 +188,6 @@ impl Runtime {
         let fleet = self.layout.fleet(&crew.fleet);
         let crew_paths = self.layout.crew(crew);
         let daemon_pool = self.layout.mise_data_dir();
-        let log = crew_paths.logs.join("mise.pools.log");
-
         let crew_id = crew.to_string();
         tc.install_level(
             &crew_id,
@@ -199,7 +197,7 @@ impl Runtime {
             std::slice::from_ref(&daemon_pool),
             &fleet.installed_marker(),
             tools.fleet,
-            &log,
+            &fleet.logs().join("mise.pools.log"),
             None,
         )?;
         tc.install_level(
@@ -210,7 +208,7 @@ impl Runtime {
             &[fleet.mise_pool(), daemon_pool],
             &crew_paths.installed_marker(),
             tools.crew,
-            &log,
+            &crew_paths.logs.join("mise.pools.log"),
             None,
         )
     }

@@ -161,6 +161,11 @@ impl FleetPaths {
     pub fn installed_marker(&self) -> PathBuf {
         self.root.join("mise.installed")
     }
+    /// Where the fleet pool's installs are logged (#23): beside the
+    /// pool, never under whichever crew's pass triggered the install.
+    pub fn logs(&self) -> PathBuf {
+        self.root.join("logs")
+    }
 }
 
 impl CrewPaths {

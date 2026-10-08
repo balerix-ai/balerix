@@ -140,3 +140,58 @@ fn package_install_and_remove_edit_plugins_yaml_offline() {
     );
     assert!(!yaml.contains("sha256"), "{yaml}");
 }
+
+/// #7: `--sha256` with a directory is refused rather than dropped, and an
+/// explicit `--api-url` without a local token is an error, not "daemon not
+/// running"; either way plugins.yaml is left as it was.
+#[test]
+fn install_refuses_a_digest_for_a_directory_and_an_unusable_api_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let pkg = dir.path().join("pkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("balerix-plugin.yaml"), MANIFEST).unwrap();
+    fs::write(pkg.join("mise.toml"), MISE).unwrap();
+    let pkg = pkg.display().to_string();
+    let plugins_yaml = home.join(".config/balerix/plugins.yaml");
+
+    balerix(&home)
+        .args(["plugin", "install", &pkg, "--sha256", &"0".repeat(64)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "is a directory, used in place with no digest",
+        ));
+    assert!(!plugins_yaml.exists());
+
+    balerix(&home)
+        .args(["plugin", "install", &pkg, "--api-url", "http://127.0.0.1:1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--api-url http://127.0.0.1:1: no daemon token at ",
+        ))
+        .stderr(predicate::str::contains("daemon not running").not());
+    assert!(!plugins_yaml.exists(), "nothing declared");
+
+    // without the flag the same machine is simply offline
+    balerix(&home)
+        .args(["plugin", "install", &pkg])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("daemon not running"));
+    balerix(&home)
+        .args([
+            "plugin",
+            "remove",
+            "hello",
+            "--api-url",
+            "http://127.0.0.1:1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no daemon token at "));
+    let yaml = fs::read_to_string(&plugins_yaml).unwrap();
+    assert!(yaml.contains("name: hello"), "the entry is kept: {yaml}");
+}

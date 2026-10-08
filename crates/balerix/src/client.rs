@@ -168,11 +168,19 @@ impl Client {
     /// `Some(client)` when an endpoint and token exist, `None` when no
     /// daemon has published an endpoint (so `plugin install` can edit the
     /// file offline). A stale endpoint still yields a client whose calls
-    /// fail with `NOT_RUNNING`.
+    /// fail with `NOT_RUNNING`. An explicit `--api-url` names a daemon the
+    /// caller expects to be up, so a missing token there is an error, not
+    /// "daemon not running" (#7).
     pub fn try_connect(api_url: Option<&str>) -> Result<Option<Self>> {
         match Self::connect(api_url) {
             Ok(c) => Ok(Some(c)),
-            Err(e) if e.to_string().starts_with(NOT_RUNNING) => Ok(None),
+            Err(e) if e.to_string().starts_with(NOT_RUNNING) => match api_url {
+                None => Ok(None),
+                Some(url) => Err(anyhow!(
+                    "--api-url {url}: no daemon token at {}",
+                    server_paths(&layout_from_env()?).token().display()
+                )),
+            },
             Err(e) => Err(e),
         }
     }

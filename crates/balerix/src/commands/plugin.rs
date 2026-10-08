@@ -17,17 +17,10 @@ use crate::cli::{
     ApiOnlyArgs, ListArgs, PluginInstallArgs, PluginOpenArgs, PluginPackageArgs, PluginRemoveArgs,
 };
 use crate::client::{Client, NOT_RUNNING};
-use crate::commands::fleet::{parse_duration, wait_purged};
+use crate::commands::fleet::{label, parse_duration, wait_purged};
 use crate::wiring::layout_from_env;
 
 const NOT_SYNCED: &str = "daemon not running; `balerix serve` syncs plugins at start\n";
-
-fn label<T: serde::Serialize>(v: T) -> String {
-    serde_json::to_value(v)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default()
-}
 
 pub fn render_plugins(rows: &[PluginStatus]) -> String {
     if rows.is_empty() {
@@ -57,13 +50,13 @@ pub fn render_plugins(rows: &[PluginStatus]) -> String {
 
 pub fn render_sync(r: &SyncReport) -> String {
     let mut out = String::new();
-    for (label, names) in [
+    for (heading, names) in [
         ("installed", &r.installed),
         ("stopped", &r.stopped),
         ("unchanged", &r.unchanged),
     ] {
         if !names.is_empty() {
-            out.push_str(&format!("{label}: {}\n", names.join(", ")));
+            out.push_str(&format!("{heading}: {}\n", names.join(", ")));
         }
     }
     // Spec L-6: the fleets a removed plugin owned, one line each
@@ -98,7 +91,7 @@ fn owned_fleets(rows: &[FleetSummary], plugin: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn plugins_file_path() -> Result<PathBuf> {
+pub(crate) fn plugins_file_path() -> Result<PathBuf> {
     Ok(layout_from_env()?.config_root.join("plugins.yaml"))
 }
 
@@ -168,6 +161,13 @@ fn describe_source(
     }
     let path = std::fs::canonicalize(source).with_context(|| format!("{source}: not found"))?;
     if path.is_dir() {
+        if sha256.is_some() {
+            bail!(
+                "--sha256: {} is a directory, used in place with no digest; \
+                 it applies to tarballs and URLs",
+                path.display()
+            );
+        }
         let manifest = read_manifest(&path)?;
         return Ok((path.display().to_string(), None, manifest));
     }
@@ -191,9 +191,11 @@ fn describe_source(
     ))
 }
 
-/// Syncs when a daemon is reachable; otherwise says `serve` will.
-fn sync_if_running(api_url: Option<&str>) -> Result<String> {
-    match Client::try_connect(api_url)? {
+/// Syncs when a daemon is reachable; otherwise says `serve` will. The
+/// client is found before `plugins.yaml` is written, so an `--api-url`
+/// that cannot be used fails the command with the file unchanged.
+fn sync_if_running(client: Option<Client>) -> Result<String> {
+    match client {
         Some(c) => match c.sync_plugins() {
             Ok(r) => Ok(render_sync(&r)),
             Err(e) if e.to_string().starts_with(NOT_RUNNING) => Ok(NOT_SYNCED.to_string()),
@@ -205,6 +207,7 @@ fn sync_if_running(api_url: Option<&str>) -> Result<String> {
 
 pub fn install_command(args: &PluginInstallArgs) -> Result<String> {
     let (source, sha256, manifest) = describe_source(&args.source, args.sha256.as_deref())?;
+    let client = Client::try_connect(args.api_url.as_deref())?;
     let path = plugins_file_path()?;
     let mut file = load_file(&path)?;
     install_entry(
@@ -228,7 +231,7 @@ pub fn install_command(args: &PluginInstallArgs) -> Result<String> {
     if let Some(d) = sha256 {
         out.push_str(&format!("sha256: {d}\n"));
     }
-    out.push_str(&sync_if_running(args.api_url.as_deref())?);
+    out.push_str(&sync_if_running(client)?);
     Ok(out)
 }
 
@@ -260,6 +263,11 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
             path.display()
         );
     }
+    let client = if args.purge {
+        None
+    } else {
+        Client::try_connect(args.api_url.as_deref())?
+    };
     if removed {
         save_file(&path, &file)?;
     }
@@ -304,7 +312,7 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
     Ok(format!(
         "removed {} from plugins.yaml (state kept; --purge deletes it)\n{}",
         args.name,
-        sync_if_running(args.api_url.as_deref())?
+        sync_if_running(client)?
     ))
 }
 

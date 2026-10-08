@@ -54,16 +54,30 @@ fn version(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceVersion, W
 `Runtime::version` (`inspect.rs`), through `inspect_git` with every Spec C
 control and the `FILTER_KEYS` check first:
 
-1. `rev-parse HEAD` → `head`; `merge-base <base_ref> HEAD` → `merge_base`.
-2. The path set: `diff --name-only -z <merge_base>` ∪ `diff --name-only -z
-   HEAD` ∪ `ls-files --others --exclude-standard -z`, sorted, deduplicated.
-3. For each path, `symlink_metadata` under the worktree (never following a
-   symlink): `size` and `mtime` as nanoseconds since the epoch, or the word
-   `missing` when the path is gone (a deletion between the listing and the
-   `stat` still changes the fingerprint).
-4. `fingerprint = hex(sha256(head \0 merge_base \0 (path \0 size \0 mtime \0)*))`.
+1. `merge-base <base_ref> HEAD` → `merge_base`; `status --porcelain=v2
+   --branch` → `head` and the changed and untracked paths. (Since #108 and
+   #174 the probe, `merge-base`, the name-only diff and `status` run in one
+   sandboxed `/bin/sh`; see AGENTS.md.)
+2. The path set: `diff --name-only -z <merge_base>` ∪ the status's changed
+   ∪ untracked paths, sorted, deduplicated; a path that fails
+   `check_path` is dropped before any `stat` (#19) — including a valid
+   Linux file name with a `\` in it, which is then left out of the
+   fingerprint.
+3. For at most `VERSION_PATH_CAP` (2000) paths (#18) — the tracked
+   changes (the name-only diff ∪ the status's changed) first, sorted, then
+   the untracked paths, sorted, so a large untracked tree cannot hide an
+   edit to a tracked file; the kept ones are hashed sorted by path —
+   `symlink_metadata` under the worktree (never following a symlink):
+   `size` and `mtime` as nanoseconds since the epoch, or the word `missing`
+   when the `stat` fails for any reason — the path is gone (a deleted
+   tracked file, or a deletion between the listing and the `stat`, still
+   changes the fingerprint), or EACCES, ELOOP: deterministic either way.
+4. `fingerprint = hex(sha256(head \0 merge_base \0 (path \0 size \0 mtime \0)*
+   [\0 capped \0 total \0]))`, the bracketed marker only when the set was
+   larger than the cap, so a path coming or going past it still changes
+   the fingerprint (an edit to one past the cap does not).
 
-The hashing is a pure function `fingerprint_of(head, merge_base, entries)`
+The hashing is a pure function `fingerprint_of(head, merge_base, entries, total)`
 in `inspect.rs`, unit-tested on its own. `sha2` and `hex` are already
 workspace dependencies; `balerix-runtime` adds them as ordinary
 dependencies.
@@ -89,7 +103,10 @@ The body becomes `{ "phase", "events", "workspace" }`, where `workspace` is
 `{ "head", "fingerprint" }` from `Host::workspace_version`, or `null` when
 the call fails for any reason (no worktree, a refused filter, a transport
 failure — logged at debug, never an error status, since the column must
-keep flowing). The call is made on every poll; nothing is cached.
+keep flowing). The call is made on every poll; nothing is cached. It is
+bounded at 1.5 s (`VERSION_DEADLINE`, #18): past that the poll answers
+`workspace: null` and counts a version failure, so a slow daemon stalls the
+column no more than a failing one does.
 
 ### 3.2 The page
 
@@ -102,11 +119,15 @@ Each poll: if `workspace` is non-null and its fingerprint differs from
 and hold it as `pendingDiff` together with the fingerprint. Then, if no
 comment box is open and at least 3 s have passed since `lastApplied`,
 apply it. Saving or cancelling a comment box applies a waiting
-`pendingDiff` at once. "Reload diff" fetches and applies unconditionally.
+`pendingDiff` at once. "Reload diff" fetches and applies unconditionally,
+stamping `rendered` with the fingerprint read just before its fetch (#20);
+a poll's fetch that a reload overtook, for the fingerprint now rendered,
+parks nothing. The poll is two halves (#20): `pollEvents` (the column)
+and `refreshDiff` (the diff), called in turn by `poll`.
 
 Applying:
 
-- **Re-anchoring** (`anchorComments(diff, comments)`, a standalone
+- **Re-anchoring** (`anchorComments(workspaceDiff, comments)`, a standalone
   function in the inline script): for each comment, exact match on
   `(path, side, line, text)` keeps it; otherwise the lines of the same
   `path` and `side` whose `text` equals the comment's are collected; exactly
@@ -116,8 +137,8 @@ Applying:
   re-anchoring so a re-anchored line number persists.
 - **Scroll**: the diff column's `scrollTop` is saved before the render; after
   it, the first file header that was at or above the top of the viewport is
-  scrolled back to the top when it still exists, else the offset is
-  restored.
+  put back where it was, the same distance into the file (#20), when it
+  still exists, else the offset is restored.
 - **Comment boxes**: text typed into a pending or editing box is written to
   the draft on every `input` event, so a render restores it. Deferral makes
   this a second line of defence, not the first.
@@ -131,7 +152,7 @@ Applying:
 ### 3.3 Metrics
 
 `diff_refreshes_total` (counter, applies) and `version_failures_total`
-(counter, `workspace_version` errors during a poll), through the SDK's
+(counter, `workspace_version` errors and timeouts during a poll), through the SDK's
 `Metrics`. The daemon's 404 `no workspace for agent …` is not counted:
 it is the routine answer before `up` has made the worktree, and a page
 left open on such an agent would otherwise add one every poll and drown

@@ -272,9 +272,13 @@ credentials, hook input, or sandbox rules.
   call ends (`workspace::ScratchHome`): nono writes a session record per
   `run` under `$HOME`, and the agent's own `nono/` holds its live
   session's, so those could never be swept there. Each call is a sandbox start (about 55 ms idle, far
-  more on a loaded host), so the reader's `version` is four calls and its
-  `diff` one combined `git diff -U3` split per file (`split_patch`), plus
-  one `--no-index` per untracked file; keep it that way. Tests that run git in an existing
+  more on a loaded host), so the reader's `version` is one call (#174: its
+  four git commands run in one `/bin/sh` under the profile,
+  `workspace::sandboxed_git_script`; the script is a constant and every
+  value, git's path and the base ref included, is a positional argument)
+  and its `diff` one combined `git diff -U3` split per file
+  (`split_patch`), plus one `--no-index` per untracked file; keep it that
+  way. Tests that run git in an existing
   clone need Landlock and gate on `support::landlock_works`. Go through
   `Workspace::prepare_sandbox` before the first sandboxed call: it writes
   the profile, then runs one `git version` that must exit 0. The yes/no
@@ -527,8 +531,8 @@ credentials, hook input, or sandbox rules.
   `uncommitted` (and the `version` fingerprint) now come from `git status`,
   so an index-only change (staged, with the worktree back at `HEAD`'s
   content) counts as uncommitted, where `diff HEAD` used to miss it.
-- A workspace `diff` refuses with `repository config sets <key>; workspace
-  diff refused` when the clone's `.git/config` declares a
+- A workspace `diff` or `version` refuses with `repository config sets
+  <key>; workspace read refused` when the clone's `.git/config` declares a
   `filter.<x>.<clean|smudge|process>`, or when it sets
   `extensions.worktreeconfig` (a `config.worktree` file could then hold a
   filter the check's `--local` read cannot see, so the extension alone is
@@ -544,6 +548,16 @@ credentials, hook input, or sandbox rules.
   size and mtime of every changed or untracked path — content, not index
   state: a byte-identical `git add` is invisible by design, and a same-size
   rewrite within the filesystem's mtime resolution is the theoretical miss.
+  At most `VERSION_PATH_CAP` (2000) paths are stat'ed, tracked changes
+  first and untracked paths after them (each sorted), so a large untracked
+  tree cannot hide an edit to a tracked file; past the cap a marker and
+  the total count are hashed too, so a path coming or going still shows
+  but an edit to one left out does not (#18). A path that fails
+  `check_path` — a valid Linux name with a `\` in it, say — is left out
+  of the fingerprint altogether (#19). A path whose `stat` fails for any
+  reason hashes as `missing`.
+  The web plugin's `events.json` waits 1.5 s for it, then answers
+  `workspace: null` and counts a `version_failures_total`.
   The review page applies a changed diff automatically (3 s rate limit),
   but never while a comment box is open.
 - `web`'s event buffer is memory only: after a plugin restart the review

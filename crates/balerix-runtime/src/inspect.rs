@@ -19,7 +19,7 @@ use balerix_core::{AgentId, MaterializeError, WorkspaceError, WorkspaceReader};
 use crate::layout::{AgentPaths, CrewPaths};
 use crate::materializer::Runtime;
 use crate::sandbox::write_git_profile;
-use crate::workspace::{GitLog, sandboxed_git, sandboxed_git_streaming};
+use crate::workspace::{GitLog, sandboxed_git, sandboxed_git_script, sandboxed_git_streaming};
 
 /// Command-line config beats every config file: whatever an agent wrote
 /// into its clone's `.git/config`, no program runs from it here (the rest
@@ -383,13 +383,6 @@ fn patch_header(file: &FileDiff) -> Option<String> {
     (plain(old) && plain(&file.path)).then(|| format!("diff --git a/{old} b/{}", file.path))
 }
 
-fn split_z(s: &str) -> BTreeSet<String> {
-    s.split('\0')
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 /// `diff --name-status -z --find-renames` → one `FileDiff` per record,
 /// patches empty. `R`/`C` records carry two paths; a torn pair ends the
 /// parse.
@@ -451,18 +444,70 @@ pub fn shape_patch(raw: String) -> (String, bool, bool) {
 }
 
 /// One changed or untracked path as the fingerprint sees it: `(size,
-/// mtime, mtime_nsec)` from `symlink_metadata`, or `None` when the path
-/// vanished between the listing and the `stat`.
+/// mtime, mtime_nsec)` from `symlink_metadata`, or `None` when the `stat`
+/// failed for any reason — the path vanished between the listing and the
+/// `stat` (a deleted tracked file always does), or a parent is not
+/// searchable, or a loop: every error hashes as `missing`, so the result
+/// is still deterministic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathStat {
     pub path: String,
     pub stat: Option<(u64, i64, i64)>,
 }
 
+/// The most paths `version` stats (#18): a worktree with a large
+/// un-ignored tree (a build output, a vendored checkout) would otherwise
+/// cost one `stat` per path on every poll of every open review page.
+pub const VERSION_PATH_CAP: usize = 2000;
+
+/// At most `VERSION_PATH_CAP` paths, stat'ed under `workspace` and
+/// returned sorted, and how many paths there were in all. The cap fills
+/// with the `tracked` changes first (sorted), then the `untracked` paths not
+/// among them (sorted), so a large untracked tree cannot push an edit to a
+/// tracked file out of the fingerprint. The kept entries are sorted by path
+/// whichever side they came from, so a `git add` that moves a path from
+/// untracked to tracked, and changes no bytes, still changes nothing. A
+/// path git named is held to `check_path` first, as every other read's is
+/// (#19): one that fails is neither stat'ed nor counted. That includes a
+/// valid Linux file name with a `\` in it (`check_path` refuses
+/// backslashes): such a file is left out of the fingerprint, so an edit to
+/// it alone does not refresh the review page.
+pub fn stat_paths(
+    workspace: &Path,
+    tracked: BTreeSet<String>,
+    untracked: BTreeSet<String>,
+) -> (Vec<PathStat>, usize) {
+    let untracked: Vec<String> = untracked
+        .into_iter()
+        .filter(|p| !tracked.contains(p))
+        .collect();
+    let paths: Vec<String> = tracked
+        .into_iter()
+        .chain(untracked)
+        .filter(|p| check_path(p).is_ok())
+        .collect();
+    let total = paths.len();
+    let mut entries: Vec<PathStat> = paths
+        .into_iter()
+        .take(VERSION_PATH_CAP)
+        .map(|path| {
+            let stat = std::fs::symlink_metadata(workspace.join(&path))
+                .ok()
+                .map(|m| (m.len(), m.mtime(), m.mtime_nsec()));
+            PathStat { path, stat }
+        })
+        .collect();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    (entries, total)
+}
+
 /// `hex(sha256(head \0 merge_base \0 (path \0 size \0 mtime.nsec \0 |
-/// path \0 missing \0)*))` (Spec D §2.3). Entries are hashed in the order
-/// given; callers pass them sorted.
-pub fn fingerprint_of(head: &str, merge_base: &str, entries: &[PathStat]) -> String {
+/// path \0 missing \0)* [\0 capped \0 total \0]))` (Spec D §2.3). Entries
+/// are hashed in the order given; callers pass them sorted. When `total`
+/// is more than the entries (`VERSION_PATH_CAP`), a marker and the count
+/// follow, so the fingerprint still changes when a path past the cap
+/// comes or goes; it starts with the NUL no entry's (non-empty) path can.
+pub fn fingerprint_of(head: &str, merge_base: &str, entries: &[PathStat], total: usize) -> String {
     let mut h = Sha256::new();
     h.update(head.as_bytes());
     h.update([0]);
@@ -479,6 +524,11 @@ pub fn fingerprint_of(head: &str, merge_base: &str, entries: &[PathStat]) -> Str
             }
             None => h.update(b"missing"),
         }
+        h.update([0]);
+    }
+    if total > entries.len() {
+        h.update(b"\0capped\0");
+        h.update(total.to_string().as_bytes());
         h.update([0]);
     }
     hex::encode(h.finalize())
@@ -520,30 +570,116 @@ fn confine(workspace: &Path, full: &Path) -> Result<(), WorkspaceError> {
 /// the repository config names a program git would run.
 #[allow(clippy::type_complexity)]
 fn refuse_filters(
+    id: &str,
     git: &dyn Fn(&[&str], &[i32]) -> Result<String, WorkspaceError>,
 ) -> Result<(), WorkspaceError> {
-    let filters = git(
-        &[
-            "config",
-            "--local",
-            "--includes",
-            "--name-only",
-            "--get-regexp",
-            FILTER_KEYS,
-        ],
-        &[0, 1],
-    )?;
-    match filters
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|k| !k.is_empty())
-    {
-        Some(key) => Err(WorkspaceError::Filter {
-            key: key.to_string(),
+    let mut args = PROBE.to_vec();
+    args.push(FILTER_KEYS);
+    let filters = git(&args, &[0, 1])?;
+    match filter_key(&filters) {
+        Some(key) => Err(WorkspaceError::Filter { key }),
+        None if filters.trim().is_empty() => Ok(()),
+        // git exited 0, so something matched, but no line is a key
+        None => Err(WorkspaceError::Tool {
+            id: id.to_string(),
+            subcommand: "config".into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            stderr: filters,
         }),
-        None => Ok(()),
     }
+}
+
+/// The `FILTER_KEYS` probe, before the regex: `refuse_filters` and
+/// `VERSION_SCRIPT` both run exactly this.
+const PROBE: &[&str] = &[
+    "config",
+    "--local",
+    "--includes",
+    "--name-only",
+    "--get-regexp",
+];
+
+/// Whether `key` (as `config --name-only` prints it, lowercased) is one
+/// `FILTER_KEYS` matches; the regex, spelled out without a regex engine.
+fn is_filter_key(key: &str) -> bool {
+    let between = |prefix: &str, suffixes: &[&str]| {
+        key.strip_prefix(prefix)
+            .is_some_and(|rest| suffixes.iter().any(|s| rest.ends_with(s)))
+    };
+    between("filter.", &[".clean", ".smudge", ".process"])
+        || between("remote.", &[".promisor"])
+        || key == "extensions.worktreeconfig"
+        || key == "extensions.partialclone"
+}
+
+/// The first line of a probe's output that is a `FILTER_KEYS` key: a
+/// warning git printed first (the version script folds stderr in) is
+/// skipped, never taken for the key.
+fn filter_key(probe: &str) -> Option<String> {
+    probe
+        .lines()
+        .map(str::trim)
+        .find(|k| is_filter_key(k))
+        .map(str::to_string)
+}
+
+/// `version`'s four git calls as one sandbox start (#174;
+/// `workspace::sandboxed_git_script`). `$1` is the base ref, `$2`
+/// `FILTER_KEYS`, and the rest git with its options, so nothing the caller
+/// passes is ever script text. The filter probe runs first, as in
+/// `refuse_filters`: a match prints the key and exits `VERSION_FILTER`; an
+/// exit 1 that printed anything (stderr is folded in) is a failure, as
+/// `is_gits_answer` would judge it. Then `merge-base`, the name-only diff
+/// against it (`DIFF_FLAGS`) and `status` (`STATUS`), each failing with its
+/// own code (`version_stage`). On success stdout is `<merge-base> \0
+/// <name-only -z> \0 <status -z>` (`parse_version`). The `-c` pairs are
+/// `CONFIG`'s, passed in `"$@"`; a unit test holds the two flag lists to
+/// the constants.
+const VERSION_SCRIPT: &str = r#"base=$1 keys=$2
+shift 2
+found=$("$@" config --local --includes --name-only --get-regexp "$keys" 2>&1)
+case $? in
+0) printf '%s' "$found"; exit 80 ;;
+1) if [ -n "$found" ]; then printf '%s\n' "$found" >&2; exit 81; fi ;;
+*) printf '%s\n' "$found" >&2; exit 81 ;;
+esac
+mb=$("$@" merge-base "$base" HEAD) || exit 83
+printf '%s\000' "$mb"
+"$@" diff --no-ext-diff --no-textconv --no-color --submodule=short --ignore-submodules=dirty --name-only -z "$mb" || exit 84
+printf '\000'
+"$@" status --porcelain=v2 -z --branch --no-ahead-behind --untracked-files=all --ignore-submodules=dirty || exit 82
+"#;
+
+/// `VERSION_SCRIPT`'s exit when the probe found a key (on stdout).
+const VERSION_FILTER: i32 = 80;
+
+/// The git subcommand behind one of `VERSION_SCRIPT`'s failure exits.
+fn version_stage(code: i32) -> Option<&'static str> {
+    match code {
+        81 => Some("config"),
+        82 => Some("status"),
+        83 => Some("merge-base"),
+        84 => Some("diff"),
+        _ => None,
+    }
+}
+
+/// `VERSION_SCRIPT`'s stdout: the merge-base, the name-only paths and the
+/// parsed status. The name-only records are non-empty and NUL-terminated,
+/// so the first empty record ends them; `None` when that structure is not
+/// there.
+pub fn parse_version(out: &str) -> Option<(String, BTreeSet<String>, Status)> {
+    let (merge_base, mut rest) = out.split_once('\0')?;
+    let mut names = BTreeSet::new();
+    loop {
+        let (record, after) = rest.split_once('\0')?;
+        rest = after;
+        if record.is_empty() {
+            break;
+        }
+        names.insert(record.to_string());
+    }
+    Some((merge_base.trim().to_string(), names, parse_status(rest)))
 }
 
 impl WorkspaceReader for Runtime {
@@ -554,7 +690,7 @@ impl WorkspaceReader for Runtime {
         let id = agent.to_string();
         let (paths, crew) = self.sandboxed_workspace_of(agent)?;
         let git = |args: &[&str], ok: &[i32]| self.inspect_git(&id, &crew, &paths, args, ok);
-        refuse_filters(&git)?;
+        refuse_filters(&id, &git)?;
         let status = parse_status(&git(STATUS, &[0])?);
         let merge_base = git(&["merge-base", base_ref, "HEAD"], &[0])?
             .trim()
@@ -744,36 +880,66 @@ impl WorkspaceReader for Runtime {
             entries,
         })
     }
-    /// `refuse_filters`, one `status`, `merge-base` and one name-only
-    /// diff against it: four sandboxed calls (#108).
+    /// The filter probe, `merge-base`, one name-only diff against it and
+    /// one `status`, in one sandbox start (`VERSION_SCRIPT`, #174).
     fn version(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceVersion, WorkspaceError> {
         let id = agent.to_string();
         let (paths, crew) = self.sandboxed_workspace_of(agent)?;
-        let git = |args: &[&str], ok: &[i32]| self.inspect_git(&id, &crew, &paths, args, ok);
-        refuse_filters(&git)?;
-        let status = parse_status(&git(STATUS, &[0])?);
-        let merge_base = git(&["merge-base", base_ref, "HEAD"], &[0])?
-            .trim()
-            .to_string();
+        let tool_error =
+            |subcommand: &str, args: Vec<String>, stderr: String| WorkspaceError::Tool {
+                id: id.clone(),
+                subcommand: subcommand.to_string(),
+                args,
+                stderr,
+            };
+        let out = sandboxed_git_script(
+            &self.tools,
+            &crew,
+            &paths,
+            VERSION_SCRIPT,
+            &[base_ref, FILTER_KEYS],
+            CONFIG,
+            &[0, VERSION_FILTER, 81, 82, 83, 84],
+        )
+        .map_err(|f| tool_error(&f.subcommand, f.args, f.stderr))?;
+        // each stage's own git arguments, as `inspect_git` reports them
+        let stage_args = |stage: &str| -> Vec<String> {
+            let mut args: Vec<&str> = CONFIG.to_vec();
+            let merge_base = out.stdout.split('\0').next().unwrap_or_default();
+            match stage {
+                "config" => args.extend(PROBE.iter().chain([&FILTER_KEYS])),
+                "merge-base" => args.extend(["merge-base", base_ref, "HEAD"]),
+                "diff" => {
+                    args.push("diff");
+                    args.extend(DIFF_FLAGS);
+                    args.extend(["--name-only", "-z", merge_base]);
+                }
+                _ => args.extend(STATUS),
+            }
+            args.into_iter().map(str::to_string).collect()
+        };
+        if out.code == VERSION_FILTER {
+            return Err(match filter_key(&out.stdout) {
+                Some(key) => WorkspaceError::Filter { key },
+                None => tool_error("config", stage_args("config"), out.stdout.clone()),
+            });
+        }
+        if let Some(stage) = version_stage(out.code) {
+            return Err(tool_error(stage, stage_args(stage), out.stderr));
+        }
+        let (merge_base, mut paths_seen, status) = parse_version(&out.stdout).ok_or_else(|| {
+            tool_error(
+                "sh",
+                Vec::new(),
+                format!("unexpected output from the version script: {}", out.stderr),
+            )
+        })?;
         let head = status.head.unwrap_or_default();
-        let mut against_base: Vec<&str> = vec!["diff"];
-        against_base.extend(DIFF_FLAGS);
-        against_base.extend(["--name-only", "-z", merge_base.as_str()]);
-        let mut paths_seen = split_z(&git(&against_base, &[0])?);
         paths_seen.extend(status.changed);
-        paths_seen.extend(status.untracked);
-        // `BTreeSet`: sorted and deduplicated, so the hash order is fixed.
-        let entries: Vec<PathStat> = paths_seen
-            .into_iter()
-            .map(|path| {
-                let stat = std::fs::symlink_metadata(paths.workspace.join(&path))
-                    .ok()
-                    .map(|m| (m.len(), m.mtime(), m.mtime_nsec()));
-                PathStat { path, stat }
-            })
-            .collect();
+        // `BTreeSet`s: sorted and deduplicated, so the hash order is fixed.
+        let (entries, total) = stat_paths(&paths.workspace, paths_seen, status.untracked);
         Ok(WorkspaceVersion {
-            fingerprint: fingerprint_of(&head, &merge_base, &entries),
+            fingerprint: fingerprint_of(&head, &merge_base, &entries, total),
             head,
         })
     }
@@ -964,6 +1130,104 @@ mod tests {
         assert!(cut.ends_with('\n'), "cut at a line boundary");
     }
 
+    /// The script spells `STATUS` and `DIFF_FLAGS` out; they must not drift.
+    #[test]
+    fn the_version_script_runs_the_same_flags_as_the_constants() {
+        assert!(VERSION_SCRIPT.contains(&format!("\"$@\" {} ||", STATUS.join(" "))));
+        assert!(VERSION_SCRIPT.contains(&format!(
+            "\"$@\" diff {} --name-only -z \"$mb\" ||",
+            DIFF_FLAGS.join(" ")
+        )));
+        assert!(VERSION_SCRIPT.contains(&format!("\"$@\" {} \"$keys\"", PROBE.join(" "))));
+        // nothing but the positional parameters reaches a command
+        assert!(!VERSION_SCRIPT.contains("eval"));
+        for code in 81..=84 {
+            let stage = version_stage(code).unwrap();
+            assert!(VERSION_SCRIPT.contains(&format!("exit {code}")), "{stage}");
+        }
+        assert!(VERSION_SCRIPT.contains(&format!("exit {VERSION_FILTER}")));
+        assert_eq!(version_stage(0), None);
+        assert_eq!(version_stage(1), None);
+    }
+
+    /// #19: a git-supplied path is held to `check_path` before the `stat`,
+    /// like every other read: one that would leave the worktree, or reach
+    /// into `.git`, is neither stat'ed nor counted.
+    #[test]
+    fn version_drops_paths_that_fail_check_path_before_the_stat() {
+        let root = std::env::temp_dir().join(format!("balerix-stat-paths-{}", std::process::id()));
+        let ws = root.join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        std::fs::write(ws.join("ok"), "x").unwrap();
+        std::fs::write(ws.join(".git/HEAD"), "x").unwrap();
+        std::fs::write(root.join("outside"), "x").unwrap();
+        let outside = root.join("outside").display().to_string();
+        let paths = BTreeSet::from(
+            [
+                "ok",
+                "../outside",
+                outside.as_str(),
+                ".git/HEAD",
+                "a/./b",
+                "a\\b",
+            ]
+            .map(String::from),
+        );
+        let (entries, total) = stat_paths(&ws, paths, BTreeSet::new());
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(total, 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "ok");
+        assert!(entries[0].stat.is_some());
+    }
+
+    /// The key is the first line that is one; a warning before it is not.
+    #[test]
+    fn the_filter_key_is_the_first_line_that_is_a_filter_key() {
+        assert_eq!(
+            filter_key("warning: something odd\nfilter.x.clean\n").as_deref(),
+            Some("filter.x.clean")
+        );
+        for key in [
+            "filter.lfs.smudge",
+            "filter.a.b.process",
+            "extensions.worktreeconfig",
+            "extensions.partialclone",
+            "remote.origin.promisor",
+        ] {
+            assert_eq!(filter_key(key).as_deref(), Some(key));
+        }
+        assert_eq!(filter_key("warning: only a warning\n"), None);
+        assert_eq!(filter_key("filter.x.cleanup\nremote.x.url\n"), None);
+        assert_eq!(filter_key(""), None);
+    }
+
+    #[test]
+    fn the_version_output_splits_into_merge_base_names_and_status() {
+        let out = "abc123\0README\0src/a b.rs\0\0# branch.oid def456\0? new\0";
+        let (mb, names, status) = parse_version(out).unwrap();
+        assert_eq!(mb, "abc123");
+        assert_eq!(
+            names.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["README", "src/a b.rs"]
+        );
+        assert_eq!(status.head.as_deref(), Some("def456"));
+        assert_eq!(
+            status
+                .untracked
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
+        // no names
+        let (mb, names, status) = parse_version("abc\0\0# branch.oid (initial)\0").unwrap();
+        assert_eq!((mb.as_str(), names.len(), status.head), ("abc", 0, None));
+        // cut short: no end to the names
+        assert_eq!(parse_version("abc\0README\0"), None);
+        assert_eq!(parse_version("abc"), None);
+    }
+
     #[test]
     fn the_fingerprint_changes_with_every_input_and_is_stable() {
         let a = PathStat {
@@ -974,45 +1238,53 @@ mod tests {
             path: "b".into(),
             stat: None,
         };
-        let base = fingerprint_of("h", "m", &[a.clone(), b.clone()]);
+        let base = fingerprint_of("h", "m", &[a.clone(), b.clone()], 2);
         assert_eq!(base.len(), 64);
         assert_eq!(
             base,
-            fingerprint_of("h", "m", &[a.clone(), b.clone()]),
+            fingerprint_of("h", "m", &[a.clone(), b.clone()], 2),
             "stable"
         );
         assert_ne!(
             base,
-            fingerprint_of("H", "m", &[a.clone(), b.clone()]),
+            fingerprint_of("H", "m", &[a.clone(), b.clone()], 2),
             "head"
         );
         assert_ne!(
             base,
-            fingerprint_of("h", "M", &[a.clone(), b.clone()]),
+            fingerprint_of("h", "M", &[a.clone(), b.clone()], 2),
             "merge-base"
         );
         assert_ne!(
             base,
-            fingerprint_of("h", "m", std::slice::from_ref(&a)),
+            fingerprint_of("h", "m", std::slice::from_ref(&a), 1),
             "a path"
         );
         let bigger = PathStat {
             path: "a".into(),
             stat: Some((2, 10, 500)),
         };
-        assert_ne!(base, fingerprint_of("h", "m", &[bigger, b.clone()]), "size");
+        assert_ne!(
+            base,
+            fingerprint_of("h", "m", &[bigger, b.clone()], 2),
+            "size"
+        );
         let later = PathStat {
             path: "a".into(),
             stat: Some((1, 11, 500)),
         };
-        assert_ne!(base, fingerprint_of("h", "m", &[later, b.clone()]), "mtime");
+        assert_ne!(
+            base,
+            fingerprint_of("h", "m", &[later, b.clone()], 2),
+            "mtime"
+        );
         let nsec = PathStat {
             path: "a".into(),
             stat: Some((1, 10, 501)),
         };
         assert_ne!(
             base,
-            fingerprint_of("h", "m", &[nsec, b.clone()]),
+            fingerprint_of("h", "m", &[nsec, b.clone()], 2),
             "mtime nsec"
         );
         let present = PathStat {
@@ -1021,9 +1293,63 @@ mod tests {
         };
         assert_ne!(
             base,
-            fingerprint_of("h", "m", &[a, present]),
+            fingerprint_of("h", "m", &[a.clone(), present], 2),
             "missing vs present"
         );
-        assert_eq!(fingerprint_of("", "", &[]).len(), 64);
+        assert_eq!(fingerprint_of("", "", &[], 0).len(), 64);
+        // past the cap: the count is hashed, and only past it
+        let both = [a, b];
+        assert_eq!(
+            fingerprint_of("h", "m", &both, 1),
+            base,
+            "no marker at or under"
+        );
+        let capped = fingerprint_of("h", "m", &both, 3);
+        assert_ne!(capped, base, "a marker past the cap");
+        assert_ne!(capped, fingerprint_of("h", "m", &both, 4), "the count");
+    }
+
+    /// #18: past `VERSION_PATH_CAP` only the first paths in sorted order
+    /// are stat'ed; the total is still counted. A failed `stat` (here, no
+    /// such directory) is `missing`.
+    #[test]
+    fn version_stats_at_most_the_cap_in_sorted_order() {
+        let paths: BTreeSet<String> = (0..VERSION_PATH_CAP + 5)
+            .map(|i| format!("p{i:05}"))
+            .collect();
+        let first: Vec<String> = paths.iter().take(VERSION_PATH_CAP).cloned().collect();
+        let (entries, total) =
+            stat_paths(Path::new("/nonexistent-balerix"), paths, BTreeSet::new());
+        assert_eq!(total, VERSION_PATH_CAP + 5);
+        assert_eq!(
+            entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
+            first
+        );
+        assert!(entries.iter().all(|e| e.stat.is_none()));
+        let few = BTreeSet::from(["b".to_string(), "a".to_string()]);
+        let (entries, total) = stat_paths(Path::new("/nonexistent-balerix"), few, BTreeSet::new());
+        assert_eq!((entries.len(), total), (2, 2));
+        assert_eq!(entries[0].path, "a");
+        // tracked changes fill the cap first, whatever sorts before them
+        let untracked: BTreeSet<String> = (0..VERSION_PATH_CAP)
+            .map(|i| format!("0vendor/{i:05}"))
+            .chain(["z".to_string()])
+            .collect();
+        let tracked = BTreeSet::from(["z".to_string(), "m".to_string()]);
+        let (entries, total) = stat_paths(Path::new("/nonexistent-balerix"), tracked, untracked);
+        assert_eq!(total, VERSION_PATH_CAP + 2, "z is counted once");
+        assert_eq!(entries.len(), VERSION_PATH_CAP);
+        assert!(entries.is_sorted_by(|a, b| a.path < b.path));
+        let kept: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(
+            kept.contains(&"m") && kept.contains(&"z"),
+            "the tracked changes are kept"
+        );
+        assert_eq!(kept[0], "0vendor/00000");
+        assert_eq!(
+            kept[VERSION_PATH_CAP - 3],
+            "0vendor/01997",
+            "then untracked, in order"
+        );
     }
 }

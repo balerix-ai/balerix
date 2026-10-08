@@ -344,13 +344,14 @@ fn system_prefixes() -> String {
     }
 }
 
-/// `nono`'s arguments up to and including the git binary, for a git
-/// call in `agent`'s existing clone: `-s --log-file <logs>/nono-git.log
-/// run --no-audit --profile <git profile> -- <git>`. No audit trail: one
-/// per call, at the web plugin's poll, would grow nono's state without
-/// bound (the session record `--no-audit` keeps goes to a `ScratchHome`). The profile is
-/// `sandbox::render_git_profile`; `write_git_profile` must have run.
-fn sandbox_args(tools: &ToolPaths, agent: &AgentPaths) -> Vec<String> {
+/// `nono`'s arguments up to and including the `--` before the program,
+/// for a call in `agent`'s existing clone: `-s --log-file
+/// <logs>/nono-git.log run --no-audit --profile <git profile> --`. No audit
+/// trail: one per call, at the web plugin's poll, would grow nono's state
+/// without bound (the session record `--no-audit` keeps goes to a
+/// `ScratchHome`). The profile is `sandbox::render_git_profile`;
+/// `write_git_profile` must have run.
+fn sandbox_args(agent: &AgentPaths) -> Vec<String> {
     vec![
         "-s".into(),
         "--log-file".into(),
@@ -360,8 +361,54 @@ fn sandbox_args(tools: &ToolPaths, agent: &AgentPaths) -> Vec<String> {
         "--profile".into(),
         agent.git_profile.display().to_string(),
         "--".into(),
-        tools.git.display().to_string(),
     ]
+}
+
+/// git and its options on every call in `agent`'s clone, before the
+/// caller's: fsmonitor off, hooks pointed at an empty directory, and the
+/// repository named exactly (`sandboxed_git`).
+fn git_command(tools: &ToolPaths, crew: &CrewPaths, agent: &AgentPaths) -> Vec<String> {
+    vec![
+        tools.git.display().to_string(),
+        "-c".into(),
+        "core.fsmonitor=false".into(),
+        "-c".into(),
+        format!("core.hooksPath={}", crew.no_hooks().display()),
+        "-C".into(),
+        agent.workspace.display().to_string(),
+        format!("--git-dir={}", agent.workspace.join(".git").display()),
+        format!("--work-tree={}", agent.workspace.display()),
+    ]
+}
+
+/// The nono command for one call under the git profile, from an empty
+/// environment with a fresh `ScratchHome`, logged to the crew's `git.log`.
+fn sandboxed_cmd(
+    tools: &ToolPaths,
+    crew: &CrewPaths,
+    agent: &AgentPaths,
+    log: GitLog,
+) -> Result<(Cmd, ScratchHome), GitFailure> {
+    let log_file = crew.logs.join("git.log");
+    let home = ScratchHome::new(agent).map_err(|e| GitFailure {
+        subcommand: String::new(),
+        args: Vec::new(),
+        stderr: format!(
+            "cannot create nono's home beside {}: {e}",
+            agent.nono_home.display()
+        ),
+        unanswered: None,
+    })?;
+    let cmd = Cmd::new(&tools.nono)
+        .env_clear()
+        .env("HOME", home.path().display().to_string())
+        .env("PATH", outer_path(tools));
+    let cmd = match log {
+        GitLog::Full => cmd.log(&log_file),
+        GitLog::ArgvOnly => cmd.log_argv_only(&log_file),
+    }
+    .args(sandbox_args(agent));
+    Ok((cmd, home))
 }
 
 /// nono's `$HOME` for one daemon call under the git profile: a fresh
@@ -500,6 +547,40 @@ pub(crate) fn sandboxed_git_streaming(
     run_sandboxed_git(tools, crew, agent, args, &[0], GitLog::ArgvOnly, Some(sink))
 }
 
+/// Several git calls in one sandbox start (#174): `script`, a fixed
+/// constant, runs as `/bin/sh -c <script> sh <leading…> <git…>` under the
+/// git profile (`/bin` is one of its system prefixes), where `<git…>` is
+/// git with `sandboxed_git`'s options and then `git_args`, so the script
+/// runs each call as `"$@" <subcommand> …` after shifting `leading` off.
+/// Every value reaches the script as an argument, never as script text.
+/// Logged as one argv-only `git.log` entry. `accepted` are the script's
+/// exit codes, which the caller interprets: no `is_gits_answer` here, since
+/// a nono that fails exits with its own code, not one of the script's. A
+/// failure is reported with the subcommand `sh`. `write_git_profile` must
+/// have run.
+pub(crate) fn sandboxed_git_script(
+    tools: &ToolPaths,
+    crew: &CrewPaths,
+    agent: &AgentPaths,
+    script: &'static str,
+    leading: &[&str],
+    git_args: &[&str],
+    accepted: &[i32],
+) -> Result<CmdOutput, GitFailure> {
+    let (cmd, _home) = sandboxed_cmd(tools, crew, agent, GitLog::ArgvOnly)?;
+    cmd.args(["/bin/sh", "-c", script, "sh"])
+        .args(leading.iter().copied())
+        .args(git_command(tools, crew, agent))
+        .args(git_args.iter().copied())
+        .run_with_exit_codes(accepted)
+        .map_err(|f| GitFailure {
+            subcommand: "sh".into(),
+            args: f.args,
+            stderr: f.stderr,
+            unanswered: None,
+        })
+}
+
 /// Where a streamed call's stdout goes, chunk by chunk.
 type StdoutSink<'a> = &'a mut dyn FnMut(&[u8]);
 
@@ -512,35 +593,10 @@ fn run_sandboxed_git(
     log: GitLog,
     sink: Option<StdoutSink<'_>>,
 ) -> Result<CmdOutput, GitFailure> {
-    let log_file = crew.logs.join("git.log");
-    let home = ScratchHome::new(agent).map_err(|e| GitFailure {
-        subcommand: String::new(),
-        args: Vec::new(),
-        stderr: format!(
-            "cannot create nono's home beside {}: {e}",
-            agent.nono_home.display()
-        ),
-        unanswered: None,
-    })?;
-    let cmd = Cmd::new(&tools.nono)
-        .env_clear()
-        .env("HOME", home.path().display().to_string())
-        .env("PATH", outer_path(tools));
-    let cmd = match log {
-        GitLog::Full => cmd.log(&log_file),
-        GitLog::ArgvOnly => cmd.log_argv_only(&log_file),
-    }
-    .args(sandbox_args(tools, agent))
-    .args(["-c", "core.fsmonitor=false"])
-    .args([
-        "-c".to_string(),
-        format!("core.hooksPath={}", crew.no_hooks().display()),
-        "-C".to_string(),
-        agent.workspace.display().to_string(),
-        format!("--git-dir={}", agent.workspace.join(".git").display()),
-        format!("--work-tree={}", agent.workspace.display()),
-    ])
-    .args(args.iter().copied());
+    let (cmd, _home) = sandboxed_cmd(tools, crew, agent, log)?;
+    let cmd = cmd
+        .args(git_command(tools, crew, agent))
+        .args(args.iter().copied());
     // git's own: the first word that is neither an option nor a `-c` value
     let mut words = args.iter().copied();
     let mut subcommand = String::new();
@@ -883,8 +939,7 @@ impl Workspace<'_> {
     /// Whether `/bin/true` runs under the git profile: the canary's
     /// second question, asked only once `git version` has failed.
     fn sandbox_starts(&self, agent: &AgentPaths) -> bool {
-        let mut args = sandbox_args(self.tools, agent);
-        args.pop();
+        let mut args = sandbox_args(agent);
         args.push("/bin/true".into());
         let Ok(home) = ScratchHome::new(agent) else {
             return false;
@@ -1202,7 +1257,10 @@ impl Workspace<'_> {
             sh_quote(&outer_path(self.tools)),
             sh_quote(&self.tools.nono.display().to_string()),
         );
-        for word in sandbox_args(self.tools, agent) {
+        let words = sandbox_args(agent)
+            .into_iter()
+            .chain([self.tools.git.display().to_string()]);
+        for word in words {
             upload_pack.push(' ');
             upload_pack.push_str(&sh_quote(&word));
         }

@@ -61,7 +61,7 @@ impl WebPlugin {
         )?;
         let version_failures_total = metrics.int_counter(
             "version_failures_total",
-            "workspace_version calls that failed during an events.json poll",
+            "workspace_version calls that failed or timed out during an events.json poll",
         )?;
         Ok(Self {
             shared: Arc::new(Shared {

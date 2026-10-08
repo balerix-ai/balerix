@@ -50,7 +50,26 @@ fn a_package_runs_its_start_task_inside_the_sandbox() {
     let rt = Runtime::new(layout.clone(), tools);
     let plan = rt.materialize_plugin(&plugin, &host).unwrap();
     let paths = layout.plugin(&plugin.name);
-    assert!(paths.installed_marker().exists());
+    let installed = || {
+        fs::metadata(paths.installed_marker())
+            .unwrap()
+            .modified()
+            .unwrap()
+    };
+    let first = installed();
+    assert_eq!(
+        fs::read_to_string(paths.installed_marker()).unwrap(),
+        plugin.hash().as_str(),
+        "the marker holds what render_plugin compares it with"
+    );
+    // #4: the marker install_plugin writes is the one render_plugin reads,
+    // so the same inputs do not install again
+    assert_eq!(rt.materialize_plugin(&plugin, &host).unwrap(), plan);
+    assert_eq!(
+        installed(),
+        first,
+        "same inputs: the marker is not rewritten"
+    );
     let launch = fs::read_to_string(&paths.launch).unwrap();
     assert!(!launch.contains("tok-secret"), "token in launch.sh");
 

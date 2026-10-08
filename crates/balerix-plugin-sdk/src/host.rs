@@ -940,6 +940,58 @@ mod tests {
         assert_eq!(a.read().await, None, "stays closed");
     }
 
+    /// A daemon that answers `hello` 2xx with a body that is not a
+    /// `HelloResponse` (#7). Reported as a transport failure today; the
+    /// label is arguably wrong, and pinned here so a change is deliberate.
+    #[tokio::test]
+    async fn a_2xx_hello_with_a_malformed_body_is_a_bad_reply() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':')
+                    && k.eq_ignore_ascii_case("content-length")
+                {
+                    length = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let reply = "not json";
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            )
+            .unwrap();
+        });
+        let fake = FakeHost::start("tok", json!({}), vec![]).await;
+        let mut env = fake.env("flow", std::path::Path::new("/s"));
+        env.api_url = format!("http://{addr}");
+        let e = Host::new(env)
+            .unwrap()
+            .hello("0.1.0", "127.0.0.1:1", None)
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(matches!(e, SdkError::Transport(_)), "{e:?}");
+        assert_eq!(
+            e.to_string(),
+            "daemon: bad reply: expected ident at line 1 column 2"
+        );
+    }
+
     #[tokio::test]
     async fn statuses_and_transport_failures_are_reported() {
         let fake = FakeHost::start("tok", json!({}), vec![]).await;

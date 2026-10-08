@@ -33,10 +33,10 @@ pub use plugin::{
 };
 pub use quote::sh_quote;
 pub use sandbox::{
-    Grants, SIGNAL_SCOPING_ABI, SelfTestError, balerix_grants, check_conflicts, host_landlock_abi,
-    landlock_abi, merge_profile, render_git_profile, render_profile, sandbox_self_test,
-    signal_scoping_warning, validate_profile, validate_profile_at, write_git_profile,
-    write_profile, write_profile_at,
+    Grants, PluginGrants, Roots, SIGNAL_SCOPING_ABI, SelfTestError, balerix_grants,
+    check_conflicts, check_plugin_sandbox, host_landlock_abi, landlock_abi, merge_profile,
+    render_git_profile, render_profile, sandbox_self_test, signal_scoping_warning,
+    validate_profile, validate_profile_at, write_git_profile, write_profile, write_profile_at,
 };
 pub use tmux::{ANCHOR_WINDOW, ATTACH_SESSION_PREFIX, STOP_WAIT, TmuxAttach, TmuxRunner};
 pub use toolchain::{

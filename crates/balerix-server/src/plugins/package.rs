@@ -13,6 +13,11 @@ use super::config::Source;
 
 /// Largest tarball `fetch` accepts (spec §2.1).
 const MAX_TARBALL: u64 = 64 << 20;
+/// Most bytes an unpack writes, all files together: the compressed cap
+/// alone lets a digest-matching bomb fill the disk (#3).
+const MAX_UNPACKED: u64 = 512 << 20;
+/// Most entries an unpack accepts, directories included (#3).
+const MAX_ENTRIES: usize = 10_000;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -31,6 +36,9 @@ pub fn fetch(url: &str) -> Result<Vec<u8>, PluginError> {
         url: url.to_string(),
         message,
     };
+    if !url.starts_with("https://") {
+        return Err(fail("only https:// URLs are fetched".into()));
+    }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(FETCH_TIMEOUT))
         .http_status_as_error(true)
@@ -49,6 +57,27 @@ pub fn fetch(url: &str) -> Result<Vec<u8>, PluginError> {
     Ok(buf)
 }
 
+/// What stands in for a directory source's digest (#4): the sha256 of
+/// its `mise.toml` and `balerix-plugin.yaml`, each file's own sha256
+/// joined so that moving bytes from one to the other changes it. A
+/// missing file hashes as empty: reading the manifest reports it.
+pub fn directory_digest(dir: &Path) -> Result<String, PluginError> {
+    let file = |name: &str| -> Result<String, PluginError> {
+        let path = dir.join(name);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(sha256_hex(&bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(sha256_hex(b"")),
+            Err(e) => Err(PluginError::io(&path, e)),
+        }
+    };
+    let joined = format!(
+        "mise.toml {}\nbalerix-plugin.yaml {}\n",
+        file("mise.toml")?,
+        file("balerix-plugin.yaml")?
+    );
+    Ok(sha256_hex(joined.as_bytes()))
+}
+
 fn relative_inside(path: &Path) -> bool {
     !path.as_os_str().is_empty()
         && path
@@ -57,11 +86,23 @@ fn relative_inside(path: &Path) -> bool {
 }
 
 /// Unpacks a `.tar.gz` into `dest`, which this creates and which must not
-/// already exist. Rejects absolute paths, `..`, links and special files;
-/// files end up 0444 (0555 when executable), directories 0755. On any
-/// error `dest` is removed again — and only ever `dest` as created here,
-/// never a directory the caller already had.
+/// already exist. Rejects absolute paths, `..`, links and special files,
+/// and an archive over 512 MiB unpacked or 10,000 entries; files end up
+/// 0444 (0555 when executable), directories 0755. On any error `dest` is
+/// removed again — and only ever `dest` as created here, never a
+/// directory the caller already had.
 pub fn unpack(tarball: &[u8], dest: &Path) -> Result<(), PluginError> {
+    unpack_with_limits(tarball, dest, MAX_UNPACKED, MAX_ENTRIES)
+}
+
+/// `unpack` with its caps as parameters, so a test can reach them
+/// without half a gigabyte.
+pub(crate) fn unpack_with_limits(
+    tarball: &[u8],
+    dest: &Path,
+    max_bytes: u64,
+    max_entries: usize,
+) -> Result<(), PluginError> {
     if let Some(parent) = dest.parent() {
         ensure_dir(parent)?;
     }
@@ -71,9 +112,15 @@ pub fn unpack(tarball: &[u8], dest: &Path) -> Result<(), PluginError> {
     std::fs::create_dir(dest).map_err(|e| PluginError::io(dest, e))?;
     let result = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))
         .map_err(|e| PluginError::io(dest, e))
-        .and_then(|()| unpack_inner(tarball, dest));
-    if result.is_err() {
-        let _ = std::fs::remove_dir_all(dest);
+        .and_then(|()| unpack_inner(tarball, dest, max_bytes, max_entries));
+    if result.is_err()
+        && let Err(e) = std::fs::remove_dir_all(dest)
+    {
+        tracing::warn!(
+            path = %dest.display(),
+            error = %e,
+            "a failed unpack left its partial tree behind"
+        );
     }
     result
 }
@@ -81,7 +128,8 @@ pub fn unpack(tarball: &[u8], dest: &Path) -> Result<(), PluginError> {
 /// Creates `path` and every missing ancestor, each 0755, so an unpacked
 /// tree does not depend on the daemon's umask.
 fn ensure_dir(path: &Path) -> Result<(), PluginError> {
-    if path.is_dir() {
+    // `Path::new("x").parent()` is `Some("")`: the current directory
+    if path.as_os_str().is_empty() || path.is_dir() {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -100,10 +148,24 @@ fn ensure_dir(path: &Path) -> Result<(), PluginError> {
         .map_err(|e| PluginError::io(path, e))
 }
 
-fn unpack_inner(tarball: &[u8], dest: &Path) -> Result<(), PluginError> {
+fn unpack_inner(
+    tarball: &[u8],
+    dest: &Path,
+    max_bytes: u64,
+    max_entries: usize,
+) -> Result<(), PluginError> {
     let bad = PluginError::Package;
+    let too_large = || bad(format!("larger than {} MiB unpacked", max_bytes >> 20));
+    let mut written: u64 = 0;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tarball));
-    for entry in archive.entries().map_err(|e| bad(e.to_string()))? {
+    for (n, entry) in archive
+        .entries()
+        .map_err(|e| bad(e.to_string()))?
+        .enumerate()
+    {
+        if n >= max_entries {
+            return Err(bad(format!("more than {max_entries} entries")));
+        }
         let mut entry = entry.map_err(|e| bad(e.to_string()))?;
         // `path()` is the header's name verbatim; tar-rs sanitises only
         // inside its own `unpack`, which this deliberately does not use.
@@ -126,7 +188,14 @@ fn unpack_inner(tarball: &[u8], dest: &Path) -> Result<(), PluginError> {
                     ensure_dir(parent)?;
                 }
                 let mut f = std::fs::File::create(&full).map_err(|e| PluginError::io(&full, e))?;
-                std::io::copy(&mut entry, &mut f).map_err(|e| PluginError::io(&full, e))?;
+                // one byte past what is left tells "exactly full" from "over"
+                let remaining = max_bytes - written;
+                let copied = std::io::copy(&mut (&mut entry).take(remaining + 1), &mut f)
+                    .map_err(|e| PluginError::io(&full, e))?;
+                if copied > remaining {
+                    return Err(too_large());
+                }
+                written += copied;
                 let exec = entry
                     .header()
                     .mode()
@@ -228,6 +297,13 @@ pub fn install(
     expected: Option<&str>,
     install_root: &Path,
 ) -> Result<(PathBuf, Option<String>), PluginError> {
+    // `load_plugins_file` already requires it; this boundary does not
+    // unpack anything unverified whoever calls it
+    if expected.is_none() && !matches!(source, Source::Directory(_)) {
+        return Err(PluginError::Package(
+            "a tarball or URL source needs a sha256".into(),
+        ));
+    }
     if let (Source::Url(_), Some(exp)) = (source, expected) {
         let dest = install_root.join(name).join(digest_prefix(exp));
         if dest.is_dir() {
@@ -609,5 +685,80 @@ mod tests {
         let other = "b".repeat(64);
         let e = install("p", &url, Some(&other), &root).unwrap_err();
         assert!(matches!(e, PluginError::Fetch { .. }), "{e}");
+    }
+
+    fn files(sizes: &[usize]) -> Vec<u8> {
+        tar_with(|b| {
+            for (i, size) in sizes.iter().enumerate() {
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(tar::EntryType::Regular);
+                h.set_size(*size as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, format!("f{i}"), &vec![0u8; *size][..])
+                    .unwrap();
+            }
+        })
+    }
+
+    /// #3: the running total covers every file, not one at a time.
+    #[test]
+    fn unpack_stops_at_the_byte_cap_across_files() {
+        let out = tempfile::tempdir().unwrap();
+        let mib = 1 << 20;
+        let at_cap = files(&[mib / 2, mib / 2]);
+        unpack_with_limits(&at_cap, &out.path().join("a"), mib as u64, 10).unwrap();
+        let over = files(&[mib / 2, mib / 2 + 1]);
+        let dest = out.path().join("b");
+        let e = unpack_with_limits(&over, &dest, mib as u64, 10).unwrap_err();
+        assert_eq!(e.to_string(), "package: larger than 1 MiB unpacked");
+        assert!(!dest.exists(), "the partial tree is removed");
+    }
+
+    #[test]
+    fn unpack_stops_at_the_entry_cap() {
+        let out = tempfile::tempdir().unwrap();
+        unpack_with_limits(&files(&[1, 1, 1]), &out.path().join("a"), 1 << 20, 3).unwrap();
+        let dest = out.path().join("b");
+        let e = unpack_with_limits(&files(&[1, 1, 1, 1]), &dest, 1 << 20, 3).unwrap_err();
+        assert_eq!(e.to_string(), "package: more than 3 entries");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn fetch_refuses_anything_but_https() {
+        // a listener-free loopback port: a real request would fail differently
+        let e = fetch("http://127.0.0.1:1/p.tar.gz").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "http://127.0.0.1:1/p.tar.gz: only https:// URLs are fetched"
+        );
+    }
+
+    #[test]
+    fn install_refuses_an_unpinned_tarball_or_url() {
+        let src = package_dir();
+        let out = tempfile::tempdir().unwrap();
+        let tarball = out.path().join("p.tar.gz");
+        create(src.path(), &tarball).unwrap();
+        let root = out.path().join("install");
+        for source in [
+            Source::Tarball(tarball),
+            Source::Url("https://255.255.255.255/p.tar.gz".into()),
+        ] {
+            let e = install("p", &source, None, &root).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "package: a tarball or URL source needs a sha256"
+            );
+        }
+        assert!(!root.exists(), "nothing is unpacked unverified");
+    }
+
+    #[test]
+    fn ensure_dir_takes_the_empty_parent_of_a_relative_name_as_there() {
+        let parent = Path::new("x").parent().unwrap();
+        assert_eq!(parent, Path::new(""));
+        ensure_dir(parent).unwrap();
     }
 }

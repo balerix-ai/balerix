@@ -36,7 +36,10 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     Ok(Duration::from_secs(n * mult))
 }
 
-fn label<T: serde::Serialize>(v: T) -> String {
+/// The wire name of a serializable enum value, for a table cell. A value
+/// that does not serialize to a string (never the case for the enums this
+/// is given) shows as a blank cell rather than failing the whole table.
+pub(crate) fn label<T: serde::Serialize>(v: T) -> String {
     serde_json::to_value(v)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))

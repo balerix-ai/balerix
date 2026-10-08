@@ -211,6 +211,9 @@ pub struct PluginStatus {
 /// What `POST /v1/plugins/sync` did, by plugin name.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncReport {
+    /// Plugins started or restarted: new ones, and declared ones whose
+    /// package, manifest or config changed, a config-only change included
+    /// (the plugin is stopped and started again).
     pub installed: Vec<String>,
     pub stopped: Vec<String>,
     pub unchanged: Vec<String>,

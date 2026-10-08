@@ -275,6 +275,15 @@ makes an existing remote branch its clone's branch and start point
   localhost TCP on that port only, leaves other egress at nono's default
   (allowed) for the fleet's `sandbox.network` to tighten, and still holds under
   a user `block: true`, so hooks keep flowing when egress is cut off.
+- **Signal isolation is pinned, not inherited.** The agent and plugin
+  profiles write `security.signal_mode: isolated`, at the top level and
+  in `platform_overrides.{linux,macos}` (an `extends` parent's per-OS
+  override is applied after the top level), and refuse the key in the
+  `sandbox` block, at the top level and under `platform_overrides.<os>`
+  (nono applies those after `extends`): `agent-supervise` sits outside the
+  sandbox as the same user, and an agent that could kill it would orphan
+  its tree out of `stop`'s reach (#118). nono enforces it from Landlock
+  ABI v6 (Linux 6.12); below that `serve` logs one warning and runs.
 - **A private clone per agent, over a shared object cache (Spec N).** An
   agent's `workspace/` is a full `git clone --reference crews/<c>/repo`,
   so refs, index, config, hooks and HEAD are its own and the sandbox
@@ -304,7 +313,8 @@ makes an existing remote branch its clone's branch and start point
   `env`. Not the agent's own profile, which grants more than git needs.
   `check_clone` stays for the message it gives; the profile is what
   holds when the clone changes after the check (#70). The workspace
-  reader is not yet under it.
+  reader's `diff` and `version` run under it too (#108), in as few calls
+  as their output allows: each is a sandbox start.
 - **The planner is pure; the executor is dumb.** Every decision is in
   `reconcile::plan` (a total function) so the model-based test compares plans
   structurally and `cargo mutants` has something to bite.

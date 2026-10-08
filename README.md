@@ -23,8 +23,29 @@ asset is attested (`gh attestation verify <file> --repo balerix-ai/balerix`).
   `--exec-path` directory may be anywhere, but a git that brings its own
   libraries (nix, Linuxbrew), or a mise shim, cannot run in the sandbox
   balerix's own git calls in an agent's clone use, so `down` (without
-  `--purge`), `remove` and a branch change fail on such a host for now;
-  `down --purge` is the way past.
+  `--purge`), `remove`, a branch change and the workspace reader fail on
+  such a host until its prefix is granted (below); `down --purge` is the
+  other way past. Linux 6.12 (Landlock ABI v6) or newer keeps agents from
+  signalling their supervisor; on an older kernel `serve` warns once and
+  runs without it.
+- **Daemon config:** `$XDG_CONFIG_HOME/balerix/config.toml`, every key
+  optional:
+  ```toml
+  [server]
+  bind = "127.0.0.1:7643"   # loopback only
+  log = "info"              # a tracing filter
+
+  [sandbox]
+  # Read-only prefixes the git profile (balerix's own git in an agent's
+  # clone) grants beside /usr, /lib, /lib64 and /bin: where a nix or
+  # Linuxbrew git loads its libraries. Never reaches an agent's profile.
+  git_read = ["/nix/store"]
+  ```
+  Each `git_read` entry must be an absolute path to an existing
+  directory, not `/`, and clear of balerix's state, data and config
+  roots; `serve` refuses to start otherwise
+  (`config.toml: sandbox.git_read[0]: …`). The error a removal prints when
+  git cannot run under the profile names the setting.
 - **Container:** `docker run -d --name balerix -v balerix:/home/balerix
   ghcr.io/balerix-ai/balerix:<ver>` runs the daemon with its tools. It listens on
   loopback inside the container only, so run the client there too:

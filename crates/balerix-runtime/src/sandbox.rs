@@ -97,6 +97,19 @@ pub fn render_profile(
         // egress is cut off.
         "network": { "open_port": [daemon_port] },
         "environment": { "deny_vars": ["*"], "set_vars": env },
+        // Written, not left to nono's default: the agent supervisor sits
+        // outside the sandbox as the same user, and an agent that could
+        // signal it would orphan its own tree out of `stop`'s reach
+        // (Spec N amendment §13.6, #118). The top-level key beats a
+        // profile the user block `extends`, but nono applies the parent's
+        // `platform_overrides` for the running OS after that, so the
+        // per-OS patches pin it too. The key is refused in the user block
+        // at both levels (`check_conflicts`).
+        "security": { "signal_mode": "isolated" },
+        "platform_overrides": {
+            "linux": { "security": { "signal_mode": "isolated" } },
+            "macos": { "security": { "signal_mode": "isolated" } },
+        },
     });
     Ok(merge_profile(base, user))
 }
@@ -114,25 +127,31 @@ pub fn render_profile(
 /// Not derived from the agent's profile: that one carries write access,
 /// open network, the user's `sandbox` block and the agent's `env`, none
 /// of which the daemon's git should have. `set_vars` holds the hardening
-/// `harden_agent_git` puts on a command's environment, since nono drops
-/// every variable this list does not name. `git` comes from the host:
+/// for git's environment, since nono drops every variable this list does
+/// not name. `git` comes from the host:
 /// the binary is granted as a single file, canonical since Landlock rules
 /// bind to what the path resolves to, and `exec_path` (`git_exec_path`)
 /// as a directory, since `upload-pack` spawns `pack-objects` through it
 /// (#109). Its libraries are not granted: a git that loads them from
 /// outside `SYSTEM_READ` (nix, Linuxbrew), or a mise shim, cannot run
 /// under this profile and the calls fail closed (Spec N amendment §12.1,
-/// NS-6).
+/// NS-6) unless the operator names their prefix in the daemon's
+/// `[sandbox] git_read` (#111), which `git_read` carries.
 pub fn render_git_profile(
     id: &AgentId,
     paths: &AgentPaths,
     crew: &CrewPaths,
     git: &Path,
     exec_path: &Path,
+    git_read: &[PathBuf],
 ) -> Value {
     let mut read: Vec<PathBuf> = SYSTEM_READ.iter().map(PathBuf::from).collect();
     read.push(std::fs::canonicalize(git).unwrap_or_else(|_| git.to_path_buf()));
     read.push(exec_path.to_path_buf());
+    // the daemon's `[sandbox] git_read` (config.toml, #111): read-only
+    // prefixes a git built outside the system prefixes loads its libraries
+    // from; validated at load, never from a fleet's `sandbox` block
+    read.extend(git_read.iter().cloned());
     read.push(crew.cache_objects());
     read.push(crew.no_hooks());
     read.push(paths.workspace.clone());
@@ -195,13 +214,15 @@ fn git_exec_path(tools: &ToolPaths, id: &str) -> Result<PathBuf, MaterializeErro
 /// Writes the git profile just before the daemon uses it, so nothing
 /// depends on the order of the materialize steps or on a file an earlier
 /// pass (or anything else) left there. Validated only when the bytes
-/// changed. Creates what nono needs to exist: the hooks directory the
+/// changed. Sweeps the temp nono homes another, killed, daemon left
+/// (`workspace::sweep_stale_homes`). Creates what nono needs to exist: the hooks directory the
 /// profile names, nono's `$HOME` and the log directory.
 pub fn write_git_profile(
     tools: &ToolPaths,
     id: &str,
     paths: &AgentPaths,
     crew: &CrewPaths,
+    git_read: &[PathBuf],
 ) -> Result<(), MaterializeError> {
     let agent_id: AgentId = id.parse().map_err(|_| MaterializeError::Invalid {
         id: id.to_string(),
@@ -214,15 +235,23 @@ pub fn write_git_profile(
             message: e.to_string(),
         })?;
     }
+    // the temp nono homes a SIGKILLed daemon could not remove
+    crate::workspace::sweep_stale_homes(paths);
     let exec_path = git_exec_path(tools, id)?;
-    let profile = render_git_profile(&agent_id, paths, crew, &tools.git, &exec_path);
+    let profile = render_git_profile(&agent_id, paths, crew, &tools.git, &exec_path, git_read);
     let path = paths.git_profile.clone();
     if write_profile_at(&agent_id, &path, &profile)? {
+        // nono's state stays out of the agent's own `nono/` (#108)
+        let home = crate::workspace::ScratchHome::new(paths).map_err(|e| MaterializeError::Io {
+            id: id.to_string(),
+            path: paths.nono_home.clone(),
+            message: format!("cannot create nono's home beside it: {e}"),
+        })?;
         validate_profile_at(
             tools,
             &agent_id,
             &path,
-            &paths.nono_home,
+            home.path(),
             &paths.logs.join("nono.validate.log"),
         )?;
     }
@@ -299,6 +328,22 @@ pub fn check_conflicts(
     if u.contains_key("meta") {
         return Err(conflict("meta".into(), "balerix-owned".into()));
     }
+    check_security(u, "", &conflict)?;
+    if let Some(overrides) = u.get("platform_overrides") {
+        let Value::Object(os) = overrides else {
+            return Err(conflict(
+                "platform_overrides".into(),
+                "expected an object".into(),
+            ));
+        };
+        // nono applies the patch for the running OS after `extends`, so
+        // it could loosen what the base profile pins
+        for (name, patch) in os {
+            if let Value::Object(patch) = patch {
+                check_security(patch, &format!("platform_overrides.{name}."), &conflict)?;
+            }
+        }
+    }
     let Some(fs_value) = u.get("filesystem") else {
         return Ok(());
     };
@@ -337,6 +382,32 @@ pub fn check_conflicts(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// `security.signal_mode` is balerix's (#118), whatever its value: even
+/// `null` hands the decision to whatever profile `extends` names. The rest
+/// of `security` is the user's.
+fn check_security(
+    block: &serde_json::Map<String, Value>,
+    prefix: &str,
+    conflict: &impl Fn(String, String) -> MaterializeError,
+) -> Result<(), MaterializeError> {
+    let Some(security) = block.get("security") else {
+        return Ok(());
+    };
+    let Value::Object(security) = security else {
+        return Err(conflict(
+            format!("{prefix}security"),
+            "expected an object".into(),
+        ));
+    };
+    if security.contains_key("signal_mode") {
+        return Err(conflict(
+            format!("{prefix}security.signal_mode"),
+            "balerix-owned; agents stay signal-isolated".into(),
+        ));
     }
     Ok(())
 }
@@ -436,6 +507,56 @@ pub fn sandbox_self_test(tools: &ToolPaths, paths: &AgentPaths) -> Result<(), Se
     Err(SelfTestError::Failed(line))
 }
 
+/// The Landlock ABI that scopes signals (Linux 6.12). Below it nono
+/// cannot enforce `signal_mode: isolated` (#118).
+pub const SIGNAL_SCOPING_ABI: u32 = 6;
+
+/// The ABI `nono setup --check-only` reports on its `Landlock V<n>` line;
+/// `None` when no such line is there.
+pub fn landlock_abi(setup_report: &str) -> Option<u32> {
+    setup_report.lines().find_map(|line| {
+        line.trim()
+            .trim_start_matches(['*', ' '])
+            .strip_prefix("Landlock V")?
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
+/// The start-up warning for a kernel that cannot scope signals, if any.
+/// An unknown ABI warns about nothing: the serve start-up never fails on
+/// this, and a guess is no better than silence.
+pub fn signal_scoping_warning(abi: Option<u32>) -> Option<String> {
+    let abi = abi?;
+    (abi < SIGNAL_SCOPING_ABI).then(|| {
+        format!(
+            "Landlock ABI v{abi} cannot scope signals (v{SIGNAL_SCOPING_ABI}, Linux 6.12, can): \
+             agents' signal_mode isolated is not enforced, and an agent can signal its \
+             supervisor (#118)"
+        )
+    })
+}
+
+/// Asks `nono setup --check-only` for the kernel's Landlock ABI, from an
+/// empty environment with `home` as nono's `$HOME`; with its update check
+/// off it writes nothing there. `None` when nono cannot be run or does
+/// not say.
+pub fn host_landlock_abi(tools: &ToolPaths, home: &Path) -> Option<u32> {
+    let out = std::process::Command::new(&tools.nono)
+        .args(["setup", "--check-only"])
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("NO_COLOR", "1")
+        // otherwise it asks update.nono.sh and records that under `home`
+        .env("NONO_NO_UPDATE_CHECK", "1")
+        .output()
+        .ok()?;
+    landlock_abi(&String::from_utf8_lossy(&out.stdout))
+        .or_else(|| landlock_abi(&String::from_utf8_lossy(&out.stderr)))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SelfTestError {
     /// nono exited 1 with `Landlock not available` (Spec O §19.2).
@@ -514,6 +635,19 @@ mod tests {
             "nothing under crews/c/repo is ever writable (Spec N §6)"
         );
         assert_eq!(p["workdir"]["access"], "none");
+        assert_eq!(
+            p["security"],
+            json!({ "signal_mode": "isolated" }),
+            "pinned, not left to nono's default: the supervisor outside must not be signalled (#118)"
+        );
+        assert_eq!(
+            p["platform_overrides"],
+            json!({
+                "linux": { "security": { "signal_mode": "isolated" } },
+                "macos": { "security": { "signal_mode": "isolated" } },
+            }),
+            "an `extends` parent's per-OS override is applied after the top level"
+        );
         assert_eq!(
             p["network"],
             json!({ "open_port": [7643] }),
@@ -610,6 +744,70 @@ mod tests {
         );
     }
 
+    /// #118: the agent must not loosen signal isolation, whether at the
+    /// top level or through the per-OS patch nono applies after `extends`.
+    #[test]
+    fn signal_mode_is_balerix_owned_at_every_level() {
+        let (id, grants, env) = fixture();
+        let refuse = |user: Value| {
+            render_profile(&id, &grants, 1, &env, &user)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            refuse(json!({ "security": { "signal_mode": "allow_all" } })),
+            "f/c/a: sandbox.security.signal_mode: balerix-owned; agents stay signal-isolated"
+        );
+        assert_eq!(
+            refuse(json!({ "security": { "signal_mode": null } })),
+            "f/c/a: sandbox.security.signal_mode: balerix-owned; agents stay signal-isolated",
+            "null would fall back to whatever `extends` names"
+        );
+        assert_eq!(
+            refuse(
+                json!({ "platform_overrides": { "linux": { "security": { "signal_mode": "allow_same_sandbox" } } } })
+            ),
+            "f/c/a: sandbox.platform_overrides.linux.security.signal_mode: balerix-owned; agents stay signal-isolated"
+        );
+        assert_eq!(
+            refuse(
+                json!({ "platform_overrides": { "macos": { "security": { "signal_mode": "allow_all" } } } })
+            ),
+            "f/c/a: sandbox.platform_overrides.macos.security.signal_mode: balerix-owned; agents stay signal-isolated"
+        );
+        assert_eq!(
+            refuse(json!({ "security": "allow_all" })),
+            "f/c/a: sandbox.security: expected an object"
+        );
+        assert_eq!(
+            refuse(json!({ "platform_overrides": { "linux": { "security": null } } })),
+            "f/c/a: sandbox.platform_overrides.linux.security: expected an object"
+        );
+        // the rest of `security` is the user's
+        let p = render_profile(
+            &id,
+            &grants,
+            1,
+            &env,
+            &json!({ "security": { "process_info_mode": "allow_all" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            p["security"],
+            json!({ "signal_mode": "isolated", "process_info_mode": "allow_all" })
+        );
+        assert!(
+            render_profile(
+                &id,
+                &grants,
+                1,
+                &env,
+                &json!({ "platform_overrides": { "linux": { "network": { "block": true } } } })
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn malformed_filesystem_shapes_are_rejected() {
         let (id, grants, env) = fixture();
@@ -673,6 +871,37 @@ mod tests {
         assert_eq!(once, json!({ "a": [1, 2, 3], "b": { "c": 1, "d": 2 } }));
     }
 
+    /// #118: what `nono setup --check-only` prints decides the start-up
+    /// warning; anything it does not say plainly is no warning at all.
+    #[test]
+    fn signal_scoping_is_read_from_the_landlock_abi_nono_reports() {
+        let report = |abi: &str| {
+            format!(
+                "[2/4] Testing sandbox support...\n  * Kernel version: 6.1.0\n  * Landlock enabled (syscall probe)\n  * {abi}\n  * Available features:\n"
+            )
+        };
+        assert_eq!(landlock_abi(&report("Landlock V6")), Some(6));
+        assert_eq!(landlock_abi(&report("Landlock V7")), Some(7));
+        assert_eq!(landlock_abi(&report("Landlock V5")), Some(5));
+        assert_eq!(landlock_abi("Landlock enabled (syscall probe)\n"), None);
+        assert_eq!(landlock_abi(""), None);
+
+        assert_eq!(signal_scoping_warning(Some(6)), None);
+        assert_eq!(signal_scoping_warning(Some(7)), None);
+        assert_eq!(
+            signal_scoping_warning(None),
+            None,
+            "unknown is not a warning"
+        );
+        assert_eq!(
+            signal_scoping_warning(Some(5)).as_deref(),
+            Some(
+                "Landlock ABI v5 cannot scope signals (v6, Linux 6.12, can): agents' signal_mode \
+                 isolated is not enforced, and an agent can signal its supervisor (#118)"
+            )
+        );
+    }
+
     /// Spec N amendment §4: what the daemon's own git in a clone may reach.
     #[test]
     fn the_git_profile_reads_only_and_carries_nothing_of_the_users() {
@@ -682,7 +911,7 @@ mod tests {
         let crew = layout.crew(&id.crew_ref());
         let git = Path::new("/opt/git/bin/git");
         let exec_path = Path::new("/opt/git/libexec/git-core");
-        let p = render_git_profile(&id, &paths, &crew, git, exec_path);
+        let p = render_git_profile(&id, &paths, &crew, git, exec_path, &[]);
 
         assert_eq!(p["meta"]["name"], "balerix-git-f-c-a");
         let fs = p["filesystem"].as_object().unwrap();
@@ -739,5 +968,20 @@ mod tests {
             "upload-pack spawns pack-objects through git's exec-path (#109)"
         );
         assert!(!read.contains(&paths.home), "the agent's home is not git's");
+
+        // #111: the daemon's read-only prefixes, and nothing else, join it
+        let with = render_git_profile(
+            &id,
+            &paths,
+            &crew,
+            git,
+            exec_path,
+            &[PathBuf::from("/nix/store")],
+        );
+        let mut expected = p["filesystem"]["read"].as_array().unwrap().clone();
+        expected.insert(7, json!("/nix/store")); // after git's own grants
+        assert_eq!(with["filesystem"]["read"], Value::Array(expected));
+        assert_eq!(with["environment"], p["environment"]);
+        assert_eq!(with["network"], p["network"]);
     }
 }

@@ -54,6 +54,21 @@ expression: profile
       7643
     ]
   },
+  "platform_overrides": {
+    "linux": {
+      "security": {
+        "signal_mode": "isolated"
+      }
+    },
+    "macos": {
+      "security": {
+        "signal_mode": "isolated"
+      }
+    }
+  },
+  "security": {
+    "signal_mode": "isolated"
+  },
   "workdir": {
     "access": "none"
   }

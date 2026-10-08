@@ -210,6 +210,21 @@ python = "3.12.8"
       7643
     ]
   },
+  "platform_overrides": {
+    "linux": {
+      "security": {
+        "signal_mode": "isolated"
+      }
+    },
+    "macos": {
+      "security": {
+        "signal_mode": "isolated"
+      }
+    }
+  },
+  "security": {
+    "signal_mode": "isolated"
+  },
   "workdir": {
     "access": "none"
   }
@@ -427,6 +442,21 @@ python = "3.12.8"
     "open_port": [
       7643
     ]
+  },
+  "platform_overrides": {
+    "linux": {
+      "security": {
+        "signal_mode": "isolated"
+      }
+    },
+    "macos": {
+      "security": {
+        "signal_mode": "isolated"
+      }
+    }
+  },
+  "security": {
+    "signal_mode": "isolated"
   },
   "workdir": {
     "access": "none"

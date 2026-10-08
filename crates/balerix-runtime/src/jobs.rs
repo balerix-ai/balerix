@@ -60,6 +60,7 @@ pub fn sync_crew(
         tools,
         gh_config_dir,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .sync_cache(&id, &paths, repo, git_ref)
     .map_err(SyncError::Cache)?;
@@ -207,6 +208,7 @@ pub fn harvest(
         tools,
         gh_config_dir: None,
         cache_is_read_only: false,
+        git_read: &[],
     }
     .harvest_only(&id.to_string(), &slice.crew(), &agent)
 }

@@ -256,17 +256,25 @@ credentials, hook input, or sandbox rules.
   line that dates readiness; the tick after it logs the phase.
 - `Workspace::git` (`crates/balerix-runtime/src/workspace.rs`) (`scrub_git_env`)
   scrubs `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_PREFIX`/`GIT_COMMON_DIR`
-  from every git call; `harden_agent_git` adds the rest of the hardening for a
-  call in an agent's clone. The integration-test `git`
+  from every git call; a call in an agent's clone runs under the git
+  profile instead (`workspace::sandboxed_git`, next item). The integration-test `git`
   fixtures do the same — the pre-commit hook exports them, and a git
   subprocess that inherits them operates on this repository instead of the
   test's.
-- The clone step's git (`Workspace::agent_git` and the harvest's
-  `upload-pack`) runs inside `nono run --profile nono-git-profile.json`
-  from an empty environment. Its hardening variables live in that
-  profile's `set_vars` (`sandbox::render_git_profile`), not on the
-  command: a variable added to `harden_agent_git` alone reaches the
-  workspace reader and not these calls. Tests that run git in an existing
+- Every daemon git call in an agent's existing clone — the clone step's
+  (`Workspace::agent_git`, the harvest's `upload-pack`) and the workspace
+  reader's (`inspect.rs`, #108) — goes through `workspace::sandboxed_git`
+  and runs inside `nono run --profile nono-git-profile.json` from an empty
+  environment. Its hardening variables live in that profile's `set_vars`
+  (`sandbox::render_git_profile`), not on the command: nono drops every
+  other variable. Each call runs `--no-audit` with `HOME` a fresh
+  `.nono-git-*` directory beside the agent's `nono/`, removed when the
+  call ends (`workspace::ScratchHome`): nono writes a session record per
+  `run` under `$HOME`, and the agent's own `nono/` holds its live
+  session's, so those could never be swept there. Each call is a sandbox start (about 55 ms idle, far
+  more on a loaded host), so the reader's `version` is four calls and its
+  `diff` one combined `git diff -U3` split per file (`split_patch`), plus
+  one `--no-index` per untracked file; keep it that way. Tests that run git in an existing
   clone need Landlock and gate on `support::landlock_works`. Go through
   `Workspace::prepare_sandbox` before the first sandboxed call: it writes
   the profile, then runs one `git version` that must exit 0. The yes/no
@@ -285,7 +293,11 @@ credentials, hook input, or sandbox rules.
   `sandbox::git_exec_path`; a git that cannot answer fails the step),
   not its shared libraries, so a `git` that loads them from elsewhere
   (nix, Linuxbrew) or is a mise shim cannot run under it (#109, Spec N
-  amendment NS-6). That fails closed: `down` without
+  amendment NS-6) unless the daemon's `config.toml` names the prefix in
+  `[sandbox] git_read` (#111; `Runtime::with_git_read`, validated in
+  `serve.rs`; pods get none). When the canary's `git version` fails,
+  `/bin/true` under the same profile tells "git could not run" (the
+  error names `sandbox.git_read`) from "the sandbox did not start". That fails closed: `down` without
   `--purge`, `remove` and a branch change fail on such a host, `--purge`
   is the way past, and the user `sandbox` block does not reach this
   profile.
@@ -488,8 +500,9 @@ credentials, hook input, or sandbox rules.
   `fake-claude` records a paste line by line; the real `claude` is expected
   to arrive as one message — verify with `mise run verify-claude`
   (Spec C §8, pending).
-- Workspace git calls (`balerix-runtime/src/inspect.rs`) set
-  `GIT_OPTIONAL_LOCKS=0` and `-c core.fsmonitor=false -c core.hooksPath=<empty>`
+- Workspace git calls (`balerix-runtime/src/inspect.rs`) run under the git
+  profile (`GIT_OPTIONAL_LOCKS=0` and the rest in its `set_vars`), with
+  `-c core.fsmonitor=false -c core.hooksPath=<empty>`
   and pass `--no-ext-diff --no-textconv --no-color --submodule=short
   --ignore-submodules=dirty` to every `diff`: the clone's `.git/config` is
   agent-writable, and the last two keep git out of a nested repository the
@@ -500,6 +513,13 @@ credentials, hook input, or sandbox rules.
   clone's `.git` directory makes git refuse instead of discovering the
   repository that holds the state root. Keep those when adding a git call
   there.
+- Two plugin-visible changes came with the sandboxed reader (#108): git
+  inside the git profile sees no `HOME` and no system config, so the
+  daemon user's global `core.excludesFile` no longer hides untracked
+  files (only the clone's `.gitignore` and `.git/info/exclude` do); and
+  `uncommitted` (and the `version` fingerprint) now come from `git status`,
+  so an index-only change (staged, with the worktree back at `HEAD`'s
+  content) counts as uncommitted, where `diff HEAD` used to miss it.
 - A workspace `diff` refuses with `repository config sets <key>; workspace
   diff refused` when the clone's `.git/config` declares a
   `filter.<x>.<clean|smudge|process>`, or when it sets

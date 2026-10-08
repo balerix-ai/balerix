@@ -22,7 +22,7 @@ use crate::tools::{Cmd, CmdOutput, ToolPaths};
 /// set, over whatever the daemon inherited: a `0` in its environment
 /// would otherwise reach the harvest's `upload-pack` (#67). Harmless on
 /// the cache and a fresh clone, which have no promisor remote; what it
-/// guards is described at `harden_agent_git`.
+/// guards is described at `PROMISOR_KEYS`.
 pub(crate) fn scrub_git_env(mut cmd: Cmd) -> Cmd {
     for var in [
         "GIT_DIR",
@@ -36,49 +36,17 @@ pub(crate) fn scrub_git_env(mut cmd: Cmd) -> Cmd {
     cmd.env("GIT_NO_LAZY_FETCH", "1")
 }
 
-/// Config and environment for a git call in a repository the agent can
-/// write to (its private clone), for the workspace reader (`inspect.rs`);
-/// the clone step runs under the git profile instead, whose `set_vars`
-/// carry the same variables (`sandbox::render_git_profile`). Command-line
-/// config beats every config file, so nothing the agent wrote into its
-/// `.git/config` runs as the daemon: fsmonitor off, hooks pointed at an
-/// empty directory, no optional locks, no prompt, and the `GIT_*` scrub.
-/// `GIT_CEILING_DIRECTORIES` is the agent's own root, the parent of
-/// `workspace/`: the agent owns the clone and can delete its `.git`, and
-/// repository discovery would then walk up and run the command in whatever
-/// repository contains the state root. git only honours a ceiling that
-/// matches the resolved path, so it is canonical.
-/// `GIT_NO_LAZY_FETCH=1` (from `scrub_git_env`): a promisor remote in the
-/// clone's config (`extensions.partialClone`, or any `remote.<x>.promisor`)
-/// would otherwise make any call that reads a missing object (`status`,
-/// `diff`) fetch it from `remote.<x>.url` as the daemon, into the clone's
-/// own object store where the next harvest carries it into the cache, and
-/// run `remote.<x>.uploadpack` as the daemon on the way. git honours the
-/// variable from 2.45.1 (and the patched maintenance releases from
-/// 2.39.4), so it is the second layer: both callers refuse such a config
-/// by key before any call that reads an object (`check_clone_config` for
-/// the clone step, `refuse_filters` for the workspace reader, #67), on
-/// any git.
-pub(crate) fn harden_agent_git(cmd: Cmd, crew: &CrewPaths, agent_root: &Path) -> Cmd {
-    let no_hooks = crew.no_hooks();
-    let _ = std::fs::create_dir_all(&no_hooks);
-    let ceiling = agent_root
-        .canonicalize()
-        .unwrap_or_else(|_| agent_root.to_path_buf());
-    scrub_git_env(cmd)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CEILING_DIRECTORIES", ceiling.display().to_string())
-        .args(["-c", "core.fsmonitor=false"])
-        .args([
-            "-c".to_string(),
-            format!("core.hooksPath={}", no_hooks.display()),
-        ])
-}
-
 /// Config keys that declare a promisor remote, in the form `git config
 /// --name-only` prints them (lowercased). `inspect.rs`'s `FILTER_KEYS`
-/// carries the same alternation for the workspace reader.
+/// carries the same alternation for the workspace reader. A promisor
+/// remote in the clone's config would make any call that reads a missing
+/// object (`status`, `diff`) fetch it from `remote.<x>.url`, and run
+/// `remote.<x>.uploadpack` on the way. `GIT_NO_LAZY_FETCH=1` (the git
+/// profile's `set_vars`, and `scrub_git_env`) closes that from git 2.45.1
+/// (and the patched maintenance releases from 2.39.4); the git profile's
+/// blocked network is what holds on any git, and the refusal by key
+/// (`check_clone_config`, `refuse_filters`) is the operator's message
+/// (#67).
 pub(crate) const PROMISOR_KEYS: &str = r"^(extensions\.partialclone|remote\..*\.promisor)$";
 
 /// What to do with an existing clone (Spec N §4 step 1): Spec L §12's
@@ -361,6 +329,250 @@ fn first_symlink_with(
     Ok(None)
 }
 
+/// `/usr, /lib, /lib64 and /bin`: the git profile's system prefixes, as
+/// the canary's hint names them (`/etc` is granted too, but holds no
+/// library).
+fn system_prefixes() -> String {
+    let dirs: Vec<&str> = crate::sandbox::SYSTEM_READ
+        .iter()
+        .copied()
+        .filter(|d| *d != "/etc")
+        .collect();
+    match dirs.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => dirs.join(", "),
+    }
+}
+
+/// `nono`'s arguments up to and including the git binary, for a git
+/// call in `agent`'s existing clone: `-s --log-file <logs>/nono-git.log
+/// run --no-audit --profile <git profile> -- <git>`. No audit trail: one
+/// per call, at the web plugin's poll, would grow nono's state without
+/// bound (the session record `--no-audit` keeps goes to a `ScratchHome`). The profile is
+/// `sandbox::render_git_profile`; `write_git_profile` must have run.
+fn sandbox_args(tools: &ToolPaths, agent: &AgentPaths) -> Vec<String> {
+    vec![
+        "-s".into(),
+        "--log-file".into(),
+        agent.logs.join("nono-git.log").display().to_string(),
+        "run".into(),
+        "--no-audit".into(),
+        "--profile".into(),
+        agent.git_profile.display().to_string(),
+        "--".into(),
+        tools.git.display().to_string(),
+    ]
+}
+
+/// nono's `$HOME` for one daemon call under the git profile: a fresh
+/// directory beside the agent's `nono/`, removed when the guard drops,
+/// success or failure. nono writes a session record under `$HOME` on every
+/// `run` (`.local/state/nono/sessions/`), even with `--no-audit`; in the
+/// agent's own `nono/`, where its live session's record also is, those
+/// could not be swept without risking that one. nono writes it as the
+/// supervisor, outside the sandbox, so the profile grants nothing on it;
+/// git inside sees no `HOME` at all (`deny_vars`), as before, so no
+/// global config either way.
+pub(crate) struct ScratchHome(PathBuf);
+
+impl ScratchHome {
+    pub(crate) fn new(agent: &AgentPaths) -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = agent
+            .nono_home
+            .parent()
+            .unwrap_or(&agent.nono_home)
+            .to_path_buf();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or_default();
+        let path = parent.join(format!(
+            ".nono-git-{}-{}-{nanos}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // `create_dir`, not `create_dir_all`: a name already there is
+        // someone else's, never reused
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// Removes the `ScratchHome`s another process left beside `agent`'s
+/// `nono/`: a daemon that was SIGKILLed mid-call never ran their guards.
+/// Only one daemon runs against a state root, so a directory named for
+/// another pid is never in use; this process's own are left alone.
+pub(crate) fn sweep_stale_homes(agent: &AgentPaths) {
+    let Some(parent) = agent.nono_home.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let ours = std::process::id().to_string();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(".nono-git-")) else {
+            continue;
+        };
+        let pid = rest.split('-').next().unwrap_or_default();
+        if pid != ours && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+impl Drop for ScratchHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// What `sandboxed_git` writes to the crew's `git.log`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitLog {
+    /// argv, stdout, stderr and the exit status.
+    Full,
+    /// argv, stderr and the exit status: for a call whose stdout is a
+    /// request's payload (the workspace reader's diffs).
+    ArgvOnly,
+}
+
+/// A failed `sandboxed_git`, reported as git's: git's subcommand (its
+/// first argument past the options), and the argv nono ran, or git's own
+/// arguments when the call exited with an accepted non-zero code but
+/// printed on stderr (`is_gits_answer`). That last case keeps the output
+/// in `unanswered`, for a caller to whom such an exit is harmless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitFailure {
+    pub subcommand: String,
+    pub args: Vec<String>,
+    pub stderr: String,
+    pub unanswered: Option<Box<CmdOutput>>,
+}
+
+/// One git call inside the agent's existing clone, run under the git
+/// profile (`sandbox::render_git_profile`; Spec N amendment 2026-10-01,
+/// #68, #70): it reads the clone and the crew cache's objects, writes
+/// nothing and has no network, so whatever the clone points at, git sees
+/// no more than the agent could. The checks before it give the operator a
+/// readable refusal; the profile is the boundary, and holds even when the
+/// clone changes after the checks.
+///
+/// nono starts from an empty environment (`HOME` is the agent's `nono/`,
+/// as for `launch.sh`), and the profile's `set_vars` carry the hardening
+/// (`GIT_OPTIONAL_LOCKS=0`, `GIT_NO_LAZY_FETCH=1`, no prompt, no system
+/// config, the ceiling at the agent's root); the `-c` pairs turn off
+/// fsmonitor and point hooks at an empty directory, over any config the
+/// agent wrote. `--git-dir` names `workspace/.git` exactly: with `-C`
+/// alone, a `.git` git rejects (say, its `HEAD` deleted) makes git take
+/// `workspace/` itself for a bare repository. `accepted` are the exit
+/// codes that count as success (0 included). A failure is reported as
+/// git's, with git's subcommand, not nono's. An accepted non-zero exit
+/// that printed anything on stderr is a failure too (`is_gits_answer`).
+/// `write_git_profile` must have run.
+pub(crate) fn sandboxed_git(
+    tools: &ToolPaths,
+    crew: &CrewPaths,
+    agent: &AgentPaths,
+    args: &[&str],
+    accepted: &[i32],
+    log: GitLog,
+) -> Result<CmdOutput, GitFailure> {
+    run_sandboxed_git(tools, crew, agent, args, accepted, log, None)
+}
+
+/// `sandboxed_git` with stdout handed to `sink` as it arrives instead of
+/// collected (`Cmd::run_streaming`): exit 0 only, logged without stdout.
+pub(crate) fn sandboxed_git_streaming(
+    tools: &ToolPaths,
+    crew: &CrewPaths,
+    agent: &AgentPaths,
+    args: &[&str],
+    sink: &mut dyn FnMut(&[u8]),
+) -> Result<CmdOutput, GitFailure> {
+    run_sandboxed_git(tools, crew, agent, args, &[0], GitLog::ArgvOnly, Some(sink))
+}
+
+/// Where a streamed call's stdout goes, chunk by chunk.
+type StdoutSink<'a> = &'a mut dyn FnMut(&[u8]);
+
+fn run_sandboxed_git(
+    tools: &ToolPaths,
+    crew: &CrewPaths,
+    agent: &AgentPaths,
+    args: &[&str],
+    accepted: &[i32],
+    log: GitLog,
+    sink: Option<StdoutSink<'_>>,
+) -> Result<CmdOutput, GitFailure> {
+    let log_file = crew.logs.join("git.log");
+    let home = ScratchHome::new(agent).map_err(|e| GitFailure {
+        subcommand: String::new(),
+        args: Vec::new(),
+        stderr: format!(
+            "cannot create nono's home beside {}: {e}",
+            agent.nono_home.display()
+        ),
+        unanswered: None,
+    })?;
+    let cmd = Cmd::new(&tools.nono)
+        .env_clear()
+        .env("HOME", home.path().display().to_string())
+        .env("PATH", outer_path(tools));
+    let cmd = match log {
+        GitLog::Full => cmd.log(&log_file),
+        GitLog::ArgvOnly => cmd.log_argv_only(&log_file),
+    }
+    .args(sandbox_args(tools, agent))
+    .args(["-c", "core.fsmonitor=false"])
+    .args([
+        "-c".to_string(),
+        format!("core.hooksPath={}", crew.no_hooks().display()),
+        "-C".to_string(),
+        agent.workspace.display().to_string(),
+        format!("--git-dir={}", agent.workspace.join(".git").display()),
+        format!("--work-tree={}", agent.workspace.display()),
+    ])
+    .args(args.iter().copied());
+    // git's own: the first word that is neither an option nor a `-c` value
+    let mut words = args.iter().copied();
+    let mut subcommand = String::new();
+    while let Some(word) = words.next() {
+        if word == "-c" {
+            words.next();
+        } else if !word.starts_with('-') {
+            subcommand = word.to_string();
+            break;
+        }
+    }
+    let out = match sink {
+        Some(sink) => cmd.run_streaming(accepted, sink),
+        None => cmd.run_with_exit_codes(accepted),
+    }
+    .map_err(|f| GitFailure {
+        subcommand: subcommand.clone(),
+        args: f.args,
+        stderr: f.stderr,
+        unanswered: None,
+    })?;
+    if !is_gits_answer(&out) {
+        return Err(GitFailure {
+            subcommand,
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            stderr: out.stderr.clone(),
+            unanswered: Some(Box::new(out)),
+        });
+    }
+    Ok(out)
+}
+
 pub struct Workspace<'a> {
     pub tools: &'a ToolPaths,
     /// `GH_CONFIG_DIR` for the daemon's git calls when `git.auth: gh`.
@@ -368,6 +580,9 @@ pub struct Workspace<'a> {
     /// Spec O §8.1: the cache is a read-only mount kept current by a Job;
     /// a new clone skips the fetch into it and the harvested-branch seed.
     pub cache_is_read_only: bool,
+    /// The daemon's `[sandbox] git_read` (#111): read-only prefixes the
+    /// git profile grants beside the system ones. Empty in a pod.
+    pub git_read: &'a [PathBuf],
 }
 
 impl Workspace<'_> {
@@ -617,14 +832,18 @@ impl Workspace<'_> {
     /// exit 1 as git's answer, and nono's own failure to run also exits 1;
     /// a `version` that must exit 0 tells the two apart for a nono that
     /// validates but cannot run at all, and names the log to read. A
-    /// failure on a later call is caught by `is_gits_answer`.
+    /// failure on a later call is caught by `is_gits_answer`. When
+    /// `version` fails, `/bin/true` under the same profile says whether
+    /// the sandbox started at all, and the error names `sandbox.git_read`
+    /// when it did (#111).
     fn prepare_sandbox(
         &self,
         id: &str,
         crew: &CrewPaths,
         agent: &AgentPaths,
     ) -> Result<(), MaterializeError> {
-        write_git_profile(self.tools, id, agent, crew)?;
+        write_git_profile(self.tools, id, agent, crew, self.git_read)?;
+        let log = agent.logs.join("nono-git.log");
         self.agent_git(id, crew, agent, &["version"], &[0])
             .map(|_| ())
             .map_err(|e| match e {
@@ -635,55 +854,52 @@ impl Workspace<'_> {
                     subcommand,
                     args,
                     stderr,
-                } => MaterializeError::Tool {
-                    id,
-                    tool,
-                    subcommand,
-                    args,
-                    stderr: format!(
-                        "the sandbox did not start; see {}: {stderr}",
-                        agent.logs.join("nono-git.log").display()
-                    ),
-                },
+                } => {
+                    // #111: a sandbox that runs `/bin/true` started; it is
+                    // git that could not run under it, typically a git
+                    // that loads its libraries from its own prefix
+                    let hint = if self.sandbox_starts(agent) {
+                        format!(
+                            "git could not run under the git profile (the sandbox itself \
+                             starts); if it loads libraries from outside {}, add that prefix \
+                             to `sandbox.git_read` in the daemon's config.toml",
+                            system_prefixes()
+                        )
+                    } else {
+                        "the sandbox did not start".to_string()
+                    };
+                    MaterializeError::Tool {
+                        id,
+                        tool,
+                        subcommand,
+                        args,
+                        stderr: format!("{hint}; see {}: {stderr}", log.display()),
+                    }
+                }
                 other => other,
             })
     }
 
-    /// `nono`'s arguments up to and including the git binary, for a git
-    /// call in `agent`'s existing clone: `-s --log-file <logs>/nono-git.log
-    /// run --profile <git profile> -- <git>`. The profile is
-    /// `sandbox::render_git_profile`; `write_git_profile` must have run.
-    fn sandbox_args(&self, agent: &AgentPaths) -> Vec<String> {
-        vec![
-            "-s".into(),
-            "--log-file".into(),
-            agent.logs.join("nono-git.log").display().to_string(),
-            "run".into(),
-            "--profile".into(),
-            agent.git_profile.display().to_string(),
-            "--".into(),
-            self.tools.git.display().to_string(),
-        ]
+    /// Whether `/bin/true` runs under the git profile: the canary's
+    /// second question, asked only once `git version` has failed.
+    fn sandbox_starts(&self, agent: &AgentPaths) -> bool {
+        let mut args = sandbox_args(self.tools, agent);
+        args.pop();
+        args.push("/bin/true".into());
+        let Ok(home) = ScratchHome::new(agent) else {
+            return false;
+        };
+        Cmd::new(&self.tools.nono)
+            .env_clear()
+            .env("HOME", home.path().display().to_string())
+            .env("PATH", outer_path(self.tools))
+            .args(args)
+            .run()
+            .is_ok()
     }
 
-    /// One git call inside the agent's existing clone, run under the git
-    /// profile (`sandbox::render_git_profile`; Spec N amendment
-    /// 2026-10-01, #68, #70): it reads the clone and the crew cache's
-    /// objects, writes nothing and has no network, so whatever the clone
-    /// points at, git sees no more than the agent could. The checks
-    /// before it give the operator a readable refusal; the profile is the
-    /// boundary, and holds even when the clone changes after the checks.
-    ///
-    /// nono starts from an empty environment (`HOME` is the agent's
-    /// `nono/`, as for `launch.sh`), and the profile's `set_vars` carry
-    /// the hardening `harden_agent_git` sets for the workspace reader;
-    /// the `-c` pairs are the same. `--git-dir` names `workspace/.git`
-    /// exactly: with `-C` alone, a `.git` git rejects (say, its `HEAD`
-    /// deleted) makes git take `workspace/` itself for a bare repository.
-    /// `accepted` are the exit codes that count as success (0 included).
-    /// A failure is reported as git's, with git's subcommand, not nono's.
-    /// An accepted non-zero exit that printed anything on stderr is a
-    /// failure too (`is_gits_answer`).
+    /// One git call inside the agent's existing clone, under the git
+    /// profile (`sandboxed_git`), as a materialize step.
     fn agent_git(
         &self,
         id: &str,
@@ -692,37 +908,15 @@ impl Workspace<'_> {
         args: &[&str],
         accepted: &[i32],
     ) -> Result<String, MaterializeError> {
-        let cmd = Cmd::new(&self.tools.nono)
-            .env_clear()
-            .env("HOME", agent.nono_home.display().to_string())
-            .env("PATH", outer_path(self.tools))
-            .log(&crew.logs.join("git.log"))
-            .args(self.sandbox_args(agent))
-            .args(["-c", "core.fsmonitor=false"])
-            .args([
-                "-c".to_string(),
-                format!("core.hooksPath={}", crew.no_hooks().display()),
-                "-C".to_string(),
-                agent.workspace.display().to_string(),
-                format!("--git-dir={}", agent.workspace.join(".git").display()),
-                format!("--work-tree={}", agent.workspace.display()),
-            ])
-            .args(args.iter().copied());
-        let tool_error = |argv: Vec<String>, stderr: String| MaterializeError::Tool {
-            id: id.to_string(),
-            tool: "git".into(),
-            subcommand: args.first().copied().unwrap_or_default().to_string(),
-            args: argv,
-            stderr,
-        };
-        let out = cmd
-            .run_with_exit_codes(accepted)
-            .map_err(|f| tool_error(f.args, f.stderr))?;
-        if !is_gits_answer(&out) {
-            let argv = args.iter().map(|a| (*a).to_string()).collect();
-            return Err(tool_error(argv, out.stderr));
-        }
-        Ok(out.stdout)
+        sandboxed_git(self.tools, crew, agent, args, accepted, GitLog::Full)
+            .map(|o| o.stdout)
+            .map_err(|f| MaterializeError::Tool {
+                id: id.to_string(),
+                tool: "git".into(),
+                subcommand: f.subcommand,
+                args: f.args,
+                stderr: f.stderr,
+            })
     }
 
     /// The agent's private clone on `branch` (Spec N §4): a clone of
@@ -996,33 +1190,42 @@ impl Workspace<'_> {
         }
         // Run by a shell on the fetch's serving side: every word quoted.
         // `env -i` for the same reason `agent_git` clears its environment.
+        // `home` lives until the fetch below has returned.
+        let home = ScratchHome::new(agent).map_err(|e| MaterializeError::Io {
+            id: id.to_string(),
+            path: agent.nono_home.clone(),
+            message: format!("cannot create nono's home beside it: {e}"),
+        })?;
         let mut upload_pack = format!(
             "--upload-pack=env -i HOME={} PATH={} {}",
-            sh_quote(&agent.nono_home.display().to_string()),
+            sh_quote(&home.path().display().to_string()),
             sh_quote(&outer_path(self.tools)),
             sh_quote(&self.tools.nono.display().to_string()),
         );
-        for word in self.sandbox_args(agent) {
+        for word in sandbox_args(self.tools, agent) {
             upload_pack.push(' ');
             upload_pack.push_str(&sh_quote(&word));
         }
         upload_pack.push_str(" upload-pack --strict");
         before_fetch();
-        self.git(
-            id,
-            crew,
-            &[
-                "-C",
-                &crew.repo.display().to_string(),
-                "fetch",
-                "--quiet",
-                "--no-auto-gc",
-                &upload_pack,
-                &file_url(&agent.workspace.join(".git")),
-                &format!("+{refname}:{refname}"),
-            ],
-        )
-        .map(|_| true)
+        let fetched = self
+            .git(
+                id,
+                crew,
+                &[
+                    "-C",
+                    &crew.repo.display().to_string(),
+                    "fetch",
+                    "--quiet",
+                    "--no-auto-gc",
+                    &upload_pack,
+                    &file_url(&agent.workspace.join(".git")),
+                    &format!("+{refname}:{refname}"),
+                ],
+            )
+            .map(|_| true);
+        drop(home);
+        fetched
     }
 
     fn record_branch(id: &str, agent: &AgentPaths, branch: &str) -> Result<(), MaterializeError> {
@@ -1161,8 +1364,8 @@ impl Workspace<'_> {
 mod tests {
     use crate::tools::{Cmd, CmdOutput};
     use crate::workspace::{
-        CloneDecision, decide_clone, file_url, first_symlink_with, harden_agent_git,
-        is_gits_answer, scrub_git_env,
+        CloneDecision, ScratchHome, decide_clone, file_url, first_symlink_with, is_gits_answer,
+        scrub_git_env, sweep_stale_homes,
     };
 
     /// #136: git's own maintenance removes `objects/maintenance.lock`
@@ -1198,6 +1401,32 @@ mod tests {
         assert_eq!(err.0, missing);
         assert_eq!(err.1.kind(), std::io::ErrorKind::NotFound);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// #108 review: a SIGKILLed daemon's temp homes are swept; this
+    /// process's own, and anything else, are left.
+    #[test]
+    fn stale_scratch_homes_of_another_pid_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = crate::StateLayout::from_env(dir.path(), |_| None);
+        let agent = layout.agent(&"f/c/a".parse().unwrap());
+        let root = agent.nono_home.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&root).unwrap();
+        let other = root.join(".nono-git-4194304999-0-1");
+        std::fs::create_dir_all(other.join(".local/state/nono/sessions")).unwrap();
+        let ours = ScratchHome::new(&agent).unwrap();
+        let unrelated = root.join(".nono-gitx");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let file = root.join(".nono-git-1-0-0");
+        std::fs::write(&file, "").unwrap();
+
+        sweep_stale_homes(&agent);
+        assert!(!other.exists(), "another pid's home is swept");
+        assert!(ours.path().exists(), "this process's own is in use");
+        assert!(unrelated.exists() && file.exists(), "only our directories");
+        let path = ours.path().to_path_buf();
+        drop(ours);
+        assert!(!path.exists());
     }
 
     /// Spec N amendment §12.2 (#109): git's yes/no probes are silent on
@@ -1236,8 +1465,6 @@ mod tests {
     /// #67: the variable is set on every git call balerix makes, over
     /// whatever the daemon inherited (`GIT_NO_LAZY_FETCH=0` in its
     /// environment would otherwise reach the harvest's `upload-pack`).
-    /// The probe is a script that ignores its arguments, since the
-    /// hardened builder adds `-c` pairs a shell would read as a command.
     #[test]
     fn every_git_call_sets_git_no_lazy_fetch() {
         use std::os::unix::fs::PermissionsExt;
@@ -1251,10 +1478,6 @@ mod tests {
 
         assert_eq!(sees(scrub_git_env(inherited())), "1");
         assert_eq!(sees(scrub_git_env(Cmd::new(&probe))), "1");
-
-        let layout = crate::StateLayout::from_env(dir.path(), |_| None);
-        let crew = layout.crew(&"f/c".parse().unwrap());
-        assert_eq!(sees(harden_agent_git(inherited(), &crew, dir.path())), "1");
     }
 
     /// #70: the harvest names the clone by URL; git percent-decodes it,

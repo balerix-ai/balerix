@@ -1,6 +1,7 @@
 //! `Runtime`: the `Materializer` over real tools. `render_agent` is the
 //! pure-ish half (files only) shared with `balerix dev materialize`.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use balerix_api::{CredentialBundle, GitAuth, GitSettings};
@@ -21,6 +22,8 @@ use crate::workspace::Workspace;
 pub struct Runtime {
     pub layout: StateLayout,
     pub tools: ToolPaths,
+    /// The daemon's `[sandbox] git_read` (#111), for the git profile only.
+    pub git_read: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -38,8 +41,21 @@ pub struct RenderOutcome {
 }
 
 impl Runtime {
+    /// No `git_read`: what a pod (`agent/src/sidecar.rs`) and the tests
+    /// get.
     pub fn new(layout: StateLayout, tools: ToolPaths) -> Self {
-        Self { layout, tools }
+        Self {
+            layout,
+            tools,
+            git_read: Vec::new(),
+        }
+    }
+
+    /// The daemon's `[sandbox] git_read` (#111), validated by the caller.
+    #[must_use]
+    pub fn with_git_read(mut self, git_read: Vec<PathBuf>) -> Self {
+        self.git_read = git_read;
+        self
     }
 
     /// Steps 2–5 of the pipeline without subprocesses: home, `mise.toml`,
@@ -246,6 +262,7 @@ impl Runtime {
             tools: &self.tools,
             gh_config_dir: (git.auth == GitAuth::Gh).then(|| self.layout.fleet_gh_dir(fleet)),
             cache_is_read_only: self.layout.pod_layout().is_some(),
+            git_read: &self.git_read,
         }
     }
 
@@ -371,6 +388,7 @@ impl Materializer for Runtime {
             tools: &self.tools,
             gh_config_dir: None,
             cache_is_read_only: false,
+            git_read: &self.git_read,
         }
         .harvest_and_remove(&id, &crew, &paths)?;
         Self::rm_rf(&id, &paths.root)
@@ -397,6 +415,7 @@ impl Materializer for Runtime {
                         tools: &self.tools,
                         gh_config_dir: None,
                         cache_is_read_only: false,
+                        git_read: &self.git_read,
                     }
                     .harvest_and_remove(
                         &agent_id.to_string(),

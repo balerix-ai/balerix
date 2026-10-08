@@ -64,6 +64,15 @@ impl Materializer for PluginMaterializer {
         _: &CredentialBundle,
         host: &HookTarget,
     ) -> Result<LaunchPlan, MaterializeError> {
+        // Keyed on the agent name alone: this materializer is installed
+        // only for the reserved `balerix` fleet's actor, where an agent
+        // name is a plugin name. Given another fleet's agent it would
+        // launch the plugin of the same name in that agent's place.
+        debug_assert!(
+            balerix_core::is_reserved_fleet(agent.id.fleet.as_str()),
+            "PluginMaterializer given {}, outside the plugin fleet",
+            agent.id
+        );
         let plugin = self
             .get(&agent.id.agent)
             .ok_or_else(|| MaterializeError::Invalid {

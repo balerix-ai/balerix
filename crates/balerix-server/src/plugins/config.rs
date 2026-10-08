@@ -45,7 +45,7 @@ pub fn load_plugins_file(path: &Path) -> Result<PluginsFile, PluginError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PluginsFile::default()),
         Err(e) => return Err(PluginError::io(path, e)),
     };
-    let file: PluginsFile = serde_norway::from_str(&text).map_err(|e| PluginError::Config {
+    let mut file: PluginsFile = serde_norway::from_str(&text).map_err(|e| PluginError::Config {
         path: "(parse)".into(),
         message: e.to_string(),
     })?;
@@ -66,8 +66,13 @@ pub fn load_plugins_file(path: &Path) -> Result<PluginsFile, PluginError> {
             return Err(entry_error(i, "name", "duplicate"));
         }
     }
+    // trimmed once, here, so what is validated is what `resolve_source`
+    // resolves: `"  ./web"` is `./web`, not a path with a leading space
+    for entry in &mut file.plugins {
+        entry.source = entry.source.trim().to_string();
+    }
     for (i, entry) in file.plugins.iter().enumerate() {
-        if entry.source.trim().is_empty() {
+        if entry.source.is_empty() {
             return Err(entry_error(i, "source", "must not be empty"));
         }
         if entry.source.starts_with("https://") {
@@ -306,6 +311,23 @@ mod tests {
         );
         assert_eq!(
             resolve_source(&f.plugins[1], dir.path()).unwrap(),
+            Source::Directory(dir.path().join("web"))
+        );
+    }
+
+    /// #3: the source that is validated is the one that is resolved.
+    #[test]
+    fn a_source_is_trimmed_once_for_validation_and_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("web")).unwrap();
+        let p = write(
+            dir.path(),
+            "plugins:\n  - name: web\n    source: \"  ./web \"\n",
+        );
+        let f = load_plugins_file(&p).unwrap();
+        assert_eq!(f.plugins[0].source, "./web");
+        assert_eq!(
+            resolve_source(&f.plugins[0], dir.path()).unwrap(),
             Source::Directory(dir.path().join("web"))
         );
     }

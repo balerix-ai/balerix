@@ -530,4 +530,32 @@ mod tests {
                 .unwrap()
         );
     }
+    /// #25: every row, so `mise run check` alone catches a regression in
+    /// any of them (the tools-gated integration tests are the only other
+    /// coverage).
+    #[test]
+    fn mise_env_pins_every_row() {
+        let layout = StateLayout::from_env(Path::new("/h"), |_| None);
+        let paths = layout.agent(&id());
+        let agent = "/h/.local/state/balerix/fleets/payments/crews/backend/agents/alice";
+        let home = format!("{agent}/home");
+        let shared = "/h/.local/state/balerix/fleets/payments/crews/backend/mise/installs:\
+                      /h/.local/state/balerix/fleets/payments/mise/installs:\
+                      /h/.local/share/balerix/mise/installs";
+        let expected: BTreeMap<String, String> = [
+            ("MISE_GLOBAL_CONFIG_FILE", format!("{agent}/mise.toml")),
+            ("MISE_DATA_DIR", format!("{home}/.local/share/mise")),
+            ("MISE_SHARED_INSTALL_DIRS", shared.to_string()),
+            ("MISE_CONFIG_DIR", format!("{home}/.config/mise")),
+            ("MISE_STATE_DIR", format!("{home}/.local/state/mise")),
+            ("MISE_CACHE_DIR", format!("{home}/.cache/mise")),
+            ("MISE_YES", "1".to_string()),
+            ("MISE_QUIET", "1".to_string()),
+            ("MISE_AUTO_INSTALL", "false".to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(mise_env(&id(), &paths, &layout), expected);
+    }
 }

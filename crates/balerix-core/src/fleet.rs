@@ -312,6 +312,19 @@ mod tests {
         );
     }
 
+    /// #25: the reverse conversion carries both pool tables, so nothing
+    /// that round-trips a fleet through the wire type drops them.
+    #[test]
+    fn round_trips_the_fleet_and_crew_tool_tables() {
+        let mut original = spec("payments", "backend", "acme/api", "main", &["alice"]);
+        original.tools = BTreeMap::from([("node".to_string(), "22.11.0".to_string())]);
+        original.crews.get_mut("backend").unwrap().tools =
+            BTreeMap::from([("python".to_string(), "3.12.8".to_string())]);
+        let back: FleetSpec = Fleet::try_from(original.clone()).unwrap().into();
+        assert_eq!(back.tools, original.tools);
+        assert_eq!(back.crews["backend"].tools, original.crews["backend"].tools);
+    }
+
     #[test]
     fn an_empty_identity_field_reports_its_path() {
         let mut s = spec("f", "c", "acme/x", "main", &["a"]);

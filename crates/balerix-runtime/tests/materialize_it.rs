@@ -7,7 +7,7 @@ use std::process::Command;
 
 use balerix_api::{AgentSettings, CredentialBundle, CrewSpec, FleetSpec, GitAuth, GitSettings};
 use balerix_core::{CrewRef, CrewTools, Fleet, HookTarget, Keep, Materializer, ResolvedAgent};
-use balerix_runtime::{Runtime, embedded_system_tools};
+use balerix_runtime::{Runtime, SocketPolicy, embedded_system_tools};
 
 fn no_tools() -> BTreeMap<String, String> {
     BTreeMap::new()
@@ -418,6 +418,7 @@ fn a_purge_deletes_a_broken_clone_without_harvesting() {
         gh_config_dir: None,
         cache_is_read_only: false,
         git_read: &[],
+        socket_policy: SocketPolicy::Open,
     };
     ws.ensure_clone(
         &agent.id.to_string(),

@@ -5,7 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use balerix_core::AgentId;
-use balerix_runtime::{agent_env, balerix_grants, render_profile, validate_profile, write_profile};
+use balerix_runtime::{
+    SocketPolicy, agent_env, balerix_grants, render_profile, validate_profile, write_profile,
+};
 
 #[test]
 fn generated_profile_validates_and_enforces_isolation() {
@@ -309,7 +311,8 @@ fn the_git_profile_reads_the_clone_and_the_cache_and_writes_nothing() {
     // a temp nono home a SIGKILLed daemon left behind (#108)
     let stale = paths.root.join(".nono-git-4194304999-7-0");
     std::fs::create_dir_all(stale.join(".local/state/nono/sessions")).unwrap();
-    balerix_runtime::write_git_profile(&tools, "f/c/a", &paths, &crew, &[]).unwrap();
+    balerix_runtime::write_git_profile(&tools, "f/c/a", &paths, &crew, &[], SocketPolicy::Open)
+        .unwrap();
     assert!(
         !stale.exists(),
         "writing the profile sweeps another pid's temp homes"
@@ -419,7 +422,8 @@ fn the_git_profile_grants_gits_exec_path() {
         ),
     );
 
-    balerix_runtime::write_git_profile(&shimmed, "f/c/a", &paths, &crew, &[]).unwrap();
+    balerix_runtime::write_git_profile(&shimmed, "f/c/a", &paths, &crew, &[], SocketPolicy::Open)
+        .unwrap();
     let granted = std::fs::canonicalize(&real).unwrap();
     let profile = std::fs::read_to_string(&paths.git_profile).unwrap();
     assert!(
@@ -474,9 +478,16 @@ fn a_git_that_cannot_name_its_exec_path_writes_no_profile() {
         "git-refusing.sh",
         "echo 'shim: no exec path' >&2\nexit 3",
     );
-    let e = balerix_runtime::write_git_profile(&refusing, "f/c/a", &paths, &crew, &[])
-        .unwrap_err()
-        .to_string();
+    let e = balerix_runtime::write_git_profile(
+        &refusing,
+        "f/c/a",
+        &paths,
+        &crew,
+        &[],
+        SocketPolicy::Open,
+    )
+    .unwrap_err()
+    .to_string();
     assert_eq!(e, "f/c/a: git --exec-path: shim: no exec path");
     assert!(!paths.git_profile.exists());
 
@@ -487,9 +498,10 @@ fn a_git_that_cannot_name_its_exec_path_writes_no_profile() {
         "git-lost.sh",
         &format!("echo '{}'", missing.display()),
     );
-    let e = balerix_runtime::write_git_profile(&lost, "f/c/a", &paths, &crew, &[])
-        .unwrap_err()
-        .to_string();
+    let e =
+        balerix_runtime::write_git_profile(&lost, "f/c/a", &paths, &crew, &[], SocketPolicy::Open)
+            .unwrap_err()
+            .to_string();
     assert!(
         e.starts_with(&format!("f/c/a: git --exec-path: {}: ", missing.display())),
         "{e}"
@@ -504,9 +516,10 @@ fn a_git_that_cannot_name_its_exec_path_writes_no_profile() {
         "git-wrong.sh",
         &format!("echo '{}'", file.display()),
     );
-    let e = balerix_runtime::write_git_profile(&wrong, "f/c/a", &paths, &crew, &[])
-        .unwrap_err()
-        .to_string();
+    let e =
+        balerix_runtime::write_git_profile(&wrong, "f/c/a", &paths, &crew, &[], SocketPolicy::Open)
+            .unwrap_err()
+            .to_string();
     assert!(e.ends_with(": not a directory"), "{e}");
     assert!(!paths.git_profile.exists());
 }
@@ -543,6 +556,55 @@ fn the_exec_path_query_starts_from_an_empty_environment() {
             tools.git.display()
         ),
     );
-    balerix_runtime::write_git_profile(&strict, "f/c/a", &paths, &crew, &[]).unwrap();
+    balerix_runtime::write_git_profile(&strict, "f/c/a", &paths, &crew, &[], SocketPolicy::Open)
+        .unwrap();
     assert!(paths.git_profile.exists());
+}
+
+/// The git profile under each socket policy (spec 2026-10-08): Mediate
+/// pins pathname mediation and grants no socket directory (the daemon's
+/// git makes no sockets); Deny grants the wrapper `sandbox-exec` runs
+/// from.
+#[test]
+fn the_git_profile_carries_the_socket_policy() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("nono", false));
+        return;
+    };
+    let root = support::temp_root("sandbox-git-sockets");
+    let layout = support::layout(&root);
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let paths = layout.agent(&id);
+    let crew = layout.crew(&id.crew_ref());
+    std::fs::create_dir_all(&paths.workspace).unwrap();
+    let read = |p: &std::path::Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+    };
+
+    balerix_runtime::write_git_profile(&tools, "f/c/a", &paths, &crew, &[], SocketPolicy::Mediate)
+        .unwrap();
+    let p = read(&paths.git_profile);
+    assert_eq!(p["linux"]["af_unix_mediation"], "pathname");
+    assert_eq!(
+        p["platform_overrides"]["linux"]["linux"]["af_unix_mediation"],
+        "pathname"
+    );
+    assert!(
+        p["filesystem"].get("unix_socket_subtree_bind").is_none(),
+        "{p}"
+    );
+
+    balerix_runtime::write_git_profile(&tools, "f/c/a", &paths, &crew, &[], SocketPolicy::Deny)
+        .unwrap();
+    let p = read(&paths.git_profile);
+    assert!(p.get("linux").is_none(), "{p}");
+    let balerix = tools.balerix.display().to_string();
+    assert!(
+        p["filesystem"]["read"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some(&*balerix)),
+        "{p}"
+    );
 }

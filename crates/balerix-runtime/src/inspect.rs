@@ -96,28 +96,34 @@ impl Runtime {
     ) -> Result<(AgentPaths, CrewPaths), WorkspaceError> {
         let (paths, crew) = self.workspace_of(agent)?;
         let id = agent.to_string();
-        write_git_profile(&self.tools, &id, &paths, &crew, &self.git_read).map_err(
-            |e| match e {
-                MaterializeError::Io { path, message, .. } => WorkspaceError::Io { path, message },
-                MaterializeError::Tool {
-                    subcommand,
-                    args,
-                    stderr,
-                    ..
-                } => WorkspaceError::Tool {
-                    id: id.clone(),
-                    subcommand,
-                    args,
-                    stderr,
-                },
-                other => WorkspaceError::Tool {
-                    id: id.clone(),
-                    subcommand: "git profile".into(),
-                    args: Vec::new(),
-                    stderr: other.to_string(),
-                },
+        write_git_profile(
+            &self.tools,
+            &id,
+            &paths,
+            &crew,
+            &self.git_read,
+            self.socket_policy,
+        )
+        .map_err(|e| match e {
+            MaterializeError::Io { path, message, .. } => WorkspaceError::Io { path, message },
+            MaterializeError::Tool {
+                subcommand,
+                args,
+                stderr,
+                ..
+            } => WorkspaceError::Tool {
+                id: id.clone(),
+                subcommand,
+                args,
+                stderr,
             },
-        )?;
+            other => WorkspaceError::Tool {
+                id: id.clone(),
+                subcommand: "git profile".into(),
+                args: Vec::new(),
+                stderr: other.to_string(),
+            },
+        })?;
         Ok((paths, crew))
     }
 
@@ -154,7 +160,7 @@ impl Runtime {
     ) -> Result<(), WorkspaceError> {
         let mut argv: Vec<&str> = CONFIG.to_vec();
         argv.extend(args);
-        sandboxed_git_streaming(&self.tools, crew, paths, &argv, sink)
+        sandboxed_git_streaming(&self.tools, self.socket_policy, crew, paths, &argv, sink)
             .map(|_| ())
             .map_err(|f| WorkspaceError::Tool {
                 id: id.to_string(),
@@ -181,7 +187,15 @@ impl Runtime {
     ) -> Result<String, WorkspaceError> {
         let mut argv: Vec<&str> = CONFIG.to_vec();
         argv.extend(args);
-        match sandboxed_git(&self.tools, crew, paths, &argv, accepted, GitLog::ArgvOnly) {
+        match sandboxed_git(
+            &self.tools,
+            self.socket_policy,
+            crew,
+            paths,
+            &argv,
+            accepted,
+            GitLog::ArgvOnly,
+        ) {
             Ok(out) => Ok(out.stdout),
             Err(f) if lenient && f.unanswered.is_some() => {
                 Ok(f.unanswered.map(|o| o.stdout).unwrap_or_default())
@@ -894,6 +908,7 @@ impl WorkspaceReader for Runtime {
             };
         let out = sandboxed_git_script(
             &self.tools,
+            self.socket_policy,
             &crew,
             &paths,
             VERSION_SCRIPT,

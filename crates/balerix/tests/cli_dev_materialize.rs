@@ -118,7 +118,10 @@ fn with_credentials_writes_real_values() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("credentials: written (real)"));
+        .stdout(predicate::str::contains("credentials: written (real)"))
+        .stdout(predicate::str::contains(
+            "sandbox: previewed with unix_sockets = \"open\"",
+        ));
     let creds =
         fs::read_to_string(out.path().join(
             "state/fleets/payments/crews/backend/agents/alice/home/.claude/.credentials.json",

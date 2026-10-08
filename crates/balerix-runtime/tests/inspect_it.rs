@@ -9,7 +9,7 @@ use std::process::Command;
 
 use balerix_api::{EntryKind, FileStatus, WORKSPACE_FILE_LIMIT};
 use balerix_core::{AgentId, RepoRef, WorkspaceError, WorkspaceReader};
-use balerix_runtime::{Runtime, Workspace};
+use balerix_runtime::{Runtime, SocketPolicy, Workspace};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -77,6 +77,7 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         gh_config_dir: None,
         cache_is_read_only: false,
         git_read: &[],
+        socket_policy: SocketPolicy::Open,
     };
     let rt = Runtime::new(layout.clone(), tools.clone());
 
@@ -505,6 +506,7 @@ fn clone_with_changes(
         gh_config_dir: None,
         cache_is_read_only: false,
         git_read: &[],
+        socket_policy: SocketPolicy::Open,
     };
     ws.ensure_repo("f/c/a", &crew, &repo, "main").unwrap();
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")

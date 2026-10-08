@@ -13,6 +13,9 @@ pub mod materializer;
 pub mod plugin;
 pub mod quote;
 pub mod sandbox;
+#[cfg(target_os = "linux")]
+pub mod seccomp;
+pub mod socket_policy;
 pub mod supervise;
 pub mod testing;
 pub mod tmux;
@@ -37,6 +40,9 @@ pub use sandbox::{
     check_conflicts, check_plugin_sandbox, host_landlock_abi, landlock_abi, merge_profile,
     render_git_profile, render_profile, sandbox_self_test, signal_scoping_warning,
     validate_profile, validate_profile_at, write_git_profile, write_profile, write_profile_at,
+};
+pub use socket_policy::{
+    ProbeFailure, SocketPolicy, UnixSockets, resolve as resolve_socket_policy,
 };
 pub use tmux::{ANCHOR_WINDOW, ATTACH_SESSION_PREFIX, STOP_WAIT, TmuxAttach, TmuxRunner};
 pub use toolchain::{

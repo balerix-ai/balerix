@@ -74,6 +74,10 @@ rand = "0.10.2"
 # The agent supervisor's three syscalls (Spec N amendment §13): the child
 # subreaper flag, kill and wait, without `unsafe`.
 rustix = { version = "1.1.4", default-features = false, features = ["std", "process"] }
+# `balerix sandbox-exec`'s seccomp filter (Linux only): no Unix socket
+# creation for a sandboxed process.
+seccompiler = "0.5.0"
+libc = "0.2.189"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

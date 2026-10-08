@@ -11,7 +11,7 @@ use std::process::Command;
 use balerix_core::{AgentId, CrewRef, RepoRef};
 use balerix_runtime::jobs::{PoolLevel, SyncError, harvest, sync_crew, sync_pool};
 use balerix_runtime::layout::{PodMounts, SharedSlice};
-use balerix_runtime::{StateLayout, Workspace};
+use balerix_runtime::{SocketPolicy, StateLayout, Workspace};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -351,6 +351,7 @@ fn pod_clone(
         gh_config_dir: None,
         cache_is_read_only: true,
         git_read: &[],
+        socket_policy: SocketPolicy::Open,
     }
     .ensure_clone(
         &id.to_string(),

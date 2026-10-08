@@ -4,7 +4,7 @@
 
 use balerix_api::PluginManifest;
 use balerix_core::{HookTarget, ResolvedPlugin};
-use balerix_runtime::{Runtime, StateLayout, ToolPaths};
+use balerix_runtime::{Runtime, SocketPolicy, StateLayout, ToolPaths};
 use serde_json::json;
 
 #[test]
@@ -121,4 +121,58 @@ fn a_manifest_grant_under_balerixs_roots_writes_nothing() {
     let paths = layout.plugin(&plugin.name);
     assert!(!paths.profile.exists(), "no profile from a refused block");
     assert!(!paths.launch.exists());
+}
+
+/// The same plugin's profile and `launch.sh` under the two policies that
+/// change them (spec 2026-10-08); the snapshots above are `Open`.
+#[test]
+fn plugin_files_under_each_socket_policy() {
+    for (policy, name) in [
+        (SocketPolicy::Deny, "plugin_deny"),
+        (SocketPolicy::Mediate, "plugin_mediate"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().display().to_string();
+        let layout = StateLayout::xdg(
+            dir.path().join("state"),
+            dir.path().join("data"),
+            dir.path().join("config"),
+        );
+        let tools = ToolPaths {
+            git: "/tools/git".into(),
+            gh: "/tools/gh".into(),
+            mise: "/tools/mise".into(),
+            nono: "/tools/nono".into(),
+            tmux: "/tools/tmux".into(),
+            balerix: "/tools/balerix".into(),
+        };
+        let rt = Runtime::new(layout.clone(), tools).with_socket_policy(policy);
+        let manifest: PluginManifest = serde_json::from_value(json!({
+            "apiVersion": "balerix/v1", "kind": "Plugin", "name": "web", "version": "0.1.0",
+            "protocol": 1, "start": "serve", "routes": true,
+            "sandbox": { "network": { "block": true } }
+        }))
+        .unwrap();
+        let plugin = ResolvedPlugin {
+            name: "web".parse().unwrap(),
+            package: dir.path().join("data/plugins/web/0123456789ab"),
+            manifest,
+            config: json!({}),
+            fleet_defaults: json!({}),
+            digest: Some("0123456789abcdef".into()),
+        };
+        let host = HookTarget {
+            url: "http://127.0.0.1:7643".into(),
+            secret: "plugin-token".into(),
+        };
+        rt.render_plugin(&plugin, &host).unwrap();
+        let paths = layout.plugin(&plugin.name);
+        let scrub = |s: String| s.replace(&root, "<root>");
+        let out = format!(
+            "==== nono-profile.json ====\n{}\n==== launch.sh ====\n{}\n",
+            scrub(std::fs::read_to_string(&paths.profile).unwrap()),
+            scrub(std::fs::read_to_string(&paths.launch).unwrap()),
+        );
+        insta::assert_snapshot!(name, out);
+    }
 }

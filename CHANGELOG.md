@@ -1,5 +1,18 @@
 # Changelog
 
+### Upgrading
+
+- The daemon now refuses an inexact tool version (`latest`, `22`, `22.x`,
+  …) in a fleet's, crew's or agent's `tools` on every fleet it is posted,
+  not only in `balerix up`'s client-side check (#24). A stored fleet
+  record written by a client that bypassed that check and holding such a
+  version fails every pass after the upgrade with `<fleet>: invalid
+  stored spec: <path>: expected an exact version, got "…"`; re-apply it
+  with exact versions (`mise latest <tool>@<version>` names one), or
+  `balerix down` it. `down` is enough on one machine only: in Kubernetes
+  mode a record whose spec no longer converts sends its agents no Stop,
+  so re-apply it there instead.
+
 ## 0.2.1 - 2026-10-07
 
 ### Features

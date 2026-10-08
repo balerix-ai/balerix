@@ -2,7 +2,7 @@
 //! repos are validated by `balerix_core::Fleet`; this covers everything else.
 
 use balerix_api::AgentSettings;
-use balerix_core::is_exact_version;
+use balerix_core::{exact_version_message, is_exact_version};
 use serde_json::Value;
 
 use crate::ConfigError;
@@ -22,13 +22,6 @@ pub const RESERVED_ENV_PREFIXES: &[&str] = &[
     "TMPDIR",
     "CLAUDE_CODE_TMPDIR",
 ];
-
-/// The message for a tool version `is_exact_version` refuses; shared by
-/// `validate_agent` and `tools_layer` so the two stay identical by
-/// construction rather than by two hand-kept copies.
-fn exact_version_message(tool: &str, version: &str) -> String {
-    format!("expected an exact version, got {version:?} (try: mise latest {tool}@{version})")
-}
 
 /// Validates one resolved settings block; `path` prefixes every message.
 pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), ConfigError> {

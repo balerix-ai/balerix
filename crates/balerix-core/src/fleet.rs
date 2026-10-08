@@ -7,12 +7,13 @@ use balerix_api::{AgentSettings, CrewSpec, FleetSpec, GitSettings};
 
 use crate::name::{AgentName, CrewName, FleetName, NameError};
 use crate::repo::{RepoError, RepoRef};
+use crate::version::{exact_version_message, is_exact_version};
 
 /// A validated fleet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fleet {
     pub name: FleetName,
-    /// Tools for the fleet pool, verbatim from `FleetSpec`.
+    /// Tools for the fleet pool, from `FleetSpec`; every version exact.
     pub tools: BTreeMap<String, String>,
     pub crews: BTreeMap<CrewName, Crew>,
 }
@@ -23,7 +24,7 @@ pub struct Crew {
     pub repo: RepoRef,
     pub git_ref: String,
     pub git: GitSettings,
-    /// Tools for this crew's pool, verbatim from `CrewSpec`.
+    /// Tools for this crew's pool, from `CrewSpec`; every version exact.
     pub tools: BTreeMap<String, String>,
     pub agents: BTreeMap<AgentName, AgentSettings>,
 }
@@ -46,6 +47,27 @@ pub enum FleetError {
     /// receives a resolved spec, never trusts its caller with a git argv.
     #[error("{path}: {reason}")]
     InvalidBranch { path: String, reason: String },
+    /// #24: re-checked here for the same reason as `InvalidBranch`: the
+    /// admin `POST` must not hand mise a fuzzy version.
+    #[error("{path}: {}", exact_version_message(tool, version))]
+    InexactVersion {
+        path: String,
+        tool: String,
+        version: String,
+    },
+}
+
+/// Refuses the first tool in `tools` whose version is not exact; `path`
+/// is the table's config path (`tools`, `crews.c.tools`, …).
+fn check_tools(path: &str, tools: &BTreeMap<String, String>) -> Result<(), FleetError> {
+    match tools.iter().find(|(_, v)| !is_exact_version(v)) {
+        Some((tool, version)) => Err(FleetError::InexactVersion {
+            path: format!("{path}.{tool}"),
+            tool: tool.clone(),
+            version: version.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The tmux anchor window that keeps a crew's session alive is named
@@ -60,6 +82,7 @@ impl TryFrom<FleetSpec> for Fleet {
             path: "name".to_string(),
             source,
         })?;
+        check_tools("tools", &spec.tools)?;
         let tools = spec.tools;
         let mut crews = BTreeMap::new();
         for (crew_name, crew) in spec.crews {
@@ -94,6 +117,7 @@ fn convert_crew(path: &str, crew: CrewSpec) -> Result<Crew, FleetError> {
             }
         }
     }
+    check_tools(&format!("{path}.tools"), &crew.tools)?;
     let mut agents = BTreeMap::new();
     for (agent_name, settings) in crew.agents {
         let agent_path = format!("{path}.agents.{agent_name}");
@@ -111,6 +135,7 @@ fn convert_crew(path: &str, crew: CrewSpec) -> Result<Crew, FleetError> {
                 reason,
             })?;
         }
+        check_tools(&format!("{agent_path}.tools"), &settings.tools)?;
         agents.insert(agent_name, settings);
     }
     Ok(Crew {
@@ -306,6 +331,52 @@ mod tests {
             Fleet::try_from(s).unwrap_err().to_string(),
             "crews.c.git.identity.email: must not be empty"
         );
+    }
+
+    /// #24: the admin `POST /v1/fleets` receives a resolved spec; every
+    /// tool table is re-checked here so the daemon never hands mise a
+    /// fuzzy version, whichever client wrote the spec.
+    #[test]
+    fn an_inexact_fleet_tool_reports_its_path() {
+        let mut s = spec("f", "c", "acme/x", "main", &["a"]);
+        s.tools.insert("node".into(), "latest".into());
+        assert_eq!(
+            Fleet::try_from(s).unwrap_err(),
+            FleetError::InexactVersion {
+                path: "tools.node".into(),
+                tool: "node".into(),
+                version: "latest".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_inexact_crew_tool_reports_its_path() {
+        let mut s = spec("f", "c", "acme/x", "main", &["a"]);
+        let crew = s.crews.get_mut("c").unwrap();
+        crew.tools.insert("python".into(), "3.12".into());
+        assert_eq!(
+            Fleet::try_from(s).unwrap_err().to_string(),
+            "crews.c.tools.python: expected an exact version, got \"3.12\" \
+             (try: mise latest python@3.12)"
+        );
+    }
+
+    #[test]
+    fn an_inexact_agent_tool_reports_its_path() {
+        let mut s = spec("f", "c", "acme/x", "main", &["a"]);
+        let crew = s.crews.get_mut("c").unwrap();
+        let agent = crew.agents.get_mut("a").unwrap();
+        agent.tools.insert("node".into(), "22.11.0".into());
+        agent.tools.insert("ripgrep".into(), "14.x".into());
+        assert_eq!(
+            Fleet::try_from(s.clone()).unwrap_err().to_string(),
+            "crews.c.agents.a.tools.ripgrep: expected an exact version, got \"14.x\" \
+             (try: mise latest ripgrep@14.x)"
+        );
+        let agent = s.crews.get_mut("c").unwrap().agents.get_mut("a").unwrap();
+        agent.tools.insert("ripgrep".into(), "14.1.1".into());
+        assert!(Fleet::try_from(s).is_ok());
     }
 
     #[test]

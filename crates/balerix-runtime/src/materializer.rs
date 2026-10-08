@@ -15,6 +15,7 @@ use crate::home::{HomeInputs, write_home};
 use crate::launch::{hooks_port, render_launch, wants_continue, write_launch};
 use crate::layout::StateLayout;
 use crate::sandbox::{balerix_grants, render_profile, validate_profile, write_profile};
+use crate::socket_policy::{SocketPolicy, apply_to_profile};
 use crate::toolchain::{Toolchain, drop_stale_marker, system_tools};
 use crate::tools::ToolPaths;
 use crate::workspace::Workspace;
@@ -24,6 +25,10 @@ pub struct Runtime {
     pub tools: ToolPaths,
     /// The daemon's `[sandbox] git_read` (#111), for the git profile only.
     pub git_read: Vec<PathBuf>,
+    /// Which Unix sockets the agents', plugins' and the daemon's git
+    /// sandboxes may use (spec 2026-10-08). `Open` from `new`; `serve`
+    /// and the pod sidecar set it with `with_socket_policy`.
+    pub socket_policy: SocketPolicy,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -41,13 +46,14 @@ pub struct RenderOutcome {
 }
 
 impl Runtime {
-    /// No `git_read`: what a pod (`agent/src/sidecar.rs`) and the tests
-    /// get.
+    /// No `git_read`, and the `Open` socket policy: what a pod
+    /// (`agent/src/sidecar.rs`) and the tests get.
     pub fn new(layout: StateLayout, tools: ToolPaths) -> Self {
         Self {
             layout,
             tools,
             git_read: Vec::new(),
+            socket_policy: SocketPolicy::Open,
         }
     }
 
@@ -55,6 +61,13 @@ impl Runtime {
     #[must_use]
     pub fn with_git_read(mut self, git_read: Vec<PathBuf>) -> Self {
         self.git_read = git_read;
+        self
+    }
+
+    /// The resolved `[sandbox] unix_sockets` (`socket_policy::resolve`).
+    #[must_use]
+    pub fn with_socket_policy(mut self, policy: SocketPolicy) -> Self {
+        self.socket_policy = policy;
         self
     }
 
@@ -102,21 +115,37 @@ impl Runtime {
             &hooks.secret,
             &agent.settings.env,
         );
-        let profile = render_profile(
-            id,
-            &balerix_grants(
+        // the policy last, over the merged fleet block, so nothing the
+        // block carries can re-set what it pins
+        let profile = apply_to_profile(
+            render_profile(
                 id,
-                &paths,
-                &crew,
-                &self.layout,
-                &self.tools.balerix,
-                &self.tools.mise,
-            ),
-            hooks_port(&hooks.url),
-            &env,
-            &agent.settings.sandbox,
-        )?;
+                &balerix_grants(
+                    id,
+                    &paths,
+                    &crew,
+                    &self.layout,
+                    &self.tools.balerix,
+                    &self.tools.mise,
+                ),
+                hooks_port(&hooks.url),
+                &env,
+                &agent.settings.sandbox,
+            )?,
+            self.socket_policy,
+            &[paths.home.clone(), paths.workspace.clone()],
+            &self.tools.balerix,
+        );
         let profile_changed = write_profile(id, &paths, &profile)?;
+        if profile_changed
+            && self.socket_policy == SocketPolicy::Deny
+            && grants_unix_sockets(&agent.settings.sandbox)
+        {
+            tracing::warn!(
+                agent = %id,
+                "the fleet's sandbox grants Unix sockets, which unix_sockets = \"deny\" makes unusable"
+            );
+        }
 
         // Removed as soon as either rendered file has changed (Phase 3 spec
         // §6.2), before any later fallible step (e.g. `write_launch`) can
@@ -141,6 +170,7 @@ impl Runtime {
             &agent.settings.claude.binary,
             &agent.settings.claude.args,
             resume,
+            self.socket_policy,
         );
         write_launch(id, &paths, &script)?;
 
@@ -261,6 +291,7 @@ impl Runtime {
             gh_config_dir: (git.auth == GitAuth::Gh).then(|| self.layout.fleet_gh_dir(fleet)),
             cache_is_read_only: self.layout.pod_layout().is_some(),
             git_read: &self.git_read,
+            socket_policy: self.socket_policy,
         }
     }
 
@@ -274,6 +305,22 @@ impl Runtime {
             message: e.to_string(),
         })
     }
+}
+
+/// Whether a fleet's `sandbox` block grants Unix sockets
+/// (`filesystem.unix_socket*`), at the top level or in a platform patch.
+fn grants_unix_sockets(sandbox: &serde_json::Value) -> bool {
+    let in_fs = |block: &serde_json::Value| {
+        block
+            .get("filesystem")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|fs| fs.keys().any(|k| k.starts_with("unix_socket")))
+    };
+    in_fs(sandbox)
+        || sandbox
+            .get("platform_overrides")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|os| os.values().any(in_fs))
 }
 
 /// How long `rm_rf` keeps retrying a directory that refills under it, and
@@ -387,6 +434,7 @@ impl Materializer for Runtime {
             gh_config_dir: None,
             cache_is_read_only: false,
             git_read: &self.git_read,
+            socket_policy: self.socket_policy,
         }
         .harvest_and_remove(&id, &crew, &paths)?;
         Self::rm_rf(&id, &paths.root)
@@ -414,6 +462,7 @@ impl Materializer for Runtime {
                         gh_config_dir: None,
                         cache_is_read_only: false,
                         git_read: &self.git_read,
+                        socket_policy: self.socket_policy,
                     }
                     .harvest_and_remove(
                         &agent_id.to_string(),
@@ -632,6 +681,38 @@ mod tests {
         assert!(
             !paths.installed_marker().exists(),
             "marker must be removed even though a later step failed"
+        );
+    }
+
+    /// The policy is applied to the profile as written, after the fleet's
+    /// block is merged: a block that replaces the `linux` objects (a
+    /// string is not refused) still ends with pathname mediation pinned.
+    #[test]
+    fn mediate_is_applied_after_the_fleets_sandbox_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).with_socket_policy(SocketPolicy::Mediate);
+        let mut a = agent(&[]);
+        a.settings.sandbox = serde_json::json!({
+            "linux": "off",
+            "platform_overrides": { "linux": { "linux": "off", "network": { "block": true } } },
+        });
+        rt.render_agent(
+            &a,
+            &CredentialBundle::default(),
+            &hooks(),
+            &RenderOptions::default(),
+        )
+        .unwrap();
+        let paths = rt.layout.agent(&a.id);
+        let p: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.profile).unwrap()).unwrap();
+        assert_eq!(p["linux"]["af_unix_mediation"], "pathname");
+        let linux = &p["platform_overrides"]["linux"];
+        assert_eq!(linux["linux"]["af_unix_mediation"], "pathname");
+        assert_eq!(linux["network"]["block"], true, "the fleet's own keys kept");
+        assert_eq!(
+            p["filesystem"]["unix_socket_subtree_bind"],
+            serde_json::json!([paths.home, paths.workspace])
         );
     }
 

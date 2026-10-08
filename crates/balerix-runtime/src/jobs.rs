@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use balerix_core::{AgentId, CrewRef, FleetName, MaterializeError, RepoRef};
 
 use crate::layout::{PodMounts, SharedSlice, StateLayout};
+use crate::socket_policy::SocketPolicy;
 use crate::toolchain::{Toolchain, drop_stale_marker};
 use crate::tools::ToolPaths;
 use crate::workspace::Workspace;
@@ -61,6 +62,7 @@ pub fn sync_crew(
         gh_config_dir,
         cache_is_read_only: false,
         git_read: &[],
+        socket_policy: SocketPolicy::Open,
     }
     .sync_cache(&id, &paths, repo, git_ref)
     .map_err(SyncError::Cache)?;
@@ -209,6 +211,7 @@ pub fn harvest(
         gh_config_dir: None,
         cache_is_read_only: false,
         git_read: &[],
+        socket_policy: SocketPolicy::Open,
     }
     .harvest_only(&id.to_string(), &slice.crew(), &agent)
 }

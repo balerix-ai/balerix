@@ -109,6 +109,9 @@ pub fn materialize_command(args: &MaterializeArgs) -> Result<String> {
     } else {
         "credentials: none found on the host (nothing to redact)\n"
     });
+    out.push_str(
+        "sandbox: previewed with unix_sockets = \"open\" (serve resolves its own policy)\n",
+    );
     if !args.install {
         out.push_str("not run: mise install, nono profile validate (pass --install)\n");
     }

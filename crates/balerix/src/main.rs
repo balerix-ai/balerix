@@ -18,6 +18,17 @@ fn main() -> ExitCode {
     if let Command::AgentSupervise { argv } = &cli.command {
         return commands::supervise::agent_supervise_command(argv);
     }
+    if let Command::SandboxExec { argv } = &cli.command {
+        return commands::sandbox::exec(argv);
+    }
+    if let Command::SandboxProbe {
+        tcp,
+        inside,
+        outside,
+    } = &cli.command
+    {
+        return commands::sandbox::probe(*tcp, inside, outside);
+    }
     match run(cli) {
         Ok(out) => {
             print!("{out}");
@@ -71,6 +82,12 @@ fn run(cli: Cli) -> anyhow::Result<String> {
         Command::HookRelay => commands::relay::hook_relay_command(),
         Command::AgentSupervise { .. } => {
             anyhow::bail!("agent-supervise is handled in main")
+        }
+        Command::SandboxExec { .. } => {
+            anyhow::bail!("sandbox-exec is handled in main")
+        }
+        Command::SandboxProbe { .. } => {
+            anyhow::bail!("sandbox-probe is handled in main")
         }
     }
 }

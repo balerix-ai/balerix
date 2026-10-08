@@ -59,6 +59,25 @@ pub enum Command {
         #[arg(last = true, required = true, value_name = "ARGV")]
         argv: Vec<std::ffi::OsString>,
     },
+    /// Runs a command with Unix socket creation refused (seccomp), for
+    /// `[sandbox] unix_sockets = "deny"`. Profiles put it inside nono.
+    #[command(hide = true)]
+    SandboxExec {
+        #[arg(last = true, required = true, value_name = "ARGV")]
+        argv: Vec<std::ffi::OsString>,
+    },
+    /// Checks, from inside a sandbox, that TCP and a Unix socket in the
+    /// granted directory work and one outside it is refused. The daemon
+    /// runs it at start-up (`[sandbox] unix_sockets = "auto"`).
+    #[command(hide = true)]
+    SandboxProbe {
+        #[arg(long)]
+        tcp: u16,
+        #[arg(long)]
+        inside: PathBuf,
+        #[arg(long)]
+        outside: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]

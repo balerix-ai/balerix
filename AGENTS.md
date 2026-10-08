@@ -305,6 +305,28 @@ credentials, hook input, or sandbox rules.
   `--purge`, `remove` and a branch change fail on such a host, `--purge`
   is the way past, and the user `sandbox` block does not reach this
   profile.
+- Unix sockets in a sandbox (`socket_policy.rs`, `seccomp.rs`; `[sandbox]
+  unix_sockets`, default `auto`, resolved once in `serve.rs::socket_policy`):
+  `linux.af_unix_mediation` is balerix-owned and refused in every `sandbox`
+  block, and `SocketPolicy` is applied to a profile after the fleet or
+  manifest block is merged (`apply_to_profile`). `Mediate` is nono's
+  pathname mediation, which needs ptrace, so on a host where it does not
+  work (`kernel.yama.ptrace_scope = 2`, restricted containers) `auto`
+  resolves to `Deny`; the probe (10 s deadline) passes only if its JSON line
+  is exactly `{"tcp":"ok","inside":"ok","outside":"refused"}` (its profile
+  cannot set `environment.set_vars`: nono reserves `PATH`). `Deny` runs
+  every nono command (`launch.sh`, the daemon's sandboxed git, upload-pack,
+  the sandbox start check) through `balerix sandbox-exec`, which installs
+  two stacked seccomp filters (`socket(AF_UNIX)` -> `EAFNOSUPPORT`;
+  io_uring -> `ENOSYS`). The pod sidecar always resolves `auto` (no bundle
+  field: `AgentBundle` is in published `balerix-api` with
+  `deny_unknown_fields`). Under `Deny`, `serve` and the sidecar both
+  run `balerix sandbox-exec` once at start-up
+  (`socket_policy::check_sandbox_exec`) and refuse to start with its cause
+  when it fails (in a pod: an image `balerix` without it). Tests: `cli_sandbox_sockets`
+  (a real tmux server) and `cli_sandbox_*`; the Mediate ones skip where
+  mediation does not work unless `BALERIX_REQUIRE_MEDIATION=1` (CI sets it;
+  not set locally at `ptrace_scope` 2).
 - `TmuxRunner::at_socket` is the pod runner: `-S <path> -u -N` on every
   call, and stops wait on `pane_dead` through a waiter the pane is
   respawned into, never on `/proc` (the pid is the agent container's).

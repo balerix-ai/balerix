@@ -2,6 +2,20 @@
 
 ### Upgrading
 
+- New `[sandbox] unix_sockets` setting in the daemon's `config.toml`
+  (`auto` | `mediate` | `deny` | `open`, default `auto`) controls which
+  Unix sockets agents, plugins and the daemon's sandboxed git can reach.
+  On a host where nono's pathname mediation does not work
+  (`kernel.yama.ptrace_scope = 2`, restricted containers) `auto` resolves
+  to `deny`: sandboxed processes can no longer create Unix sockets (a
+  local postgres, docker or `git fsmonitor` in an agent's workspace fails
+  with "address family not supported") unless you set `open`. Agents
+  already running keep their old profile until their next launch: restart
+  them with `balerix down` / `balerix up`, or restart the daemon, which
+  re-renders on its first pass. In Kubernetes mode the pod sidecar always
+  resolves `auto` and, when that is `deny`, refuses to start unless the
+  image's `balerix` supports `sandbox-exec`: build agent images on a
+  balerix base of this release or later.
 - The daemon now refuses an inexact tool version (`latest`, `22`, `22.x`,
   …) in a fleet's, crew's or agent's `tools` on every fleet it is posted,
   not only in `balerix up`'s client-side check (#24). A stored fleet

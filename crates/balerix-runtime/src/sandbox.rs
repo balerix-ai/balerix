@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::fsutil::write_atomic;
 use crate::launch::outer_path;
 use crate::layout::{AgentPaths, CrewPaths, StateLayout};
+use crate::socket_policy::{SocketPolicy, apply_to_profile};
 use crate::tools::{Cmd, ToolPaths};
 
 pub(crate) const SYSTEM_READ: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/etc"];
@@ -211,9 +212,9 @@ fn git_exec_path(tools: &ToolPaths, id: &str) -> Result<PathBuf, MaterializeErro
     Ok(dir)
 }
 
-/// Writes the git profile just before the daemon uses it, so nothing
-/// depends on the order of the materialize steps or on a file an earlier
-/// pass (or anything else) left there. Validated only when the bytes
+/// Writes the git profile, under the socket policy, just before the
+/// daemon uses it, so nothing depends on the order of the materialize
+/// steps or on a file an earlier pass (or anything else) left there. Validated only when the bytes
 /// changed. Sweeps the temp nono homes another, killed, daemon left
 /// (`workspace::sweep_stale_homes`). Creates what nono needs to exist: the hooks directory the
 /// profile names, nono's `$HOME` and the log directory.
@@ -223,6 +224,7 @@ pub fn write_git_profile(
     paths: &AgentPaths,
     crew: &CrewPaths,
     git_read: &[PathBuf],
+    policy: SocketPolicy,
 ) -> Result<(), MaterializeError> {
     let agent_id: AgentId = id.parse().map_err(|_| MaterializeError::Invalid {
         id: id.to_string(),
@@ -238,7 +240,13 @@ pub fn write_git_profile(
     // the temp nono homes a SIGKILLed daemon could not remove
     crate::workspace::sweep_stale_homes(paths);
     let exec_path = git_exec_path(tools, id)?;
-    let profile = render_git_profile(&agent_id, paths, crew, &tools.git, &exec_path, git_read);
+    // no socket directory of its own: the daemon's git makes no sockets
+    let profile = apply_to_profile(
+        render_git_profile(&agent_id, paths, crew, &tools.git, &exec_path, git_read),
+        policy,
+        &[],
+        &tools.balerix,
+    );
     let path = paths.git_profile.clone();
     if write_profile_at(&agent_id, &path, &profile)? {
         // nono's state stays out of the agent's own `nono/` (#108)
@@ -329,6 +337,7 @@ pub fn check_conflicts(
         return Err(conflict("meta".into(), "balerix-owned".into()));
     }
     check_security(u, "", &conflict)?;
+    check_linux(u, "", &conflict)?;
     if let Some(overrides) = u.get("platform_overrides") {
         let Value::Object(os) = overrides else {
             return Err(conflict(
@@ -340,7 +349,9 @@ pub fn check_conflicts(
         // it could loosen what the base profile pins
         for (name, patch) in os {
             if let Value::Object(patch) = patch {
-                check_security(patch, &format!("platform_overrides.{name}."), &conflict)?;
+                let prefix = format!("platform_overrides.{name}.");
+                check_security(patch, &prefix, &conflict)?;
+                check_linux(patch, &prefix, &conflict)?;
             }
         }
     }
@@ -407,6 +418,25 @@ fn check_security(
         return Err(conflict(
             format!("{prefix}security.signal_mode"),
             "balerix-owned; agents stay signal-isolated".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `linux.af_unix_mediation` is balerix's (spec 2026-10-08 §3.4), whatever
+/// its value: the daemon's `[sandbox] unix_sockets` decides it for every
+/// sandbox, so even `off` or `null` is refused.
+fn check_linux(
+    block: &serde_json::Map<String, Value>,
+    prefix: &str,
+    conflict: &impl Fn(String, String) -> MaterializeError,
+) -> Result<(), MaterializeError> {
+    if let Some(Value::Object(linux)) = block.get("linux")
+        && linux.contains_key("af_unix_mediation")
+    {
+        return Err(conflict(
+            format!("{prefix}linux.af_unix_mediation"),
+            "balerix-owned; set [sandbox] unix_sockets in the daemon's config.toml".into(),
         ));
     }
     Ok(())
@@ -1059,6 +1089,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn af_unix_mediation_is_balerix_owned_at_every_level() {
+        let (id, grants, env) = fixture();
+        let refuse = |user: Value| {
+            render_profile(&id, &grants, 1, &env, &user)
+                .unwrap_err()
+                .to_string()
+        };
+        let msg = "balerix-owned; set [sandbox] unix_sockets in the daemon's config.toml";
+        assert_eq!(
+            refuse(json!({ "linux": { "af_unix_mediation": "off" } })),
+            format!("f/c/a: sandbox.linux.af_unix_mediation: {msg}")
+        );
+        assert_eq!(
+            refuse(json!({ "linux": { "af_unix_mediation": null } })),
+            format!("f/c/a: sandbox.linux.af_unix_mediation: {msg}")
+        );
+        assert_eq!(
+            refuse(
+                json!({ "platform_overrides": { "linux": { "linux": { "af_unix_mediation": "pathname" } } } })
+            ),
+            format!("f/c/a: sandbox.platform_overrides.linux.linux.af_unix_mediation: {msg}")
+        );
+        // other `linux` keys are not this check's business
+        render_profile(&id, &grants, 1, &env, &json!({ "linux": {} })).unwrap();
+    }
+
     /// #118: the agent must not loosen signal isolation, whether at the
     /// top level or through the per-OS patch nono applies after `extends`.
     #[test]
@@ -1631,6 +1688,11 @@ mod tests {
             (
                 json!({ "platform_overrides": { "linux": { "platform_overrides": {} } } }),
                 "platform_overrides.linux.platform_overrides",
+            ),
+            (json!({ "linux": { "af_unix_mediation": "off" } }), "linux"),
+            (
+                json!({ "platform_overrides": { "linux": { "linux": { "af_unix_mediation": "off" } } } }),
+                "platform_overrides.linux.linux",
             ),
             (
                 json!({ "platform_overrides": { "beos": {} } }),

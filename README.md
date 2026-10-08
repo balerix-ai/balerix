@@ -40,12 +40,38 @@ asset is attested (`gh attestation verify <file> --repo balerix-ai/balerix`).
   # clone) grants beside /usr, /lib, /lib64 and /bin: where a nix or
   # Linuxbrew git loads its libraries. Never reaches an agent's profile.
   git_read = ["/nix/store"]
+
+  # Which Unix sockets a sandboxed process may use (Linux): auto | mediate | deny | open.
+  unix_sockets = "auto"
   ```
   Each `git_read` entry must be an absolute path to an existing
   directory, not `/`, and clear of balerix's state, data and config
   roots; `serve` refuses to start otherwise
   (`config.toml: sandbox.git_read[0]: …`). The error a removal prints when
   git cannot run under the profile names the setting.
+
+  `unix_sockets` decides what agents, plugins and balerix's own sandboxed
+  git can do with Unix sockets. Without a policy a sandboxed process could
+  connect to a socket outside its grants, including the daemon's tmux
+  server. `serve` resolves the setting once at start-up and logs the result.
+
+  | Value | Effect |
+  |---|---|
+  | `auto` (default) | `mediate` where nono's pathname mediation works on this host (a 10 s probe at start-up), else `deny` |
+  | `mediate` | nono mediates pathname sockets: only the agent's or plugin's own directories (and `unix_socket*` grants) are reachable; `serve` refuses to start if the probe fails |
+  | `deny` | no `socket(AF_UNIX)` at all (`EAFNOSUPPORT`), through a seccomp filter that `balerix sandbox-exec` installs before the command runs; `socketpair`, pipes and TCP still work |
+  | `open` | nono's default: any socket the daemon's user can reach. Reopens the exposure; logged as a warning |
+
+  Hosts where mediation cannot work (`kernel.yama.ptrace_scope = 2`,
+  restricted containers) resolve `auto` to `deny`. Under `deny` a
+  program that needs a Unix socket inside an agent's workspace (a local
+  postgres, docker, `git fsmonitor`) fails with "address family not
+  supported"; set `open` to allow them, with the risk. `deny` also fails
+  `io_uring_setup`/`io_uring_enter`/`io_uring_register` with `ENOSYS`, since
+  io_uring can create sockets without `socket()`. Fleet `unix_socket*` grants
+  are ignored under `deny` (a warning is logged). macOS is not covered yet
+  (the setting resolves to `open` behaviour there). Agents pick the policy up
+  at their next launch.
 - **Container:** `docker run -d --name balerix -v balerix:/home/balerix
   ghcr.io/balerix-ai/balerix:<ver>` runs the daemon with its tools. It listens on
   loopback inside the container only, so run the client there too:

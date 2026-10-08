@@ -294,3 +294,64 @@ fn kubernetes_mode_refuses_missing_tls_and_detach_and_tmux_mode_refuses_the_tls_
         String::from_utf8_lossy(&out.stderr).contains("the admin token is at least 32 characters")
     );
 }
+
+fn write_sandbox_config(home: &std::path::Path, unix_sockets: &str) {
+    let dir = home.join(".config/balerix");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.toml"),
+        format!("[sandbox]\nunix_sockets = \"{unix_sockets}\"\n"),
+    )
+    .unwrap();
+}
+
+fn serve_cmd(home: &std::path::Path, tools: &std::path::Path) -> Command {
+    let mut cmd = balerix(home, tools);
+    cmd.args([
+        "serve",
+        "--bind",
+        "127.0.0.1:0",
+        "--tmux-socket",
+        &format!("balerix-test-{}", std::process::id()),
+    ]);
+    cmd
+}
+
+#[test]
+fn serve_logs_the_resolved_unix_socket_policy() {
+    let home = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    fake_tools(tools.path());
+    write_sandbox_config(home.path(), "deny");
+    let server_dir = home.path().join(".local/state/balerix/server");
+    let mut child = serve_cmd(home.path(), tools.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&server_dir.join("endpoint"));
+    child.kill().unwrap();
+    let out = child.wait_with_output().unwrap();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(log.contains("unix_sockets = \"deny\""), "{log}");
+}
+
+#[test]
+fn serve_refuses_mediate_when_the_probe_fails() {
+    // the fake nono cannot run the probe, so it fails on any host
+    let home = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    fake_tools(tools.path());
+    write_sandbox_config(home.path(), "mediate");
+    let out = serve_cmd(home.path(), tools.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        log.contains("sandbox.unix_sockets = \"mediate\"") && log.contains("could not run nono"),
+        "{log}"
+    );
+}

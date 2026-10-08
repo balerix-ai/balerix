@@ -11,6 +11,7 @@ use crate::launch::outer_path;
 use crate::layout::{AgentPaths, CrewPaths};
 use crate::quote::sh_quote;
 use crate::sandbox::write_git_profile;
+use crate::socket_policy::{SocketPolicy, wrap_command};
 use crate::tools::{Cmd, CmdOutput, ToolPaths};
 
 /// The environment of every git call balerix makes. `git` honours
@@ -349,10 +350,12 @@ fn system_prefixes() -> String {
 /// <logs>/nono-git.log run --no-audit --profile <git profile> --`. No audit
 /// trail: one per call, at the web plugin's poll, would grow nono's state
 /// without bound (the session record `--no-audit` keeps goes to a
-/// `ScratchHome`). The profile is `sandbox::render_git_profile`;
-/// `write_git_profile` must have run.
-fn sandbox_args(agent: &AgentPaths) -> Vec<String> {
-    vec![
+/// `ScratchHome`). Under the Deny socket policy the program runs
+/// through `<balerix> sandbox-exec --`, appended here. The profile is
+/// `sandbox::render_git_profile`; `write_git_profile` must have run with
+/// the same policy.
+fn sandbox_args(agent: &AgentPaths, policy: SocketPolicy, balerix: &Path) -> Vec<String> {
+    let mut args: Vec<String> = vec![
         "-s".into(),
         "--log-file".into(),
         agent.logs.join("nono-git.log").display().to_string(),
@@ -361,7 +364,9 @@ fn sandbox_args(agent: &AgentPaths) -> Vec<String> {
         "--profile".into(),
         agent.git_profile.display().to_string(),
         "--".into(),
-    ]
+    ];
+    args.extend(wrap_command(policy, balerix, Vec::new()));
+    args
 }
 
 /// git and its options on every call in `agent`'s clone, before the
@@ -385,6 +390,7 @@ fn git_command(tools: &ToolPaths, crew: &CrewPaths, agent: &AgentPaths) -> Vec<S
 /// environment with a fresh `ScratchHome`, logged to the crew's `git.log`.
 fn sandboxed_cmd(
     tools: &ToolPaths,
+    policy: SocketPolicy,
     crew: &CrewPaths,
     agent: &AgentPaths,
     log: GitLog,
@@ -407,7 +413,7 @@ fn sandboxed_cmd(
         GitLog::Full => cmd.log(&log_file),
         GitLog::ArgvOnly => cmd.log_argv_only(&log_file),
     }
-    .args(sandbox_args(agent));
+    .args(sandbox_args(agent, policy, &tools.balerix));
     Ok((cmd, home))
 }
 
@@ -526,25 +532,36 @@ pub(crate) struct GitFailure {
 /// `write_git_profile` must have run.
 pub(crate) fn sandboxed_git(
     tools: &ToolPaths,
+    policy: SocketPolicy,
     crew: &CrewPaths,
     agent: &AgentPaths,
     args: &[&str],
     accepted: &[i32],
     log: GitLog,
 ) -> Result<CmdOutput, GitFailure> {
-    run_sandboxed_git(tools, crew, agent, args, accepted, log, None)
+    run_sandboxed_git(tools, policy, crew, agent, args, accepted, log, None)
 }
 
 /// `sandboxed_git` with stdout handed to `sink` as it arrives instead of
 /// collected (`Cmd::run_streaming`): exit 0 only, logged without stdout.
 pub(crate) fn sandboxed_git_streaming(
     tools: &ToolPaths,
+    policy: SocketPolicy,
     crew: &CrewPaths,
     agent: &AgentPaths,
     args: &[&str],
     sink: &mut dyn FnMut(&[u8]),
 ) -> Result<CmdOutput, GitFailure> {
-    run_sandboxed_git(tools, crew, agent, args, &[0], GitLog::ArgvOnly, Some(sink))
+    run_sandboxed_git(
+        tools,
+        policy,
+        crew,
+        agent,
+        args,
+        &[0],
+        GitLog::ArgvOnly,
+        Some(sink),
+    )
 }
 
 /// Several git calls in one sandbox start (#174): `script`, a fixed
@@ -558,8 +575,10 @@ pub(crate) fn sandboxed_git_streaming(
 /// a nono that fails exits with its own code, not one of the script's. A
 /// failure is reported with the subcommand `sh`. `write_git_profile` must
 /// have run.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sandboxed_git_script(
     tools: &ToolPaths,
+    policy: SocketPolicy,
     crew: &CrewPaths,
     agent: &AgentPaths,
     script: &'static str,
@@ -567,7 +586,7 @@ pub(crate) fn sandboxed_git_script(
     git_args: &[&str],
     accepted: &[i32],
 ) -> Result<CmdOutput, GitFailure> {
-    let (cmd, _home) = sandboxed_cmd(tools, crew, agent, GitLog::ArgvOnly)?;
+    let (cmd, _home) = sandboxed_cmd(tools, policy, crew, agent, GitLog::ArgvOnly)?;
     cmd.args(["/bin/sh", "-c", script, "sh"])
         .args(leading.iter().copied())
         .args(git_command(tools, crew, agent))
@@ -584,8 +603,10 @@ pub(crate) fn sandboxed_git_script(
 /// Where a streamed call's stdout goes, chunk by chunk.
 type StdoutSink<'a> = &'a mut dyn FnMut(&[u8]);
 
+#[allow(clippy::too_many_arguments)]
 fn run_sandboxed_git(
     tools: &ToolPaths,
+    policy: SocketPolicy,
     crew: &CrewPaths,
     agent: &AgentPaths,
     args: &[&str],
@@ -593,7 +614,7 @@ fn run_sandboxed_git(
     log: GitLog,
     sink: Option<StdoutSink<'_>>,
 ) -> Result<CmdOutput, GitFailure> {
-    let (cmd, _home) = sandboxed_cmd(tools, crew, agent, log)?;
+    let (cmd, _home) = sandboxed_cmd(tools, policy, crew, agent, log)?;
     let cmd = cmd
         .args(git_command(tools, crew, agent))
         .args(args.iter().copied());
@@ -639,6 +660,9 @@ pub struct Workspace<'a> {
     /// The daemon's `[sandbox] git_read` (#111): read-only prefixes the
     /// git profile grants beside the system ones. Empty in a pod.
     pub git_read: &'a [PathBuf],
+    /// The socket policy the git profile and its calls run under (spec
+    /// 2026-10-08): the `Runtime`'s.
+    pub socket_policy: SocketPolicy,
 }
 
 impl Workspace<'_> {
@@ -898,7 +922,14 @@ impl Workspace<'_> {
         crew: &CrewPaths,
         agent: &AgentPaths,
     ) -> Result<(), MaterializeError> {
-        write_git_profile(self.tools, id, agent, crew, self.git_read)?;
+        write_git_profile(
+            self.tools,
+            id,
+            agent,
+            crew,
+            self.git_read,
+            self.socket_policy,
+        )?;
         let log = agent.logs.join("nono-git.log");
         self.agent_git(id, crew, agent, &["version"], &[0])
             .map(|_| ())
@@ -939,7 +970,7 @@ impl Workspace<'_> {
     /// Whether `/bin/true` runs under the git profile: the canary's
     /// second question, asked only once `git version` has failed.
     fn sandbox_starts(&self, agent: &AgentPaths) -> bool {
-        let mut args = sandbox_args(agent);
+        let mut args = sandbox_args(agent, self.socket_policy, &self.tools.balerix);
         args.push("/bin/true".into());
         let Ok(home) = ScratchHome::new(agent) else {
             return false;
@@ -963,15 +994,23 @@ impl Workspace<'_> {
         args: &[&str],
         accepted: &[i32],
     ) -> Result<String, MaterializeError> {
-        sandboxed_git(self.tools, crew, agent, args, accepted, GitLog::Full)
-            .map(|o| o.stdout)
-            .map_err(|f| MaterializeError::Tool {
-                id: id.to_string(),
-                tool: "git".into(),
-                subcommand: f.subcommand,
-                args: f.args,
-                stderr: f.stderr,
-            })
+        sandboxed_git(
+            self.tools,
+            self.socket_policy,
+            crew,
+            agent,
+            args,
+            accepted,
+            GitLog::Full,
+        )
+        .map(|o| o.stdout)
+        .map_err(|f| MaterializeError::Tool {
+            id: id.to_string(),
+            tool: "git".into(),
+            subcommand: f.subcommand,
+            args: f.args,
+            stderr: f.stderr,
+        })
     }
 
     /// The agent's private clone on `branch` (Spec N §4): a clone of
@@ -1257,7 +1296,7 @@ impl Workspace<'_> {
             sh_quote(&outer_path(self.tools)),
             sh_quote(&self.tools.nono.display().to_string()),
         );
-        let words = sandbox_args(agent)
+        let words = sandbox_args(agent, self.socket_policy, &self.tools.balerix)
             .into_iter()
             .chain([self.tools.git.display().to_string()]);
         for word in words {
@@ -1420,11 +1459,27 @@ impl Workspace<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::layout::StateLayout;
+    use crate::socket_policy::SocketPolicy;
     use crate::tools::{Cmd, CmdOutput};
     use crate::workspace::{
         CloneDecision, ScratchHome, decide_clone, file_url, first_symlink_with, is_gits_answer,
-        scrub_git_env, sweep_stale_homes,
+        sandbox_args, scrub_git_env, sweep_stale_homes,
     };
+    use std::path::Path;
+
+    #[test]
+    fn deny_puts_sandbox_exec_after_nonos_separator() {
+        let layout = StateLayout::from_env(Path::new("/h"), |_| None);
+        let agent = layout.agent(&"f/c/a".parse().unwrap());
+        let args = sandbox_args(&agent, SocketPolicy::Deny, Path::new("/b"));
+        assert_eq!(args[args.len() - 4..], ["--", "/b", "sandbox-exec", "--"]);
+        for policy in [SocketPolicy::Mediate, SocketPolicy::Open] {
+            let args = sandbox_args(&agent, policy, Path::new("/b"));
+            assert_eq!(args.last().unwrap(), "--");
+            assert!(!args.iter().any(|a| a == "sandbox-exec"), "{policy:?}");
+        }
+    }
 
     /// #136: git's own maintenance removes `objects/maintenance.lock`
     /// between the listing and the read. An entry gone by then is skipped;

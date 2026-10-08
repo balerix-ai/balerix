@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use balerix_api::{AgentSettings, CredentialBundle, CrewSpec, FleetSpec, GitSettings};
 use balerix_core::{Fleet, HookTarget, ResolvedAgent};
-use balerix_runtime::{RenderOptions, Runtime, StateLayout, ToolPaths};
+use balerix_runtime::{RenderOptions, Runtime, SocketPolicy, StateLayout, ToolPaths};
 use serde_json::json;
 
 fn fleet() -> Fleet {
@@ -114,4 +114,58 @@ fn payments_agents_generate_known_files() {
         );
     }
     insta::assert_snapshot!("payments_generated", out);
+}
+
+/// alice's profile and `launch.sh` under the two policies that change
+/// them (spec 2026-10-08); `payments_generated` above is `Open`.
+#[test]
+fn payments_alice_under_each_socket_policy() {
+    for (policy, name) in [
+        (SocketPolicy::Deny, "payments_alice_deny"),
+        (SocketPolicy::Mediate, "payments_alice_mediate"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let layout = StateLayout::xdg(root.join("state"), root.join("data"), root.join("config"));
+        let tools = ToolPaths {
+            git: "/tools/git".into(),
+            gh: "/tools/gh".into(),
+            mise: "/tools/mise".into(),
+            nono: "/tools/nono".into(),
+            tmux: "/tools/tmux".into(),
+            balerix: "/tools/balerix".into(),
+        };
+        std::fs::create_dir_all(&layout.config_root).unwrap();
+        std::fs::write(layout.system_mise_toml(), "[tools]\nclaude = \"2.1.0\"\n").unwrap();
+        let rt = Runtime::new(layout.clone(), tools).with_socket_policy(policy);
+        let alice = ResolvedAgent::from_fleet(&fleet())
+            .into_iter()
+            .find(|a| a.id.agent.as_str() == "alice")
+            .unwrap();
+        let hooks = HookTarget {
+            url: "http://127.0.0.1:7643".into(),
+            secret: "secret-alice".into(),
+        };
+        rt.render_agent(
+            &alice,
+            &CredentialBundle::default(),
+            &hooks,
+            &RenderOptions {
+                redact_credentials: true,
+            },
+        )
+        .unwrap();
+        let paths = layout.agent(&alice.id);
+        let mut out = String::new();
+        for (label, path) in [
+            ("nono-profile.json", paths.profile.clone()),
+            ("launch.sh", paths.launch.clone()),
+        ] {
+            out.push_str(&format!(
+                "==== {label} ====\n{}\n",
+                normalize(&std::fs::read_to_string(path).unwrap(), root)
+            ));
+        }
+        insta::assert_snapshot!(name, out);
+    }
 }

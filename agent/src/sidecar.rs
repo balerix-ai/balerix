@@ -22,7 +22,8 @@ use balerix_core::{
 };
 use balerix_runtime::layout::{PodLayout, PodMounts};
 use balerix_runtime::sandbox::sandbox_self_test;
-use balerix_runtime::{Runtime, StateLayout, TmuxRunner, ToolPaths};
+use balerix_runtime::{Runtime, SocketPolicy, StateLayout, TmuxRunner, ToolPaths, UnixSockets};
+use std::path::Path;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 
@@ -140,6 +141,31 @@ pub async fn main(args: SidecarArgs) -> Result<()> {
     }
 }
 
+/// The pod's Unix socket policy, resolved once at start-up (`auto`: there
+/// is no bundle field, see the spec's deviation note). Under `Deny` the
+/// `balerix` binary must support `sandbox-exec`: the agent image pairs
+/// this sidecar with the base image's `balerix`, which may be older.
+async fn resolve_socket_policy(tools: &ToolPaths, run_dir: &Path) -> Result<SocketPolicy> {
+    let (tools, scratch) = (tools.clone(), run_dir.join("socket-probe"));
+    tokio::task::spawn_blocking(move || {
+        let (policy, why) = balerix_runtime::resolve_socket_policy(UnixSockets::Auto, || {
+            balerix_runtime::socket_policy::probe_mediation(&tools, &scratch)
+        })
+        .map_err(|e| anyhow!("{e}"))?;
+        match policy {
+            SocketPolicy::Open => tracing::warn!("{why}"),
+            _ => tracing::info!("{why}"),
+        }
+        // fails closed: no agent runs without the policy it was given
+        if policy == SocketPolicy::Deny {
+            balerix_runtime::socket_policy::check_sandbox_exec(&tools.balerix)
+                .map_err(|e| anyhow!("unix_sockets = \"deny\": {e}"))?;
+        }
+        Ok(policy)
+    })
+    .await?
+}
+
 async fn sidecar(args: SidecarArgs) -> Result<()> {
     let loaded = bundle::load(&args.bundle)?;
     let id = loaded.id.clone();
@@ -161,7 +187,9 @@ async fn sidecar(args: SidecarArgs) -> Result<()> {
     };
     let tools = ToolPaths::discover_in(&std::env::var_os("PATH").unwrap_or_default(), &balerix)
         .map_err(|e| anyhow!("{e} (the sidecar needs git, gh, mise, nono and tmux on PATH)"))?;
-    let runtime = Arc::new(Runtime::new(layout.clone(), tools.clone()));
+    let socket_policy = resolve_socket_policy(&tools, &args.run_dir).await?;
+    let runtime =
+        Arc::new(Runtime::new(layout.clone(), tools.clone()).with_socket_policy(socket_policy));
     let runner = Arc::new(TmuxRunner::at_socket(tools.tmux.clone(), pod.tmux_socket()));
 
     // §7.1: the hook listener first; its port goes into the profile's

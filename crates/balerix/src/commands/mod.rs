@@ -3,5 +3,6 @@ pub mod dev;
 pub mod fleet;
 pub mod plugin;
 pub mod relay;
+pub mod sandbox;
 pub mod serve;
 pub mod supervise;

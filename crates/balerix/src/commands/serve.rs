@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use balerix_core::{FleetStore, ReconcilePolicy};
-use balerix_runtime::{Runtime, StateLayout, TmuxRunner};
+use balerix_runtime::{Runtime, SocketPolicy, StateLayout, TmuxRunner, UnixSockets};
 use balerix_server::kube::{self, LinkHub, NoFiles, NoPool, serve_tls};
 use balerix_server::{
     Daemon, FileFleetStore, Metrics, PluginClient, PluginEventHandler, PluginHostConfig, PluginKv,
@@ -34,6 +34,9 @@ pub struct ServerConfig {
     /// `[sandbox] git_read`: read-only prefixes the git profile grants
     /// beside the system ones (#111), canonical and validated.
     pub git_read: Vec<PathBuf>,
+    /// `[sandbox] unix_sockets`: which Unix sockets sandboxed processes
+    /// may use; `auto` is resolved at start-up.
+    pub unix_sockets: UnixSockets,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -51,6 +54,8 @@ struct ConfigFile {
 struct SandboxTable {
     #[serde(default)]
     git_read: Vec<PathBuf>,
+    #[serde(default)]
+    unix_sockets: UnixSockets,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -75,6 +80,7 @@ impl ServerConfig {
                 .bind
                 .unwrap_or_else(|| "127.0.0.1:7643".to_string()),
             log: file.server.log.unwrap_or_else(|| "info".to_string()),
+            unix_sockets: file.sandbox.unix_sockets,
             git_read: file
                 .sandbox
                 .git_read
@@ -371,6 +377,7 @@ fn run(
     init_tracing(paths, log, detached_child)?;
     let tools = tool_paths()?;
     warn_without_signal_scoping(&tools, paths);
+    let socket_policy = socket_policy(config, &tools, paths)?;
     let token = load_or_create_token(&paths.token())?;
     let vault = Vault::load_or_create(&paths.vault_key())?;
     let store = FileFleetStore::new(layout.fleets_dir(), vault.clone());
@@ -382,7 +389,9 @@ fn run(
             .with_context(|| format!("cannot bind {bind}"))?;
         let url = format!("http://{}", listener.local_addr()?);
         let runtime = Arc::new(
-            Runtime::new(layout.clone(), tools.clone()).with_git_read(config.git_read.clone()),
+            Runtime::new(layout.clone(), tools.clone())
+                .with_git_read(config.git_read.clone())
+                .with_socket_policy(socket_policy),
         );
         let ports = Ports {
             materializer: runtime.clone(),
@@ -465,6 +474,36 @@ fn warn_without_signal_scoping(tools: &balerix_runtime::ToolPaths, paths: &Serve
     }
 }
 
+/// Resolves `[sandbox] unix_sockets` once per start (spec 2026-10-08 §3.1).
+/// The probe runs in the server directory's `socket-probe/`. A failing
+/// probe under an explicit `mediate` refuses to start, and so does a
+/// `deny` whose `balerix sandbox-exec` does not run: every agent would
+/// otherwise fail in its pane.
+fn socket_policy(
+    config: &ServerConfig,
+    tools: &balerix_runtime::ToolPaths,
+    paths: &ServerPaths,
+) -> Result<SocketPolicy> {
+    if !cfg!(target_os = "linux") {
+        tracing::info!("unix_sockets: not applied on this OS");
+        return Ok(SocketPolicy::Open);
+    }
+    let scratch = paths.dir.join("socket-probe");
+    let (policy, why) = balerix_runtime::socket_policy::resolve(config.unix_sockets, || {
+        balerix_runtime::socket_policy::probe_mediation(tools, &scratch)
+    })
+    .map_err(|e| anyhow!("config.toml: sandbox.unix_sockets = \"mediate\": {e}"))?;
+    match policy {
+        SocketPolicy::Open => tracing::warn!("{why}"),
+        _ => tracing::info!("{why}"),
+    }
+    if policy == SocketPolicy::Deny {
+        balerix_runtime::socket_policy::check_sandbox_exec(&tools.balerix)
+            .map_err(|e| anyhow!("unix_sockets = \"deny\": {e}"))?;
+    }
+    Ok(policy)
+}
+
 /// SIGINT or SIGTERM ends the daemon; SIGHUP is ignored so a closed
 /// terminal does not take a detached daemon with it.
 async fn shutdown_signal() {
@@ -540,6 +579,44 @@ fn detach(paths: &ServerPaths, bind: &str, tmux_socket: &str) -> Result<String> 
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deny_refuses_to_start_when_sandbox_exec_does_not_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // written under another name and renamed once closed (ETXTBSY)
+        let tmp = dir.path().join(".balerix.tmp");
+        std::fs::write(
+            &tmp,
+            "#!/bin/sh\necho 'balerix sandbox-exec: cannot install the filter' >&2\nexit 126\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let balerix = dir.path().join("balerix");
+        std::fs::rename(&tmp, &balerix).unwrap();
+        let none = PathBuf::from("/nonexistent");
+        let tools = balerix_runtime::ToolPaths {
+            git: none.clone(),
+            gh: none.clone(),
+            mise: none.clone(),
+            nono: none.clone(),
+            tmux: none,
+            balerix,
+        };
+        let config = ServerConfig {
+            bind: "127.0.0.1:0".into(),
+            log: "info".into(),
+            git_read: Vec::new(),
+            unix_sockets: UnixSockets::Deny,
+        };
+        let paths = ServerPaths::new(dir.path().join("server"));
+        let e = socket_policy(&config, &tools, &paths)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unix_sockets = \"deny\""), "{e}");
+        assert!(e.contains("cannot install the filter"), "{e}");
+    }
+
     #[test]
     fn config_defaults_when_missing_and_parses_the_server_table() {
         let dir = tempfile::tempdir().unwrap();
@@ -564,6 +641,24 @@ mod tests {
         std::fs::write(&path, "[server]\nport = 1\n").unwrap();
         let e = load(&path).unwrap_err().to_string();
         assert!(e.contains("config.toml") && e.contains("port"), "{e}");
+    }
+
+    #[test]
+    fn unix_sockets_loads_defaults_to_auto_and_refuses_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let layout = StateLayout::xdg(
+            dir.path().join("state"),
+            dir.path().join("data"),
+            dir.path().join("config"),
+        );
+        let load = |p: &Path| ServerConfig::load_for(p, &layout);
+        assert_eq!(load(&path).unwrap().unix_sockets, UnixSockets::Auto);
+        std::fs::write(&path, "[sandbox]\nunix_sockets = \"deny\"\n").unwrap();
+        assert_eq!(load(&path).unwrap().unix_sockets, UnixSockets::Deny);
+        std::fs::write(&path, "[sandbox]\nunix_sockets = \"nope\"\n").unwrap();
+        let e = load(&path).unwrap_err().to_string();
+        assert!(e.contains("config.toml") && e.contains("nope"), "{e}");
     }
 
     /// #111: `[sandbox] git_read`, validated at load.

@@ -119,11 +119,15 @@ Each poll: if `workspace` is non-null and its fingerprint differs from
 and hold it as `pendingDiff` together with the fingerprint. Then, if no
 comment box is open and at least 3 s have passed since `lastApplied`,
 apply it. Saving or cancelling a comment box applies a waiting
-`pendingDiff` at once. "Reload diff" fetches and applies unconditionally.
+`pendingDiff` at once. "Reload diff" fetches and applies unconditionally,
+stamping `rendered` with the fingerprint read just before its fetch (#20);
+a poll's fetch that a reload overtook, for the fingerprint now rendered,
+parks nothing. The poll is two halves (#20): `pollEvents` (the column)
+and `refreshDiff` (the diff), called in turn by `poll`.
 
 Applying:
 
-- **Re-anchoring** (`anchorComments(diff, comments)`, a standalone
+- **Re-anchoring** (`anchorComments(workspaceDiff, comments)`, a standalone
   function in the inline script): for each comment, exact match on
   `(path, side, line, text)` keeps it; otherwise the lines of the same
   `path` and `side` whose `text` equals the comment's are collected; exactly
@@ -133,8 +137,8 @@ Applying:
   re-anchoring so a re-anchored line number persists.
 - **Scroll**: the diff column's `scrollTop` is saved before the render; after
   it, the first file header that was at or above the top of the viewport is
-  scrolled back to the top when it still exists, else the offset is
-  restored.
+  put back where it was, the same distance into the file (#20), when it
+  still exists, else the offset is restored.
 - **Comment boxes**: text typed into a pending or editing box is written to
   the draft on every `input` event, so a render restores it. Deferral makes
   this a second line of defence, not the first.

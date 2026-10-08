@@ -272,7 +272,6 @@ const key = "balerix-review/" + id;
 let diff = null;
 let pending = null;
 let rendered = null;
-let latestFp = null;
 let pendingDiff = null;
 let lastApplied = 0;
 let renderedAt = null;
@@ -302,9 +301,9 @@ function parsePatch(patch) {{
 // same path and side with the same text are collected — exactly one hit
 // re-anchors the comment to that line number, none or several make it
 // stale. Returns the stale comments; re-anchored ones are updated in place.
-function anchorComments(diff, comments) {{
+function anchorComments(workspaceDiff, comments) {{
   const exact = new Set(); const byText = new Map();
-  for (const f of diff.files) for (const h of parsePatch(f.patch)) for (const l of h.lines) {{
+  for (const f of workspaceDiff.files) for (const h of parsePatch(f.patch)) for (const l of h.lines) {{
     if (l.kind === "meta") continue;
     exact.add(f.path + " " + l.side + " " + l.line + " " + l.text);
     const k = f.path + " " + l.side + " " + l.text;
@@ -393,17 +392,20 @@ function render() {{
 }}
 
 // Keep the reader's place across a re-render: the file whose header was at
-// or above the top of the viewport is scrolled back to the top when it is
-// still there; otherwise the raw offset is restored.
+// or above the top of the viewport is put back where it was, the same
+// distance into it (top - its old offsetTop), when it is still there;
+// otherwise the raw offset is restored.
 function renderKeepingScroll() {{
   const root = document.getElementById("diff");
   const top = root.scrollTop;
   const files = Array.from(root.querySelectorAll(".file"));
   const above = files.filter((f) => f.offsetTop <= top);
-  const topPath = above.length ? above[above.length - 1].dataset.path : null;
+  const anchor = above.length ? above[above.length - 1] : null;
+  const topPath = anchor ? anchor.dataset.path : null;
+  const into = anchor ? top - anchor.offsetTop : 0;
   render();
   const again = topPath === null ? null : Array.from(root.querySelectorAll(".file")).find((f) => f.dataset.path === topPath);
-  root.scrollTop = again ? again.offsetTop : top;
+  root.scrollTop = again ? again.offsetTop + into : top;
 }}
 
 function fmtAge(ms) {{
@@ -439,11 +441,25 @@ async function fetchDiff() {{
   if (!r.ok) throw new Error(await r.text());
   return await r.json();
 }}
+// The worktree's fingerprint now, for a diff about to be fetched: read
+// before the fetch, so a change after it makes the next poll fetch again
+// rather than be missed. `after` is past every sequence number, so the
+// column's events are left to the poll. null when there is no version.
+async function currentFp() {{
+  try {{
+    const r = await (await fetch(prefix + "/agents/" + id + "/events.json?after=" + Number.MAX_SAFE_INTEGER)).json();
+    return r.workspace ? r.workspace.fingerprint : null;
+  }} catch (e) {{ return null; }}
+}}
 // Manual "Reload diff": unconditional, and the way a daemon refusal reaches
-// the banner.
-async function loadDiff() {{
+// the banner. Stamps the fingerprint the fetch corresponds to: `fp` when
+// the caller just read it, else `currentFp()`.
+async function loadDiff(fp) {{
   const banner = document.getElementById("banner"); banner.textContent = "";
-  try {{ applyDiff(await fetchDiff(), latestFp); }}
+  try {{
+    if (fp === undefined) fp = await currentFp();
+    applyDiff(await fetchDiff(), fp);
+  }}
   catch (e) {{ banner.style.color = "#b00"; banner.textContent = "diff: " + e.message; }}
 }}
 
@@ -472,9 +488,10 @@ function renderEvent(e) {{
   row.appendChild(pre); row.onclick = () => {{ pre.hidden = !pre.hidden; }};
   return row;
 }}
-// One poll drives both columns (Spec D PD-2): the events, and the
-// worktree's version — a new fingerprint fetches the diff once and parks
-// it until maybeApply lets it through.
+// The activity column's half of a poll: new events and the phase. Returns
+// the poll's body (its `workspace` is the version, or null when the daemon
+// refused, failed or was slower than the plugin's deadline), or null when
+// the poll itself failed.
 async function pollEvents() {{
   try {{
     const r = await (await fetch(prefix + "/agents/" + id + "/events.json?after=" + lastSeq)).json();
@@ -485,39 +502,50 @@ async function pollEvents() {{
     if (lastSeq > 0) document.getElementById("no-events").hidden = true;
     document.getElementById("unread").textContent = unread ? "(" + unread + " new)" : "";
     if (r.events.length && atBottom) box.scrollTop = box.scrollHeight;
-    const w = r.workspace;
-    if (w) {{
-      latestFp = w.fingerprint;
-      if (w.fingerprint !== rendered && !(pendingDiff && pendingDiff.fp === w.fingerprint) && !fetching) {{
-        fetching = true;
-        try {{
-          pendingDiff = {{ diff: await fetchDiff(), fp: w.fingerprint }};
-          const banner = document.getElementById("banner");
-          if (banner.textContent.startsWith("diff: ")) banner.textContent = "";
-        }}
-        catch (e) {{
-          if (diff === null) {{ const banner = document.getElementById("banner"); banner.style.color = "#b00"; banner.textContent = "diff: " + e.message; }}
-          else console.warn("diff", e);
-        }}
-        finally {{ fetching = false; }}
-      }}
-    }} else if (diff === null && !fetching) {{
-      // no version: surface the daemon's reason once
-      fetching = true; try {{ await loadDiff(); }} finally {{ fetching = false; }}
+    return r;
+  }} catch (e) {{ console.warn("events", e); return null; }}
+}}
+// The diff column's half: a new fingerprint fetches the diff once and parks
+// it until maybeApply lets it through — unless a reload applied that
+// fingerprint while the fetch was out. No version before any diff is shown
+// surfaces the daemon's reason once, through loadDiff.
+async function refreshDiff(w) {{
+  if (fetching) return;
+  if (w) {{
+    const fp = w.fingerprint;
+    if (fp === rendered || (pendingDiff && pendingDiff.fp === fp)) return;
+    fetching = true;
+    try {{
+      const d = await fetchDiff();
+      if (fp !== rendered) pendingDiff = {{ diff: d, fp }};
+      const banner = document.getElementById("banner");
+      if (banner.textContent.startsWith("diff: ")) banner.textContent = "";
     }}
-    maybeApply();
-  }} catch (e) {{ console.warn("events", e); }}
+    catch (e) {{
+      if (diff === null) {{ const banner = document.getElementById("banner"); banner.style.color = "#b00"; banner.textContent = "diff: " + e.message; }}
+      else console.warn("diff", e);
+    }}
+    finally {{ fetching = false; }}
+  }} else if (diff === null) {{
+    fetching = true; try {{ await loadDiff(null); }} finally {{ fetching = false; }}
+  }}
+}}
+// One poll drives both columns (Spec D PD-2), each through its own half.
+async function poll() {{
+  const r = await pollEvents();
+  if (r) await refreshDiff(r.workspace);
+  maybeApply();
 }}
 
 function applyCollapse() {{ side.classList.toggle("collapsed", !!draft.collapsed); if (!draft.collapsed) {{ unread = 0; document.getElementById("unread").textContent = ""; }} }}
 document.getElementById("collapse").onclick = () => {{ draft.collapsed = !draft.collapsed; save(); applyCollapse(); }};
-document.getElementById("reload").onclick = loadDiff;
+document.getElementById("reload").onclick = () => loadDiff();
 document.getElementById("send").onclick = send;
 document.getElementById("summary").oninput = (ev) => {{ draft.summary = ev.target.value; save(); }};
 applyCollapse();
 render();
-pollEvents();
-setInterval(pollEvents, {poll});
+poll();
+setInterval(poll, {poll});
 setInterval(tickAge, 1000);
 </script>
 </body></html>
@@ -1105,6 +1133,114 @@ console.log("anchor cases ok");
         );
     }
 
+    /// The review page's whole script under `node` with a stub DOM and a
+    /// scripted `fetch` (#20): the scroll keeps the reader's offset into the
+    /// top file; "Reload diff" stamps the fingerprint read before its fetch;
+    /// a poll's fetch that a reload overtook parks nothing.
+    #[test]
+    fn the_review_page_keeps_its_place_and_its_fingerprints_under_node() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let node = Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !require_or_skip("node", node) {
+            return;
+        }
+        let page = review_html("", "f/c/a");
+        let start = page.find("<script>\n").expect("the script") + "<script>\n".len();
+        let end = page.rfind("</script>").expect("its end");
+        let stubs = r#"
+const assert = require("node:assert");
+class El {
+  constructor(tag) { this.tag = tag; this.children = []; this.dataset = {}; this.style = {}; this.className = ""; this.textContent = ""; this.value = ""; this.hidden = false; this.scrollTop = 0; this.scrollHeight = 0; this.clientHeight = 0; this.classList = { add() {}, remove() {}, toggle() {}, contains() { return false; } }; }
+  appendChild(c) { this.children.push(c); return c; }
+  append(...cs) { for (const c of cs) this.children.push(c); }
+  replaceChildren() { this.children = []; }
+  // layout: the files stack 100 px apart, in order
+  querySelectorAll(sel) { assert.strictEqual(sel, ".file"); const out = this.children.filter((c) => c instanceof El && c.className === "file"); out.forEach((f, i) => { f.offsetTop = i * 100; }); return out; }
+}
+const els = {};
+globalThis.document = { getElementById: (k) => (els[k] = els[k] || new El(k)), createElement: (t) => new El(t) };
+globalThis.localStorage = { getItem: () => null, setItem: () => {} };
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+// fetch: events.json answers `version` (null until set); diff.json waits on `diffs`
+let version = null; const diffs = []; const fetched = [];
+const json = (v) => ({ ok: true, json: async () => v, text: async () => JSON.stringify(v) });
+globalThis.fetch = async (url) => {
+  fetched.push(url);
+  if (url.includes("/events.json")) return json({ phase: "ready", events: [], workspace: version && { head: "h", fingerprint: version } });
+  return await new Promise((resolve) => diffs.push((d) => resolve(json(d))));
+};
+const settle = async () => { for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r)); };
+const file = (path) => ({ path, status: "modified", patch: "@@ -1 +1 @@\n-a\n+b\n" });
+const diffOf = (...paths) => ({ base_ref: "origin/main", head: "h", truncated: false, files: paths.map(file) });
+"#;
+        let cases = r#"
+(async () => {
+  // the first poll finds no version: one diff fetch, through loadDiff
+  await settle();
+  diffs.shift()(diffOf("a", "b", "c"));
+  await settle();
+  assert.strictEqual(diff.files.length, 3);
+  assert.strictEqual(rendered, null);
+
+  // scroll: 30 px into b (offsetTop 100); a file lands above it
+  const root = document.getElementById("diff");
+  root.scrollTop = 130;
+  applyDiff(diffOf("0", "a", "b", "c"), "x");
+  assert.strictEqual(root.scrollTop, 230, "the same 30 px into b, now at 200");
+
+  // "Reload diff" stamps the fingerprint read just before its fetch
+  version = "f1";
+  document.getElementById("reload").onclick({ type: "click" });
+  await settle();
+  assert.ok(fetched[fetched.length - 2].endsWith("events.json?after=" + Number.MAX_SAFE_INTEGER), fetched.join("\n"));
+  diffs.shift()(diffOf("a"));
+  await settle();
+  assert.strictEqual(rendered, "f1", "the fingerprint the fetch corresponds to");
+
+  // a poll's fetch for f2 that a reload overtakes parks nothing
+  version = "f2";
+  const polling = poll();
+  await settle();
+  assert.strictEqual(diffs.length, 1, "the poll's fetch is out");
+  const reload = loadDiff();
+  await settle();
+  diffs.pop()(diffOf("a", "b"));
+  await reload;
+  assert.strictEqual(rendered, "f2");
+  diffs.shift()(diffOf("a", "b"));
+  await polling;
+  assert.strictEqual(pendingDiff, null, "no second render of what is on screen");
+  console.log("page cases ok");
+})().catch((e) => { console.error(e); process.exit(1); });
+"#;
+        let script = format!("{stubs}\n{}\n{cases}", &page[start..end]);
+        let mut child = Command::new("node")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("node starts");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(script.as_bytes())
+            .expect("the script reaches node");
+        let out = child.wait_with_output().expect("node finishes");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("page cases ok"),
+            "node failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn the_review_page_links_its_routes_through_the_prefix_and_escapes_the_id() {
         let page = review_html("/v1/plugins/web", "f/c/a");
@@ -1142,7 +1278,7 @@ console.log("anchor cases ok");
             "a cut entry is marked on its row (#42)"
         );
         assert!(
-            !page.contains("loadDiff();\npollEvents();"),
+            !page.contains("loadDiff();\npoll();"),
             "the first diff comes from the first poll"
         );
         let page = review_html("/p", "<x>&");

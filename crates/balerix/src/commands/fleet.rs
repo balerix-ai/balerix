@@ -264,21 +264,25 @@ pub fn down_command(args: &DownArgs) -> Result<String> {
     let client = Client::connect(args.api_url.as_deref())?;
     client.down(&args.fleet, &q)?;
     if args.purge {
-        let start = Instant::now();
-        while client.get(&args.fleet)?.is_some() {
-            if start.elapsed() >= timeout {
-                bail!(
-                    "timed out after {}s waiting for the purge",
-                    timeout.as_secs()
-                );
-            }
-            std::thread::sleep(POLL);
-        }
+        wait_purged(&client, &args.fleet, Instant::now() + timeout)?;
         return Ok(format!("{}: purged\n", args.fleet));
     }
     wait_until(&client, &args.fleet, timeout, "down", |r| {
         Ok(r.status.phase == FleetPhase::Down)
     })
+}
+
+/// Polls until `fleet` has no record (its purge finished) or `deadline`
+/// passes. `down --purge` and `plugin remove --purge` (#169) share it.
+pub fn wait_purged(client: &Client, fleet: &str, deadline: Instant) -> Result<()> {
+    while client.get(fleet)?.is_some() {
+        let now = Instant::now();
+        if now >= deadline {
+            bail!("timed out waiting for the purge of {fleet}");
+        }
+        std::thread::sleep(POLL.min(deadline - now));
+    }
+    Ok(())
 }
 
 pub fn status_command(args: &StatusArgs) -> Result<String> {

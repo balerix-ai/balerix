@@ -25,12 +25,13 @@ daemon → plugin request bodies are capped at 1 MiB by the SDK's `router`
 (`balerix-plugin-sdk/src/plugin.rs`). On both sides a body over its cap is
 read to its end, up to four times the cap and for at most 10 s, after the
 token is checked (a bad token is a 401 before the body is read), before
-it is answered (the
-route's usual over-cap answer: 413, or 400 where the route folds every
-body error into one), so a client that writes the whole body before
-reading gets that answer rather than a reset; a body declared or found
+it is answered (413 on every route, `hello` included), so a client that
+writes the whole body before reading gets that answer rather than a
+reset; the plugin mount (`/v1/plugins/<name>/…`, 1 MiB, §6) does the
+same after it has authenticated the caller; a body declared or found
 larger than four times the cap is answered without being read and the
-connection closed. A plugin's response body over 1 MiB is
+connection closed, and one still arriving after the 10 s is answered 408
+`body not received within 10s` and the connection closed. A plugin's response body over 1 MiB is
 rejected by the daemon before it is parsed and counted as a `body` failure
 — for `intercept`, the interceptor chain's fail-open (§4) —
 (`balerix-server/src/plugins/client.rs`).
@@ -83,6 +84,7 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 | `POST hello` | always | `{ name, version, protocol, listen, manifest? }` | `{ config }` | 200 | `hello.json` |
 | `POST hello`, Kubernetes mode, no manifest or one outside the grant | always | same | `{ error }`: `hello.manifest: required in kubernetes mode`, `hello.manifest.name: "<m>" does not match the plugin "<p>"` or `hello.manifest.needs: <cap> is not granted` | 400 | (asserted by `crates/balerix-server/tests/kube_plugins_it.rs`, §6) |
 | `POST hello`, bad/missing token | always | same | `{ error }` | 401 | `hello-bad-token.json` |
+| `POST hello`, over the plugin's rate (the hook route's bucket: 20/s, burst 50, per plugin, counted after the token) | always | same | `{ "error": "rate limit exceeded" }` | 429 | (asserted by `crates/balerix-server/tests/plugins_it.rs`, §6) |
 | `GET fleets` | `fleets` | — | `[FleetRecord]` | 200 | `fleets.json` |
 | `GET fleets/{name}` | `fleets` | — | `FleetRecord` | 200 | (shape as in `fleets.json`'s `response[0]`) |
 | `GET fleets/{name}`, unknown name | `fleets` | — | `{ error }` | 404 | `fleet-missing.json` |
@@ -108,6 +110,8 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 | `GET kv/{key}`, unknown key | `kv` | — | `{ "error": "no such key" }` | 404 | (same status as `fleet-missing.json`) |
 | `PUT kv/{key}?secret=<bool>` | `kv` | raw bytes | `{}` | 200 | `kv-put.json` |
 | `DELETE kv/{key}` | `kv` | — | `{}` | 200 | (same success shape as `PUT`) |
+| any `kv/{key}`, key outside the grammar (`kv/` with no key included, any method) | `kv` | — | `{ "error": "kv: invalid key: <reason>" }` | 400 | (asserted by `events_it.rs`, §6) |
+| `PUT kv/{key}`, key is a directory of other keys (`a` beside `a/b`) or under a key that is a value (`a/b` beside `a`) | `kv` | raw bytes | `{ "error": "kv: key \"<key>\" conflicts with an existing key: …" }` | 409 | (asserted by `events_it.rs`, §6); `GET` answers such a key 404 and `DELETE` 200, as for an unknown key |
 
 `manifest` is the plugin's `balerix-plugin.yaml` as JSON. The SDK sends it
 only when it was given an authority (`BALERIX_CA_FILE`): `hello` rejects
@@ -145,7 +149,10 @@ shape for one fleet. `owner` is present when a plugin manages the fleet
 - `{ "action": "stop" }`
 
 **KV**: keys match `[A-Za-z0-9._/-]{1,200}`, with no empty segment and no
-bare `.` or `..` segment. `PUT` and
+bare `.` or `..` segment (`balerix_api::check_kv_key`); the SDK's `Host`
+refuses any other key itself with the daemon's 400 `kv: invalid key:
+<reason>`. A key travels as one path segment, `/` encoded as `%2F`, so a
+reverse proxy in front of the daemon must keep encoded slashes. `PUT` and
 `GET` bodies are raw bytes, content-type `application/octet-stream`;
 `?secret=true` on `PUT` stores the value through the daemon's vault.
 `?prefix=` on the list route filters returned `keys` by prefix

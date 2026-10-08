@@ -82,6 +82,21 @@ fn package_install_and_remove_edit_plugins_yaml_offline() {
         .failure()
         .stderr(predicate::str::contains("daemon not running"));
 
+    // a bad --timeout changes nothing (lane H review)
+    balerix(&home)
+        .args(["plugin", "remove", "hello", "--purge", "--timeout", "soon"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid duration"));
+    let yaml = fs::read_to_string(home.join(".config/balerix/plugins.yaml")).unwrap();
+    assert!(yaml.contains("name: hello"), "{yaml}");
+    // --timeout only means something with --purge
+    balerix(&home)
+        .args(["plugin", "remove", "hello", "--timeout", "1m"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--purge"));
+
     balerix(&home)
         .args(["plugin", "remove", "hello", "--purge"])
         .assert()

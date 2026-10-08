@@ -16,15 +16,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::rejection::{BytesRejection, PathRejection};
+use axum::extract::{Path, Request, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use balerix_core::AgentId;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+
+use crate::body_limit::{Drain, limited, refuse};
 
 /// Under `hook-relay`'s 5 s and Claude's 10 s command timeout; above the
 /// Daemon's own 2 s handler timeout, so a slow chain is the Daemon's
@@ -59,11 +63,44 @@ impl std::fmt::Debug for Hooks {
     }
 }
 
+/// The secret is checked before the body is read (`require_secret`, a
+/// `route_layer` outside the drain); an over-cap body is then read to its
+/// end before its 413 (#168, `body_limit`).
 pub fn router(hooks: Arc<Hooks>) -> Router {
-    Router::new()
-        .route("/v1/agents/{fleet}/{crew}/{agent}/events", post(events))
-        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+    let events = Router::new().route("/v1/agents/{fleet}/{crew}/{agent}/events", post(events));
+    limited(events, Drain::new(BODY_LIMIT))
+        .route_layer(middleware::from_fn_with_state(
+            hooks.clone(),
+            require_secret,
+        ))
         .with_state(hooks)
+}
+
+/// The caller presents this agent's local secret, or is answered 401
+/// having had at most `body_limit::REFUSAL_READ` of its body read.
+async fn require_secret(
+    State(h): State<Arc<Hooks>>,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let ok = match path {
+        Ok(Path((fleet, crew, agent))) => {
+            format!("{fleet}/{crew}/{agent}") == h.id.to_string()
+                && bearer(req.headers())
+                    .is_some_and(|t| constant_time_eq(t.as_bytes(), h.secret.as_bytes()))
+        }
+        Err(_) => false,
+    };
+    if ok {
+        next.run(req).await
+    } else {
+        refuse(req, unauthorized()).await
+    }
+}
+
+fn unauthorized() -> Response {
+    error(StatusCode::UNAUTHORIZED, "unknown agent or bad secret")
 }
 
 /// Length-then-bytes comparison with no early exit (as the daemon's
@@ -93,22 +130,12 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
 
-async fn events(
-    State(h): State<Arc<Hooks>>,
-    Path((fleet, crew, agent)): Path<(String, String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let unauthorized = || error(StatusCode::UNAUTHORIZED, "unknown agent or bad secret");
-    if format!("{fleet}/{crew}/{agent}") != h.id.to_string() {
-        return unauthorized();
-    }
-    let Some(token) = bearer(&headers) else {
-        return unauthorized();
+/// `require_secret` has checked the caller.
+async fn events(State(h): State<Arc<Hooks>>, body: Result<Bytes, BytesRejection>) -> Response {
+    let body = match body {
+        Ok(b) => b,
+        Err(e) => return error(e.status(), &e.body_text()),
     };
-    if !constant_time_eq(token.as_bytes(), h.secret.as_bytes()) {
-        return unauthorized();
-    }
     let name = match serde_json::from_slice::<Value>(&body) {
         Ok(Value::Object(map)) => match map.get("hook_event_name") {
             Some(Value::String(s)) => s.clone(),

@@ -70,6 +70,16 @@ fn ca_file(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 async fn sidecar(daemon_url: &str) -> (String, Arc<AtomicU64>, mpsc::UnboundedReceiver<String>) {
+    sidecar_with_recv_buffer(daemon_url, None).await
+}
+
+/// `sidecar`, its listener's receive buffer set to `bytes` when given:
+/// the kernel cannot absorb a body the sidecar leaves unread, so a client
+/// that writes all of it sees what the sidecar did with it (#168).
+async fn sidecar_with_recv_buffer(
+    daemon_url: &str,
+    recv_buffer: Option<u32>,
+) -> (String, Arc<AtomicU64>, mpsc::UnboundedReceiver<String>) {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let tls = client_config(&ca_file(dir.path())).unwrap();
     let (events, rx) = mpsc::unbounded_channel();
@@ -83,7 +93,12 @@ async fn sidecar(daemon_url: &str) -> (String, Arc<AtomicU64>, mpsc::UnboundedRe
         failures: failures.clone(),
         events,
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    if let Some(bytes) = recv_buffer {
+        socket.set_recv_buffer_size(bytes).unwrap();
+    }
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(1024).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(axum::serve(listener, router(hooks)).into_future());
     (url, failures, rx)
@@ -266,4 +281,97 @@ async fn a_daemon_that_stalls_the_body_fails_open_inside_one_budget() {
         start.elapsed()
     );
     assert_eq!(failures.load(Ordering::Relaxed), 1);
+}
+
+/// One request on a raw socket: the head declaring `declared` body bytes,
+/// then `send` of them (`declared` when `None`), then the answer's status
+/// line and headers and body as text. A write the sidecar refused is an
+/// `Err`, which is the failure #168 is about.
+fn raw_post(
+    base: &str,
+    secret: &str,
+    declared: usize,
+    send: Option<usize>,
+) -> Result<String, String> {
+    use std::io::{Read, Write};
+    let authority = base.trim_start_matches("http://");
+    let mut s = std::net::TcpStream::connect(authority).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    write!(
+        s,
+        "POST /v1/agents/f/c/a/events HTTP/1.1\r\nHost: {authority}\r\n\
+         Authorization: Bearer {secret}\r\nContent-Type: application/json\r\n\
+         Content-Length: {declared}\r\n\r\n"
+    )
+    .map_err(|e| e.to_string())?;
+    let body = vec![b'x'; send.unwrap_or(declared)];
+    for chunk in body.chunks(64 << 10) {
+        s.write_all(chunk).map_err(|e| format!("write: {e}"))?;
+    }
+    let mut answer = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => answer.extend_from_slice(&buf[..n]),
+            Err(e) if answer.is_empty() => return Err(format!("read: {e}")),
+            Err(_) => break,
+        }
+        let text = String::from_utf8_lossy(&answer);
+        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+            let length = head.lines().find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().unwrap())
+            });
+            if length.is_some_and(|n| body.len() >= n) {
+                break;
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&answer).into_owned())
+}
+
+/// #168: an event body over the 1 MiB cap is read to its end (up to four
+/// times the cap) before the 413, so a client that writes it all reads
+/// the answer instead of EPIPE; one declared past four times is answered
+/// at once and the connection closed; a bad secret is a 401 before a
+/// byte of the body is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_event_is_drained_before_its_413_and_a_bad_secret_reads_none_of_it() {
+    use balerix_agent::hooks::BODY_LIMIT;
+    let (seen, daemon) = fake_daemon(false).await;
+    let (base, _, _) = sidecar_with_recv_buffer(&daemon, Some(4096)).await;
+    for len in [BODY_LIMIT + 1, 4 * BODY_LIMIT] {
+        let b = base.clone();
+        let text = tokio::task::spawn_blocking(move || raw_post(&b, SECRET, len, None))
+            .await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{len} bytes: {e}"));
+        assert!(text.starts_with("HTTP/1.1 413"), "{len} bytes: {text}");
+        assert!(text.contains(r#"{"error":"#), "{len} bytes: {text}");
+    }
+    let b = base.clone();
+    let text =
+        tokio::task::spawn_blocking(move || raw_post(&b, SECRET, 4 * BODY_LIMIT + 1, Some(0)))
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(text.starts_with("HTTP/1.1 413"), "{text}");
+    assert!(
+        text.to_ascii_lowercase().contains("connection: close"),
+        "{text}"
+    );
+    let b = base.clone();
+    let started = Instant::now();
+    let text = tokio::task::spawn_blocking(move || raw_post(&b, "nope", 2 * BODY_LIMIT, Some(0)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(text.starts_with("HTTP/1.1 401"), "{text}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "answered without waiting for the body"
+    );
+    assert!(seen.0.lock().await.is_empty(), "nothing forwarded");
 }

@@ -19,7 +19,7 @@ pub use chain::{ObserverQueue, PluginEventHandler};
 pub use client::{CallFailure, PluginClient};
 pub use config::{Source, load_plugins_file, resolve_source};
 pub use host::{PluginHost, PluginHostConfig};
-pub use kv::{PluginKv, validate_key};
+pub use kv::PluginKv;
 pub use manifest::read_manifest;
 pub use materializer::{NullStore, PluginMaterializer};
 pub use registry::{ActivationRow, PluginAddr, PluginInfo, PluginRegistry};
@@ -56,10 +56,19 @@ pub enum PluginError {
     Capability(String),
     #[error("kv: invalid key: {0}")]
     KvKey(String),
+    /// A 409: the key is a directory of other keys, or under a key that
+    /// is a value (#14). The string is the key.
+    #[error(
+        "kv: key {0:?} conflicts with an existing key: a key cannot be both a value and a directory of other keys"
+    )]
+    KvConflict(String),
     #[error("plugin is not active for agent {0}")]
     NotActive(String),
     #[error("{path}: {message}")]
     Kv { path: PathBuf, message: String },
+    /// A 503: the daemon cannot do it yet; the same call later can.
+    #[error("{0}")]
+    Unavailable(String),
     /// A 409: the plugin set is not this path's to change (Spec O §23.2).
     #[error("{0}")]
     Managed(String),

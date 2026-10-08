@@ -238,6 +238,26 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
         ("payments/backend/bob".to_string(), keys)
     );
 
+    // `PluginAction::validate`'s refusals answer as the daemon's route
+    // does (the same message as events_it.rs's over-cap case)
+    let over = PluginAction::SendText {
+        text: "x".repeat(balerix_api::MAX_SEND_TEXT + 1),
+        submit: true,
+    };
+    let e = host
+        .action("payments/backend/bob", &over)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "daemon: HTTP 400: text: expected at most {} bytes, got {}",
+            balerix_api::MAX_SEND_TEXT,
+            balerix_api::MAX_SEND_TEXT + 1
+        )
+    );
+    assert_eq!(fake.actions().len(), 2, "a refused action is not recorded");
+
     let bytes = b64(fx["kv-put"]["raw"].as_str().unwrap());
     host.kv_put("state/payments/backend/bob", &bytes, false)
         .await
@@ -250,6 +270,77 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
         serde_json::to_value(host.kv_list("state/").await.unwrap()).unwrap(),
         fx["kv-list"]["response"]["keys"]
     );
+
+    // the daemon's kv query and key grammar, on the wire
+    let resp = c
+        .get(format!("{}/v1/plugin-host/kv?prefix=&bogus=1", fake.url))
+        .bearer_auth("tok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400, "unknown query fields refused");
+    let resp = c
+        .get(format!("{}/v1/plugin-host/kv/a%2F..%2Fb", fake.url))
+        .bearer_auth("tok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({ "error": "kv: invalid key: segment \"..\" is not allowed" })
+    );
+    // `kv/` with no key is the same 400 (#14)
+    let resp = c
+        .get(format!("{}/v1/plugin-host/kv/", fake.url))
+        .bearer_auth("tok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({ "error": "kv: invalid key: empty" })
+    );
+    // a key cannot be both a value and a directory of other keys (#14)
+    let e = host
+        .kv_put("state/payments", b"x", false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "daemon: HTTP 409: kv: key \"state/payments\" conflicts with an existing key: a key cannot be both a value and a directory of other keys"
+    );
+    let e = host
+        .kv_put("state/payments/backend/bob/x", b"x", false)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().starts_with("daemon: HTTP 409: "), "{e}");
+    // a body that is not JSON keeps axum's 415, as on the daemon (#14)
+    let resp = c
+        .post(format!(
+            "{}/v1/plugin-host/agents/payments/backend/bob/actions",
+            fake.url
+        ))
+        .bearer_auth("tok")
+        .header("content-type", "text/plain")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 415);
+    // and `Host` refuses the same keys without a round trip, `.` and `..`
+    // included (the URL parser would resolve those away)
+    for key in [".", "..", "a/../b", "", "a b"] {
+        let e = host.kv_get(key).await.unwrap_err();
+        assert!(
+            e.to_string()
+                .starts_with("daemon: HTTP 400: kv: invalid key: "),
+            "{key:?}: {e}"
+        );
+        assert!(host.kv_put(key, b"x", false).await.is_err(), "{key:?}");
+        assert!(host.kv_delete(key).await.is_err(), "{key:?}");
+    }
 
     let diff: WorkspaceDiff =
         serde_json::from_value(fx["workspace-diff"]["response"].clone()).unwrap();

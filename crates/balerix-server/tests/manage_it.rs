@@ -286,6 +286,16 @@ async fn the_manage_routes_refuse_bad_names_bodies_and_flags() {
         (s, v["error"].as_str()),
         (400, Some("name: \"g\" does not match the fleet f"))
     );
+    // the admin routes' rejection statuses (#14): a body that is not
+    // JSON at all keeps axum's 415
+    let auth = format!("Bearer {gh_tok}");
+    let (s, _, text) = w.api.raw(
+        "PUT",
+        "/v1/plugin-host/fleets/f",
+        &[("Authorization", &auth), ("content-type", "text/plain")],
+        Some(b"{}"),
+    );
+    assert_eq!(s, 415, "{text}");
     assert!(
         w.h.resolver.calls().is_empty(),
         "nothing above reached the resolver"

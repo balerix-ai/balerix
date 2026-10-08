@@ -5,10 +5,12 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Writes `bytes` to `path` via a sibling temp file and rename, created
 /// 0600 from the start, parent directory created if missing. The temp
-/// name is `.{name}.tmp~{pid}`: `~` is outside every validated key
+/// name is `.{name}.tmp~{pid}-{n}`, `n` a process-wide counter, so two
+/// concurrent writes of one path never share a temp file. `~` is outside every validated key
 /// alphabet in this crate (e.g. `plugins::kv`'s `[A-Za-z0-9._/-]`), so a
 /// caller that lists a directory by validated name can never mistake a
 /// real entry for this leftover.
@@ -21,7 +23,10 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .file_name()
         .ok_or_else(|| io::Error::other("path has no file name"))?
         .to_string_lossy();
-    let tmp = dir.join(format!(".{name}.tmp~{}", std::process::id()));
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.tmp~{}-{n}", std::process::id()));
+    // only a dead process with this pid can have left this name
     let _ = fs::remove_file(&tmp);
     let mut f = OpenOptions::new()
         .write(true)
@@ -32,7 +37,11 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     f.sync_all()?;
     drop(f);
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, path)
+    // a rename onto a directory fails (the kv store's collisions, #14);
+    // the temp file must not stay behind
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 #[cfg(test)]

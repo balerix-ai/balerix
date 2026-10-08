@@ -77,6 +77,12 @@ pub enum Msg {
     },
     /// The sidecar's link closed and no newer one replaced it.
     LinkDown { agent: AgentId },
+    /// Runs a pass and answers whether one ran: `false` when it was
+    /// skipped because the daemon pool is not ready (Spec F §5). Every
+    /// message queued before it, and the pass each one started, is done
+    /// by then; `PluginHost::purge` uses it to wait for a pass that saw
+    /// the plugin's removal (#1).
+    Barrier { reply: oneshot::Sender<bool> },
 }
 
 #[derive(Clone)]
@@ -308,7 +314,13 @@ impl Actor {
                     }
                     self.publish();
                 }
-                None => self.pass().await,
+                Some(Msg::Barrier { reply }) => {
+                    let ran = self.pass().await;
+                    let _ = reply.send(ran);
+                }
+                None => {
+                    self.pass().await;
+                }
             }
             if matches!(self.record.desired, Desired::Down { purge: true, .. })
                 && self.record.is_down()
@@ -509,16 +521,18 @@ impl Actor {
         self.publish();
     }
 
-    async fn pass(&mut self) {
+    /// `false` when the pass was skipped (the daemon pool not ready).
+    async fn pass(&mut self) -> bool {
         if self.ports.kube.is_some() {
-            return self.mirror_pass().await;
+            self.mirror_pass().await;
+            return true;
         }
         // Spec F §5: the daemon pool is a precondition, not the fleet's
         // fault. Skip the pass and leave status alone; a crew marked failed
         // here would move restart counters for a daemon-level condition.
         if *self.shared.system_pool.borrow() != SystemPoolState::Ready {
             tracing::debug!(fleet = %self.name, "skipping the pass: daemon mise pool not ready");
-            return;
+            return false;
         }
         let ports = self.ports.clone();
         let name = self.name.clone();
@@ -611,6 +625,7 @@ impl Actor {
         }
         self.persist().await;
         self.publish();
+        true
     }
 
     async fn persist(&self) {

@@ -1,6 +1,7 @@
 //! Over-limit request bodies (#116): the same drain as the daemon's
 //! `balerix_server::body_limit`, for the plugin's own listener (the SDK
-//! depends on `balerix-api` only, so it keeps its own copy).
+//! depends on `balerix-api` only, so it keeps its own copy; so does the
+//! agent sidecar, `agent/src/body_limit.rs`).
 //!
 //! axum refuses a body the moment it has read past the route's
 //! `DefaultBodyLimit`, and the connection is then closed with the rest of
@@ -16,8 +17,8 @@
 //!   answers it as over the limit, so the client reads that answer after
 //!   its last byte; a body without a length that turns out to fit is
 //!   handed on as read, and one that runs past the ceiling, or is still
-//!   arriving after [`DRAIN_TIME`], is answered then and the connection
-//!   closed.
+//!   arriving after [`DRAIN_TIME`], is answered then (408 for the time)
+//!   and the connection closed.
 //!
 //! "Answered as over the limit" means the route's own handler runs on a
 //! stand-in body one byte over the limit: whatever the route answers an
@@ -101,7 +102,9 @@ pub(crate) async fn drain_over_limit(
     match tokio::time::timeout(drain.time, read(body, limit, ceiling, keep)).await {
         Ok(Read::Fits(kept)) => next.run(Request::from_parts(parts, Body::from(kept))).await,
         Ok(Read::Over) => next.run(over_limit(parts, limit)).await,
-        Ok(Read::PastCeiling) | Err(_) => closing(next.run(over_limit(parts, limit)).await),
+        Ok(Read::PastCeiling) => closing(next.run(over_limit(parts, limit)).await),
+        // still arriving, under the ceiling so far: not the route's 413
+        Err(_) => timed_out(drain.time),
         Ok(Read::Broken(e)) => {
             let error = format!("Failed to read the request body: {e}");
             closing((StatusCode::BAD_REQUEST, Json(ErrorBody { error })).into_response())
@@ -166,6 +169,13 @@ fn over_limit(mut parts: Parts, limit: usize) -> Request {
     parts.headers.remove(TRANSFER_ENCODING);
     parts.headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
     Request::from_parts(parts, Body::from(Bytes::from(vec![b' '; len])))
+}
+
+/// A body still arriving when the drain time is up (lane H review): a
+/// 408 that says so, the rest left unread.
+pub(crate) fn timed_out(time: Duration) -> Response {
+    let error = format!("body not received within {time:?}");
+    closing((StatusCode::REQUEST_TIMEOUT, Json(ErrorBody { error })).into_response())
 }
 
 /// The rest of the body is not read: the connection cannot be reused.

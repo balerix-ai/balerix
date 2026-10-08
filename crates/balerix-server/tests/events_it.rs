@@ -403,12 +403,77 @@ async fn host_routes_are_gated_by_needs_and_kv_and_actions_work() {
         !on_disk.windows(6).any(|x| x == b"s3cret"),
         "sealed on disk"
     );
-    let e = host.kv_get("../x").await.unwrap_err();
+    // the daemon's own check (`Host` refuses these keys before sending)
+    let flow_token = token(&w, "flow").await;
+    let (s, v) = w
+        .api
+        .plugin(&flow_token, "GET", "/v1/plugin-host/kv/..%2Fx", None);
+    assert_eq!(s, 400, "{v}");
     assert!(
-        e.to_string()
-            .starts_with("daemon: HTTP 400: kv: invalid key"),
-        "{e}"
+        v["error"].as_str().unwrap().starts_with("kv: invalid key"),
+        "{v}"
     );
+    // `kv/` with no key is the same JSON 400, after authentication (#14)
+    for method in ["GET", "PUT", "DELETE"] {
+        let (s, v) = w
+            .api
+            .plugin(&flow_token, method, "/v1/plugin-host/kv/", None);
+        assert_eq!(
+            (s, v),
+            (400, json!({ "error": "kv: invalid key: empty" })),
+            "{method}"
+        );
+        let (s, v) = w.api.plugin("nope", method, "/v1/plugin-host/kv/", None);
+        assert_eq!(
+            (s, v),
+            (401, json!({ "error": "unknown plugin or bad token" })),
+            "{method}"
+        );
+    }
+    // a key that is a directory of other keys, or under one that is a
+    // value, cannot be written, and reads and deletes as absent (#14)
+    host.kv_put("c", b"v", false).await.unwrap();
+    let (s, v) = w.api.raw_put(&flow_token, "/v1/plugin-host/kv/c%2Fd", b"x");
+    assert_eq!(s, 409, "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("conflicts with an existing key"),
+        "{v}"
+    );
+    assert_eq!(host.kv_get("c/d").await.unwrap(), None);
+    host.kv_delete("c/d").await.unwrap();
+    host.kv_put("e/f", b"v", false).await.unwrap();
+    let e = host.kv_put("e", b"x", false).await.unwrap_err();
+    assert!(e.to_string().starts_with("daemon: HTTP 409: "), "{e}");
+    assert_eq!(host.kv_get("e").await.unwrap(), None);
+    host.kv_delete("e").await.unwrap();
+    assert_eq!(
+        host.kv_get("e/f").await.unwrap().as_deref(),
+        Some(&b"v"[..]),
+        "the key under it is untouched"
+    );
+    assert_eq!(
+        host.kv_list("").await.unwrap(),
+        vec![
+            "c".to_string(),
+            "e/f".to_string(),
+            "state/f/c/a".to_string(),
+            "tok".to_string()
+        ],
+        "no temp file left behind"
+    );
+    // an action body that is not JSON keeps axum's 415, as on the admin
+    // routes (#14)
+    let auth = format!("Bearer {flow_token}");
+    let (s, _, text) = w.api.raw(
+        "POST",
+        "/v1/plugin-host/agents/f/c/a/actions",
+        &[("Authorization", &auth), ("content-type", "text/plain")],
+        Some(b"{}"),
+    );
+    assert_eq!(s, 415, "{text}");
     host.kv_delete("tok").await.unwrap();
     assert_eq!(host.kv_get("tok").await.unwrap(), None);
     host.action("f/c/a", &PluginAction::Stop).await.unwrap();
@@ -517,11 +582,11 @@ async fn an_over_cap_send_text_is_a_400_naming_the_field_and_types_nothing() {
     );
 }
 
-/// #116: a body over a route's limit is read to the end (up to four
-/// times the limit) before the answer, so a client that writes the
-/// whole body first still reads it — the answer each route gives today
-/// (`hello` maps every body rejection to 400). Past four times the limit
-/// the answer comes at once, without reading the body.
+/// #116, #168: a body over a route's limit is read to the end (up to
+/// four times the limit) before the answer, so a client that writes the
+/// whole body first still reads it: a 413 on every route, the plugin
+/// mount included. Past four times the limit the answer comes at once,
+/// without reading the body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_limited_route_answers_a_client_that_sends_the_whole_body() {
     // A small receive buffer: without the drain, the bytes the server
@@ -547,11 +612,34 @@ async fn every_limited_route_answers_a_client_that_sends_the_whole_body() {
         .unwrap();
     let flow = token(&w, "flow").await;
     let admin = w.api.token().to_string();
-    let routes: [(&str, &str, &str, usize, u16); 4] = [
+    // web serves routes: ready, so the mount reads the body itself
+    struct Bare;
+    impl Plugin for Bare {}
+    let web = token(&w, "web").await;
+    let (listener, listen) = bind().await.unwrap();
+    let web_token = web.clone();
+    tokio::spawn(async move { run(listener, Arc::new(Bare), &web_token, None).await });
+    let env = Env {
+        api_url: w.api.base.clone(),
+        name: "web".into(),
+        token: web,
+        scratch: w.dir.path().join("web-scratch"),
+        ca: None,
+        tls: None,
+        listen: "127.0.0.1:0".into(),
+        revision: None,
+    };
+    Host::new(env)
+        .unwrap()
+        .hello("0.1.0", &listen, None)
+        .await
+        .unwrap();
+    let routes: [(&str, &str, &str, usize, u16); 5] = [
         ("POST", "/v1/fleets", &admin, 4 << 20, 413),
         ("POST", "/v1/agents/f/c/a/events", &secret, 1 << 20, 413),
-        ("POST", "/v1/plugin-host/hello", &flow, 64 << 10, 400),
+        ("POST", "/v1/plugin-host/hello", &flow, 64 << 10, 413),
         ("PUT", "/v1/plugin-host/kv/big", &flow, 1 << 20, 413),
+        ("POST", "/v1/plugins/web/upload", &admin, 1 << 20, 413),
     ];
     for (method, path, token, limit, want) in routes {
         let cases = [
@@ -621,11 +709,12 @@ async fn every_limited_route_answers_a_client_that_sends_the_whole_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bad_token_is_answered_before_an_over_limit_body_is_read() {
     let w = world().await;
-    let routes: [(&str, &str, usize); 4] = [
+    let routes: [(&str, &str, usize); 5] = [
         ("POST", "/v1/fleets", 4 << 20),
         ("POST", "/v1/agents/f/c/a/events", 1 << 20),
         ("POST", "/v1/plugin-host/hello", 64 << 10),
         ("PUT", "/v1/plugin-host/kv/big", 1 << 20),
+        ("POST", "/v1/plugins/web/upload", 1 << 20),
     ];
     for (method, path, limit) in routes {
         let base = w.api.base.clone();

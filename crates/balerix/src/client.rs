@@ -227,6 +227,18 @@ impl Client {
 mod tests {
     use super::*;
 
+    /// #1: a purge that runs to its deadline answers the daemon's own
+    /// `plugin <name> is still stopping`, not this client's timeout.
+    #[test]
+    fn the_purge_wait_ends_before_the_client_gives_up() {
+        let wait = balerix_server::plugins::host::PURGE_WAIT;
+        assert!(wait < TIMEOUT, "{wait:?} vs {TIMEOUT:?}");
+        assert!(
+            TIMEOUT - wait >= Duration::from_secs(5),
+            "room for the purge itself"
+        );
+    }
+
     #[test]
     fn endpoint_prefers_flag_then_env_then_file() {
         let dir = tempfile::tempdir().unwrap();

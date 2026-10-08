@@ -124,6 +124,7 @@ impl Api {
         let mut req = match method {
             "GET" => agent.get(&url).force_send_body(),
             "POST" => agent.post(&url),
+            "PUT" => agent.put(&url),
             _ => unreachable!(),
         };
         for (k, v) in headers {

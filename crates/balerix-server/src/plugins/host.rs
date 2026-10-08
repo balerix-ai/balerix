@@ -36,9 +36,10 @@ pub struct PluginHostConfig {
     pub install_root: PathBuf,
 }
 
-/// How long `purge` waits for the actor to finish stopping the plugin
-/// before refusing to delete its state.
-const PURGE_WAIT: Duration = Duration::from_secs(30);
+/// How long `purge` waits for the actor to run a pass and finish stopping
+/// the plugin before refusing to delete its state. Below the CLI's 30 s
+/// request timeout, so a purge that runs out answers its own error (#1).
+pub const PURGE_WAIT: Duration = Duration::from_secs(20);
 
 /// Waits until `id` is absent from the published record. `Err(())` on
 /// timeout; a closed channel means the actor is gone and nothing of it is
@@ -292,6 +293,10 @@ impl PluginHost {
             .materializer
             .get(name)
             .ok_or(DaemonError::Unauthorized)?;
+        // Unreachable over HTTP: `plugin_hello` takes `name` from
+        // `req.name` itself (the token is then checked against that
+        // plugin), and names are not normalised. It guards a direct
+        // caller that passes a name and a request that disagree.
         if req.name != name.as_str() {
             return Err(DaemonError::Invalid(format!(
                 "hello.name: {:?} does not match the token's plugin {:?}",
@@ -366,23 +371,44 @@ impl PluginHost {
     /// Deletes `plugins/<name>/` through the materializer and the installed
     /// packages under `install_root/<name>/`.
     ///
-    /// Holds the sync lock and waits for the actor to have taken the agent
-    /// out of the record before deleting: the actor answers `Apply` before
-    /// running the pass that stops the plugin, so a `sync` + `purge` pair
-    /// would otherwise delete `plugins/<name>/` out from under a process
-    /// that is still running.
+    /// Holds the sync lock and, within one `PURGE_WAIT`, waits for a pass
+    /// the actor runs after this request (`Msg::Barrier`), then for the
+    /// agent to be out of the record, before deleting. The actor answers
+    /// `Apply` before running the pass that stops the plugin, so a sync
+    /// then a purge would otherwise delete `plugins/<name>/` out from
+    /// under a process that is still running; and a window the record
+    /// never held (one that outlived a daemon restart) is only stopped by
+    /// a pass, which the record alone cannot show (#1).
     pub async fn purge(&self, name: &AgentName) -> Result<(), PluginError> {
         let _guard = self.syncing.lock().await;
         if self.materializer.get(name).is_some() {
             return Err(PluginError::StillDeclared(name.to_string()));
         }
+        let deadline = tokio::time::Instant::now() + PURGE_WAIT;
+        let stopping = || PluginError::Internal(format!("plugin {name} is still stopping"));
+        let gone = || PluginError::Internal("plugin actor is gone".into());
+        let (reply, rx) = oneshot::channel();
+        tokio::time::timeout_at(deadline, self.handle.tx.send(Msg::Barrier { reply }))
+            .await
+            .map_err(|_| stopping())?
+            .map_err(|_| gone())?;
+        let ran = tokio::time::timeout_at(deadline, rx)
+            .await
+            .map_err(|_| stopping())?
+            .map_err(|_| gone())?;
+        if !ran {
+            return Err(PluginError::Unavailable(format!(
+                "plugin {name}: the daemon's tool pool is not ready, so no reconcile pass ran and its window may still be running; nothing was deleted, try again once the pool is ready"
+            )));
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         wait_until_stopped(
             &mut self.handle.status.clone(),
             &plugin_id(name).to_string(),
-            PURGE_WAIT,
+            left,
         )
         .await
-        .map_err(|()| PluginError::Internal(format!("plugin {name} is still stopping")))?;
+        .map_err(|()| stopping())?;
         let materializer = self.materializer.clone();
         let packages = self.config.install_root.join(name.as_str());
         let name = name.clone();

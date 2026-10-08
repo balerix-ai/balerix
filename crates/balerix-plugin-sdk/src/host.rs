@@ -68,11 +68,14 @@ fn urlencode(s: &str) -> String {
     encode(s, |b| unreserved(b) || matches!(b, b'.' | b'/'))
 }
 
-/// A kv key as one path segment: `.` and `/` are escaped too. The URL
-/// parser resolves `.` and `..` segments (their `%2e` spellings
-/// included) while it builds the request, so an unescaped `../x` would
-/// leave for a different route instead of collecting the daemon's
-/// `kv: invalid key` (plugins spec §4.1).
+/// A kv key as one path segment: `/` is escaped, and `.` too, so a key
+/// with a `..` segment inside it (`a/../b` → `a%2F%2E%2E%2Fb`) is one
+/// segment the URL parser leaves alone and the daemon's grammar refuses.
+/// A key that is exactly `.` or `..` is not saved by this: the parser
+/// resolves those segments, `%2E` spellings included, and the request
+/// would reach `kv/` instead. That is why every kv method checks the key
+/// against `balerix_api::check_kv_key` first (`key_url`). A reverse
+/// proxy in front of the daemon must keep `%2F` encoded.
 fn path_encode(s: &str) -> String {
     encode(s, unreserved)
 }
@@ -101,8 +104,23 @@ impl Host {
         &self.env
     }
 
+    /// Fleet names and agent ids go into paths as they are: their
+    /// grammars (`[a-z0-9-]` segments, `/` only between an id's three
+    /// parts) leave nothing to encode, and a malformed one is the
+    /// daemon's 404 or 400 to answer.
     fn url(&self, path: &str) -> String {
         format!("{}/v1/plugin-host/{path}", self.env.api_url)
+    }
+
+    /// `kv/{key}`, or the daemon's own 400 for a key outside the grammar
+    /// without the round trip: a bare `.` or `..` could not reach the
+    /// daemon's check at all (`path_encode`).
+    fn key_url(&self, key: &str) -> Result<String, SdkError> {
+        balerix_api::check_kv_key(key).map_err(|why| SdkError::Status {
+            status: 400,
+            message: format!("kv: invalid key: {why}"),
+        })?;
+        Ok(self.url(&format!("kv/{}", path_encode(key))))
     }
 
     /// Sends with the bearer; `Ok((status, bytes))` for any status.
@@ -236,9 +254,7 @@ impl Host {
     }
 
     pub async fn kv_get(&self, key: &str) -> Result<Option<Vec<u8>>, SdkError> {
-        let (status, bytes) = self
-            .send(self.http.get(self.url(&format!("kv/{}", path_encode(key)))))
-            .await?;
+        let (status, bytes) = self.send(self.http.get(self.key_url(key)?)).await?;
         match status {
             200..=299 => Ok(Some(bytes)),
             404 => Ok(None),
@@ -249,19 +265,16 @@ impl Host {
     pub async fn kv_put(&self, key: &str, bytes: &[u8], secret: bool) -> Result<(), SdkError> {
         let req = self
             .http
-            .put(self.url(&format!("kv/{}?secret={secret}", path_encode(key))))
+            .put(format!("{}?secret={secret}", self.key_url(key)?))
             .header("content-type", "application/octet-stream")
             .body(bytes.to_vec());
         self.json::<serde_json::Value>(req).await.map(|_| ())
     }
 
     pub async fn kv_delete(&self, key: &str) -> Result<(), SdkError> {
-        self.json::<serde_json::Value>(
-            self.http
-                .delete(self.url(&format!("kv/{}", path_encode(key)))),
-        )
-        .await
-        .map(|_| ())
+        self.json::<serde_json::Value>(self.http.delete(self.key_url(key)?))
+            .await
+            .map(|_| ())
     }
 
     pub async fn kv_list(&self, prefix: &str) -> Result<Vec<String>, SdkError> {
@@ -667,6 +680,9 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(url.path(), "/v1/plugin-host/kv/%2E%2E%2Fx");
+        // multibyte: every UTF-8 byte is escaped on its own
+        assert_eq!(path_encode("ä/€"), "%C3%A4%2F%E2%82%AC");
+        assert_eq!(urlencode("ä €"), "%C3%A4%20%E2%82%AC");
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 //! running daemon, lists, purges, packages.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use balerix_api::{
@@ -16,6 +17,7 @@ use crate::cli::{
     ApiOnlyArgs, ListArgs, PluginInstallArgs, PluginOpenArgs, PluginPackageArgs, PluginRemoveArgs,
 };
 use crate::client::{Client, NOT_RUNNING};
+use crate::commands::fleet::{parse_duration, wait_purged};
 use crate::wiring::layout_from_env;
 
 const NOT_SYNCED: &str = "daemon not running; `balerix serve` syncs plugins at start\n";
@@ -246,17 +248,23 @@ pub fn list_command(args: &ListArgs) -> Result<String> {
 }
 
 pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
+    // parsed before anything changes: a bad value leaves plugins.yaml be
+    let timeout = parse_duration(&args.timeout)?;
     let path = plugins_file_path()?;
     let mut file = load_file(&path)?;
-    if should_bail(remove_entry(&mut file, &args.name), args.purge) {
+    let removed = remove_entry(&mut file, &args.name);
+    if should_bail(removed, args.purge) {
         bail!(
             "plugin {:?} is not declared in {}",
             args.name,
             path.display()
         );
     }
-    save_file(&path, &file)?;
+    if removed {
+        save_file(&path, &file)?;
+    }
     if args.purge {
+        let deadline = Instant::now() + timeout;
         let client = Client::connect(args.api_url.as_deref())
             .map_err(|e| anyhow!("{e}; --purge needs a running daemon (the entry was removed)"))?;
         // Spec L-6: the daemon downs the plugin's up fleets during the
@@ -269,7 +277,14 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
         // sync's `downed` would (it downs every undeclared owner's).
         let report = client.sync_plugins()?;
         let owned = owned_fleets(&client.list()?, &args.name);
-        let mut out = render_sync(&report);
+        // a retry (a plain `remove` first, or a purge that failed half
+        // way) finds the entry gone and purges what it left all the same
+        let mut out = if removed {
+            String::new()
+        } else {
+            format!("{} was already absent from plugins.yaml\n", args.name)
+        };
+        out.push_str(&render_sync(&report));
         for fleet in &owned {
             let result = client
                 .down(
@@ -280,7 +295,7 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
                         ..DownQuery::default()
                     },
                 )
-                .map(|_| ());
+                .and_then(|_| wait_purged(&client, fleet, deadline));
             out.push_str(&render_purge_result(fleet, result));
         }
         client.purge_plugin(&args.name)?;
@@ -420,6 +435,43 @@ mod tests {
         assert_eq!(
             render_purge_result("gh-acme-old", Err(anyhow!("fleet task is gone"))),
             "fleet gh-acme-old: fleet task is gone (purge failed)\n"
+        );
+    }
+
+    /// #169: `--purge` waits for each owned fleet's purge, as `down
+    /// --purge` does, with the same `--timeout` (5m); one that runs out
+    /// is reported like any other failure and the removal goes on.
+    #[test]
+    fn remove_takes_downs_timeout_and_reports_a_purge_that_ran_out() {
+        use clap::Parser;
+        let parsed = |argv: &[&str]| match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+            crate::cli::Command::Plugin {
+                command: crate::cli::PluginCommand::Remove(a),
+            } => a.timeout,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            parsed(&["balerix", "plugin", "remove", "gh", "--purge"]),
+            "5m"
+        );
+        assert_eq!(
+            parsed(&[
+                "balerix",
+                "plugin",
+                "remove",
+                "gh",
+                "--purge",
+                "--timeout",
+                "30s"
+            ]),
+            "30s"
+        );
+        assert_eq!(
+            render_purge_result(
+                "gh-acme-slow",
+                Err(anyhow!("timed out waiting for the purge of gh-acme-slow"))
+            ),
+            "fleet gh-acme-slow: timed out waiting for the purge of gh-acme-slow (purge failed)\n"
         );
     }
 

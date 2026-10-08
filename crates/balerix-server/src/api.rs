@@ -17,7 +17,7 @@ use balerix_api::{
     DownQuery, ErrorBody, FleetRequest, FleetSummary, HelloRequest, HelloResponse, PluginStatus,
     SessionRequest, SessionResponse, SyncReport,
 };
-use balerix_core::{AgentName, FleetName, FleetRecord, Keep, NameError};
+use balerix_core::{AgentName, FleetName, FleetRecord, Keep, NameError, plugin_id};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -102,7 +102,8 @@ impl From<PluginError> for ApiError {
             PluginError::Fetch { .. } => StatusCode::BAD_GATEWAY,
             PluginError::Capability(_) => StatusCode::FORBIDDEN,
             PluginError::NotActive(_) => StatusCode::NOT_FOUND,
-            PluginError::Managed(_) => StatusCode::CONFLICT,
+            PluginError::Managed(_) | PluginError::KvConflict(_) => StatusCode::CONFLICT,
+            PluginError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             PluginError::Io { .. } | PluginError::Internal(_) | PluginError::Kv { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -304,13 +305,13 @@ fn fleet_name(s: &str) -> Result<FleetName, ApiError> {
         .map_err(|e: balerix_core::NameError| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))
 }
 
-/// Malformed JSON and a body that doesn't match `FleetRequest` (including
+/// Malformed JSON and a body that doesn't match its type (including
 /// an unknown field: `deny_unknown_fields`) are both a plain 400 — the
 /// spec's error table only names 400 for a bad request body. Only the
 /// rejections whose status carries information the client actually needs
 /// pass through axum's own: a missing/wrong `Content-Type` (415) and a
 /// body over the limit (413, via `BytesRejection`).
-fn body(b: Result<Json<FleetRequest>, JsonRejection>) -> Result<FleetRequest, ApiError> {
+pub(crate) fn body<T>(b: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     b.map(|Json(r)| r).map_err(|e| {
         let status = match &e {
             JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_) => {
@@ -467,10 +468,20 @@ async fn plugin_hello(
     let Some(token) = bearer(&headers) else {
         return Err(unauthorized());
     };
-    let req = b
-        .map(|Json(r)| r)
-        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    let req = body(b)?;
     let name: AgentName = req.name.parse().map_err(|_: NameError| unauthorized())?;
+    // The hook route's bucket, per plugin, once the caller is known to be
+    // this plugin (#6): an authenticated plugin cannot flood the actor
+    // with hellos. `plugin_hello` checks the token again.
+    if state.daemon.plugin_for_token(token).await.as_ref() != Some(&name) {
+        return Err(unauthorized());
+    }
+    if !state.limiter.allow(&plugin_id(&name).to_string()) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded",
+        ));
+    }
     state
         .daemon
         .plugin_hello(&name, token, req)
@@ -597,14 +608,16 @@ async fn proxied(state: &AppState, name: &str, req: Request) -> Response {
                 proxy::forward(state.daemon.proxy_client(), &addr, plugin.as_str(), req).await;
             (plugin.to_string(), resp)
         }
+        // Both answered without the body: at most `REFUSAL_READ` of it
+        // is read, so a small request keeps its connection (#168).
         Mount::NotReady(plugin) => {
             let e = ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("plugin {:?} is not ready", plugin.as_str()),
             );
-            (plugin.to_string(), e.into_response())
+            (plugin.to_string(), refuse(req, e.into_response()).await)
         }
-        Mount::Refused(e) => ("unknown".to_string(), e.into_response()),
+        Mount::Refused(e) => ("unknown".to_string(), refuse(req, e.into_response()).await),
     };
     state
         .daemon

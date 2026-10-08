@@ -340,20 +340,24 @@ credentials, hook input, or sandbox rules.
   `balerix-e2e-plugins-<pid>`, the flow e2e `balerix-e2e-flow-<pid>`).
 - A body over a route's limit is read to its end, up to four times the
   limit and for at most 10 s, before the route answers it
-  (`body_limit::drain_over_limit`, #116; the SDK keeps a copy): axum alone
+  (`body_limit::drain_over_limit`, #116; the SDK and the agent
+  sidecar's hook ingress keep copies, #168): axum alone
   answers 413 the moment it has read past the limit and the connection
   closes with the rest unread, so a client still writing got EPIPE in
-  place of the answer. Past four times the limit, or the time, the answer
-  comes at once with `Connection: close`, and a client still writing can
-  miss it. Authentication sits *outside* the drain (the auth
+  place of the answer. Past four times the limit the answer (413), and
+  after the time a 408, comes at once with `Connection: close`, and a
+  client still writing can miss it. Authentication sits *outside* the drain (the auth
   `route_layer` goes on after `limited`; the events route has
   `hooks::require_secret`, the plugin routes `require_plugin`): a caller
   that fails it is answered 401 having had at most 64 KiB of its body read
   (`body_limit::refuse`; more than that and the connection is closed
   unread). A limited router goes through `limited`, never a bare
   `DefaultBodyLimit`. The answer is the route's own: the middleware hands
-  the handler a stand-in body one byte over the limit, so `hello` still
-  answers 400. `api_it.rs::one_byte_over` sends exactly one byte over, on
+  the handler a stand-in body one byte over the limit, so a route's own 413 (and
+  its JSON body) is what the client reads. The plugin mount
+  (`proxy.rs::read_body`) is not a limited router, since it
+  authenticates inside its handler, and drains the same way itself
+  (#168); a refused or not-ready mount goes through `refuse`. `api_it.rs::one_byte_over` sends exactly one byte over, on
   a connection of its own (#79, #113), and
   `events_it.rs::every_limited_route_answers_a_client_that_sends_the_whole_body`
   sends it all.
@@ -382,8 +386,11 @@ credentials, hook input, or sandbox rules.
 - `plugin remove --purge` (and `down --purge`) used to answer 500 `Directory
   not empty` about one run in twenty: `tmux kill-window` returns before nono
   finishes writing its ledger under `plugins/<name>/nono/`. Fixed on both
-  sides — `PluginHost::purge` waits (30 s) for the actor to take the plugin
-  out of the record before deleting anything, and `Runtime::rm_rf` retries
+  sides — `PluginHost::purge` waits (20 s, under the CLI's 30 s
+  request timeout) for a pass the actor runs after the request
+  (`Msg::Barrier`; a window that outlived a restart is in no record) and
+  for the plugin to be out of the record before deleting anything, and
+  refuses while the daemon's tool pool is not ready (no pass can run, #1), and `Runtime::rm_rf` retries
   `remove_dir_all` for 5 s while the error is `DirectoryNotEmpty`.
 - `up` waits for plugin activations as well as `Ready`; a `fake=pending` in
   the timeout table means the plugin never said `hello` (look at

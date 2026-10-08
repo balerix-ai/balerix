@@ -378,6 +378,14 @@ credentials, hook input, or sandbox rules.
 - Plugin packages: `plugins.yaml` directory sources are used in place with no
   digest (development and the e2e); tarballs and URLs need `sha256` and
   unpack read-only under `$XDG_DATA_HOME/balerix/plugins/<name>/<digest12>/`.
+- A plugin manifest's `sandbox` block is an allowlist, unlike a fleet's
+  (`sandbox::check_plugin_sandbox`, #2): `filesystem` (the six grant lists
+  and `deny`), `network` minus its credential keys,
+  `security.ipc_mode`, and those inside `platform_overrides.<os>`. Paths are
+  absolute and literal (no `~`, `$`, `..`, globs), and no grant may reach the
+  state, data or config root outside the plugin's own grants. Anything else
+  fails the render with `sandbox.<key path>: not accepted`. Widening the list
+  means checking what the key lets nono's supervisor do outside the sandbox.
 - The daemon runs `mise trust` + `mise install` on the package's own
   `mise.toml` with `MISE_STATE_DIR` under the plugin's home; the sandbox uses
   the same dir, so if `mise run` says the config is untrusted, the two

@@ -12,7 +12,10 @@ use crate::launch::{hooks_port, outer_path};
 use crate::layout::{PluginPaths, StateLayout};
 use crate::materializer::{RenderOutcome, Runtime};
 use crate::quote::sh_quote;
-use crate::sandbox::{Grants, SYSTEM_READ, render_profile, validate_profile_at, write_profile_at};
+use crate::sandbox::{
+    Grants, PluginGrants, SYSTEM_READ, check_plugin_sandbox, render_profile, validate_profile_at,
+    write_profile_at,
+};
 use crate::tools::{Cmd, ToolPaths};
 
 /// Where mise's searches for config files must stop, colon-separated. Both
@@ -234,6 +237,21 @@ impl Runtime {
         let paths = self.layout.plugin(&plugin.name);
         write_plugin_home(&plugin.name, &paths)?;
         let env = plugin_env(plugin, &paths, &self.layout, &host.url, &host.secret);
+        // before anything is written from the manifest's block (#2)
+        let layout = &self.layout;
+        check_plugin_sandbox(
+            &id,
+            &plugin.manifest.sandbox,
+            &[
+                ("state", &layout.state_root),
+                ("data", &layout.data_root),
+                ("config", &layout.config_root),
+            ],
+            PluginGrants {
+                read_only: &[plugin.package.clone(), layout.mise_data_dir()],
+                read_write: &[paths.home.clone(), paths.scratch.clone()],
+            },
+        )?;
         let profile = render_profile(
             &id,
             &plugin_grants(

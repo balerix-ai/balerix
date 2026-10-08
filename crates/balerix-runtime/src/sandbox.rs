@@ -1,7 +1,7 @@
 //! The generated nono profile (Phase 2 spec §4.2 step 4, P2-5, P2-7).
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use balerix_core::{AgentId, MaterializeError};
 use serde_json::{Value, json};
@@ -410,6 +410,321 @@ fn check_security(
         ));
     }
     Ok(())
+}
+
+/// balerix's own trees, named for the error message: the state, data and
+/// config roots (`StateLayout`).
+pub type Roots<'a> = [(&'a str, &'a Path)];
+
+/// The grants balerix already gives a plugin under its roots, by access:
+/// a manifest entry inside one of them is not a reach into the roots.
+#[derive(Debug, Clone, Copy)]
+pub struct PluginGrants<'a> {
+    /// Read-only: the package and the mise pool. Only a `read` or
+    /// `read_file` entry is let through here.
+    pub read_only: &'a [PathBuf],
+    /// Read-write: `home/` and `scratch/`. Any level.
+    pub read_write: &'a [PathBuf],
+}
+
+/// What a plugin's `sandbox` block may set (#2). Everything else nono
+/// accepts reaches past the filesystem rules below: `extends`,
+/// `groups`, `packs`, `command_policies` (with its own `fs_read`),
+/// `workdir`, `hooks` and `session_hooks` (run outside the sandbox),
+/// credential capture and injection, raw Seatbelt rules, AF_UNIX socket
+/// grants, process inspection and capability elevation (nono 0.79.0's
+/// profile schema). The top level takes `filesystem`, `network`,
+/// `security` and `platform_overrides`; each patch the first three.
+/// `platform_overrides` names nono knows.
+const PLUGIN_OSES: &[&str] = &["linux", "macos", "windows"];
+/// Grant lists, checked against the roots, and `deny`, which grants
+/// nothing (checked as a literal path only). Not `bypass_protection`: on
+/// macOS it lifts nono's `deny_credentials` for `~/.ssh` and `~/.aws`.
+const PLUGIN_FS_KEYS: &[&str] = &[
+    "read",
+    "read_file",
+    "allow",
+    "allow_file",
+    "write",
+    "write_file",
+    "deny",
+];
+/// Ports, domains and proxies; never credentials (`credentials`,
+/// `custom_credentials` make nono's supervisor read a secret — a
+/// `file://` or `env://` one included — and hand it to an upstream the
+/// manifest names) nor TLS interception.
+const PLUGIN_NETWORK_KEYS: &[&str] = &[
+    "block",
+    "allow_http2",
+    "network_profile",
+    "allow_domain",
+    "deny_domain",
+    "open_port",
+    "open_port_range",
+    "connect_port",
+    "listen_port",
+    "listen_port_range",
+    "no_proxy",
+    "upstream_proxy",
+    "upstream_bypass",
+];
+/// `signal_mode` is refused by `check_conflicts` (#118); the rest of
+/// `security` would widen the sandbox at runtime (`process_info_mode`
+/// reads other processes, among them other plugins' tokens in their
+/// environment; `capability_elevation` with `approval_backends` lets a
+/// webhook grant paths) or degrade it (`wsl2_proxy_policy`).
+const PLUGIN_SECURITY_KEYS: &[&str] = &["ipc_mode", "signal_mode"];
+
+/// A plugin manifest's `sandbox` block (#2): only the keys above, and no
+/// filesystem grant that reaches balerix's own state, data or config —
+/// the daemon's token and vault, the fleet store, other plugins' trees
+/// and KV, every agent. Every path entry (top level and in
+/// `platform_overrides.<os>`) must be an absolute, literal path: no `~`,
+/// no `$`, no `..` and no glob (`*`, `?`, `[`, `{`), since nono would
+/// expand what balerix compares. A grant must not overlap a root in
+/// either direction, so `/` or the home holding the roots is refused as
+/// well, unless it lies inside a grant balerix already gives the plugin
+/// at that level (`grants`). The plugin's own `plugins/<name>/` is not
+/// one: `kv/` is reached through the API only. Both the path as written
+/// and as resolved (the longest existing prefix canonicalised, a
+/// dangling link followed) are compared, so a symlink into a root is
+/// caught; an entry is let through only if its resolved path is inside a
+/// resolved grant. Run on every render, so a symlink planted since the
+/// last one is seen; one planted between the render and nono's start
+/// (Landlock follows it then) is not, a gap the install-time trust in
+/// the package already covers. `security.signal_mode`, `environment` and `meta` are
+/// left to `check_conflicts`, which refuses them with their own messages.
+pub fn check_plugin_sandbox(
+    id: &AgentId,
+    user: &Value,
+    roots: &Roots<'_>,
+    grants: PluginGrants<'_>,
+) -> Result<(), MaterializeError> {
+    let conflict = |path: String, message: String| MaterializeError::SandboxConflict {
+        id: id.to_string(),
+        path,
+        message,
+    };
+    let Value::Object(u) = user else {
+        return Ok(());
+    };
+    let roots: Vec<(&str, [PathBuf; 2])> = roots
+        .iter()
+        .map(|(what, p)| (*what, [p.to_path_buf(), resolve_existing(p)]))
+        .collect();
+    let resolve = |ps: &[PathBuf]| ps.iter().map(|p| resolve_existing(p)).collect::<Vec<_>>();
+    let read_only = resolve(grants.read_only);
+    let read_write = resolve(grants.read_write);
+    let ctx = PluginCheck {
+        roots: &roots,
+        read_only: &read_only,
+        read_write: &read_write,
+    };
+    ctx.block(u, "", true).map_err(|(at, m)| conflict(at, m))
+}
+
+struct PluginCheck<'a> {
+    roots: &'a [(&'a str, [PathBuf; 2])],
+    read_only: &'a [PathBuf],
+    read_write: &'a [PathBuf],
+}
+
+type Refusal = (String, String);
+
+fn not_accepted(at: String) -> Refusal {
+    (at, "not accepted in a plugin's sandbox block".into())
+}
+
+fn object<'v>(v: &'v Value, at: &str) -> Result<&'v serde_json::Map<String, Value>, Refusal> {
+    v.as_object()
+        .ok_or_else(|| (at.to_string(), "expected an object".into()))
+}
+
+impl PluginCheck<'_> {
+    /// The top level (`top`) or one `platform_overrides.<os>` patch.
+    fn block(
+        &self,
+        u: &serde_json::Map<String, Value>,
+        prefix: &str,
+        top: bool,
+    ) -> Result<(), Refusal> {
+        for (key, value) in u {
+            let at = format!("{prefix}{key}");
+            match key.as_str() {
+                // `check_conflicts`' to refuse, with its own message
+                "environment" | "meta" if top => {}
+                "filesystem" => self.filesystem(object(value, &at)?, &at)?,
+                "network" => {
+                    for k in object(value, &at)?.keys() {
+                        if !PLUGIN_NETWORK_KEYS.contains(&k.as_str()) {
+                            return Err(not_accepted(format!("{at}.{k}")));
+                        }
+                    }
+                }
+                "security" => {
+                    for k in object(value, &at)?.keys() {
+                        if !PLUGIN_SECURITY_KEYS.contains(&k.as_str()) {
+                            return Err(not_accepted(format!("{at}.{k}")));
+                        }
+                    }
+                }
+                "platform_overrides" if top => {
+                    for (os, patch) in object(value, &at)? {
+                        let os_at = format!("{at}.{os}");
+                        if !PLUGIN_OSES.contains(&os.as_str()) {
+                            return Err(not_accepted(os_at));
+                        }
+                        self.block(object(patch, &os_at)?, &format!("{os_at}."), false)?;
+                    }
+                }
+                _ => return Err(not_accepted(at)),
+            }
+        }
+        Ok(())
+    }
+
+    fn filesystem(&self, fs: &serde_json::Map<String, Value>, at: &str) -> Result<(), Refusal> {
+        for (key, entries) in fs {
+            let list_at = format!("{at}.{key}");
+            if !PLUGIN_FS_KEYS.contains(&key.as_str()) {
+                return Err(not_accepted(list_at));
+            }
+            let Value::Array(items) = entries else {
+                return Err((list_at, "expected an array".into()));
+            };
+            for (i, item) in items.iter().enumerate() {
+                let entry_at = format!("{list_at}[{i}]");
+                let raw = entry_text(item).ok_or_else(|| {
+                    (
+                        entry_at.clone(),
+                        "expected a path string or { path, when }".to_string(),
+                    )
+                })?;
+                let path = literal_path(raw).map_err(|m| (entry_at.clone(), m))?;
+                if let Some(level) = level(key) {
+                    self.grant(raw, &path, level).map_err(|m| (entry_at, m))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One grant against the roots; the message on refusal.
+    fn grant(&self, raw: &str, path: &Path, level: &str) -> Result<(), String> {
+        let resolved = resolve_existing(path);
+        let forms = [path.to_path_buf(), resolved.clone()];
+        let inside = |gs: &[PathBuf]| gs.iter().any(|g| resolved.starts_with(g));
+        let granted = inside(self.read_write) || (level == "read" && inside(self.read_only));
+        for (what, root_forms) in self.roots {
+            for root in root_forms {
+                for entry in &forms {
+                    if root.starts_with(entry) {
+                        return Err(format!(
+                            "{raw} covers balerix's {what} root {}",
+                            root.display()
+                        ));
+                    }
+                    if entry.starts_with(root) && !granted {
+                        return Err(format!(
+                            "{raw} is inside balerix's {what} root {}; a plugin may name \
+                             only paths in its home/ or scratch/ there, or read its \
+                             package or the mise pool",
+                            root.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The path of a nono `ConditionalPath`: a string, or an object with a
+/// string `path` and at most a `when` beside it. Anything else is refused
+/// here rather than left to nono's validation.
+fn entry_text(v: &Value) -> Option<&str> {
+    match v {
+        Value::String(s) => Some(s),
+        Value::Object(m) if m.keys().all(|k| k == "path" || k == "when") => {
+            m.get("path").and_then(Value::as_str)
+        }
+        _ => None,
+    }
+}
+
+/// An entry nono will not expand: absolute, no `~`, `$`, `..` or glob.
+fn literal_path(raw: &str) -> Result<PathBuf, String> {
+    if raw.starts_with('~') {
+        return Err(format!("{raw}: `~` is not expanded; name an absolute path"));
+    }
+    if raw.contains('$') {
+        return Err(format!(
+            "{raw}: variables are not expanded; name an absolute path"
+        ));
+    }
+    if raw.contains(['*', '?', '[', '{']) {
+        return Err(format!(
+            "{raw}: glob patterns (`*`, `?`, `[`, `{{`) are not accepted; name a literal path"
+        ));
+    }
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(format!("{raw}: must be an absolute path"));
+    }
+    if path.components().any(|c| c == Component::ParentDir) {
+        return Err(format!("{raw}: must not contain `..`"));
+    }
+    Ok(path.to_path_buf())
+}
+
+/// `path` with its longest existing prefix canonicalised and the rest
+/// appended: what a symlink on the way actually names, for a path that
+/// may not exist yet. A dangling symlink on the way is followed to its
+/// target (up to 40 links, as the kernel does). Unchanged when nothing of
+/// it exists.
+fn resolve_existing(path: &Path) -> PathBuf {
+    resolve_links(path, 40)
+}
+
+fn resolve_links(path: &Path, links: u32) -> PathBuf {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        let finish = |base: PathBuf| rest.iter().rev().fold(base, |acc, part| acc.join(part));
+        if let Ok(canon) = std::fs::canonicalize(existing) {
+            return finish(canon);
+        }
+        if links > 0
+            && let Ok(target) = std::fs::read_link(existing)
+            && let Some(parent) = existing.parent()
+        {
+            let base = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            return resolve_links(&finish(lexical(&base.join(target))), links - 1);
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// `..` and `.` folded away without touching the filesystem: for a link
+/// target joined onto its canonical directory.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Writes the profile; returns whether its bytes changed.
@@ -983,5 +1298,443 @@ mod tests {
         assert_eq!(with["filesystem"]["read"], Value::Array(expected));
         assert_eq!(with["environment"], p["environment"]);
         assert_eq!(with["network"], p["network"]);
+    }
+
+    /// A real tree: the three roots, a plugin's grants under them, and
+    /// another plugin beside it (#2).
+    struct Reserved {
+        _dir: tempfile::TempDir,
+        top: PathBuf,
+        layout: StateLayout,
+        inside: Vec<PathBuf>,
+    }
+
+    impl Reserved {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let top = std::fs::canonicalize(dir.path()).unwrap();
+            let layout = StateLayout::xdg(top.join("state"), top.join("data"), top.join("config"));
+            let web = layout.plugin(&"web".parse().unwrap());
+            let package = layout.plugins_data_dir().join("web").join("0123456789ab");
+            for d in [
+                &web.home,
+                &web.scratch,
+                &web.kv,
+                &package,
+                &layout.config_root,
+            ] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            std::fs::create_dir_all(layout.plugin(&"other".parse().unwrap()).home).unwrap();
+            let inside = vec![
+                package,
+                web.home.clone(),
+                web.scratch.clone(),
+                layout.mise_data_dir(),
+            ];
+            Self {
+                _dir: dir,
+                top,
+                layout,
+                inside,
+            }
+        }
+
+        fn check(&self, user: Value) -> Result<(), MaterializeError> {
+            let id: AgentId = "balerix/plugins/web".parse().unwrap();
+            let l = &self.layout;
+            let roots: [(&str, &Path); 3] = [
+                ("state", &l.state_root),
+                ("data", &l.data_root),
+                ("config", &l.config_root),
+            ];
+            let read_only = [self.inside[0].clone(), self.inside[3].clone()];
+            let read_write = [self.inside[1].clone(), self.inside[2].clone()];
+            check_plugin_sandbox(
+                &id,
+                &user,
+                &roots,
+                PluginGrants {
+                    read_only: &read_only,
+                    read_write: &read_write,
+                },
+            )
+        }
+
+        fn refused(&self, user: Value) -> String {
+            let e = self.check(user).unwrap_err();
+            assert!(
+                matches!(e, MaterializeError::SandboxConflict { .. }),
+                "{e:?}"
+            );
+            e.to_string()
+                .replace(&self.top.display().to_string(), "<top>")
+        }
+    }
+
+    fn read(p: impl AsRef<Path>) -> Value {
+        json!({ "filesystem": { "read": [p.as_ref().display().to_string()] } })
+    }
+
+    #[test]
+    fn a_plugin_cannot_grant_itself_balerixs_own_roots() {
+        let r = Reserved::new();
+        let id = "balerix/plugins/web";
+        assert_eq!(
+            r.refused(read(r.layout.server_dir())),
+            format!(
+                "{id}: sandbox.filesystem.read[0]: <top>/state/server is inside balerix's \
+                 state root <top>/state; a plugin may name only paths in its home/ or \
+                 scratch/ there, or read its package or the mise pool"
+            )
+        );
+        // another plugin's tree, and its own `kv/`
+        let other = r.layout.plugin(&"other".parse().unwrap()).home;
+        assert!(
+            r.refused(read(&other))
+                .contains("inside balerix's state root")
+        );
+        let kv = r.layout.plugin(&"web".parse().unwrap()).kv;
+        assert!(r.refused(read(&kv)).contains("inside balerix's state root"));
+        assert!(
+            r.refused(read(r.layout.plugins_data_dir().join("other")))
+                .contains("inside balerix's data root")
+        );
+        assert!(
+            r.refused(read(r.layout.config_root.join("config.toml")))
+                .contains("inside balerix's config root")
+        );
+        // an ancestor of a root reaches it too
+        assert_eq!(
+            r.refused(json!({ "filesystem": { "allow": ["/"] } })),
+            format!("{id}: sandbox.filesystem.allow[0]: / covers balerix's state root <top>/state")
+        );
+        assert!(
+            r.refused(read(&r.top))
+                .contains("covers balerix's state root")
+        );
+    }
+
+    #[test]
+    fn every_grant_list_and_platform_override_is_walked() {
+        let r = Reserved::new();
+        let server = r.layout.server_dir().display().to_string();
+        for key in [
+            "read",
+            "allow",
+            "write",
+            "read_file",
+            "allow_file",
+            "write_file",
+        ] {
+            let e = r.refused(json!({ "filesystem": { key: ["/opt/ok", server] } }));
+            assert!(e.contains(&format!("sandbox.filesystem.{key}[1]: ")), "{e}");
+        }
+        let e = r.refused(json!({
+            "platform_overrides": { "linux": { "filesystem": { "read": [{ "path": server }] } } }
+        }));
+        assert!(
+            e.contains("sandbox.platform_overrides.linux.filesystem.read[0]: "),
+            "{e}"
+        );
+        // keys that grant nothing are not paths
+        r.check(json!({ "filesystem": { "deny": [server] } }))
+            .unwrap();
+    }
+
+    #[test]
+    fn paths_must_be_literal_and_absolute() {
+        let r = Reserved::new();
+        let pkg = r.inside[0].display().to_string();
+        for (entry, why) in [
+            ("~/.local/state/balerix", "`~` is not expanded"),
+            ("$HOME/x", "variables are not expanded"),
+            ("/opt/${X}", "variables are not expanded"),
+            ("relative/dir", "must be an absolute path"),
+            (&format!("{pkg}/../../other"), "must not contain `..`"),
+            ("/opt/../etc", "must not contain `..`"),
+        ] {
+            let e = r.refused(json!({ "filesystem": { "read": [entry] } }));
+            assert!(e.contains(why), "{entry}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_symlink_into_a_root_is_refused_by_where_it_leads() {
+        let r = Reserved::new();
+        let outside = r.top.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(r.layout.server_dir()).unwrap();
+        let link = outside.join("link");
+        std::os::unix::fs::symlink(r.layout.server_dir(), &link).unwrap();
+        assert!(
+            r.refused(read(&link))
+                .contains("inside balerix's state root"),
+            "the link itself"
+        );
+        assert!(
+            r.refused(read(link.join("token")))
+                .contains("inside balerix's state root"),
+            "a path that does not exist yet, beneath it"
+        );
+        // dangling: its target does not exist yet; relative, through `..`
+        let dangling = outside.join("dangling");
+        std::os::unix::fs::symlink("../state/managed/x", &dangling).unwrap();
+        assert!(
+            r.refused(read(&dangling))
+                .contains("inside balerix's state root"),
+            "a dangling link is followed to where it would lead"
+        );
+        // planted in the plugin's own home, pointing out of it
+        let home = &r.inside[1];
+        std::os::unix::fs::symlink(r.layout.fleets_dir(), home.join("fleets")).unwrap();
+        assert!(
+            r.refused(read(home.join("fleets")))
+                .contains("inside balerix's state root"),
+            "inside a grant as written, not as resolved"
+        );
+        // and a root reached through a symlinked ancestor of it
+        let alias = r.top.join("alias");
+        std::os::unix::fs::symlink(&r.top, &alias).unwrap();
+        assert!(
+            r.refused(read(alias.join("state")))
+                .contains("covers balerix's state root")
+        );
+    }
+
+    #[test]
+    fn the_plugins_own_grants_and_unrelated_paths_pass() {
+        let r = Reserved::new();
+        for p in &r.inside {
+            r.check(read(p.join("sub/file"))).unwrap();
+            r.check(read(p)).unwrap();
+        }
+        r.check(json!({
+            "filesystem": { "read": ["/opt/data", { "path": "/srv/x" }], "allow": ["/var/tmp/p"] },
+            "platform_overrides": { "macos": { "filesystem": { "read": ["/Library/X"] } } },
+            "network": { "block": true }
+        }))
+        .unwrap();
+        r.check(json!({})).unwrap();
+        r.check(Value::Null).unwrap();
+    }
+
+    /// nono expands `*` and `**` in grant paths (0.79.0), so a pattern
+    /// would reach a root the literal comparison never saw.
+    #[test]
+    fn glob_patterns_are_refused_in_every_path_list() {
+        let r = Reserved::new();
+        let top = r.top.display().to_string();
+        for entry in [
+            format!("{top}/st*/**"),
+            format!("{top}/state/*"),
+            "/home/*/.local/state/balerix/**".to_string(),
+            "/opt/data?".to_string(),
+            "/opt/[ab]".to_string(),
+            "/opt/{a,b}".to_string(),
+        ] {
+            for key in ["read", "allow_file", "deny"] {
+                let e = r.refused(json!({ "filesystem": { key: [entry] } }));
+                assert!(
+                    e.contains("glob patterns (`*`, `?`, `[`, `{`) are not accepted"),
+                    "{key} {entry}: {e}"
+                );
+            }
+        }
+        let e = r.refused(json!({
+            "platform_overrides": { "linux": { "filesystem": { "read": [format!("{top}/st*/**")] } } }
+        }));
+        assert!(
+            e.contains("sandbox.platform_overrides.linux.filesystem.read[0]: "),
+            "{e}"
+        );
+    }
+
+    /// Only `filesystem`, `network` and `security` (and per-OS patches of
+    /// them) are a plugin's: every other key nono accepts reaches past
+    /// the filesystem rules (`command_policies.commands.<cmd>.sandbox.fs_read`
+    /// read the daemon token).
+    #[test]
+    fn keys_outside_the_plugin_allowlist_are_refused_by_path() {
+        let r = Reserved::new();
+        let server = r.layout.server_dir().display().to_string();
+        let refused = [
+            (json!({ "extends": "default" }), "extends"),
+            (json!({ "groups": { "include": ["x"] } }), "groups"),
+            (json!({ "packs": ["a/b"] }), "packs"),
+            (json!({ "workdir": { "access": "readwrite" } }), "workdir"),
+            (json!({ "hooks": {} }), "hooks"),
+            (json!({ "session_hooks": {} }), "session_hooks"),
+            (json!({ "credential_capture": {} }), "credential_capture"),
+            (
+                json!({ "credential_providers": {} }),
+                "credential_providers",
+            ),
+            (
+                json!({ "unsafe_macos_seatbelt_rules": ["(allow default)"] }),
+                "unsafe_macos_seatbelt_rules",
+            ),
+            (
+                json!({ "command_policies": { "commands": { "cat": { "sandbox": { "fs_read": [server] } } } } }),
+                "command_policies",
+            ),
+            (json!({ "commands": {} }), "commands"),
+            (json!({ "binary": "/bin/sh" }), "binary"),
+            (
+                json!({ "filesystem": { "unix_socket": ["/run/x.sock"] } }),
+                "filesystem.unix_socket",
+            ),
+            (
+                json!({ "filesystem": { "unix_socket_subtree_bind": ["/run"] } }),
+                "filesystem.unix_socket_subtree_bind",
+            ),
+            (
+                json!({ "filesystem": { "bypass_protection": ["/x"] } }),
+                "filesystem.bypass_protection",
+            ),
+            (
+                json!({ "filesystem": { "suppress_save_prompt": ["/x"] } }),
+                "filesystem.suppress_save_prompt",
+            ),
+            (
+                json!({ "network": { "custom_credentials": { "x": { "upstream": "http://127.0.0.1:1", "credential_key": format!("file://{server}/token") } } } }),
+                "network.custom_credentials",
+            ),
+            (
+                json!({ "network": { "credentials": ["github"] } }),
+                "network.credentials",
+            ),
+            (
+                json!({ "network": { "tls_intercept": {} } }),
+                "network.tls_intercept",
+            ),
+            (
+                json!({ "security": { "process_info_mode": "allow_all" } }),
+                "security.process_info_mode",
+            ),
+            (
+                json!({ "security": { "capability_elevation": true } }),
+                "security.capability_elevation",
+            ),
+            (
+                json!({ "security": { "approval_backends": {} } }),
+                "security.approval_backends",
+            ),
+            (
+                json!({ "platform_overrides": { "linux": { "hooks": {} } } }),
+                "platform_overrides.linux.hooks",
+            ),
+            (
+                json!({ "platform_overrides": { "linux": { "environment": {} } } }),
+                "platform_overrides.linux.environment",
+            ),
+            (
+                json!({ "platform_overrides": { "linux": { "platform_overrides": {} } } }),
+                "platform_overrides.linux.platform_overrides",
+            ),
+            (
+                json!({ "platform_overrides": { "beos": {} } }),
+                "platform_overrides.beos",
+            ),
+        ];
+        for (block, at) in refused {
+            assert_eq!(
+                r.refused(block),
+                format!(
+                    "balerix/plugins/web: sandbox.{at}: not accepted in a plugin's sandbox block"
+                )
+            );
+        }
+        assert!(
+            r.refused(json!({ "network": [] }))
+                .ends_with("sandbox.network: expected an object")
+        );
+        // `check_conflicts` keeps its own messages for these
+        r.check(
+            json!({ "environment": {}, "meta": {}, "security": { "signal_mode": "allow_all" } }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_manifest_using_every_accepted_key_passes() {
+        let r = Reserved::new();
+        let home = r.inside[1].display().to_string();
+        let package = r.inside[0].display().to_string();
+        let fs = json!({
+            "read": [format!("{package}/lib"), { "path": "/opt/data", "when": "linux" }],
+            "read_file": ["/etc/hosts"],
+            "allow": [format!("{home}/cache")],
+            "allow_file": [format!("{home}/x.db")],
+            "write": ["/var/tmp/out"],
+            "write_file": ["/var/tmp/out.log"],
+            "deny": [r.layout.server_dir().display().to_string()],
+        });
+        let network = json!({
+            "block": false, "allow_http2": true, "network_profile": "dev",
+            "allow_domain": ["example.com"], "deny_domain": ["evil.example"],
+            "open_port": [8080], "open_port_range": [[9000, 9010]], "connect_port": [443],
+            "listen_port": [8081], "listen_port_range": [[9100, 9110]],
+            "no_proxy": [".internal"], "upstream_proxy": "proxy:3128", "upstream_bypass": ["*.corp"],
+        });
+        let security = json!({ "ipc_mode": "full" });
+        r.check(json!({
+            "filesystem": fs, "network": network, "security": security,
+            "platform_overrides": {
+                "linux": { "filesystem": fs, "network": network, "security": security },
+                "macos": { "filesystem": { "read": ["/Library/X"] } },
+                "windows": {},
+            }
+        }))
+        .unwrap();
+    }
+
+    /// The package and the pool are read-only grants: a writable entry
+    /// inside them is a reach into the root, whatever it resolves to
+    /// later (a `home/x` swapped for a link into the pool, say).
+    #[test]
+    fn an_exemption_holds_only_at_the_level_balerix_grants() {
+        let r = Reserved::new();
+        let (package, pool) = (&r.inside[0], &r.inside[3]);
+        for p in [package, pool] {
+            r.check(json!({ "filesystem": { "read": [p.join("x")], "read_file": [p.join("y")] } }))
+                .unwrap();
+            for key in ["allow", "allow_file", "write", "write_file"] {
+                let e = r.refused(json!({ "filesystem": { key: [p.join("x")] } }));
+                assert!(e.contains("is inside balerix's data root"), "{key}: {e}");
+            }
+        }
+        // a writable home entry that has become a link into the pool
+        std::fs::create_dir_all(pool).unwrap();
+        let link = r.inside[1].join("x");
+        std::os::unix::fs::symlink(pool, &link).unwrap();
+        assert!(
+            r.refused(json!({ "filesystem": { "allow": [link] } }))
+                .contains("is inside balerix's state root")
+        );
+        r.check(read(&link)).unwrap();
+    }
+
+    /// An entry that is not a nono `ConditionalPath` is refused here, not
+    /// skipped and left to nono's validation.
+    #[test]
+    fn a_path_entry_of_another_shape_is_refused() {
+        let r = Reserved::new();
+        for entry in [
+            json!(42),
+            json!(null),
+            json!(["/x"]),
+            json!({}),
+            json!({ "path": 1 }),
+            json!({ "path": "/x", "mode": "rw" }),
+        ] {
+            let e = r.refused(json!({ "filesystem": { "read": ["/ok", entry] } }));
+            assert!(
+                e.ends_with("sandbox.filesystem.read[1]: expected a path string or { path, when }"),
+                "{entry}: {e}"
+            );
+        }
+        r.check(json!({ "filesystem": { "deny": [{ "path": "/x", "when": ["linux"] }] } }))
+            .unwrap();
     }
 }

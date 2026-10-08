@@ -361,6 +361,7 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         ),
         "version is refused by the same check"
     );
+    assert!(!marker.exists(), "the filter ran under version");
     git(w, &["config", "--unset", "filter.pwn.clean"]);
     assert!(rt.diff(&id, "origin/main").is_ok(), "unset: diffs again");
 
@@ -381,6 +382,12 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         "{e}"
     );
     assert!(!marker.exists(), "the filter ran");
+    let e = rt.version(&id, "origin/main").unwrap_err();
+    assert!(
+        matches!(&e, WorkspaceError::Tool { subcommand, .. } if subcommand == "config"),
+        "version fails at the probe as diff does: {e:?}"
+    );
+    assert!(!marker.exists(), "the filter ran under version");
     git(w, &["config", "--unset", "include.path"]);
     let included = w.join(".git/included.config");
     std::fs::write(&included, &filter).unwrap();
@@ -458,6 +465,7 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         ),
         "version is refused by the same check"
     );
+    assert!(!marker.exists(), "the filter ran under version");
     git(w, &["config", "--unset", "remote.evil.promisor"]);
     assert!(rt.diff(&id, "origin/main").is_ok(), "unset: diffs again");
 
@@ -611,9 +619,9 @@ fn the_reader_runs_git_under_the_git_profile() {
     let calls: Vec<&str> = log.lines().filter(|l| l.starts_with("$ ")).collect();
     assert_eq!(
         calls.len(),
-        10,
+        7,
         "diff: the filter probe, status, merge-base, name-status, one combined \
-         patch, one --no-index; version: probe, status, merge-base, name-only (#108): {log}"
+         patch, one --no-index; version: one script (#108, #174): {log}"
     );
     for line in &calls {
         assert!(
@@ -624,6 +632,124 @@ fn the_reader_runs_git_under_the_git_profile() {
     assert!(
         !log.contains("+todo") && !log.contains("committed"),
         "the log keeps argv, not the diff: {log}"
+    );
+}
+
+/// #174: `version` is one sandboxed call — the filter probe, `merge-base`,
+/// the name-only diff and `status` in one `/bin/sh` under the git profile —
+/// logged as one argv-only `git.log` entry, and its fingerprint is the one
+/// the separate git calls give.
+#[test]
+fn version_is_one_sandboxed_call() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("inspect-version-once");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (id, layout) = clone_with_changes(&root, &tools);
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let w = &paths.workspace;
+    let log_path = crew.logs.join("git.log");
+    let rt = Runtime::new(layout.clone(), tools.clone());
+    // the profile is written (and validated) by the first call
+    rt.version(&id, "origin/main").unwrap();
+    std::fs::write(&log_path, "").unwrap();
+
+    let v = rt.version(&id, "origin/main").unwrap();
+    let calls = |log: &str| -> Vec<String> {
+        log.lines()
+            .filter(|l| l.starts_with("$ "))
+            .map(str::to_string)
+            .collect()
+    };
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let one = calls(&log);
+    assert_eq!(one.len(), 1, "one sandboxed call per version: {log}");
+    let profile_arg = format!("run --no-audit --profile {}", paths.git_profile.display());
+    assert!(one[0].contains(&profile_arg), "{}", one[0]);
+    assert!(one[0].contains("/bin/sh -c"), "{}", one[0]);
+    assert!(!log.contains("README"), "argv only, no stdout: {log}");
+
+    // the fingerprint the four separate calls would give
+    let head = git(w, &["rev-parse", "HEAD"]).trim().to_string();
+    let merge_base = git(w, &["merge-base", "origin/main", "HEAD"])
+        .trim()
+        .to_string();
+    let mut seen: std::collections::BTreeSet<String> =
+        git(w, &["diff", "--name-only", "-z", &merge_base])
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+    let status = balerix_runtime::inspect::parse_status(&git(
+        w,
+        &[
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--branch",
+            "--untracked-files=all",
+        ],
+    ));
+    seen.extend(status.changed);
+    seen.extend(status.untracked);
+    assert_eq!(
+        seen.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["LICENSE", "README", "notes.txt"]
+    );
+    let entries: Vec<balerix_runtime::inspect::PathStat> = seen
+        .into_iter()
+        .map(|path| {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::symlink_metadata(w.join(&path)).unwrap();
+            balerix_runtime::inspect::PathStat {
+                path,
+                stat: Some((m.len(), m.mtime(), m.mtime_nsec())),
+            }
+        })
+        .collect();
+    assert_eq!(v.head, head);
+    assert_eq!(
+        v.fingerprint,
+        balerix_runtime::inspect::fingerprint_of(&head, &merge_base, &entries)
+    );
+
+    // a refusal and a git failure are one call too, and keep their shape;
+    // README is wired to the filter, so a status or diff would run it
+    let marker = root.join("filter-ran");
+    let hook = root.join("filter.sh");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch {}\ncat\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(w.join(".gitattributes"), "README filter=pwn\n").unwrap();
+    git(
+        w,
+        &["config", "filter.pwn.clean", &hook.display().to_string()],
+    );
+    std::fs::write(&log_path, "").unwrap();
+    assert_eq!(
+        rt.version(&id, "origin/main"),
+        Err(WorkspaceError::Filter {
+            key: "filter.pwn.clean".into()
+        })
+    );
+    assert!(!marker.exists(), "the filter ran under version");
+    assert_eq!(calls(&std::fs::read_to_string(&log_path).unwrap()).len(), 1);
+    git(w, &["config", "--unset", "filter.pwn.clean"]);
+    std::fs::remove_file(w.join(".gitattributes")).unwrap();
+    let e = rt.version(&id, "origin/nope").unwrap_err();
+    assert!(
+        matches!(&e, WorkspaceError::Tool { subcommand, stderr, args, .. }
+            if subcommand == "merge-base" && stderr.contains("origin/nope")
+                && args.ends_with(&["merge-base".into(), "origin/nope".into(), "HEAD".into()])),
+        "{e:?}"
     );
 }
 

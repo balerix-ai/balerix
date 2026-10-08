@@ -272,9 +272,13 @@ credentials, hook input, or sandbox rules.
   call ends (`workspace::ScratchHome`): nono writes a session record per
   `run` under `$HOME`, and the agent's own `nono/` holds its live
   session's, so those could never be swept there. Each call is a sandbox start (about 55 ms idle, far
-  more on a loaded host), so the reader's `version` is four calls and its
-  `diff` one combined `git diff -U3` split per file (`split_patch`), plus
-  one `--no-index` per untracked file; keep it that way. Tests that run git in an existing
+  more on a loaded host), so the reader's `version` is one call (#174: its
+  four git commands run in one `/bin/sh` under the profile,
+  `workspace::sandboxed_git_script`; the script is a constant and every
+  value, git's path and the base ref included, is a positional argument)
+  and its `diff` one combined `git diff -U3` split per file
+  (`split_patch`), plus one `--no-index` per untracked file; keep it that
+  way. Tests that run git in an existing
   clone need Landlock and gate on `support::landlock_works`. Go through
   `Workspace::prepare_sandbox` before the first sandboxed call: it writes
   the profile, then runs one `git version` that must exit 0. The yes/no

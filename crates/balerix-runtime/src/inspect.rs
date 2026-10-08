@@ -19,7 +19,7 @@ use balerix_core::{AgentId, MaterializeError, WorkspaceError, WorkspaceReader};
 use crate::layout::{AgentPaths, CrewPaths};
 use crate::materializer::Runtime;
 use crate::sandbox::write_git_profile;
-use crate::workspace::{GitLog, sandboxed_git, sandboxed_git_streaming};
+use crate::workspace::{GitLog, sandboxed_git, sandboxed_git_script, sandboxed_git_streaming};
 
 /// Command-line config beats every config file: whatever an agent wrote
 /// into its clone's `.git/config`, no program runs from it here (the rest
@@ -383,13 +383,6 @@ fn patch_header(file: &FileDiff) -> Option<String> {
     (plain(old) && plain(&file.path)).then(|| format!("diff --git a/{old} b/{}", file.path))
 }
 
-fn split_z(s: &str) -> BTreeSet<String> {
-    s.split('\0')
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 /// `diff --name-status -z --find-renames` → one `FileDiff` per record,
 /// patches empty. `R`/`C` records carry two paths; a torn pair ends the
 /// parse.
@@ -520,30 +513,116 @@ fn confine(workspace: &Path, full: &Path) -> Result<(), WorkspaceError> {
 /// the repository config names a program git would run.
 #[allow(clippy::type_complexity)]
 fn refuse_filters(
+    id: &str,
     git: &dyn Fn(&[&str], &[i32]) -> Result<String, WorkspaceError>,
 ) -> Result<(), WorkspaceError> {
-    let filters = git(
-        &[
-            "config",
-            "--local",
-            "--includes",
-            "--name-only",
-            "--get-regexp",
-            FILTER_KEYS,
-        ],
-        &[0, 1],
-    )?;
-    match filters
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|k| !k.is_empty())
-    {
-        Some(key) => Err(WorkspaceError::Filter {
-            key: key.to_string(),
+    let mut args = PROBE.to_vec();
+    args.push(FILTER_KEYS);
+    let filters = git(&args, &[0, 1])?;
+    match filter_key(&filters) {
+        Some(key) => Err(WorkspaceError::Filter { key }),
+        None if filters.trim().is_empty() => Ok(()),
+        // git exited 0, so something matched, but no line is a key
+        None => Err(WorkspaceError::Tool {
+            id: id.to_string(),
+            subcommand: "config".into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            stderr: filters,
         }),
-        None => Ok(()),
     }
+}
+
+/// The `FILTER_KEYS` probe, before the regex: `refuse_filters` and
+/// `VERSION_SCRIPT` both run exactly this.
+const PROBE: &[&str] = &[
+    "config",
+    "--local",
+    "--includes",
+    "--name-only",
+    "--get-regexp",
+];
+
+/// Whether `key` (as `config --name-only` prints it, lowercased) is one
+/// `FILTER_KEYS` matches; the regex, spelled out without a regex engine.
+fn is_filter_key(key: &str) -> bool {
+    let between = |prefix: &str, suffixes: &[&str]| {
+        key.strip_prefix(prefix)
+            .is_some_and(|rest| suffixes.iter().any(|s| rest.ends_with(s)))
+    };
+    between("filter.", &[".clean", ".smudge", ".process"])
+        || between("remote.", &[".promisor"])
+        || key == "extensions.worktreeconfig"
+        || key == "extensions.partialclone"
+}
+
+/// The first line of a probe's output that is a `FILTER_KEYS` key: a
+/// warning git printed first (the version script folds stderr in) is
+/// skipped, never taken for the key.
+fn filter_key(probe: &str) -> Option<String> {
+    probe
+        .lines()
+        .map(str::trim)
+        .find(|k| is_filter_key(k))
+        .map(str::to_string)
+}
+
+/// `version`'s four git calls as one sandbox start (#174;
+/// `workspace::sandboxed_git_script`). `$1` is the base ref, `$2`
+/// `FILTER_KEYS`, and the rest git with its options, so nothing the caller
+/// passes is ever script text. The filter probe runs first, as in
+/// `refuse_filters`: a match prints the key and exits `VERSION_FILTER`; an
+/// exit 1 that printed anything (stderr is folded in) is a failure, as
+/// `is_gits_answer` would judge it. Then `merge-base`, the name-only diff
+/// against it (`DIFF_FLAGS`) and `status` (`STATUS`), each failing with its
+/// own code (`version_stage`). On success stdout is `<merge-base> \0
+/// <name-only -z> \0 <status -z>` (`parse_version`). The `-c` pairs are
+/// `CONFIG`'s, passed in `"$@"`; a unit test holds the two flag lists to
+/// the constants.
+const VERSION_SCRIPT: &str = r#"base=$1 keys=$2
+shift 2
+found=$("$@" config --local --includes --name-only --get-regexp "$keys" 2>&1)
+case $? in
+0) printf '%s' "$found"; exit 80 ;;
+1) if [ -n "$found" ]; then printf '%s\n' "$found" >&2; exit 81; fi ;;
+*) printf '%s\n' "$found" >&2; exit 81 ;;
+esac
+mb=$("$@" merge-base "$base" HEAD) || exit 83
+printf '%s\000' "$mb"
+"$@" diff --no-ext-diff --no-textconv --no-color --submodule=short --ignore-submodules=dirty --name-only -z "$mb" || exit 84
+printf '\000'
+"$@" status --porcelain=v2 -z --branch --no-ahead-behind --untracked-files=all --ignore-submodules=dirty || exit 82
+"#;
+
+/// `VERSION_SCRIPT`'s exit when the probe found a key (on stdout).
+const VERSION_FILTER: i32 = 80;
+
+/// The git subcommand behind one of `VERSION_SCRIPT`'s failure exits.
+fn version_stage(code: i32) -> Option<&'static str> {
+    match code {
+        81 => Some("config"),
+        82 => Some("status"),
+        83 => Some("merge-base"),
+        84 => Some("diff"),
+        _ => None,
+    }
+}
+
+/// `VERSION_SCRIPT`'s stdout: the merge-base, the name-only paths and the
+/// parsed status. The name-only records are non-empty and NUL-terminated,
+/// so the first empty record ends them; `None` when that structure is not
+/// there.
+pub fn parse_version(out: &str) -> Option<(String, BTreeSet<String>, Status)> {
+    let (merge_base, mut rest) = out.split_once('\0')?;
+    let mut names = BTreeSet::new();
+    loop {
+        let (record, after) = rest.split_once('\0')?;
+        rest = after;
+        if record.is_empty() {
+            break;
+        }
+        names.insert(record.to_string());
+    }
+    Some((merge_base.trim().to_string(), names, parse_status(rest)))
 }
 
 impl WorkspaceReader for Runtime {
@@ -554,7 +633,7 @@ impl WorkspaceReader for Runtime {
         let id = agent.to_string();
         let (paths, crew) = self.sandboxed_workspace_of(agent)?;
         let git = |args: &[&str], ok: &[i32]| self.inspect_git(&id, &crew, &paths, args, ok);
-        refuse_filters(&git)?;
+        refuse_filters(&id, &git)?;
         let status = parse_status(&git(STATUS, &[0])?);
         let merge_base = git(&["merge-base", base_ref, "HEAD"], &[0])?
             .trim()
@@ -744,22 +823,61 @@ impl WorkspaceReader for Runtime {
             entries,
         })
     }
-    /// `refuse_filters`, one `status`, `merge-base` and one name-only
-    /// diff against it: four sandboxed calls (#108).
+    /// The filter probe, `merge-base`, one name-only diff against it and
+    /// one `status`, in one sandbox start (`VERSION_SCRIPT`, #174).
     fn version(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceVersion, WorkspaceError> {
         let id = agent.to_string();
         let (paths, crew) = self.sandboxed_workspace_of(agent)?;
-        let git = |args: &[&str], ok: &[i32]| self.inspect_git(&id, &crew, &paths, args, ok);
-        refuse_filters(&git)?;
-        let status = parse_status(&git(STATUS, &[0])?);
-        let merge_base = git(&["merge-base", base_ref, "HEAD"], &[0])?
-            .trim()
-            .to_string();
+        let tool_error =
+            |subcommand: &str, args: Vec<String>, stderr: String| WorkspaceError::Tool {
+                id: id.clone(),
+                subcommand: subcommand.to_string(),
+                args,
+                stderr,
+            };
+        let out = sandboxed_git_script(
+            &self.tools,
+            &crew,
+            &paths,
+            VERSION_SCRIPT,
+            &[base_ref, FILTER_KEYS],
+            CONFIG,
+            &[0, VERSION_FILTER, 81, 82, 83, 84],
+        )
+        .map_err(|f| tool_error(&f.subcommand, f.args, f.stderr))?;
+        // each stage's own git arguments, as `inspect_git` reports them
+        let stage_args = |stage: &str| -> Vec<String> {
+            let mut args: Vec<&str> = CONFIG.to_vec();
+            let merge_base = out.stdout.split('\0').next().unwrap_or_default();
+            match stage {
+                "config" => args.extend(PROBE.iter().chain([&FILTER_KEYS])),
+                "merge-base" => args.extend(["merge-base", base_ref, "HEAD"]),
+                "diff" => {
+                    args.push("diff");
+                    args.extend(DIFF_FLAGS);
+                    args.extend(["--name-only", "-z", merge_base]);
+                }
+                _ => args.extend(STATUS),
+            }
+            args.into_iter().map(str::to_string).collect()
+        };
+        if out.code == VERSION_FILTER {
+            return Err(match filter_key(&out.stdout) {
+                Some(key) => WorkspaceError::Filter { key },
+                None => tool_error("config", stage_args("config"), out.stdout.clone()),
+            });
+        }
+        if let Some(stage) = version_stage(out.code) {
+            return Err(tool_error(stage, stage_args(stage), out.stderr));
+        }
+        let (merge_base, mut paths_seen, status) = parse_version(&out.stdout).ok_or_else(|| {
+            tool_error(
+                "sh",
+                Vec::new(),
+                format!("unexpected output from the version script: {}", out.stderr),
+            )
+        })?;
         let head = status.head.unwrap_or_default();
-        let mut against_base: Vec<&str> = vec!["diff"];
-        against_base.extend(DIFF_FLAGS);
-        against_base.extend(["--name-only", "-z", merge_base.as_str()]);
-        let mut paths_seen = split_z(&git(&against_base, &[0])?);
         paths_seen.extend(status.changed);
         paths_seen.extend(status.untracked);
         // `BTreeSet`: sorted and deduplicated, so the hash order is fixed.
@@ -962,6 +1080,73 @@ mod tests {
         assert!(!binary && truncated);
         assert!(cut.len() <= WORKSPACE_PATCH_LIMIT);
         assert!(cut.ends_with('\n'), "cut at a line boundary");
+    }
+
+    /// The script spells `STATUS` and `DIFF_FLAGS` out; they must not drift.
+    #[test]
+    fn the_version_script_runs_the_same_flags_as_the_constants() {
+        assert!(VERSION_SCRIPT.contains(&format!("\"$@\" {} ||", STATUS.join(" "))));
+        assert!(VERSION_SCRIPT.contains(&format!(
+            "\"$@\" diff {} --name-only -z \"$mb\" ||",
+            DIFF_FLAGS.join(" ")
+        )));
+        assert!(VERSION_SCRIPT.contains(&format!("\"$@\" {} \"$keys\"", PROBE.join(" "))));
+        // nothing but the positional parameters reaches a command
+        assert!(!VERSION_SCRIPT.contains("eval"));
+        for code in 81..=84 {
+            let stage = version_stage(code).unwrap();
+            assert!(VERSION_SCRIPT.contains(&format!("exit {code}")), "{stage}");
+        }
+        assert!(VERSION_SCRIPT.contains(&format!("exit {VERSION_FILTER}")));
+        assert_eq!(version_stage(0), None);
+        assert_eq!(version_stage(1), None);
+    }
+
+    /// The key is the first line that is one; a warning before it is not.
+    #[test]
+    fn the_filter_key_is_the_first_line_that_is_a_filter_key() {
+        assert_eq!(
+            filter_key("warning: something odd\nfilter.x.clean\n").as_deref(),
+            Some("filter.x.clean")
+        );
+        for key in [
+            "filter.lfs.smudge",
+            "filter.a.b.process",
+            "extensions.worktreeconfig",
+            "extensions.partialclone",
+            "remote.origin.promisor",
+        ] {
+            assert_eq!(filter_key(key).as_deref(), Some(key));
+        }
+        assert_eq!(filter_key("warning: only a warning\n"), None);
+        assert_eq!(filter_key("filter.x.cleanup\nremote.x.url\n"), None);
+        assert_eq!(filter_key(""), None);
+    }
+
+    #[test]
+    fn the_version_output_splits_into_merge_base_names_and_status() {
+        let out = "abc123\0README\0src/a b.rs\0\0# branch.oid def456\0? new\0";
+        let (mb, names, status) = parse_version(out).unwrap();
+        assert_eq!(mb, "abc123");
+        assert_eq!(
+            names.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["README", "src/a b.rs"]
+        );
+        assert_eq!(status.head.as_deref(), Some("def456"));
+        assert_eq!(
+            status
+                .untracked
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
+        // no names
+        let (mb, names, status) = parse_version("abc\0\0# branch.oid (initial)\0").unwrap();
+        assert_eq!((mb.as_str(), names.len(), status.head), ("abc", 0, None));
+        // cut short: no end to the names
+        assert_eq!(parse_version("abc\0README\0"), None);
+        assert_eq!(parse_version("abc"), None);
     }
 
     #[test]

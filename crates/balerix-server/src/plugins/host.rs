@@ -20,7 +20,7 @@ use balerix_core::{
 use tokio::sync::{Mutex, oneshot, watch};
 
 use super::PluginError;
-use super::config::{load_plugins_file, resolve_secrets, resolve_source};
+use super::config::{Source, load_plugins_file, resolve_secrets, resolve_source};
 use super::manifest::read_manifest;
 use super::materializer::{NullStore, PluginMaterializer};
 use super::package;
@@ -203,6 +203,26 @@ impl PluginHost {
                 ),
                 other => entry_error(i, "source", other.to_string()),
             })?;
+            // `MISE_CEILING_PATHS` is colon-separated, and the package's
+            // parent is one of its entries (#4)
+            if dir.as_os_str().as_encoded_bytes().contains(&b':') {
+                return Err(entry_error(
+                    i,
+                    "source",
+                    format!("{}: a package path must not contain ':'", dir.display()),
+                ));
+            }
+            // A directory is used in place, so nothing names its content:
+            // the bytes of its two files stand in, so an edited
+            // `mise.toml` or manifest changes the plugin's hash and is
+            // installed and trusted again on the next sync (#4).
+            let digest = match (&source, digest) {
+                (Source::Directory(_), None) => Some(
+                    package::directory_digest(&dir)
+                        .map_err(|e| entry_error(i, "source", e.to_string()))?,
+                ),
+                (_, d) => d,
+            };
             let manifest = read_manifest(&dir).map_err(|e| entry_error(i, "", e.to_string()))?;
             if manifest.name != entry.name {
                 return Err(entry_error(
@@ -460,6 +480,67 @@ fn without_nulls(v: &serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MANIFEST: &str = "apiVersion: balerix/v1\nkind: Plugin\nname: hello\nversion: 0.1.0\nprotocol: 1\nstart: serve\n";
+
+    /// `plugins.yaml` with one directory source at `package`, written.
+    fn host_config(top: &std::path::Path, package: &std::path::Path) -> PluginHostConfig {
+        std::fs::create_dir_all(package).unwrap();
+        std::fs::write(package.join("balerix-plugin.yaml"), MANIFEST).unwrap();
+        std::fs::write(package.join("mise.toml"), "[tasks.serve]\nrun = \"true\"\n").unwrap();
+        let plugins_file = top.join("plugins.yaml");
+        std::fs::write(
+            &plugins_file,
+            format!(
+                "plugins:\n  - name: hello\n    source: \"{}\"\n",
+                package.display()
+            ),
+        )
+        .unwrap();
+        PluginHostConfig {
+            plugins_file,
+            install_root: top.join("install"),
+        }
+    }
+
+    /// #4: `MISE_CEILING_PATHS` is colon-separated.
+    #[test]
+    fn a_package_path_with_a_colon_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = host_config(dir.path(), &dir.path().join("a:b"));
+        let e = PluginHost::resolve(&config).unwrap_err().to_string();
+        assert!(
+            e.starts_with("plugins.yaml: plugins[0].source: ")
+                && e.ends_with("a:b: a package path must not contain ':'"),
+            "{e}"
+        );
+    }
+
+    /// #4: a directory source's two files are part of its hash, so an
+    /// edit is a reinstall on the next sync.
+    #[test]
+    fn editing_a_directory_sources_files_changes_its_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("hello");
+        let config = host_config(dir.path(), &package);
+        let hash = || PluginHost::resolve(&config).unwrap()[0].hash();
+        let first = PluginHost::resolve(&config).unwrap();
+        assert!(first[0].digest.is_some());
+        assert_eq!(hash(), first[0].hash(), "nothing edited: the same hash");
+        std::fs::write(
+            package.join("mise.toml"),
+            "[tasks.serve]\nrun = \"false\"\n",
+        )
+        .unwrap();
+        let second = hash();
+        assert_ne!(second, first[0].hash(), "an edited mise.toml");
+        std::fs::write(
+            package.join("balerix-plugin.yaml"),
+            format!("{MANIFEST}# c\n"),
+        )
+        .unwrap();
+        assert_ne!(hash(), second, "a manifest edit that parses the same");
+    }
 
     fn record_with(agent: Option<&str>) -> FleetRecord {
         let mut record = FleetRecord::new(plugin_fleet(&[]).into());

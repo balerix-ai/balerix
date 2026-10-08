@@ -376,7 +376,9 @@ credentials, hook input, or sandbox rules.
   added and rotates on remove + re-add, not on every restart: `Actor::apply`
   reuses an existing secret and only drops the ones the spec no longer wants.
 - Plugin packages: `plugins.yaml` directory sources are used in place with no
-  digest (development and the e2e); tarballs and URLs need `sha256` and
+  `sha256` (development and the e2e); the daemon hashes their `mise.toml` and
+  `balerix-plugin.yaml` into the plugin's digest, so editing either and
+  running `plugin sync` reinstalls (#4). Tarballs and URLs need `sha256` and
   unpack read-only under `$XDG_DATA_HOME/balerix/plugins/<name>/<digest12>/`.
 - A plugin manifest's `sandbox` block is an allowlist, unlike a fleet's
   (`sandbox::check_plugin_sandbox`, #2): `filesystem` (the six grant lists

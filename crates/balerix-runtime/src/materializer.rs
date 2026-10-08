@@ -439,7 +439,7 @@ impl Materializer for Runtime {
         host: &HookTarget,
     ) -> Result<LaunchPlan, MaterializeError> {
         let out = self.render_plugin(plugin, host)?;
-        self.install_plugin(plugin)?;
+        self.install_plugin(plugin, out.toolchain_changed)?;
         Ok(out.plan)
     }
 

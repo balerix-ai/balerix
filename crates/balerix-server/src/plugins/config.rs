@@ -20,7 +20,8 @@ pub const NO_TLS: &str =
 pub enum Source {
     Url(String),
     Tarball(PathBuf),
-    /// Used in place, never copied, no digest.
+    /// Used in place, never copied, no `sha256`; `PluginHost::resolve`
+    /// hashes its `mise.toml` and manifest into the plugin's digest.
     Directory(PathBuf),
 }
 

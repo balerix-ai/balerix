@@ -57,6 +57,27 @@ pub fn fetch(url: &str) -> Result<Vec<u8>, PluginError> {
     Ok(buf)
 }
 
+/// What stands in for a directory source's digest (#4): the sha256 of
+/// its `mise.toml` and `balerix-plugin.yaml`, each file's own sha256
+/// joined so that moving bytes from one to the other changes it. A
+/// missing file hashes as empty: reading the manifest reports it.
+pub fn directory_digest(dir: &Path) -> Result<String, PluginError> {
+    let file = |name: &str| -> Result<String, PluginError> {
+        let path = dir.join(name);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(sha256_hex(&bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(sha256_hex(b"")),
+            Err(e) => Err(PluginError::io(&path, e)),
+        }
+    };
+    let joined = format!(
+        "mise.toml {}\nbalerix-plugin.yaml {}\n",
+        file("mise.toml")?,
+        file("balerix-plugin.yaml")?
+    );
+    Ok(sha256_hex(joined.as_bytes()))
+}
+
 fn relative_inside(path: &Path) -> bool {
     !path.as_os_str().is_empty()
         && path

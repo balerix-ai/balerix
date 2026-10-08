@@ -28,9 +28,27 @@ use crate::tools::{Cmd, ToolPaths};
 ///   Unbounded, that second walk climbs out of the state root and dies on
 ///   the first config file the sandbox does not grant ("error parsing
 ///   config file: … Permission denied", mise 2026.9.1).
-fn mise_ceiling(plugin: &ResolvedPlugin, paths: &PluginPaths) -> String {
-    let above_package = plugin.package.parent().unwrap_or(&plugin.package);
-    format!("{}:{}", above_package.display(), paths.home.display())
+///
+/// A package at a filesystem root has no directory above it to stop at,
+/// and the package itself as the ceiling would hide its own `mise.toml`:
+/// an error rather than that wrong value (#4). A `:` in either path would
+/// split the list; the daemon refuses such a package when it resolves it.
+fn mise_ceiling(plugin: &ResolvedPlugin, paths: &PluginPaths) -> Result<String, MaterializeError> {
+    let above_package = plugin
+        .package
+        .parent()
+        .ok_or_else(|| MaterializeError::Invalid {
+            id: plugin.id().to_string(),
+            message: format!(
+                "package {} has no parent directory for mise to stop at",
+                plugin.package.display()
+            ),
+        })?;
+    Ok(format!(
+        "{}:{}",
+        above_package.display(),
+        paths.home.display()
+    ))
 }
 
 /// The plugin's environment: the nono profile's `set_vars` (spec §5.1).
@@ -40,9 +58,9 @@ pub fn plugin_env(
     layout: &StateLayout,
     api_url: &str,
     token: &str,
-) -> BTreeMap<String, String> {
+) -> Result<BTreeMap<String, String>, MaterializeError> {
     let s = |p: &Path| p.display().to_string();
-    BTreeMap::from([
+    Ok(BTreeMap::from([
         ("HOME".to_string(), s(&paths.home)),
         ("XDG_CONFIG_HOME".to_string(), s(&paths.xdg_config())),
         ("XDG_DATA_HOME".to_string(), s(&paths.xdg_data())),
@@ -60,7 +78,7 @@ pub fn plugin_env(
         // runs in the package.
         (
             "MISE_CEILING_PATHS".to_string(),
-            mise_ceiling(plugin, paths),
+            mise_ceiling(plugin, paths)?,
         ),
         ("MISE_DATA_DIR".to_string(), s(&layout.mise_data_dir())),
         ("MISE_CONFIG_DIR".to_string(), s(&paths.mise_config_dir())),
@@ -72,7 +90,7 @@ pub fn plugin_env(
         ("BALERIX_PLUGIN_NAME".to_string(), plugin.name.to_string()),
         ("BALERIX_PLUGIN_TOKEN".to_string(), token.to_string()),
         ("BALERIX_PLUGIN_SCRATCH".to_string(), s(&paths.scratch)),
-    ])
+    ]))
 }
 
 /// Read: system dirs, the shared mise install dir, the package, the
@@ -180,7 +198,9 @@ pub fn write_plugin_home(name: &AgentName, paths: &PluginPaths) -> Result<(), Ma
 /// the same `MISE_{DATA,CONFIG,STATE,CACHE}_DIR` the sandbox will see, so
 /// the trust record and the installed tools land where the sandboxed run
 /// looks for them. `cwd=/` as for agents, so the package's config is named
-/// outright here rather than discovered.
+/// outright here rather than discovered; the same `MISE_CEILING_PATHS` as
+/// the sandbox, so no config above the package or the plugin's home is
+/// read on the way (#4).
 pub fn install_plugin_tools(
     tools: &ToolPaths,
     layout: &StateLayout,
@@ -198,6 +218,10 @@ pub fn install_plugin_tools(
         ("MISE_CONFIG_DIR".to_string(), s(&paths.mise_config_dir())),
         ("MISE_STATE_DIR".to_string(), s(&paths.mise_state_dir())),
         ("MISE_CACHE_DIR".to_string(), s(&paths.mise_cache_dir())),
+        (
+            "MISE_CEILING_PATHS".to_string(),
+            mise_ceiling(plugin, paths)?,
+        ),
         ("MISE_YES".to_string(), "1".to_string()),
         ("MISE_QUIET".to_string(), "1".to_string()),
         ("MISE_AUTO_INSTALL".to_string(), "false".to_string()),
@@ -236,7 +260,7 @@ impl Runtime {
         let id = plugin.id();
         let paths = self.layout.plugin(&plugin.name);
         write_plugin_home(&plugin.name, &paths)?;
-        let env = plugin_env(plugin, &paths, &self.layout, &host.url, &host.secret);
+        let env = plugin_env(plugin, &paths, &self.layout, &host.url, &host.secret)?;
         // before anything is written from the manifest's block (#2)
         let layout = &self.layout;
         check_plugin_sandbox(
@@ -283,17 +307,19 @@ impl Runtime {
         })
     }
 
-    /// `mise install` + `nono profile validate` unless the marker holds the
-    /// current hash; writes the hash on success.
-    pub fn install_plugin(&self, plugin: &ResolvedPlugin) -> Result<(), MaterializeError> {
-        let paths = self.layout.plugin(&plugin.name);
-        let marker = paths.installed_marker();
-        if std::fs::read_to_string(&marker)
-            .map(|s| s.trim() == plugin.hash().as_str())
-            .unwrap_or(false)
-        {
+    /// `mise install` + `nono profile validate` when `render_plugin` said
+    /// `toolchain_changed` (it compared the marker with the hash, and
+    /// removed a stale one); writes the hash on success.
+    pub fn install_plugin(
+        &self,
+        plugin: &ResolvedPlugin,
+        toolchain_changed: bool,
+    ) -> Result<(), MaterializeError> {
+        if !toolchain_changed {
             return Ok(());
         }
+        let paths = self.layout.plugin(&plugin.name);
+        let marker = paths.installed_marker();
         install_plugin_tools(&self.tools, &self.layout, plugin, &paths)?;
         validate_profile_at(
             &self.tools,
@@ -348,7 +374,7 @@ mod tests {
         let layout = StateLayout::from_env(Path::new("/h"), |_| None);
         let p = plugin();
         let paths = layout.plugin(&p.name);
-        let env = plugin_env(&p, &paths, &layout, "http://127.0.0.1:7643", "tok-1");
+        let env = plugin_env(&p, &paths, &layout, "http://127.0.0.1:7643", "tok-1").unwrap();
         let base = "/h/.local/state/balerix/plugins/web";
         assert_eq!(env["HOME"], format!("{base}/home"));
         assert_eq!(env["TMPDIR"], format!("{base}/home/tmp"));
@@ -371,6 +397,19 @@ mod tests {
         assert!(!env.contains_key("PATH"), "PATH is nono's");
         assert!(!env.contains_key("CLAUDE_CONFIG_DIR"), "no claude here");
         assert_eq!(env.len(), 16);
+    }
+
+    #[test]
+    fn a_package_at_a_filesystem_root_has_no_ceiling() {
+        let layout = StateLayout::from_env(Path::new("/h"), |_| None);
+        let mut p = plugin();
+        p.package = "/".into();
+        let paths = layout.plugin(&p.name);
+        let e = plugin_env(&p, &paths, &layout, "http://127.0.0.1:7643", "t").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "balerix/plugins/web: package / has no parent directory for mise to stop at"
+        );
     }
 
     #[test]

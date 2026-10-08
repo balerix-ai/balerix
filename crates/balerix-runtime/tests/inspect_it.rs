@@ -715,8 +715,40 @@ fn version_is_one_sandboxed_call() {
     assert_eq!(v.head, head);
     assert_eq!(
         v.fingerprint,
-        balerix_runtime::inspect::fingerprint_of(&head, &merge_base, &entries)
+        balerix_runtime::inspect::fingerprint_of(&head, &merge_base, &entries, 3)
     );
+
+    // a deleted tracked file stays in the path set and hashes as missing (#18)
+    std::fs::remove_file(w.join("LICENSE")).unwrap();
+    let deleted = rt.version(&id, "origin/main").unwrap();
+    let mut missing = entries.clone();
+    missing[0].stat = None;
+    assert_eq!(
+        deleted.fingerprint,
+        balerix_runtime::inspect::fingerprint_of(&head, &merge_base, &missing, 3)
+    );
+    std::fs::write(w.join("LICENSE"), "mit\nedited\n").unwrap();
+
+    // past the cap, an untracked tree that sorts first does not hide an
+    // edit to a tracked file that is already modified (#18)
+    let vendor = w.join("0vendor");
+    std::fs::create_dir(&vendor).unwrap();
+    for i in 0..=balerix_runtime::inspect::VERSION_PATH_CAP {
+        std::fs::write(vendor.join(format!("{i:05}")), "v\n").unwrap();
+    }
+    let crowded = rt.version(&id, "origin/main").unwrap();
+    assert_ne!(
+        crowded.fingerprint, v.fingerprint,
+        "the untracked tree counts"
+    );
+    std::fs::write(w.join("LICENSE"), "mit\nedited again, longer\n").unwrap();
+    let edited = rt.version(&id, "origin/main").unwrap();
+    assert_ne!(
+        edited.fingerprint, crowded.fingerprint,
+        "an edit to a tracked file past 2000 untracked paths"
+    );
+    std::fs::remove_dir_all(&vendor).unwrap();
+    std::fs::write(w.join("LICENSE"), "mit\nedited\n").unwrap();
 
     // a refusal and a git failure are one call too, and keep their shape;
     // README is wired to the filter, so a status or diff would run it

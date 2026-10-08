@@ -15,7 +15,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use balerix_api::{PluginAction, ResizeFrame, TextFrame};
 use balerix_plugin_sdk::SdkError;
-use balerix_plugin_sdk::metrics::IntGauge;
+use balerix_plugin_sdk::metrics::{IntCounter, IntGauge};
 use sha2::{Digest, Sha256};
 
 use crate::plugin::Shared;
@@ -708,16 +708,48 @@ async fn events_json(
         Err(e) => return (StatusCode::BAD_REQUEST, e.body_text()).into_response(),
     };
     let mut events = shared.cache.events_after(&id, after);
-    match shared.host.workspace_version(&id).await {
-        Ok(v) => events.workspace = Some(v),
-        Err(e) => {
+    events.workspace = bounded_version(
+        &id,
+        shared.host.workspace_version(&id),
+        VERSION_DEADLINE,
+        &shared.version_failures_total,
+    )
+    .await;
+    Json(events).into_response()
+}
+
+/// How long a poll waits for the worktree's version before answering
+/// without it (#18): the column keeps flowing when the daemon is slow, not
+/// only when it fails. Under the page's 2 s poll.
+const VERSION_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// `version`, or `None` when it fails or outlives `deadline`; a timeout
+/// counts in `version_failures_total` like any failure but the routine
+/// no-workspace 404 (`is_version_failure`).
+async fn bounded_version<F>(
+    id: &str,
+    version: F,
+    deadline: std::time::Duration,
+    failures: &IntCounter,
+) -> Option<balerix_api::WorkspaceVersion>
+where
+    F: std::future::Future<Output = Result<balerix_api::WorkspaceVersion, SdkError>>,
+{
+    match tokio::time::timeout(deadline, version).await {
+        Ok(Ok(v)) => Some(v),
+        Ok(Err(e)) => {
             tracing::debug!(agent = %id, "workspace version: {e}");
             if is_version_failure(&e) {
-                shared.version_failures_total.inc();
+                failures.inc();
             }
+            None
+        }
+        Err(_) => {
+            tracing::debug!(agent = %id, "workspace version: no answer within {deadline:?}");
+            failures.inc();
+            None
         }
     }
-    Json(events).into_response()
 }
 
 /// Whether a `workspace_version` error counts in `version_failures_total`
@@ -940,6 +972,29 @@ mod tests {
         )));
         assert!(is_version_failure(&status(403, "forbidden")));
         assert!(is_version_failure(&SdkError::Transport("refused".into())));
+    }
+
+    /// #18: a version slower than the deadline is answered as `null` and
+    /// counted; a quick one passes through; the routine 404 is not counted.
+    #[tokio::test]
+    async fn a_slow_version_is_dropped_and_counted() {
+        let failures = IntCounter::new("f", "failures").unwrap();
+        let short = std::time::Duration::from_millis(50);
+        let never = std::future::pending::<Result<balerix_api::WorkspaceVersion, SdkError>>();
+        assert_eq!(bounded_version("a", never, short, &failures).await, None);
+        assert_eq!(failures.get(), 1);
+        let v = balerix_api::WorkspaceVersion {
+            head: "h".into(),
+            fingerprint: "f".into(),
+        };
+        let quick = std::future::ready(Ok(v.clone()));
+        assert_eq!(bounded_version("a", quick, short, &failures).await, Some(v));
+        let routine = std::future::ready(Err(SdkError::Status {
+            status: 404,
+            message: "no workspace for agent f/c/a".into(),
+        }));
+        assert_eq!(bounded_version("a", routine, short, &failures).await, None);
+        assert_eq!(failures.get(), 1);
     }
 
     #[test]

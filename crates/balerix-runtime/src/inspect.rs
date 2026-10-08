@@ -444,18 +444,61 @@ pub fn shape_patch(raw: String) -> (String, bool, bool) {
 }
 
 /// One changed or untracked path as the fingerprint sees it: `(size,
-/// mtime, mtime_nsec)` from `symlink_metadata`, or `None` when the path
-/// vanished between the listing and the `stat`.
+/// mtime, mtime_nsec)` from `symlink_metadata`, or `None` when the `stat`
+/// failed for any reason — the path vanished between the listing and the
+/// `stat` (a deleted tracked file always does), or a parent is not
+/// searchable, or a loop: every error hashes as `missing`, so the result
+/// is still deterministic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathStat {
     pub path: String,
     pub stat: Option<(u64, i64, i64)>,
 }
 
+/// The most paths `version` stats (#18): a worktree with a large
+/// un-ignored tree (a build output, a vendored checkout) would otherwise
+/// cost one `stat` per path on every poll of every open review page.
+pub const VERSION_PATH_CAP: usize = 2000;
+
+/// At most `VERSION_PATH_CAP` paths, stat'ed under `workspace` and
+/// returned sorted, and how many paths there were in all. The cap fills
+/// with the `tracked` changes first (sorted), then the `untracked` paths not
+/// among them (sorted), so a large untracked tree cannot push an edit to a
+/// tracked file out of the fingerprint. The kept entries are sorted by path
+/// whichever side they came from, so a `git add` that moves a path from
+/// untracked to tracked, and changes no bytes, still changes nothing.
+pub fn stat_paths(
+    workspace: &Path,
+    tracked: BTreeSet<String>,
+    untracked: BTreeSet<String>,
+) -> (Vec<PathStat>, usize) {
+    let untracked: Vec<String> = untracked
+        .into_iter()
+        .filter(|p| !tracked.contains(p))
+        .collect();
+    let paths: Vec<String> = tracked.into_iter().chain(untracked).collect();
+    let total = paths.len();
+    let mut entries: Vec<PathStat> = paths
+        .into_iter()
+        .take(VERSION_PATH_CAP)
+        .map(|path| {
+            let stat = std::fs::symlink_metadata(workspace.join(&path))
+                .ok()
+                .map(|m| (m.len(), m.mtime(), m.mtime_nsec()));
+            PathStat { path, stat }
+        })
+        .collect();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    (entries, total)
+}
+
 /// `hex(sha256(head \0 merge_base \0 (path \0 size \0 mtime.nsec \0 |
-/// path \0 missing \0)*))` (Spec D §2.3). Entries are hashed in the order
-/// given; callers pass them sorted.
-pub fn fingerprint_of(head: &str, merge_base: &str, entries: &[PathStat]) -> String {
+/// path \0 missing \0)* [\0 capped \0 total \0]))` (Spec D §2.3). Entries
+/// are hashed in the order given; callers pass them sorted. When `total`
+/// is more than the entries (`VERSION_PATH_CAP`), a marker and the count
+/// follow, so the fingerprint still changes when a path past the cap
+/// comes or goes; it starts with the NUL no entry's (non-empty) path can.
+pub fn fingerprint_of(head: &str, merge_base: &str, entries: &[PathStat], total: usize) -> String {
     let mut h = Sha256::new();
     h.update(head.as_bytes());
     h.update([0]);
@@ -472,6 +515,11 @@ pub fn fingerprint_of(head: &str, merge_base: &str, entries: &[PathStat]) -> Str
             }
             None => h.update(b"missing"),
         }
+        h.update([0]);
+    }
+    if total > entries.len() {
+        h.update(b"\0capped\0");
+        h.update(total.to_string().as_bytes());
         h.update([0]);
     }
     hex::encode(h.finalize())
@@ -879,19 +927,10 @@ impl WorkspaceReader for Runtime {
         })?;
         let head = status.head.unwrap_or_default();
         paths_seen.extend(status.changed);
-        paths_seen.extend(status.untracked);
-        // `BTreeSet`: sorted and deduplicated, so the hash order is fixed.
-        let entries: Vec<PathStat> = paths_seen
-            .into_iter()
-            .map(|path| {
-                let stat = std::fs::symlink_metadata(paths.workspace.join(&path))
-                    .ok()
-                    .map(|m| (m.len(), m.mtime(), m.mtime_nsec()));
-                PathStat { path, stat }
-            })
-            .collect();
+        // `BTreeSet`s: sorted and deduplicated, so the hash order is fixed.
+        let (entries, total) = stat_paths(&paths.workspace, paths_seen, status.untracked);
         Ok(WorkspaceVersion {
-            fingerprint: fingerprint_of(&head, &merge_base, &entries),
+            fingerprint: fingerprint_of(&head, &merge_base, &entries, total),
             head,
         })
     }
@@ -1159,45 +1198,53 @@ mod tests {
             path: "b".into(),
             stat: None,
         };
-        let base = fingerprint_of("h", "m", &[a.clone(), b.clone()]);
+        let base = fingerprint_of("h", "m", &[a.clone(), b.clone()], 2);
         assert_eq!(base.len(), 64);
         assert_eq!(
             base,
-            fingerprint_of("h", "m", &[a.clone(), b.clone()]),
+            fingerprint_of("h", "m", &[a.clone(), b.clone()], 2),
             "stable"
         );
         assert_ne!(
             base,
-            fingerprint_of("H", "m", &[a.clone(), b.clone()]),
+            fingerprint_of("H", "m", &[a.clone(), b.clone()], 2),
             "head"
         );
         assert_ne!(
             base,
-            fingerprint_of("h", "M", &[a.clone(), b.clone()]),
+            fingerprint_of("h", "M", &[a.clone(), b.clone()], 2),
             "merge-base"
         );
         assert_ne!(
             base,
-            fingerprint_of("h", "m", std::slice::from_ref(&a)),
+            fingerprint_of("h", "m", std::slice::from_ref(&a), 1),
             "a path"
         );
         let bigger = PathStat {
             path: "a".into(),
             stat: Some((2, 10, 500)),
         };
-        assert_ne!(base, fingerprint_of("h", "m", &[bigger, b.clone()]), "size");
+        assert_ne!(
+            base,
+            fingerprint_of("h", "m", &[bigger, b.clone()], 2),
+            "size"
+        );
         let later = PathStat {
             path: "a".into(),
             stat: Some((1, 11, 500)),
         };
-        assert_ne!(base, fingerprint_of("h", "m", &[later, b.clone()]), "mtime");
+        assert_ne!(
+            base,
+            fingerprint_of("h", "m", &[later, b.clone()], 2),
+            "mtime"
+        );
         let nsec = PathStat {
             path: "a".into(),
             stat: Some((1, 10, 501)),
         };
         assert_ne!(
             base,
-            fingerprint_of("h", "m", &[nsec, b.clone()]),
+            fingerprint_of("h", "m", &[nsec, b.clone()], 2),
             "mtime nsec"
         );
         let present = PathStat {
@@ -1206,9 +1253,63 @@ mod tests {
         };
         assert_ne!(
             base,
-            fingerprint_of("h", "m", &[a, present]),
+            fingerprint_of("h", "m", &[a.clone(), present], 2),
             "missing vs present"
         );
-        assert_eq!(fingerprint_of("", "", &[]).len(), 64);
+        assert_eq!(fingerprint_of("", "", &[], 0).len(), 64);
+        // past the cap: the count is hashed, and only past it
+        let both = [a, b];
+        assert_eq!(
+            fingerprint_of("h", "m", &both, 1),
+            base,
+            "no marker at or under"
+        );
+        let capped = fingerprint_of("h", "m", &both, 3);
+        assert_ne!(capped, base, "a marker past the cap");
+        assert_ne!(capped, fingerprint_of("h", "m", &both, 4), "the count");
+    }
+
+    /// #18: past `VERSION_PATH_CAP` only the first paths in sorted order
+    /// are stat'ed; the total is still counted. A failed `stat` (here, no
+    /// such directory) is `missing`.
+    #[test]
+    fn version_stats_at_most_the_cap_in_sorted_order() {
+        let paths: BTreeSet<String> = (0..VERSION_PATH_CAP + 5)
+            .map(|i| format!("p{i:05}"))
+            .collect();
+        let first: Vec<String> = paths.iter().take(VERSION_PATH_CAP).cloned().collect();
+        let (entries, total) =
+            stat_paths(Path::new("/nonexistent-balerix"), paths, BTreeSet::new());
+        assert_eq!(total, VERSION_PATH_CAP + 5);
+        assert_eq!(
+            entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
+            first
+        );
+        assert!(entries.iter().all(|e| e.stat.is_none()));
+        let few = BTreeSet::from(["b".to_string(), "a".to_string()]);
+        let (entries, total) = stat_paths(Path::new("/nonexistent-balerix"), few, BTreeSet::new());
+        assert_eq!((entries.len(), total), (2, 2));
+        assert_eq!(entries[0].path, "a");
+        // tracked changes fill the cap first, whatever sorts before them
+        let untracked: BTreeSet<String> = (0..VERSION_PATH_CAP)
+            .map(|i| format!("0vendor/{i:05}"))
+            .chain(["z".to_string()])
+            .collect();
+        let tracked = BTreeSet::from(["z".to_string(), "m".to_string()]);
+        let (entries, total) = stat_paths(Path::new("/nonexistent-balerix"), tracked, untracked);
+        assert_eq!(total, VERSION_PATH_CAP + 2, "z is counted once");
+        assert_eq!(entries.len(), VERSION_PATH_CAP);
+        assert!(entries.is_sorted_by(|a, b| a.path < b.path));
+        let kept: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(
+            kept.contains(&"m") && kept.contains(&"z"),
+            "the tracked changes are kept"
+        );
+        assert_eq!(kept[0], "0vendor/00000");
+        assert_eq!(
+            kept[VERSION_PATH_CAP - 3],
+            "0vendor/01997",
+            "then untracked, in order"
+        );
     }
 }

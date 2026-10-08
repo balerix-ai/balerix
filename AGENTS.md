@@ -548,6 +548,14 @@ credentials, hook input, or sandbox rules.
   size and mtime of every changed or untracked path — content, not index
   state: a byte-identical `git add` is invisible by design, and a same-size
   rewrite within the filesystem's mtime resolution is the theoretical miss.
+  At most `VERSION_PATH_CAP` (2000) paths are stat'ed, tracked changes
+  first and untracked paths after them (each sorted), so a large untracked
+  tree cannot hide an edit to a tracked file; past the cap a marker and
+  the total count are hashed too, so a path coming or going still shows
+  but an edit to one left out does not (#18). A path whose `stat` fails
+  for any reason hashes as `missing`.
+  The web plugin's `events.json` waits 1.5 s for it, then answers
+  `workspace: null` and counts a `version_failures_total`.
   The review page applies a changed diff automatically (3 s rate limit),
   but never while a comment box is open.
 - `web`'s event buffer is memory only: after a plugin restart the review

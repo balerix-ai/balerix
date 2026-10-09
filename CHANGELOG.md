@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3 - 2026-10-09
+
+### Bug fixes
+
+- **runtime:** Bind the socket probe's sockets in a short directory (#196)
+
 ## 0.2.2 - 2026-10-09
 
 ### Features

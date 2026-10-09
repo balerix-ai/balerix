@@ -52,7 +52,7 @@ plugins:
     enabled: false
     image:
       repository: ghcr.io/balerix-ai/balerix-plugin-web
-      tag: "0.2.2"
+      tag: "0.2.3"
     needs: [fleets, attach, actions, workspace]
     config: {}
     secrets: {}

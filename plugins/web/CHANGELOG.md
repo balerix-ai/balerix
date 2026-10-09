@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3 - 2026-10-09
+
+### Bug fixes
+
+- Plugin batch (#17, #42, #20, #49, #48) (#159)
+- Daemon batch (#9, #11, #10, #12, #116) (#166)
+- Plugin host batch (#170, #15, #14, #168, #6, #1, #169) (#172)
+- Workspace reader batch (#174, #18, #19, #20) (#181)
+- Plugin hardening batch (#2, #3, #4, #5, #7) (#188)
+
 ## 0.2.2 - 2026-10-07
 
 ### Features

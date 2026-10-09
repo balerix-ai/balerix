@@ -218,11 +218,18 @@ fn run_probe(
         let what = what.to_string();
         move |e: std::io::Error| format!("{what}: {e}")
     };
-    let inside = scratch.join("inside");
-    let outside_dir = scratch.join("outside");
-    std::fs::create_dir_all(&inside).map_err(io("create scratch"))?;
-    std::fs::create_dir_all(&outside_dir).map_err(io("create scratch"))?;
+    std::fs::create_dir_all(scratch).map_err(io("create scratch"))?;
+    // The sockets get a short directory of their own: under a deep scratch
+    // their paths would pass the 108-byte sun_path and fail the bind
+    // before nono runs.
+    let sockets = SocketDir::create().map_err(io("create probe socket dir"))?;
+    let inside = sockets.0.join("inside");
+    let outside_dir = sockets.0.join("outside");
+    std::fs::create_dir_all(&inside).map_err(io("create probe socket dir"))?;
+    std::fs::create_dir_all(&outside_dir).map_err(io("create probe socket dir"))?;
     let outside = outside_dir.join("probe.sock");
+    check_socket_path(&outside)?;
+    check_socket_path(&inside.join("probe.sock"))?;
     let unix = std::os::unix::net::UnixListener::bind(&outside).map_err(io("bind probe socket"))?;
     let tcp = std::net::TcpListener::bind("127.0.0.1:0").map_err(io("bind probe port"))?;
     let port = tcp.local_addr().map_err(io("probe port"))?.port();
@@ -321,6 +328,59 @@ fn run_probe(
     stop.store(true, Ordering::Relaxed);
     let _ = accepter.join();
     outcome
+}
+
+/// The longest path a Unix socket can bind: `sun_path` is 108 bytes on
+/// Linux, the last one the NUL.
+#[cfg(target_os = "linux")]
+const SOCKET_PATH_MAX: usize = 107;
+
+#[cfg(target_os = "linux")]
+fn check_socket_path(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let len = path.as_os_str().as_bytes().len();
+    if len > SOCKET_PATH_MAX {
+        return Err(format!(
+            "probe socket path is {len} bytes, over the {SOCKET_PATH_MAX}-byte limit: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// A fresh 0700 directory for the probe's sockets, under
+/// `$XDG_RUNTIME_DIR` when set (per user, short) or the temp dir;
+/// removed on drop.
+#[cfg(target_os = "linux")]
+struct SocketDir(std::path::PathBuf);
+
+#[cfg(target_os = "linux")]
+impl SocketDir {
+    fn create() -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute() && p.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        loop {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir = base.join(format!("balerix-probe-{}-{n}", std::process::id()));
+            match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => return Ok(Self(dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SocketDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// How long the `sandbox-exec` check may take at start-up.
@@ -683,6 +743,52 @@ mod tests {
                 probe_mediation_within(&tools(nono), &d.path().join("s"), Duration::from_secs(5)),
                 Ok(())
             );
+        }
+
+        /// A `scratch` deeper than a socket path allows (108 bytes with the
+        /// NUL) still probes: the sockets live in a short directory of
+        /// their own, removed afterwards like scratch's contents.
+        #[test]
+        fn a_deep_scratch_still_probes_and_leaves_no_socket_dir() {
+            let d = tempfile::tempdir().unwrap();
+            let args = d.path().join("args");
+            let nono = stub(
+                d.path(),
+                &format!(
+                    r#"printf '%s\n' "$@" > {}; echo '{{"tcp":"ok","inside":"ok","outside":"refused"}}'; exit 0"#,
+                    args.display()
+                ),
+            );
+            let scratch = d.path().join("s".repeat(120));
+            assert_eq!(
+                probe_mediation_within(&tools(nono), &scratch, Duration::from_secs(5)),
+                Ok(())
+            );
+            assert!(
+                std::fs::read_dir(&scratch).unwrap().next().is_none(),
+                "scratch left behind"
+            );
+            let args = std::fs::read_to_string(&args).unwrap();
+            let after = |flag: &str| {
+                let mut it = args.lines().skip_while(|l| *l != flag);
+                PathBuf::from(it.nth(1).unwrap())
+            };
+            let (inside, outside) = (after("--inside"), after("--outside"));
+            assert!(!inside.starts_with(&scratch) && !outside.starts_with(&scratch));
+            let root = inside.parent().unwrap();
+            assert_eq!(outside.parent().unwrap().parent(), Some(root));
+            assert!(!root.exists(), "socket dir left behind: {}", root.display());
+        }
+
+        #[test]
+        fn a_socket_path_over_the_limit_names_the_limit() {
+            let long = Path::new("/").join("d".repeat(120)).join("probe.sock");
+            let e = check_socket_path(&long).unwrap_err();
+            assert!(
+                e.contains("107-byte limit") && e.contains(&long.display().to_string()),
+                "{e}"
+            );
+            assert!(check_socket_path(Path::new("/tmp/x/probe.sock")).is_ok());
         }
 
         #[test]

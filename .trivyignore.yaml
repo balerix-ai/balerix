@@ -2,4 +2,18 @@
 # Every entry names the binary it applies to, why it is accepted and when it
 # lapses. An expired entry fails the gate again: renew it only with a fresh
 # reason, and delete it once the pinned tool ships the fix (docs/RELEASING.md).
-vulnerabilities: []
+vulnerabilities:
+  # gh 2.102.0, the newest release, is built with Go 1.27.1; both advisories
+  # are Go stdlib denial-of-service bugs fixed in 1.27.2. gh is an HTTP and
+  # TLS client here, never a server. Upstream moved to 1.27.2 in cli/cli#14632
+  # (merged 2026-10-09). Drop these when mise.toml moves to the gh that ships it.
+  - id: CVE-2026-78667
+    paths:
+      - usr/local/bin/gh
+    expired_at: 2026-10-23
+    statement: net/http Range-header DoS in Go 1.27.1 stdlib; gh does not serve HTTP; no gh release built with Go 1.27.2 yet
+  - id: CVE-2026-97031
+    paths:
+      - usr/local/bin/gh
+    expired_at: 2026-10-23
+    statement: crypto/tls ECH DoS in Go 1.27.1 stdlib; no gh release built with Go 1.27.2 yet

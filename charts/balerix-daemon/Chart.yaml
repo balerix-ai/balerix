@@ -3,7 +3,7 @@ name: balerix-daemon
 description: One balerix Daemon and, optionally, the flow, web, matrix and github Plugins (Spec O §14.1). Needs the balerix-operator chart.
 type: application
 # moved by `release-prepare charts` (Spec O §24.5)
-version: 0.1.0
+version: 0.1.1
 # the core version; moved by `release-prepare core`. The Daemon runs the
 # operator's version (spec.version is left unset).
 appVersion: "0.2.2"

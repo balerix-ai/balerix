@@ -9,7 +9,7 @@ name = "balerix-agent"
 description = "The balerix agent pod: the sidecar that materialises and drives one agent, and the agent container's entrypoint (Spec O §6, §7)"
 # The core version (O-13): scripts/release/prepare.sh writes it with the
 # other core manifests once sub-project 5 lands.
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"

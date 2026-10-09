@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.2 - 2026-10-09
+
+### Features
+
+- Git and sandbox batch (#118, #108, #111) (#173)
+
+### Bug fixes
+
+- Supervisor batch (#148, #120, #123, #122, #121) (#158)
+- Plugin batch (#17, #42, #20, #49, #48) (#159)
+- Daemon batch (#9, #11, #10, #12, #116) (#166)
+- Plugin host batch (#170, #15, #14, #168, #6, #1, #169) (#172)
+- Toolchain batch (#24, #23, #22, #25) (#180)
+- Workspace reader batch (#174, #18, #19, #20) (#181)
+- Plugin hardening batch (#2, #3, #4, #5, #7) (#188)
+- **runtime:** Keep sandboxed processes off Unix sockets outside their grants (#189)
+
 ### Upgrading
 
 - New `[sandbox] unix_sockets` setting in the daemon's `config.toml`

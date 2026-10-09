@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-api"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-plugin-sdk"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "axum-server",

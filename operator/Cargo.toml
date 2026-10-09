@@ -9,7 +9,7 @@ name = "balerix-operator"
 description = "The balerix operator: five custom resources reconciled into pods, claims, Secrets and Jobs (Spec O §4, §5)"
 # The core version (O-13): scripts/release/prepare.sh writes it with the
 # other core manifests once sub-project 5 lands.
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"

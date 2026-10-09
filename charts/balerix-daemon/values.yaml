@@ -78,7 +78,7 @@ plugins:
     enabled: false
     image:
       repository: ghcr.io/balerix-ai/balerix-plugin-github
-      tag: "0.1.0"
+      tag: "0.1.1"
     needs: [fleets, actions, kv, manage]
     config: {}
     secrets: {}

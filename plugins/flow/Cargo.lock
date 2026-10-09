@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-plugin-flow"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "balerix-api",

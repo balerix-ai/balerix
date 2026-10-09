@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1 - 2026-10-09
+
+### Bug fixes
+
+- Plugin batch (#17, #42, #20, #49, #48) (#159)
+- Daemon batch (#9, #11, #10, #12, #116) (#166)
+- Plugin host batch (#170, #15, #14, #168, #6, #1, #169) (#172)
+- Plugin hardening batch (#2, #3, #4, #5, #7) (#188)
+
 ## 0.1.0 - 2026-10-07
 
 ### Features

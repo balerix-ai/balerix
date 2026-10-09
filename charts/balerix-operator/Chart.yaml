@@ -3,7 +3,7 @@ name: balerix-operator
 description: The balerix operator, its CustomResourceDefinitions and its RBAC (Spec O §14.1).
 type: application
 # moved by `release-prepare charts` (Spec O §24.5)
-version: 0.1.0
+version: 0.1.1
 # the core version; moved by `release-prepare core`
 appVersion: "0.2.2"
 kubeVersion: ">=1.32.0-0"

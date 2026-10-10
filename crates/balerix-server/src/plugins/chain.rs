@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 
 use super::client::PluginClient;
 use super::registry::PluginRegistry;
-use crate::metrics::Metrics;
+use crate::metrics::{DropReason, Metrics};
 
 /// How long a delivery task waits for a batch to fill before sending.
 pub const BATCH_WINDOW: Duration = Duration::from_millis(100);
@@ -99,23 +99,33 @@ impl ObserverQueue {
                 continue;
             }
             let Some(addr) = registry.ready_addr(&self.plugin) else {
-                metrics.events_dropped(self.plugin.as_str(), batch.len() as u64);
+                metrics.events_dropped(
+                    self.plugin.as_str(),
+                    DropReason::NotReady,
+                    batch.len() as u64,
+                );
                 continue;
             };
             let n = batch.len();
             if let Err(e) = client.events(&addr, &EventBatch { events: batch }).await {
                 tracing::warn!(plugin = %self.plugin, events = n, "observer batch not acknowledged: {e}");
-                metrics.events_dropped(self.plugin.as_str(), n as u64);
+                metrics.events_dropped(self.plugin.as_str(), DropReason::Unacknowledged, n as u64);
             }
         }
     }
+}
+
+/// One observing plugin: its queue and the task that delivers it.
+struct Observer {
+    queue: Arc<ObserverQueue>,
+    task: tokio::task::AbortHandle,
 }
 
 pub struct PluginEventHandler {
     registry: Arc<PluginRegistry>,
     client: PluginClient,
     metrics: Metrics,
-    observers: Mutex<BTreeMap<AgentName, Arc<ObserverQueue>>>,
+    observers: Mutex<BTreeMap<AgentName, Observer>>,
 }
 
 impl PluginEventHandler {
@@ -130,30 +140,55 @@ impl PluginEventHandler {
 
     /// The plugin's queue, its delivery task spawned on first use. Needs
     /// a tokio runtime, which every caller (a request handler) has.
-    fn queue_for(&self, name: &AgentName) -> Arc<ObserverQueue> {
+    ///
+    /// `None` for a plugin the registry no longer lists: `run` reads the
+    /// observers before it gets here, and a sync can remove the plugin in
+    /// between. The registry drops a plugin before `remove` is called, and
+    /// both this check and `remove` hold the map's lock, so a queue made
+    /// here is either seen by `remove` or never made (#13).
+    fn queue_for(&self, name: &AgentName) -> Option<Arc<ObserverQueue>> {
         let mut map = lock(&self.observers);
-        if let Some(q) = map.get(name) {
-            return q.clone();
+        if let Some(o) = map.get(name) {
+            return Some(o.queue.clone());
         }
-        let q = ObserverQueue::new(name.clone());
-        tokio::spawn(q.clone().deliver(
+        if !self.registry.is_installed(name.as_str()) {
+            return None;
+        }
+        let queue = ObserverQueue::new(name.clone());
+        let task = tokio::spawn(queue.clone().deliver(
             self.registry.clone(),
             self.client.clone(),
             self.metrics.clone(),
-        ));
-        map.insert(name.clone(), q.clone());
-        q
+        ))
+        .abort_handle();
+        map.insert(
+            name.clone(),
+            Observer {
+                queue: queue.clone(),
+                task,
+            },
+        );
+        Some(queue)
     }
 
     /// A plugin that just said hello starts from an empty queue (§4.3).
     pub fn on_hello(&self, name: &AgentName) {
-        if let Some(q) = lock(&self.observers).get(name) {
-            q.clear();
+        if let Some(o) = lock(&self.observers).get(name) {
+            o.queue.clear();
+        }
+    }
+
+    /// The plugin is no longer installed: its delivery task ends and its
+    /// queue goes, with whatever it still held (#13). A plugin of that
+    /// name installed later starts afresh on its first event.
+    pub fn remove(&self, name: &AgentName) {
+        if let Some(o) = lock(&self.observers).remove(name) {
+            o.task.abort();
         }
     }
 
     pub fn queue_len(&self, name: &AgentName) -> usize {
-        lock(&self.observers).get(name).map_or(0, |q| q.len())
+        lock(&self.observers).get(name).map_or(0, |o| o.queue.len())
     }
 
     async fn run(&self, event: &HookEvent) -> Outcome {
@@ -207,8 +242,9 @@ impl PluginEventHandler {
         for (name, _) in self.registry.observers(&agent, &event.name) {
             self.metrics
                 .plugin_event(name.as_str(), &event.name, "observe");
-            if self.queue_for(&name).push(event.clone()) {
-                self.metrics.events_dropped(name.as_str(), 1);
+            if self.queue_for(&name).is_some_and(|q| q.push(event.clone())) {
+                self.metrics
+                    .events_dropped(name.as_str(), DropReason::Overflow, 1);
             }
         }
         outcome
@@ -268,6 +304,8 @@ mod tests {
         Status500,
         NotAnObject,
         Sleep(u64),
+        /// Sleep this long, then merge `{ key: deadline_ms }`.
+        Deadline(String, u64),
     }
 
     #[derive(Clone)]
@@ -314,6 +352,12 @@ mod tests {
                                 Json(json!({ "response": { "late": true } })),
                             )
                         }
+                        Behaviour::Deadline(k, ms) => {
+                            tokio::time::sleep(Duration::from_millis(ms)).await;
+                            let mut r = v["response_so_far"].clone();
+                            r[k] = v["deadline_ms"].clone();
+                            (axum::http::StatusCode::OK, Json(json!({ "response": r })))
+                        }
                     }
                 }),
             )
@@ -329,6 +373,70 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (addr, batches)
+    }
+
+    /// An observer whose `/v1/events` records each batch, then holds its
+    /// answer (`status`) until the test adds a permit to the gate: while
+    /// one batch is held, the delivery task is stuck in that call and
+    /// everything pushed after it stays queued.
+    async fn gated_stub(
+        status: u16,
+    ) -> (
+        String,
+        Arc<StdMutex<Vec<Vec<HookEvent>>>>,
+        Arc<tokio::sync::Semaphore>,
+    ) {
+        let batches = Arc::new(StdMutex::new(Vec::new()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = Router::new().route(
+            "/v1/events",
+            post({
+                let batches = batches.clone();
+                let gate = gate.clone();
+                move |Json(b): Json<balerix_api::EventBatch>| async move {
+                    batches.lock().unwrap().push(b.events);
+                    gate.acquire().await.unwrap().forget();
+                    axum::http::StatusCode::from_u16(status).unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, batches, gate)
+    }
+
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    /// One observer `web` of `Stop` behind a gated stub, with one batch of
+    /// one event already held there.
+    async fn held_observer(
+        status: u16,
+    ) -> (
+        Arc<PluginRegistry>,
+        Arc<PluginEventHandler>,
+        Metrics,
+        Arc<StdMutex<Vec<Vec<HookEvent>>>>,
+        Arc<tokio::sync::Semaphore>,
+    ) {
+        let r = PluginRegistry::new();
+        r.replace_plugins(&[plugin("web", &[], &["Stop"])], &[]);
+        let (listen, batches, gate) = gated_stub(status).await;
+        r.set_listen(&"web".parse().unwrap(), listen, "t".into());
+        active(&r, "web");
+        let (h, m) = handler(&r);
+        h.handle(&event("Stop")).await;
+        let b = batches.clone();
+        wait_until("the first batch", || b.lock().unwrap().len() == 1).await;
+        (r, h, m, batches, gate)
     }
 
     fn active(r: &PluginRegistry, plugin: &str) {
@@ -524,12 +632,144 @@ mod tests {
                 "order kept across batches"
             );
         }
-        // not ready: nothing queued; hello clears whatever was
+        // not ready: nothing queued
         r.set_ready(&"web".parse().unwrap(), false);
         h.handle(&event("Notification")).await;
         assert_eq!(h.queue_len(&"web".parse().unwrap()), 0);
-        h.on_hello(&"web".parse().unwrap());
-        assert_eq!(h.queue_len(&"web".parse().unwrap()), 0);
+    }
+
+    /// #13: what the delivery task has not sent yet is gone after a
+    /// `hello` (§4.3: no catch-up).
+    #[tokio::test]
+    async fn hello_clears_what_the_delivery_task_has_not_sent() {
+        let (_r, h, _m, batches, gate) = held_observer(200).await;
+        let web: AgentName = "web".parse().unwrap();
+        for _ in 0..3 {
+            h.handle(&event("Stop")).await;
+        }
+        assert_eq!(h.queue_len(&web), 3, "the task is held in the first call");
+        h.on_hello(&web);
+        assert_eq!(h.queue_len(&web), 0);
+        gate.add_permits(10);
+        tokio::time::sleep(BATCH_WINDOW * 3).await;
+        assert_eq!(
+            batches.lock().unwrap().len(),
+            1,
+            "nothing queued before the hello was sent"
+        );
+    }
+
+    /// #13: each interceptor is told what remains of the shared budget,
+    /// not the whole of it.
+    #[tokio::test]
+    async fn deadline_ms_is_what_remains_of_the_budget() {
+        let r = PluginRegistry::new();
+        r.replace_plugins(
+            &[
+                plugin("first", &["PreToolUse"], &[]),
+                plugin("second", &["PreToolUse"], &[]),
+            ],
+            &[],
+        );
+        let (first, _) = stub(Behaviour::Deadline("first".into(), 300), 200).await;
+        let (second, _) = stub(Behaviour::Deadline("second".into(), 0), 200).await;
+        r.set_listen(&"first".parse().unwrap(), first, "t".into());
+        r.set_listen(&"second".parse().unwrap(), second, "t".into());
+        active(&r, "first");
+        active(&r, "second");
+        let (h, _m) = handler(&r);
+        let out = h.handle(&event("PreToolUse")).await;
+        let first = out.response["first"].as_u64().unwrap();
+        let second = out.response["second"].as_u64().unwrap();
+        assert!(
+            first <= CHAIN_BUDGET_MS && first > CHAIN_BUDGET_MS - 500,
+            "first: {first}"
+        );
+        assert!(
+            second <= first - 300 && second > 0,
+            "second: {second} after first's 300 ms of {first}"
+        );
+    }
+
+    /// #13: an observer that cannot keep up loses its oldest events, and
+    /// the handler counts them as `overflow`.
+    #[tokio::test]
+    async fn the_handler_counts_an_overflow_drop() {
+        let (_r, h, m, _batches, _gate) = held_observer(200).await;
+        for _ in 0..(OBSERVER_QUEUE + 5) {
+            h.handle(&event("Stop")).await;
+        }
+        assert_eq!(h.queue_len(&"web".parse().unwrap()), OBSERVER_QUEUE);
+        let text = m.encode();
+        assert!(
+            text.contains(
+                "balerix_plugin_events_dropped_total{plugin=\"web\",reason=\"overflow\"} 5"
+            ),
+            "{text}"
+        );
+    }
+
+    /// #13: a batch that is ready to send while its plugin is not is
+    /// dropped whole, as `not_ready`.
+    #[tokio::test]
+    async fn a_batch_ready_while_the_plugin_is_not_is_dropped_as_not_ready() {
+        let (r, h, m, batches, gate) = held_observer(200).await;
+        for _ in 0..4 {
+            h.handle(&event("Stop")).await;
+        }
+        r.set_ready(&"web".parse().unwrap(), false);
+        gate.add_permits(10);
+        let m2 = m.clone();
+        wait_until("the not-ready drop", || {
+            m2.encode().contains(
+                "balerix_plugin_events_dropped_total{plugin=\"web\",reason=\"not_ready\"} 4",
+            )
+        })
+        .await;
+        assert_eq!(batches.lock().unwrap().len(), 1, "nothing more was sent");
+    }
+
+    /// #13: a batch the plugin does not acknowledge counts as
+    /// `unacknowledged`.
+    #[tokio::test]
+    async fn an_unacknowledged_batch_is_counted() {
+        let (_r, _h, m, _batches, gate) = held_observer(500).await;
+        gate.add_permits(1);
+        let m2 = m.clone();
+        wait_until("the unacknowledged drop", || {
+            m2.encode().contains(
+                "balerix_plugin_events_dropped_total{plugin=\"web\",reason=\"unacknowledged\"} 1",
+            )
+        })
+        .await;
+    }
+
+    /// #13: a removed plugin's delivery task ends and its queue goes.
+    #[tokio::test]
+    async fn remove_ends_the_delivery_task_and_drops_the_queue() {
+        let (_r, h, _m, _batches, _gate) = held_observer(200).await;
+        let web: AgentName = "web".parse().unwrap();
+        h.handle(&event("Stop")).await;
+        let q = h.queue_for(&web).unwrap();
+        assert_eq!(q.len(), 1);
+        h.remove(&web);
+        assert_eq!(h.queue_len(&web), 0);
+        wait_until("the delivery task to let go of the queue", || {
+            Arc::strong_count(&q) == 1
+        })
+        .await;
+    }
+
+    /// #13: an event that read the observers before a sync removed the
+    /// plugin makes no queue for it after `remove` ran.
+    #[tokio::test]
+    async fn no_queue_is_made_for_a_plugin_the_registry_dropped() {
+        let (r, h, _m, _batches, _gate) = held_observer(200).await;
+        let web: AgentName = "web".parse().unwrap();
+        r.replace_plugins(&[], &[]);
+        h.remove(&web);
+        assert!(h.queue_for(&web).is_none());
+        assert_eq!(h.queue_len(&web), 0);
     }
 
     #[test]

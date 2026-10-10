@@ -15,6 +15,9 @@ use balerix_server::testing::Harness;
 use balerix_server::{Daemon, router, serve};
 use serde_json::{Value, json};
 
+mod support;
+use support::Api;
+
 fn spec(agents: &[&str]) -> FleetSpec {
     FleetSpec {
         name: "f".into(),
@@ -32,45 +35,6 @@ fn spec(agents: &[&str]) -> FleetSpec {
             },
         )]),
         ..Default::default()
-    }
-}
-
-struct Api {
-    base: String,
-    token: String,
-    agent: ureq::Agent,
-}
-
-impl Api {
-    fn call(
-        &self,
-        method: &str,
-        path: &str,
-        token: Option<&str>,
-        body: Option<&Value>,
-    ) -> (u16, Value) {
-        let url = format!("{}{path}", self.base);
-        let mut req = match method {
-            "GET" => self.agent.get(&url).force_send_body(),
-            "POST" => self.agent.post(&url),
-            "PUT" => self.agent.put(&url),
-            "DELETE" => self.agent.delete(&url).force_send_body(),
-            _ => unreachable!(),
-        };
-        if let Some(t) = token {
-            req = req.header("Authorization", &format!("Bearer {t}"));
-        }
-        let mut resp = match body {
-            Some(b) => req.send_json(b).unwrap(),
-            None => req.send_empty().unwrap(),
-        };
-        let status = resp.status().as_u16();
-        let text = resp.body_mut().read_to_string().unwrap();
-        let v = serde_json::from_str(&text).unwrap_or(Value::String(text));
-        (status, v)
-    }
-    fn admin(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
-        self.call(method, path, Some(&self.token.clone()), body)
     }
 }
 
@@ -148,15 +112,7 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
     let server = tokio::spawn(serve(listener, router(daemon.clone()), async {
         let _ = stop_rx.await;
     }));
-    let api = Arc::new(Api {
-        base: format!("http://127.0.0.1:{port}"),
-        token: "admin-tok".into(),
-        agent: ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(5)))
-            .http_status_as_error(false)
-            .build()
-            .into(),
-    });
+    let api = Arc::new(Api::new(format!("http://127.0.0.1:{port}"), "admin-tok"));
     let call = |api: Arc<Api>,
                 m: &'static str,
                 p: String,
@@ -254,16 +210,13 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
     let (st, v) = tokio::task::spawn_blocking({
         let api = api.clone();
         move || {
-            let url = format!("{}/v1/fleets", api.base);
-            let mut resp = api
-                .agent
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", api.token))
-                .header("Content-Type", "text/plain")
-                .send("{}")
-                .unwrap();
-            let status = resp.status().as_u16();
-            let text = resp.body_mut().read_to_string().unwrap();
+            let bearer = format!("Bearer {}", api.token());
+            let (status, _, text) = api.raw(
+                "POST",
+                "/v1/fleets",
+                &[("Authorization", &bearer), ("Content-Type", "text/plain")],
+                Some(b"{}"),
+            );
             let v = serde_json::from_str(&text).unwrap_or(Value::String(text));
             (status, v)
         }
@@ -470,15 +423,7 @@ async fn an_inexact_tool_version_is_a_400_naming_its_path() {
     let server = tokio::spawn(serve(listener, router(daemon.clone()), async {
         let _ = stop_rx.await;
     }));
-    let api = Api {
-        base: format!("http://127.0.0.1:{port}"),
-        token: "admin-tok".into(),
-        agent: ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(5)))
-            .http_status_as_error(false)
-            .build()
-            .into(),
-    };
+    let api = Api::new(format!("http://127.0.0.1:{port}"), "admin-tok");
 
     let mut s = spec(&["a"]);
     s.crews

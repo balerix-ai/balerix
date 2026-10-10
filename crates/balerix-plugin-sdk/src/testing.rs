@@ -75,7 +75,22 @@ pub struct FakeHost {
 }
 
 impl FakeHost {
+    /// Starts on `127.0.0.1:0`; panics when the bind fails (`try_start`
+    /// returns it).
     pub async fn start(token: &str, config: Value, fleets: Vec<FleetRecord>) -> FakeHost {
+        FakeHost::try_start("127.0.0.1:0", token, config, fleets)
+            .await
+            .unwrap_or_else(|e| panic!("FakeHost {e}"))
+    }
+
+    /// Starts on `addr`; a bind failure is `SdkError::Bind` naming it
+    /// (#176).
+    pub async fn try_start(
+        addr: &str,
+        token: &str,
+        config: Value,
+        fleets: Vec<FleetRecord>,
+    ) -> Result<FakeHost, SdkError> {
         let inner = Arc::new(Inner {
             token: token.to_string(),
             config,
@@ -98,20 +113,20 @@ impl FakeHost {
             manage_failure: Mutex::new(None),
             manage_silent: Mutex::new(false),
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = tokio::net::TcpListener::bind(addr)
             .await
-            .unwrap_or_else(|e| panic!("FakeHost bind: {e}"));
+            .map_err(|e| SdkError::Bind(format!("{addr}: {e}")))?;
         let addr = listener
             .local_addr()
-            .unwrap_or_else(|e| panic!("FakeHost local_addr: {e}"));
+            .map_err(|e| SdkError::Bind(format!("{addr}: {e}")))?;
         let app = router(inner.clone());
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        FakeHost {
+        Ok(FakeHost {
             url: format!("http://{addr}"),
             inner,
-        }
+        })
     }
 
     pub fn env(&self, name: &str, scratch: &Path) -> Env {
@@ -1284,6 +1299,26 @@ mod tests {
                 healthy,
             }
         }
+    }
+
+    /// #176: a bind failure comes back as `SdkError::Bind` naming the
+    /// address, where `start` panics.
+    #[tokio::test]
+    async fn try_start_returns_a_bind_failure() {
+        let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = taken.local_addr().unwrap().to_string();
+        let err = match FakeHost::try_start(&addr, "tok", json!({}), vec![]).await {
+            Ok(_) => panic!("bound {addr} twice"),
+            Err(e) => e,
+        };
+        match err {
+            SdkError::Bind(m) => assert!(m.starts_with(&format!("{addr}: ")), "{m}"),
+            other => panic!("expected Bind, got {other:?}"),
+        }
+        let host = FakeHost::try_start("127.0.0.1:0", "tok", json!({}), vec![])
+            .await
+            .unwrap();
+        assert!(host.url.starts_with("http://127.0.0.1:"), "{}", host.url);
     }
 
     impl Plugin for Counting {

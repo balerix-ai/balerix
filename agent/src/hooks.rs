@@ -28,7 +28,7 @@ use balerix_core::AgentId;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::body_limit::{Drain, limited, refuse};
+use balerix_api::body_limit::{Drain, limited, refuse};
 
 /// Under `hook-relay`'s 5 s and Claude's 10 s command timeout; above the
 /// Daemon's own 2 s handler timeout, so a slow chain is the Daemon's

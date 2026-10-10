@@ -124,6 +124,15 @@ impl ReferenceStateMachine for Model {
     }
 
     /// The state after the transition AND one reconcile pass.
+    ///
+    /// The model never reaches a stopped agent whose hash changed: `Up`
+    /// and `Update` are the only transitions that change a hash, and they
+    /// empty the stopped set of the agents they could change first (`Up`
+    /// of every agent it names, `Update` of all), as the daemon's
+    /// `up`/`update` do. The planner's rule for that state (the
+    /// stop wins) is covered by the deterministic
+    /// `reconcile::tests::a_stopped_agent_is_stopped_and_never_restarted`,
+    /// not by this property test (#13).
     fn apply(mut s: Self::State, t: &Self::Transition) -> Self::State {
         match t {
             Transition::Up(map) => {

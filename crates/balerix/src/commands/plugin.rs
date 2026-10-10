@@ -2,7 +2,7 @@
 //! running daemon, lists, purges, packages.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use balerix_api::{
@@ -16,7 +16,7 @@ use balerix_server::plugins::read_manifest;
 use crate::cli::{
     ApiOnlyArgs, ListArgs, PluginInstallArgs, PluginOpenArgs, PluginPackageArgs, PluginRemoveArgs,
 };
-use crate::client::{Client, NOT_RUNNING};
+use crate::client::{Client, HttpStatus, NOT_RUNNING};
 use crate::commands::fleet::{label, parse_duration, wait_purged};
 use crate::wiring::layout_from_env;
 
@@ -306,7 +306,9 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
                 .and_then(|_| wait_purged(&client, fleet, deadline));
             out.push_str(&render_purge_result(fleet, result));
         }
-        client.purge_plugin(&args.name)?;
+        purge_until(&client, &args.name, deadline, PURGE_RETRY, &mut |line| {
+            eprintln!("{line}")
+        })?;
         return Ok(format!("{out}removed {} and purged its state\n", args.name));
     }
     Ok(format!(
@@ -314,6 +316,43 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
         args.name,
         sync_if_running(client)?
     ))
+}
+
+/// How long `plugin remove --purge` waits between purges the daemon
+/// answered 503.
+const PURGE_RETRY: Duration = Duration::from_secs(1);
+
+/// `DELETE /v1/plugins/<name>`, again every `retry` while the daemon
+/// answers 503 (its tool pool not ready yet, so no pass can stop the
+/// plugin, #178) and `deadline` has not passed; the last answer otherwise.
+/// `say` gets one line for the first 503, and again whenever the daemon's
+/// reason changes.
+fn purge_until(
+    client: &Client,
+    name: &str,
+    deadline: Instant,
+    retry: Duration,
+    say: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let mut said: Option<String> = None;
+    loop {
+        match client.purge_plugin(name) {
+            Err(e) if Instant::now() + retry < deadline => {
+                let Some(h) = e.downcast_ref::<HttpStatus>().filter(|h| h.status == 503) else {
+                    return Err(e);
+                };
+                if said.as_deref() != Some(h.message.as_str()) {
+                    say(&format!(
+                        "purge of {name}: {} (HTTP 503); retrying until --timeout runs out",
+                        h.message
+                    ));
+                    said = Some(h.message.clone());
+                }
+                std::thread::sleep(retry);
+            }
+            other => return other,
+        }
+    }
 }
 
 pub fn package_command(args: &PluginPackageArgs) -> Result<String> {
@@ -350,6 +389,86 @@ fn open_with(client: &Client, name: &str) -> Result<String> {
 mod tests {
     use super::*;
     use balerix_api::AgentPhase;
+
+    const UNAVAILABLE: (&str, &str) = (
+        "503 Service Unavailable",
+        r#"{"error":"plugin hello: the daemon's tool pool was still installing after 20s"}"#,
+    );
+
+    /// #178: a 503 (the daemon's tool pool not ready yet) is retried
+    /// until the purge goes through.
+    #[test]
+    fn a_purge_answered_503_is_retried_until_it_succeeds() {
+        let (url, rx) =
+            crate::testutil::stub_server_seq(vec![UNAVAILABLE, UNAVAILABLE, ("200 OK", "{}")]);
+        let client = Client::new(url, "t".into());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut lines = Vec::new();
+        purge_until(
+            &client,
+            "hello",
+            deadline,
+            Duration::from_millis(10),
+            &mut |l| lines.push(l.to_string()),
+        )
+        .unwrap();
+        let requests: Vec<String> = rx.try_iter().collect();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert!(requests[2].starts_with("DELETE /v1/plugins/hello "));
+        assert_eq!(
+            lines,
+            vec![
+                "purge of hello: plugin hello: the daemon's tool pool was still installing after 20s (HTTP 503); retrying until --timeout runs out"
+            ],
+            "one line for the same reason twice"
+        );
+    }
+
+    /// The last 503 is the error once the deadline has passed.
+    #[test]
+    fn a_purge_still_503_at_the_deadline_fails_with_the_daemons_reason() {
+        let (url, _rx) = crate::testutil::stub_server_seq(vec![UNAVAILABLE; 50]);
+        let client = Client::new(url, "t".into());
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let e = purge_until(
+            &client,
+            "hello",
+            deadline,
+            Duration::from_millis(10),
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("still installing") && e.contains("(HTTP 503)"),
+            "{e}"
+        );
+    }
+
+    /// Any other failure is not retried.
+    #[test]
+    fn a_purge_refused_otherwise_fails_at_once() {
+        let (url, rx) = crate::testutil::stub_server_seq(vec![
+            (
+                "409 Conflict",
+                r#"{"error":"plugin hello is still declared"}"#,
+            ),
+            ("200 OK", "{}"),
+        ]);
+        let client = Client::new(url, "t".into());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let e = purge_until(
+            &client,
+            "hello",
+            deadline,
+            Duration::from_millis(10),
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("still declared"), "{e}");
+        assert_eq!(rx.try_iter().count(), 1);
+    }
 
     #[test]
     fn open_asks_for_a_session_on_the_mount_root_and_prints_the_url() {

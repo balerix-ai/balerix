@@ -272,9 +272,11 @@ dependencies = [
 name = "balerix-api"
 version = "0.2.3"
 dependencies = [
+ "axum",
  "serde",
  "serde_json",
  "serde_norway",
+ "tokio",
 ]
 
 [[package]]
@@ -368,6 +370,7 @@ dependencies = [
  "balerix-api",
  "balerix-core",
  "balerix-plugin-sdk",
+ "balerix-server",
  "chacha20poly1305",
  "flate2",
  "futures-util",

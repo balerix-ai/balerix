@@ -19,11 +19,19 @@ pub fn stub_server_n(
     status_line: &'static str,
     body: &'static str,
 ) -> (String, mpsc::Receiver<String>) {
+    stub_server_seq(vec![(status_line, body); n])
+}
+
+/// Answers one request per `(status line, body)`, in order, one connection
+/// each; every raw request goes down the channel.
+pub fn stub_server_seq(
+    answers: Vec<(&'static str, &'static str)>,
+) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        for _ in 0..n {
+        for (status_line, body) in answers {
             let (mut sock, _) = listener.accept().unwrap();
             let mut buf = Vec::new();
             let mut chunk = [0u8; 4096];

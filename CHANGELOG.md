@@ -1,5 +1,14 @@
 # Changelog
 
+### Upgrading
+
+- `balerix_plugin_events_dropped_total` has a second label, `reason`
+  (`overflow`, `not_ready` or `unacknowledged`), so its label set is now
+  `{plugin, reason}` (#13). A query or alert that matched the series on
+  `{plugin}` alone still matches; one that compares series by their full
+  label set (`on(plugin)` is fine, a bare `/` or `==` against another
+  `{plugin}` metric is not) needs `sum by (plugin)` first.
+
 ## 0.2.3 - 2026-10-09
 
 ### Bug fixes

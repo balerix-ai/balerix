@@ -7,7 +7,6 @@ pub mod actor;
 pub mod api;
 pub mod attach;
 pub mod auth;
-pub mod body_limit;
 pub mod daemon;
 pub mod fsutil;
 pub mod hooks;
@@ -20,6 +19,7 @@ pub mod proxy;
 pub mod sessions;
 pub mod store;
 pub mod system_pool;
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod vault;
 pub mod watch;
@@ -39,7 +39,7 @@ pub use lifecycle::{
     LifecycleError, ServerPaths, load_or_create_token, read_endpoint, read_pid, remove_if_exists,
     write_endpoint, write_pid,
 };
-pub use metrics::Metrics;
+pub use metrics::{DropReason, Metrics};
 pub use plugins::{
     ActivationRow, ObserverQueue, PluginAddr, PluginClient, PluginError, PluginEventHandler,
     PluginHost, PluginHostConfig, PluginInfo, PluginKv, PluginRegistry, PluginSetup, PluginSource,

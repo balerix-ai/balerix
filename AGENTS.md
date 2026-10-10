@@ -366,8 +366,9 @@ credentials, hook input, or sandbox rules.
   `balerix-e2e-plugins-<pid>`, the flow e2e `balerix-e2e-flow-<pid>`).
 - A body over a route's limit is read to its end, up to four times the
   limit and for at most 10 s, before the route answers it
-  (`body_limit::drain_over_limit`, #116; the SDK and the agent
-  sidecar's hook ingress keep copies, #168): axum alone
+  (`balerix_api::body_limit::drain_over_limit`, #116, behind
+  `balerix-api`'s `axum` feature, which the daemon, the SDK and the agent
+  sidecar's hook ingress turn on and nothing else may, #175): axum alone
   answers 413 the moment it has read past the limit and the connection
   closes with the rest unread, so a client still writing got EPIPE in
   place of the answer. Past four times the limit the answer (413), and
@@ -422,11 +423,14 @@ credentials, hook input, or sandbox rules.
 - `plugin remove --purge` (and `down --purge`) used to answer 500 `Directory
   not empty` about one run in twenty: `tmux kill-window` returns before nono
   finishes writing its ledger under `plugins/<name>/nono/`. Fixed on both
-  sides — `PluginHost::purge` waits (20 s, under the CLI's 30 s
-  request timeout) for a pass the actor runs after the request
+  sides — `PluginHost::purge` waits (20 s in all, under the CLI's 30 s
+  request timeout) for the daemon's tool pool to be ready (no pass runs
+  before it; a pool whose last install failed is a 503 at once, with its
+  reason, #178), then for a pass the actor runs after the request
   (`Msg::Barrier`; a window that outlived a restart is in no record) and
-  for the plugin to be out of the record before deleting anything, and
-  refuses while the daemon's tool pool is not ready (no pass can run, #1), and `Runtime::rm_rf` retries
+  for the plugin to be out of the record before deleting anything (#1);
+  `plugin remove --purge` retries a 503 until its `--timeout` (#178); and
+  `Runtime::rm_rf` retries
   `remove_dir_all` for 5 s while the error is `DirectoryNotEmpty`.
 - `up` waits for plugin activations as well as `Ready`; a `fake=pending` in
   the timeout table means the plugin never said `hello` (look at

@@ -22,7 +22,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::auth::{RateLimiter, bearer, constant_time_eq};
-use crate::body_limit::{Drain, drain_over_limit, limited, refuse};
 use crate::daemon::{Caller, Daemon, DaemonError};
 use crate::hooks;
 use crate::plugins::{PluginAddr, PluginError};
@@ -31,6 +30,7 @@ use crate::sessions::{
     COOKIE, CodeRejected, MOUNT_PREFIX, cookie_value, login_target, same_origin, set_cookie,
 };
 use crate::system_pool::SystemPoolState;
+use balerix_api::body_limit::{Drain, drain_over_limit, limited, refuse};
 
 #[derive(Clone)]
 pub(crate) struct AppState {

@@ -20,6 +20,7 @@ pub mod proxy;
 pub mod sessions;
 pub mod store;
 pub mod system_pool;
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod vault;
 pub mod watch;

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.4 - 2026-10-10
+
+### Bug fixes
+
+- Plugin host leftovers batch (#16, #176, #13, #178, #175) (#201)
+
 ## 0.2.3 - 2026-10-09
 
 ### Bug fixes

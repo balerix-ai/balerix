@@ -427,8 +427,9 @@ credentials, hook input, or sandbox rules.
   before it; a pool whose last install failed is a 503 at once, with its
   reason, #178), then for a pass the actor runs after the request
   (`Msg::Barrier`; a window that outlived a restart is in no record) and
-  for the plugin to be out of the record before deleting anything (#1),
-  and `Runtime::rm_rf` retries
+  for the plugin to be out of the record before deleting anything (#1);
+  `plugin remove --purge` retries a 503 until its `--timeout` (#178); and
+  `Runtime::rm_rf` retries
   `remove_dir_all` for 5 s while the error is `DirectoryNotEmpty`.
 - `up` waits for plugin activations as well as `Ready`; a `fake=pending` in
   the timeout table means the plugin never said `hello` (look at

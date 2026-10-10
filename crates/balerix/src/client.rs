@@ -42,6 +42,23 @@ pub struct Client {
     timeout: Duration,
 }
 
+/// The daemon answered neither 2xx nor 404: its message and the status,
+/// shown as `<message> (HTTP <status>)`. A caller that retries on a
+/// status downcasts to this.
+#[derive(Debug)]
+pub struct HttpStatus {
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (HTTP {})", self.message, self.status)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
 impl Client {
     pub fn connect(api_url: Option<&str>) -> Result<Self> {
         let layout = layout_from_env()?;
@@ -130,7 +147,7 @@ impl Client {
                 let message = serde_json::from_str::<ErrorBody>(&text)
                     .map(|e| e.error)
                     .unwrap_or(text);
-                bail!("{message} (HTTP {status})")
+                Err(HttpStatus { status, message }.into())
             }
         }
     }

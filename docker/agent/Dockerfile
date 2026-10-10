@@ -2,7 +2,7 @@
 # git, gh, nono, tmux, `balerix`) plus `balerix-agent`. `BASE` is the
 # runtime image of the same version; scripts/kind-up.sh passes a locally
 # built one. The context holds the binary as `balerix-agent`.
-ARG BASE=ghcr.io/balerix-ai/balerix:0.2.3
+ARG BASE=ghcr.io/balerix-ai/balerix:0.2.4
 # hadolint ignore=DL3006
 FROM ${BASE}
 COPY --chmod=0755 balerix-agent /usr/local/bin/balerix-agent

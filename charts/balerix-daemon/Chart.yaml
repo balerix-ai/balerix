@@ -6,7 +6,7 @@ type: application
 version: 0.1.2
 # the core version; moved by `release-prepare core`. The Daemon runs the
 # operator's version (spec.version is left unset).
-appVersion: "0.2.3"
+appVersion: "0.2.4"
 kubeVersion: ">=1.32.0-0"
 home: https://github.com/balerix-ai/balerix
 sources:

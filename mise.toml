@@ -11,7 +11,7 @@ gitleaks = "8.30.1"
 tmux = "3.7c"
 gh = "2.102.0"
 nono = "0.79.0"
-claude = "2.1.295"
+claude = "2.1.296"
 # The web plugin's review-page script runs under node in its tests
 # (plugins/web/src/routes.rs, #20). The 26 line, LTS from late October
 # 2026; never inherited by agents (INHERITED is claude and gh only).

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.3 - 2026-10-10
+
+
+
+### Images
+
+- `balerix` 0.2.3 → 0.2.4
+- `balerix-plugin-flow` 0.1.3 → 0.1.4
+- `balerix-plugin-web` 0.2.3 → 0.2.4
+- `balerix-plugin-matrix` 0.1.3 → 0.1.4
+- `balerix-plugin-github` 0.1.1 → 0.1.2
+
 ## 0.1.2 - 2026-10-10
 
 

@@ -133,7 +133,7 @@ pub fn router<P: Plugin>(plugin: Arc<P>, token: &str) -> Router {
     // is drained before the answer, as on the daemon (#116).
     // The bearer is checked outside the drain: a caller without it is
     // answered before the body is read.
-    crate::body_limit::limited(base, crate::body_limit::Drain::new(1 << 20))
+    balerix_api::body_limit::limited(base, balerix_api::body_limit::Drain::new(1 << 20))
         .layer(middleware::from_fn_with_state(token, require_daemon_bearer))
 }
 
@@ -146,7 +146,7 @@ async fn require_daemon_bearer(
         Some(t) if constant_time_eq(t.as_bytes(), token.as_bytes()) => next.run(req).await,
         _ => {
             let no = error(StatusCode::UNAUTHORIZED, "bad daemon token");
-            crate::body_limit::refuse(req, no).await
+            balerix_api::body_limit::refuse(req, no).await
         }
     }
 }

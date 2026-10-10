@@ -16,9 +16,9 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
 use crate::api::ApiError;
-use crate::body_limit::{self, DRAIN_FACTOR, DRAIN_TIME, Read};
 use crate::plugins::PluginAddr;
 use crate::sessions::MOUNT_PREFIX;
+use balerix_api::body_limit::{self, DRAIN_FACTOR, DRAIN_TIME, Read};
 use std::time::Duration;
 
 pub type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
@@ -182,6 +182,7 @@ async fn read_body_within(body: Body, time: Duration) -> Result<Bytes, BodyError
         Read::Over => Err(BodyError::TooLarge { close: false }),
         Read::PastCeiling => Err(BodyError::TooLarge { close: true }),
         Read::Broken(e) => Err(BodyError::Transport(e)),
+        _ => Err(BodyError::Transport("unreadable request body".into())),
     }
 }
 

@@ -25,7 +25,7 @@ name = "balerix-agent"
 path = "src/main.rs"
 
 [dependencies]
-balerix-api = { path = "../crates/balerix-api" }
+balerix-api = { path = "../crates/balerix-api", features = ["axum"] }
 balerix-core = { path = "../crates/balerix-core" }
 balerix-runtime = { path = "../crates/balerix-runtime" }
 # Error context on the entrypoints' failures, printed as the exit reason.

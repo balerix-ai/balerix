@@ -3,11 +3,15 @@
 //! This crate is a leaf: serde DTOs, with no logic beyond defaults,
 //! secret-redacting `Debug` impls and the pure validators both sides
 //! share (`branch::check_branch_name`, `workspace::check_path`,
-//! `protocol::check_kv_key`).
+//! `protocol::check_kv_key`). The `axum` feature (off by default) adds
+//! `body_limit`, the over-limit body drain the daemon, the plugin SDK and
+//! the agent sidecar share.
 
 /// The `apiVersion` every fleet file and request declares.
 pub const API_VERSION: &str = "balerix/v1";
 
+#[cfg(feature = "axum")]
+pub mod body_limit;
 pub mod branch;
 pub mod bundle;
 pub mod credentials;

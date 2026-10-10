@@ -143,8 +143,10 @@ dependencies = [
 name = "balerix-api"
 version = "0.2.3"
 dependencies = [
+ "axum",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

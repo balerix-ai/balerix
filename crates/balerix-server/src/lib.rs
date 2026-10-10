@@ -7,7 +7,6 @@ pub mod actor;
 pub mod api;
 pub mod attach;
 pub mod auth;
-pub mod body_limit;
 pub mod daemon;
 pub mod fsutil;
 pub mod hooks;

@@ -366,8 +366,9 @@ credentials, hook input, or sandbox rules.
   `balerix-e2e-plugins-<pid>`, the flow e2e `balerix-e2e-flow-<pid>`).
 - A body over a route's limit is read to its end, up to four times the
   limit and for at most 10 s, before the route answers it
-  (`body_limit::drain_over_limit`, #116; the SDK and the agent
-  sidecar's hook ingress keep copies, #168): axum alone
+  (`balerix_api::body_limit::drain_over_limit`, #116, behind
+  `balerix-api`'s `axum` feature, which the daemon, the SDK and the agent
+  sidecar's hook ingress turn on and nothing else may, #175): axum alone
   answers 413 the moment it has read past the limit and the connection
   closes with the rest unread, so a client still writing got EPIPE in
   place of the answer. Past four times the limit the answer (413), and

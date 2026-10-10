@@ -49,7 +49,7 @@ pub(crate) async fn require_secret(
         next.run(req).await
     } else {
         let no = ApiError::new(StatusCode::UNAUTHORIZED, "unknown agent or bad secret");
-        crate::body_limit::refuse(req, no.into_response()).await
+        balerix_api::body_limit::refuse(req, no.into_response()).await
     }
 }
 

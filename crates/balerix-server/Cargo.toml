@@ -9,7 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-balerix-api = { workspace = true }
+balerix-api = { workspace = true, features = ["axum"] }
 balerix-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

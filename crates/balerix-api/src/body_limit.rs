@@ -1,8 +1,7 @@
-//! Over-limit request bodies (#116, #168): the same drain as the daemon's
-//! `balerix_server::body_limit` and the SDK's
-//! `balerix_plugin_sdk::body_limit`, for the sidecar's hook ingress.
-//! `agent/` depends on neither the server nor the SDK, so it keeps its
-//! own copy; change the three together.
+//! Over-limit request bodies (#116), behind the `axum` feature: the one
+//! drain the daemon, the plugin SDK's listener and the agent sidecar's
+//! hook ingress share (#175). Every answer it makes itself is an
+//! [`ErrorBody`], the body of every non-2xx API answer.
 //!
 //! axum refuses a body the moment it has read past the route's
 //! `DefaultBodyLimit`, and the connection is then closed with the rest of
@@ -30,7 +29,6 @@ use std::future::poll_fn;
 use std::pin::Pin;
 use std::time::Duration;
 
-use axum::Router;
 use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
@@ -38,25 +36,25 @@ use axum::http::header::{CONNECTION, CONTENT_LENGTH, HeaderValue, TRANSFER_ENCOD
 use axum::http::request::Parts;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use axum::{Json, Router};
 
-use axum::Json;
-use serde_json::json;
+use crate::request::ErrorBody;
 
 /// How far past a route's limit a body is still read to its end.
-pub(crate) const DRAIN_FACTOR: usize = 4;
+pub const DRAIN_FACTOR: usize = 4;
 /// How long an over-limit body may take to arrive before it is answered
 /// unread: a slow trickle does not hold the connection.
-pub(crate) const DRAIN_TIME: Duration = Duration::from_secs(10);
+pub const DRAIN_TIME: Duration = Duration::from_secs(10);
 
 /// A route's body limit and how long its drain may take.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Drain {
-    pub(crate) limit: usize,
-    pub(crate) time: Duration,
+pub struct Drain {
+    pub limit: usize,
+    pub time: Duration,
 }
 
 impl Drain {
-    pub(crate) fn new(limit: usize) -> Self {
+    pub fn new(limit: usize) -> Self {
         Self {
             limit,
             time: DRAIN_TIME,
@@ -67,7 +65,7 @@ impl Drain {
 /// `router` with a body limit and the drain. Authentication goes on
 /// *after* this (a `route_layer`, which wraps outside it), so it answers
 /// before the body is read.
-pub(crate) fn limited<S>(router: Router<S>, drain: Drain) -> Router<S>
+pub fn limited<S>(router: Router<S>, drain: Drain) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -76,18 +74,17 @@ where
         .layer(middleware::from_fn_with_state(drain, drain_over_limit))
 }
 
-enum Read {
+/// What [`read`] made of a body. More outcomes may come; match with a
+/// wildcard.
+#[non_exhaustive]
+pub enum Read {
     Fits(Vec<u8>),
     Over,
     PastCeiling,
     Broken(String),
 }
 
-pub(crate) async fn drain_over_limit(
-    State(drain): State<Drain>,
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn drain_over_limit(State(drain): State<Drain>, req: Request, next: Next) -> Response {
     let limit = drain.limit;
     let hint = req.body().size_hint();
     if hint.upper().is_some_and(|n| n <= limit as u64) {
@@ -106,14 +103,17 @@ pub(crate) async fn drain_over_limit(
         Ok(Read::PastCeiling) => closing(next.run(over_limit(parts, limit)).await),
         // still arriving, under the ceiling so far: not the route's 413
         Err(_) => timed_out(drain.time),
-        Ok(Read::Broken(e)) => {
-            let error = format!("Failed to read the request body: {e}");
-            closing((StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response())
-        }
+        Ok(Read::Broken(e)) => closing(error(
+            StatusCode::BAD_REQUEST,
+            format!("Failed to read the request body: {e}"),
+        )),
     }
 }
 
-async fn read(mut body: Body, limit: usize, ceiling: usize, keep: bool) -> Read {
+/// Reads `body` to its end, keeping it (when `keep`) while it fits
+/// `limit` and stopping once past `ceiling`. The daemon's plugin proxy
+/// reads its bodies with this too (#168).
+pub async fn read(mut body: Body, limit: usize, ceiling: usize, keep: bool) -> Read {
     let mut kept = keep.then(Vec::new);
     let mut read = 0usize;
     while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
@@ -143,14 +143,14 @@ async fn read(mut body: Body, limit: usize, ceiling: usize, keep: bool) -> Read 
 /// The most of an unauthenticated request's body that is read before its
 /// refusal: enough for any honest small request, whose keep-alive
 /// connection then survives the 401.
-pub(crate) const REFUSAL_READ: usize = 64 << 10;
+pub const REFUSAL_READ: usize = 64 << 10;
 
 /// `resp`, the refusal of a caller that failed authentication, without
 /// reading more than [`REFUSAL_READ`] of its body (#116): a body that says
 /// it is no longer is read and dropped (within [`DRAIN_TIME`]) so the
 /// connection stays usable; any other is left unread and the connection
 /// closed.
-pub(crate) async fn refuse(req: Request, resp: Response) -> Response {
+pub async fn refuse(req: Request, resp: Response) -> Response {
     let hint = req.body().size_hint();
     if hint.upper().is_some_and(|n| n <= REFUSAL_READ as u64) {
         let body = req.into_body();
@@ -174,14 +174,72 @@ fn over_limit(mut parts: Parts, limit: usize) -> Request {
 
 /// A body still arriving when the drain time is up (lane H review): a
 /// 408 that says so, the rest left unread.
-pub(crate) fn timed_out(time: Duration) -> Response {
-    let error = format!("body not received within {time:?}");
-    closing((StatusCode::REQUEST_TIMEOUT, Json(json!({ "error": error }))).into_response())
+pub fn timed_out(time: Duration) -> Response {
+    closing(error(
+        StatusCode::REQUEST_TIMEOUT,
+        format!("body not received within {time:?}"),
+    ))
+}
+
+/// `{ "error": … }` with `status`.
+fn error(status: StatusCode, error: String) -> Response {
+    (status, Json(ErrorBody { error })).into_response()
 }
 
 /// The rest of the body is not read: the connection cannot be reused.
-fn closing(mut resp: Response) -> Response {
+pub fn closing(mut resp: Response) -> Response {
     resp.headers_mut()
         .insert(CONNECTION, HeaderValue::from_static("close"));
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::post;
+    use std::io::{Read as _, Write};
+
+    /// A body that trickles in slower than the drain allows is answered
+    /// when the time is up, 408 (not a 413: it never got past the limit),
+    /// and the connection closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_trickle_is_answered_when_the_drain_time_is_up() {
+        let app = limited(
+            Router::new().route("/", post(|_b: Bytes| async { "fits" })),
+            Drain {
+                limit: 8,
+                time: Duration::from_millis(300),
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let answer = tokio::task::spawn_blocking(move || {
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            // 16 bytes declared (over 8, under the 32 ceiling), 2 sent
+            write!(
+                s,
+                "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 16\r\n\r\nab"
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            let mut answer = String::new();
+            let _ = s.read_to_string(&mut answer);
+            (started.elapsed(), answer)
+        })
+        .await
+        .unwrap();
+        let (took, text) = answer;
+        assert!(text.starts_with("HTTP/1.1 408"), "{text}");
+        assert!(text.contains("body not received within 300ms"), "{text}");
+        assert!(
+            text.to_ascii_lowercase().contains("connection: close"),
+            "{text}"
+        );
+        assert!(
+            took >= Duration::from_millis(250) && took < Duration::from_secs(4),
+            "{took:?}"
+        );
+    }
 }

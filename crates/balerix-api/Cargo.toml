@@ -11,9 +11,21 @@ publish = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `body_limit` only, behind the `axum` feature (#175): the daemon, the SDK
+# and the agent sidecar share one drain. Off by default, so a crate that
+# wants the wire types alone (the operator) pulls no HTTP server through
+# this crate. The CLI links the daemon, so it has axum either way.
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+axum = ["dep:axum", "dep:tokio"]
 
 [dev-dependencies]
 serde_norway = { workspace = true }
+
+[package.metadata.docs.rs]
+features = ["axum"]
 
 [lints]
 workspace = true

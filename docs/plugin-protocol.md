@@ -281,11 +281,14 @@ acknowledges, anything else is logged and counted, and there is no
 catch-up for what was missed while the plugin was not `Ready`. A
 `HookEvent` is `{ agent, name, session_id?, received_at, payload }`
 (`events.json`; `session_id` is omitted when absent, present in
-`intercept.json`'s event). `balerix_plugin_events_dropped_total{plugin}`
-counts every event that never reached the plugin: those dropped on queue
-overflow, and — a whole batch at a time — those whose batch was ready to
-send while the plugin was not, and those whose batch the plugin did not
-acknowledge.
+`intercept.json`'s event). `balerix_plugin_events_dropped_total{plugin,reason}`
+counts every event that never reached the plugin, by `reason`: `overflow`
+(dropped from a full queue, oldest first), and — a whole batch at a time —
+`not_ready` (the batch was ready to send while the plugin was not) and
+`unacknowledged` (the plugin did not acknowledge the batch). Events still
+queued for a plugin that is removed (by a sync, or dropped from the
+operator's list in Kubernetes mode) are discarded with its queue and not
+counted.
 
 **`intercept`**: `response_so_far` is the chain's response before this
 plugin (`{}` for the first); `deadline_ms` is what remains of the chain's

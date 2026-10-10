@@ -29,18 +29,25 @@ use crate::plugins::{
 use crate::sessions::Sessions;
 use crate::system_pool::{SystemPoolConfig, SystemPoolState};
 
-/// The chain handler's hello hook; `PassThrough` has nothing to clear.
+/// The chain handler's plugin lifecycle hooks: a `hello`, and a plugin
+/// no longer installed. `PassThrough` has nothing to clear.
 pub trait HelloObserver: Send + Sync {
     fn on_hello(&self, name: &AgentName);
+    /// A sync or the operator's list dropped the plugin (#13).
+    fn on_removed(&self, name: &AgentName);
 }
 
 impl HelloObserver for balerix_core::PassThrough {
     fn on_hello(&self, _: &AgentName) {}
+    fn on_removed(&self, _: &AgentName) {}
 }
 
 impl HelloObserver for crate::plugins::PluginEventHandler {
     fn on_hello(&self, name: &AgentName) {
         crate::plugins::PluginEventHandler::on_hello(self, name);
+    }
+    fn on_removed(&self, name: &AgentName) {
+        crate::plugins::PluginEventHandler::remove(self, name);
     }
 }
 
@@ -529,6 +536,11 @@ impl Daemon {
             return Err(PluginError::Managed(KUBERNETES_PLUGINS.into()));
         };
         let mut report = host.sync().await?;
+        for name in &report.stopped {
+            if let Ok(name) = AgentName::try_from(name.as_str()) {
+                self.handler.on_removed(&name);
+            }
+        }
         let declared: BTreeSet<&str> = report
             .installed
             .iter()
@@ -616,6 +628,9 @@ impl Daemon {
         let dropped = d
             .replace(list.plugins)
             .map_err(|e| DaemonError::Invalid(e.to_string()))?;
+        for name in &dropped {
+            self.handler.on_removed(name);
+        }
         if let Some(m) = &self.managed {
             let listed: Vec<&str> = listed.iter().map(String::as_str).collect();
             m.retain_plugins(&listed);
@@ -3408,5 +3423,78 @@ mod tests {
             (row.config, row.activation),
             (json!({ "b": 2 }), PluginActivation::active())
         );
+    }
+
+    /// Records `on_removed`; otherwise `PassThrough`.
+    #[derive(Default)]
+    struct Removals(std::sync::Mutex<Vec<String>>);
+
+    impl EventHandler for Removals {
+        fn handle<'a>(&'a self, event: &'a HookEvent) -> balerix_core::HandlerFuture<'a> {
+            balerix_core::PassThrough.handle(event)
+        }
+    }
+
+    impl HelloObserver for Removals {
+        fn on_hello(&self, _: &AgentName) {}
+        fn on_removed(&self, name: &AgentName) {
+            self.0.lock().unwrap().push(name.to_string());
+        }
+    }
+
+    /// #13: a plugin a sync stops is removed from the chain handler, so
+    /// its observer task and queue go with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sync_that_stops_a_plugin_tells_the_handler() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let dir = tempfile::tempdir().unwrap();
+        write_plugin_package(
+            &dir.path().join("flow-pkg"),
+            "flow",
+            "hooks: { observe: [Stop] }\n",
+        );
+        std::fs::write(
+            dir.path().join("plugins.yaml"),
+            "plugins:\n  - name: flow\n    source: ./flow-pkg\n",
+        )
+        .unwrap();
+        let removals = Arc::new(Removals::default());
+        let daemon =
+            h.daemon_with_existing(removals.clone(), dir.path(), Vec::new(), ready_toolchain());
+        daemon.sync_plugins().await.unwrap();
+        assert!(removals.0.lock().unwrap().is_empty());
+        std::fs::write(dir.path().join("plugins.yaml"), "plugins: []\n").unwrap();
+        daemon.sync_plugins().await.unwrap();
+        assert_eq!(*removals.0.lock().unwrap(), vec!["flow".to_string()]);
+    }
+
+    /// #13: the same for a plugin the operator's list drops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_list_that_drops_a_plugin_tells_the_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, _, _) = crate::testing::test_authority(dir.path());
+        let tls = crate::kube::tls::client_config(&ca).unwrap();
+        let h = Harness::kube(Duration::from_secs(3600));
+        let removals = Arc::new(Removals::default());
+        let daemon = h.daemon_declared(
+            removals.clone(),
+            dir.path(),
+            "0123456789abcdef0123456789abcdef",
+            PluginClient::new(Some(tls)).unwrap(),
+        );
+        let list = |names: &[&str]| -> balerix_api::DeclaredPlugins {
+            serde_json::from_value(json!({ "plugins": names.iter().map(|n| json!({
+                "name": n, "grant": [], "token": format!("{n}-tok-0123456789abcdef0123456789ab"),
+                "url": format!("https://{n}.ns.svc:7644"), "revision": "r1"
+            })).collect::<Vec<_>>() }))
+            .unwrap()
+        };
+        daemon
+            .declare_plugins(list(&["flow", "web"]))
+            .await
+            .unwrap();
+        assert!(removals.0.lock().unwrap().is_empty());
+        daemon.declare_plugins(list(&["web"])).await.unwrap();
+        assert_eq!(*removals.0.lock().unwrap(), vec!["flow".to_string()]);
     }
 }

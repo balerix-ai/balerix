@@ -35,6 +35,28 @@ struct Inner {
     proxy_requests: IntCounterVec,
 }
 
+/// Why observer events never reached their plugin: the
+/// `balerix_plugin_events_dropped_total` `reason` label (#13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropReason {
+    /// The queue was full; the oldest event went.
+    Overflow,
+    /// The batch was ready to send while the plugin was not.
+    NotReady,
+    /// The plugin did not acknowledge the batch.
+    Unacknowledged,
+}
+
+impl DropReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DropReason::Overflow => "overflow",
+            DropReason::NotReady => "not_ready",
+            DropReason::Unacknowledged => "unacknowledged",
+        }
+    }
+}
+
 impl Metrics {
     pub fn new() -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
@@ -103,9 +125,9 @@ impl Metrics {
         let plugin_events_dropped = IntCounterVec::new(
             Opts::new(
                 "balerix_plugin_events_dropped_total",
-                "Observer events dropped on overflow",
+                "Observer events that never reached the plugin, by reason",
             ),
-            &["plugin"],
+            &["plugin", "reason"],
         )?;
         let plugin_actions = IntCounterVec::new(
             Opts::new(
@@ -252,10 +274,10 @@ impl Metrics {
         }
     }
 
-    pub fn events_dropped(&self, plugin: &str, n: u64) {
+    pub fn events_dropped(&self, plugin: &str, reason: DropReason, n: u64) {
         self.inner
             .plugin_events_dropped
-            .with_label_values(&[plugin])
+            .with_label_values(&[plugin, reason.as_str()])
             .inc_by(n);
     }
 
@@ -364,7 +386,7 @@ mod tests {
         m.plugin_event("flow", "PreToolUse", "intercept");
         m.intercept("flow", "PreToolUse", 0.01, None);
         m.intercept("flow", "PreToolUse", 1.5, Some("timeout"));
-        m.events_dropped("web", 3);
+        m.events_dropped("web", DropReason::Overflow, 3);
         m.plugin_action("flow", "send_text");
         m.hook_action(&id, "send_text");
         m.scrape_failure("web");
@@ -379,7 +401,11 @@ mod tests {
         assert!(text.contains(
             "balerix_plugin_intercept_failures_total{plugin=\"flow\",reason=\"timeout\"} 1"
         ));
-        assert!(text.contains("balerix_plugin_events_dropped_total{plugin=\"web\"} 3"));
+        assert!(
+            text.contains(
+                "balerix_plugin_events_dropped_total{plugin=\"web\",reason=\"overflow\"} 3"
+            )
+        );
         assert!(
             text.contains("balerix_plugin_actions_total{action=\"send_text\",plugin=\"flow\"} 1")
         );

@@ -422,11 +422,13 @@ credentials, hook input, or sandbox rules.
 - `plugin remove --purge` (and `down --purge`) used to answer 500 `Directory
   not empty` about one run in twenty: `tmux kill-window` returns before nono
   finishes writing its ledger under `plugins/<name>/nono/`. Fixed on both
-  sides — `PluginHost::purge` waits (20 s, under the CLI's 30 s
-  request timeout) for a pass the actor runs after the request
+  sides — `PluginHost::purge` waits (20 s in all, under the CLI's 30 s
+  request timeout) for the daemon's tool pool to be ready (no pass runs
+  before it; a pool whose last install failed is a 503 at once, with its
+  reason, #178), then for a pass the actor runs after the request
   (`Msg::Barrier`; a window that outlived a restart is in no record) and
-  for the plugin to be out of the record before deleting anything, and
-  refuses while the daemon's tool pool is not ready (no pass can run, #1), and `Runtime::rm_rf` retries
+  for the plugin to be out of the record before deleting anything (#1),
+  and `Runtime::rm_rf` retries
   `remove_dir_all` for 5 s while the error is `DirectoryNotEmpty`.
 - `up` waits for plugin activations as well as `Ready`; a `fake=pending` in
   the timeout table means the plugin never said `hello` (look at

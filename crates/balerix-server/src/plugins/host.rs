@@ -27,6 +27,7 @@ use super::package;
 use super::registry::PluginRegistry;
 use crate::actor::{self, FleetHandle, Msg, Ports, Shared};
 use crate::daemon::DaemonError;
+use crate::system_pool::SystemPoolState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginHostConfig {
@@ -119,6 +120,9 @@ pub struct PluginHost {
     registry: Arc<PluginRegistry>,
     /// One sync at a time; a second `plugin sync` waits.
     syncing: Mutex<()>,
+    /// The daemon pool's state: no pass runs until it is `Ready`, so
+    /// `purge` waits for it (#178).
+    system_pool: watch::Receiver<SystemPoolState>,
 }
 
 impl PluginHost {
@@ -146,6 +150,7 @@ impl PluginHost {
         });
         let name = RESERVED_FLEET.parse().unwrap_or_else(|_| unreachable!());
         let record = FleetRecord::new(plugin_fleet(&[]).into());
+        let system_pool = shared.system_pool.clone();
         let handle = actor::spawn(name, record, FleetSecrets::default(), ports, shared, false);
         tokio::spawn(mirror_readiness(handle.status.clone(), registry.clone()));
         Arc::new(Self {
@@ -155,6 +160,7 @@ impl PluginHost {
             clock: agent_ports.clock.clone(),
             registry,
             syncing: Mutex::new(()),
+            system_pool,
         })
     }
 
@@ -391,7 +397,7 @@ impl PluginHost {
     /// Deletes `plugins/<name>/` through the materializer and the installed
     /// packages under `install_root/<name>/`.
     ///
-    /// Holds the sync lock and, within one `PURGE_WAIT`, waits for a pass
+    /// Holds the sync lock and, within `PURGE_WAIT` in all, waits for a pass
     /// the actor runs after this request (`Msg::Barrier`), then for the
     /// agent to be out of the record, before deleting. The actor answers
     /// `Apply` before running the pass that stops the plugin, so a sync
@@ -399,14 +405,48 @@ impl PluginHost {
     /// under a process that is still running; and a window the record
     /// never held (one that outlived a daemon restart) is only stopped by
     /// a pass, which the record alone cannot show (#1).
+    ///
+    /// No pass runs until the daemon pool is ready, so a purge first waits
+    /// for that, before it takes the sync lock; a pool that failed its last
+    /// install is refused at once with the reason (#178). Both are 503s.
     pub async fn purge(&self, name: &AgentName) -> Result<(), PluginError> {
+        let deadline = tokio::time::Instant::now() + PURGE_WAIT;
+        let stopping = || PluginError::Internal(format!("plugin {name} is still stopping"));
+        let gone = || PluginError::Internal("plugin actor is gone".into());
+        let unready = |why: &str| {
+            PluginError::Unavailable(format!(
+                "plugin {name}: the daemon's tool pool {why}, so no reconcile pass can run and its window may still be running; nothing was deleted, try again once the pool is ready"
+            ))
+        };
+        let mut pool = self.system_pool.clone();
+        loop {
+            let state = pool.borrow_and_update().clone();
+            match state {
+                SystemPoolState::Ready => break,
+                SystemPoolState::Unready { reason } => {
+                    return Err(unready(&format!("is not ready ({reason})")));
+                }
+                SystemPoolState::Pending => {
+                    match tokio::time::timeout_at(deadline, pool.changed()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => return Err(gone()),
+                        Err(_) => {
+                            return Err(unready(&format!(
+                                "was still installing after {}s",
+                                PURGE_WAIT.as_secs()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        // Taken only now: a sync is not held up behind a purge waiting
+        // for the pool. A pool that drops out from here on is the
+        // barrier's "no pass ran".
         let _guard = self.syncing.lock().await;
         if self.materializer.get(name).is_some() {
             return Err(PluginError::StillDeclared(name.to_string()));
         }
-        let deadline = tokio::time::Instant::now() + PURGE_WAIT;
-        let stopping = || PluginError::Internal(format!("plugin {name} is still stopping"));
-        let gone = || PluginError::Internal("plugin actor is gone".into());
         let (reply, rx) = oneshot::channel();
         tokio::time::timeout_at(deadline, self.handle.tx.send(Msg::Barrier { reply }))
             .await

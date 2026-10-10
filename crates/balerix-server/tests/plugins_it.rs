@@ -745,6 +745,7 @@ async fn purge_deletes_nothing_while_no_pass_can_run() {
         balerix_core::fakes::FakeSystemToolchain::always_failing(),
     ))
     .await;
+    let started = Instant::now();
     let e = daemon
         .plugin_host()
         .unwrap()
@@ -755,7 +756,13 @@ async fn purge_deletes_nothing_while_no_pass_can_run() {
         matches!(e, balerix_server::PluginError::Unavailable(_)),
         "a 503, retryable: {e:?}"
     );
-    assert!(e.to_string().contains("no reconcile pass ran"), "{e}");
+    // #178: an unready pool fails at once, with its reason
+    assert!(e.to_string().contains("fake system pool failure"), "{e}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "failed fast: {:?}",
+        started.elapsed()
+    );
     let resp = axum::response::IntoResponse::into_response(balerix_server::ApiError::from(e));
     assert_eq!(resp.status(), 503);
     assert!(!stopped_hello(&h.runner.calls()));
@@ -764,6 +771,89 @@ async fn purge_deletes_nothing_while_no_pass_can_run() {
             .calls()
             .contains(&"purge_plugin hello".to_string()),
         "nothing deleted under a running window"
+    );
+}
+
+/// A daemon pool whose first install blocks until the test releases it,
+/// then succeeds: the pool is `Pending` until then.
+#[derive(Default)]
+struct HeldToolchain {
+    released: std::sync::Mutex<bool>,
+    cond: std::sync::Condvar,
+}
+
+impl HeldToolchain {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.cond.notify_all();
+    }
+}
+
+/// Releases the pool when dropped, on a failing test too: the runtime's
+/// shutdown waits for the blocked install.
+struct ReleaseOnDrop(Arc<HeldToolchain>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+impl balerix_core::SystemToolchain for HeldToolchain {
+    fn ensure_system_pool(&self) -> Result<(), MaterializeError> {
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.cond.wait(released).unwrap();
+        }
+        Ok(())
+    }
+}
+
+/// #178: a purge sent while the daemon pool is still installing waits
+/// for it (within `PURGE_WAIT`), then stops the window and deletes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purge_waits_for_a_pending_pool() {
+    let tc = Arc::new(HeldToolchain::default());
+    let _release = ReleaseOnDrop(tc.clone());
+    let (_dir, h, daemon) = orphan_daemon(tc.clone()).await;
+    assert_eq!(
+        daemon.system_pool_state(),
+        balerix_server::SystemPoolState::Pending
+    );
+    let purge = tokio::spawn({
+        let daemon = daemon.clone();
+        async move {
+            daemon
+                .plugin_host()
+                .unwrap()
+                .purge(&"hello".parse().unwrap())
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!purge.is_finished(), "waiting for the pool");
+    // the wait does not hold the sync lock
+    tokio::time::timeout(Duration::from_secs(5), daemon.sync_plugins())
+        .await
+        .expect("a sync is not held up behind the waiting purge")
+        .unwrap();
+    assert!(!purge.is_finished(), "still waiting for the pool");
+    assert!(
+        !h.materializer
+            .calls()
+            .contains(&"purge_plugin hello".to_string())
+    );
+    tc.release();
+    tokio::time::timeout(Duration::from_secs(10), purge)
+        .await
+        .expect("the purge ends once the pool is ready")
+        .unwrap()
+        .unwrap();
+    assert!(stopped_hello(&h.runner.calls()), "{:?}", h.runner.calls());
+    assert!(
+        h.materializer
+            .calls()
+            .contains(&"purge_plugin hello".to_string())
     );
 }
 

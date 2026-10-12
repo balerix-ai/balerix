@@ -95,10 +95,14 @@ impl ReadOp {
 /// into its clone's `.git/config`, no program runs from it here (the rest
 /// of the hardening is `workspace::sandboxed_git`'s and the git profile's).
 /// The prefixes are pinned so the combined diff's `diff --git a/… b/…`
-/// lines are the ones `patch_header` expects, whatever the clone sets.
+/// lines are the ones `patch_header` expects, whatever the clone sets, and
+/// `diff.suppressBlankEmpty` so a blank context line keeps its leading
+/// space: printed empty, the review page counted it as no line (#226).
 const CONFIG: &[&str] = &[
     "-c",
     "core.quotePath=true",
+    "-c",
+    "diff.suppressBlankEmpty=false",
     "-c",
     "diff.noprefix=false",
     "-c",

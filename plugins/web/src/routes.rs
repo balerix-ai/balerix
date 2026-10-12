@@ -253,6 +253,7 @@ td.ln:hover{{background:#dbe9ff}}
 tr.add td.code{{background:#e6ffec}} tr.del td.code{{background:#ffebe9}} tr.hdr td{{background:#f1f8ff;color:#57606a}}
 tr.comment td{{background:#fff8c5;white-space:normal;padding:.4rem .6rem}}
 tr.comment textarea{{width:100%;min-height:4em;box-sizing:border-box}}
+.file p.notice{{margin:0;padding:.4rem .6rem;color:#57606a;white-space:pre-wrap}}
 #stale{{border:1px solid #f0c36d;background:#fff8e1;padding:.5rem 1rem;margin:1rem 0}}
 footer{{position:fixed;bottom:0;left:0;right:0;border-top:1px solid #ddd;background:#fff;padding:.5rem 1rem;display:flex;gap:1rem;align-items:flex-start}}
 footer textarea{{flex:1;min-height:3.5em}}
@@ -285,15 +286,30 @@ function save() {{ try {{ localStorage.setItem(key, JSON.stringify(draft, transi
 function el(tag, cls, text) {{ const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }}
 const anchorOf = (c) => c.path + " " + c.side + " " + c.line + " " + c.text;
 
+// A file's patch as hunks of numbered lines. A `diff --git ` line ends the
+// hunk before it: a typechange is two sections under one header, and the
+// second's `--- /dev/null` and `+++ b/x` are not lines of the first (#226).
+// A hunk's line counts say where it ends, so an empty line inside one is a
+// blank context line whose space git dropped (`diff.suppressBlankEmpty`).
 function parsePatch(patch) {{
-  const hunks = []; let h = null; let o = 0, n = 0;
-  for (const raw of patch.split("\n")) {{
-    const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
-    if (m) {{ o = +m[1]; n = +m[2]; h = {{ header: raw, lines: [] }}; hunks.push(h); continue; }}
+  const hunks = []; let h = null; let o = 0, n = 0, oLeft = 0, nLeft = 0;
+  const rows = patch.split("\n");
+  // what follows the last newline is not a line, even inside a hunk a
+  // truncated patch cut short
+  if (patch.endsWith("\n")) rows.pop();
+  for (const raw of rows) {{
+    if (raw.startsWith("diff --git ")) {{ h = null; continue; }}
+    const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(raw);
+    if (m) {{
+      o = +m[1]; n = +m[3]; oLeft = m[2] === undefined ? 1 : +m[2]; nLeft = m[4] === undefined ? 1 : +m[4];
+      h = {{ header: raw, lines: [] }}; hunks.push(h); continue;
+    }}
     if (!h) continue;
-    if (raw.startsWith("+")) h.lines.push({{ kind: "add", side: "new", line: n++, text: raw }});
-    else if (raw.startsWith("-")) h.lines.push({{ kind: "del", side: "old", line: o++, text: raw }});
-    else if (raw.startsWith(" ")) h.lines.push({{ kind: "ctx", side: "new", line: n++, oldLine: o++, text: raw }});
+    if (raw.startsWith("+")) {{ h.lines.push({{ kind: "add", side: "new", line: n++, text: raw }}); nLeft--; }}
+    else if (raw.startsWith("-")) {{ h.lines.push({{ kind: "del", side: "old", line: o++, text: raw }}); oLeft--; }}
+    else if (raw.startsWith(" ") || (raw === "" && oLeft > 0 && nLeft > 0)) {{
+      h.lines.push({{ kind: "ctx", side: "new", line: n++, oldLine: o++, text: raw || " " }}); oLeft--; nLeft--;
+    }}
     else if (raw.startsWith("\\")) h.lines.push({{ kind: "meta", text: raw }});
   }}
   return hunks;
@@ -343,6 +359,12 @@ function commentRow(c, editing) {{
 function sameLine(c, f, l) {{ return c.path === f.path && c.side === l.side && c.line === l.line && c.text === l.text; }}
 function boxOpen() {{ return pending !== null || draft.comments.some((c) => c.editing); }}
 
+// A patch with no hunk shows what it says instead. Only the daemon's own
+// notice for a path that is not a regular file (#220) has nothing to view,
+// so only it loses the "view file" link; an empty patch (an empty file, or
+// one line past the patch cap) and git's hunkless one (a mode change, a pure
+// rename: its extended header lines) keep it (#226).
+const SKIPPED_NOT_A_FILE = "not a regular file, skipped\n";
 function renderFile(f) {{
   const box = el("div", "file"); box.dataset.path = f.path;
   const h3 = el("h3");
@@ -350,11 +372,17 @@ function renderFile(f) {{
   if (f.uncommitted) h3.appendChild(el("span", "badge", "uncommitted"));
   if (f.binary) h3.appendChild(el("span", "badge", "binary"));
   if (f.truncated) h3.appendChild(el("span", "badge", "patch truncated"));
-  if (f.status !== "deleted") {{ const a = el("a", "", "view file"); a.href = prefix + "/agents/" + id + "/file?path=" + encodeURIComponent(f.path); a.target = "_blank"; h3.appendChild(a); }}
+  const hunks = f.binary ? [] : parsePatch(f.patch);
+  if (f.status !== "deleted" && f.patch !== SKIPPED_NOT_A_FILE) {{ const a = el("a", "", "view file"); a.href = prefix + "/agents/" + id + "/file?path=" + encodeURIComponent(f.path); a.target = "_blank"; h3.appendChild(a); }}
   box.appendChild(h3);
   if (f.binary) return box;
+  if (!hunks.length) {{
+    const lines = f.patch.split("\n").filter((l) => l && !/^(diff --git |index |--- |\+\+\+ )/.test(l));
+    if (lines.length) box.appendChild(el("p", "notice", lines.join("\n")));
+    return box;
+  }}
   const table = el("table", "hunk");
-  for (const h of parsePatch(f.patch)) {{
+  for (const h of hunks) {{
     const hdr = el("tr", "hdr"); const td = el("td", "", h.header); td.colSpan = 3; hdr.appendChild(td); table.appendChild(hdr);
     for (const l of h.lines) {{
       const tr = el("tr", l.kind);
@@ -1458,6 +1486,59 @@ const rows = () => document.getElementById("events").children.filter((c) => c.cl
 "#;
         let script = format!("{DOM_STUBS}\n{fetches}\n{}\n{cases}", page_script());
         run_under_node(&script, "race cases ok");
+    }
+
+    /// #226 under `node`, on patches the daemon sends: a typechange's two
+    /// sections (git's own output, `x` from a file to a symlink) are two
+    /// hunks with no header lines in them; a blank context line printed
+    /// empty still counts; a hunkless patch is a notice, with "view file"
+    /// only when git wrote it.
+    #[test]
+    fn the_review_page_parses_typechanges_blank_lines_and_notices_under_node() {
+        let fetches = r#"globalThis.fetch = () => new Promise(() => {});"#;
+        let cases = r#"
+const lines = (p) => parsePatch(p).map((h) => h.lines.map((l) => [l.kind, l.kind === "ctx" ? l.oldLine : l.side === "old" ? l.line : "", l.side === "new" ? l.line : "", l.text]));
+const typechange = "diff --git a/x b/x\ndeleted file mode 100644\nindex ce01362..0000000\n--- a/x\n+++ /dev/null\n@@ -1 +0,0 @@\n-hello\ndiff --git a/x b/x\nnew file mode 120000\nindex 0000000..1de5659\n--- /dev/null\n+++ b/x\n@@ -0,0 +1 @@\n+target\n\\ No newline at end of file\n";
+assert.deepStrictEqual(lines(typechange), [
+  [["del", 1, "", "-hello"]],
+  [["add", "", 1, "+target"], ["meta", "", "", "\\ No newline at end of file"]],
+]);
+
+// diff.suppressBlankEmpty=true: the blank line 2 arrives as "", not " "
+const blank = "diff --git a/f b/f\nindex d32b46e..6c17d57 100644\n--- a/f\n+++ b/f\n@@ -1,5 +1,5 @@\n a\n\n b\n-c\n+C\n d\n";
+assert.deepStrictEqual(lines(blank), [[
+  ["ctx", 1, 1, " a"], ["ctx", 2, 2, " "], ["ctx", 3, 3, " b"],
+  ["del", 4, "", "-c"], ["add", "", 4, "+C"], ["ctx", 5, 5, " d"],
+]]);
+assert.deepStrictEqual(lines(blank.replace("\n\n", "\n \n")), lines(blank), "the same as git's default");
+// two hunks: the second's counts start afresh, the trailing "" is nothing
+const two = "@@ -1,2 +1,2 @@\n a\n\n@@ -9 +9 @@\n-z\n+Z\n";
+assert.deepStrictEqual(lines(two), [[["ctx", 1, 1, " a"], ["ctx", 2, 2, " "]], [["del", 9, "", "-z"], ["add", "", 9, "+Z"]]]);
+
+// a patch cut mid-hunk (`truncated`) ends in a newline: nothing after it is a line
+assert.deepStrictEqual(lines("@@ -1,5 +1,5 @@\n a\n b\n"), [[["ctx", 1, 1, " a"], ["ctx", 2, 2, " b"]]]);
+assert.deepStrictEqual(lines("@@ -1,5 +1,5 @@\n a\n\n"), [[["ctx", 1, 1, " a"], ["ctx", 2, 2, " "]]], "a blank line before the cut still counts");
+
+const file = (patch, status, truncated) => ({ path: "p", status: status || "added", uncommitted: true, binary: false, truncated: !!truncated, patch });
+const shown = (f) => texts(renderFile(f));
+const skipped = shown(file("not a regular file, skipped\n"));
+assert.ok(skipped.includes("not a regular file, skipped"), skipped.join("|"));
+assert.ok(!skipped.includes("view file"), "nothing to view: " + skipped.join("|"));
+const mode = shown(file("diff --git a/p b/p\nold mode 100644\nnew mode 100755\n", "modified"));
+assert.ok(mode.includes("old mode 100644\nnew mode 100755"), mode.join("|"));
+assert.ok(mode.includes("view file"), "git's hunkless patch keeps the link: " + mode.join("|"));
+// an empty patch: an empty file, or one long line past the patch cap
+for (const f of [file(""), file("", "modified", true)]) {
+  const box = renderFile(f);
+  assert.ok(texts(box).includes("view file"), "the only way to see it: " + texts(box).join("|"));
+  assert.ok(!box.children.some((c) => c.className === "notice"), "no empty notice");
+}
+const hunk = shown(file(blank, "modified"));
+assert.ok(hunk.includes("view file") && hunk.includes("+C"), hunk.join("|"));
+console.log("patch cases ok");
+"#;
+        let script = format!("{DOM_STUBS}\n{fetches}\n{}\n{cases}", page_script());
+        run_under_node(&script, "patch cases ok");
     }
 
     #[test]

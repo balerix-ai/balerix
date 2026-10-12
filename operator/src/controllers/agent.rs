@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use kube::api::{DeleteParams, PostParams};
+use kube::api::{DeleteParams, Patch, PostParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::finalizer::{Error as FinalizerError, Event, finalizer};
 use kube::runtime::reflector::ObjectRef;
@@ -23,15 +23,17 @@ use super::crew::crew_ready;
 use super::daemon::read_secret_string;
 use super::fleet::daemon_of;
 use super::jobs::ensure_job;
-use super::{
-    Context, Error, api_in, apply, bounded, error_policy, patch_status, reconciled, report,
-};
+use super::owned::{apply_read, delete_read, observe, observe_desired};
+use super::{Context, Error, api_in, bounded, error_policy, patch_status, reconciled, report};
 use crate::api::{Agent, AgentStatus, Crew, Daemon, Fleet, Retain};
 use crate::desired::agent::{AgentInputs, SPEC_HASH_ANNOTATION, agent_objects, agent_status};
-use crate::desired::common::{Cond, JobOutcome, conditions, owner_of};
+use crate::desired::common::{Cond, JobOutcome, conditions, labels, owner_of};
 use crate::desired::fleet::HARVEST_FINALIZER;
 use crate::desired::jobs::{JobContext, harvest_job};
 use crate::desired::names;
+use crate::desired::ownership::{
+    AGENT_LABEL, COMPONENT_LABEL, CREW_LABEL, DAEMON_LABEL, FLEET_LABEL, Identity, identity_of,
+};
 
 /// On an Agent: skip its harvest, as `--purge` does (§8.5). On a Fleet,
 /// read only while the Fleet is being deleted: skip every Agent's harvest
@@ -75,7 +77,25 @@ pub async fn controller(ctx: Arc<Context>, watches: &kube::Client, namespace: Op
         api_in::<NetworkPolicy>(client, namespace),
         watcher::Config::default(),
     )
-    .owns(api_in::<Job>(client, namespace), watcher::Config::default())
+    // a harvest Job has no owner (§26.3): it is mapped by its labels
+    .watches(
+        api_in::<Job>(client, namespace),
+        watcher::Config::default().labels(&format!("{COMPONENT_LABEL}=harvest")),
+        |job: Job| {
+            let labels = job.labels();
+            match (
+                labels.get(FLEET_LABEL),
+                labels.get(CREW_LABEL),
+                labels.get(AGENT_LABEL),
+            ) {
+                (Some(f), Some(c), Some(a)) => Some(
+                    ObjectRef::<Agent>::new(&names::agent(f, c, a))
+                        .within(&job.namespace().unwrap_or_default()),
+                ),
+                _ => None,
+            }
+        },
+    )
     .watches(
         api_in::<Fleet>(client, namespace),
         watcher::Config::default(),
@@ -104,10 +124,14 @@ pub async fn reconcile(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, E
     let agents: Api<Agent> = Api::namespaced(ctx.client.clone(), &namespace);
     let ctx2 = ctx.clone();
     finalizer(&agents, HARVEST_FINALIZER, agent, |event| async move {
-        match event {
-            Event::Apply(agent) => apply_agent(agent, ctx2).await,
-            Event::Cleanup(agent) => cleanup_agent(agent, ctx2).await,
+        let (agent, result) = match event {
+            Event::Apply(agent) => (agent.clone(), apply_agent(agent, ctx2.clone()).await),
+            Event::Cleanup(agent) => (agent.clone(), cleanup_agent(agent, ctx2.clone()).await),
+        };
+        if let Err(Error::Conflict(message)) = &result {
+            conflicted(&ctx2, &agent, message).await;
         }
+        result
     })
     .await
     .map_err(|e| match e {
@@ -115,6 +139,73 @@ pub async fn reconcile(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, E
         FinalizerError::ApplyFailed(e) | FinalizerError::CleanupFailed(e) => e,
         other => Error::from(other),
     })
+}
+
+/// `Ready=False`, reason `Conflict` (§26): an object by one of this
+/// Agent's names is not its own. Logged when it cannot be written.
+async fn conflicted(ctx: &Context, agent: &Agent, message: &str) {
+    let namespace = agent.namespace().unwrap_or_default();
+    let reported = reported(ctx, &namespace, agent);
+    let status = with_condition(
+        ctx,
+        agent,
+        None,
+        reported.as_ref(),
+        Cond::no("Ready", "Conflict", message),
+    );
+    if let Err(e) = patch_status(&ctx.client, agent, &status).await {
+        tracing::warn!(namespace = %namespace, name = %agent.name_any(), "the Conflict condition was not written: {e}");
+    }
+}
+
+/// The labels of this Agent's objects of `component` (`agent` for the
+/// claim, bundle, policy and pod; `token` for its token Secret).
+fn agent_labels(agent: &Agent, component: &str) -> serde_json::Value {
+    labels(
+        &agent.spec.daemon,
+        component,
+        &[
+            (FLEET_LABEL, agent.spec.fleet.as_str()),
+            (CREW_LABEL, agent.spec.crew.as_str()),
+            (AGENT_LABEL, agent.spec.agent.as_str()),
+        ],
+    )
+}
+
+/// What the Agent's claim carries (§26.1): the Agent's identity and its
+/// Daemon's label. The claim has no owner reference and can outlive its
+/// Agent (a finalizer removed by hand); its data is only ever the
+/// Daemon's it was made under.
+fn claim_identity(agent: &Agent) -> Identity {
+    let mut id = identity_of(&agent_labels(agent, "agent"));
+    id.insert(
+        DAEMON_LABEL.to_string(),
+        Some(names::daemon_label(&agent.spec.daemon)),
+    );
+    id
+}
+
+/// The Agent's own Pod, when there is one (§26).
+async fn own_pod(pods: &Api<Pod>, agent: &Agent) -> Result<Option<Pod>, Error> {
+    observe(
+        pods,
+        &agent.name_any(),
+        &identity_of(&agent_labels(agent, "agent")),
+        agent.uid().as_deref(),
+    )
+    .await
+}
+
+/// In a cleanup an object by the Agent's name that is not its own is
+/// left alone and counts as none: the Agent's own cannot exist beside it.
+fn absent_if_foreign<T>(found: Result<Option<T>, Error>, agent: &str) -> Result<Option<T>, Error> {
+    match found {
+        Err(Error::Conflict(why)) => {
+            tracing::warn!(agent = %agent, "{why}");
+            Ok(None)
+        }
+        other => other,
+    }
 }
 
 /// The Daemon's last word on this agent, from the Fleet's cached record.
@@ -222,16 +313,28 @@ async fn apply_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Err
         )));
     };
     let crews: Api<Crew> = Api::namespaced(ctx.client.clone(), &namespace);
-    let crew = crews
-        .get_opt(&names::crew(&agent.spec.fleet, &agent.spec.crew))
-        .await?;
+    let crew_labels = labels(
+        &agent.spec.daemon,
+        "crew",
+        &[
+            (FLEET_LABEL, agent.spec.fleet.as_str()),
+            (CREW_LABEL, agent.spec.crew.as_str()),
+        ],
+    );
+    let crew = observe(
+        &crews,
+        &names::crew(&agent.spec.fleet, &agent.spec.crew),
+        &identity_of(&crew_labels),
+        None,
+    )
+    .await?;
     let waiting = match crew.as_ref().map(crew_ready) {
         Some(Ok(())) => None,
         Some(Err(why)) => Some(why),
         None => Some("the Crew does not exist yet".to_string()),
     };
     if let Some(why) = waiting {
-        let pod = pods.get_opt(&name).await?;
+        let pod = own_pod(&pods, &agent).await?;
         let status = with_condition(
             &ctx,
             &agent,
@@ -247,11 +350,15 @@ async fn apply_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Err
     // a Secret the user must fix is a condition, looked at again each period
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &namespace);
     let token_secret = names::token(&name);
-    let token = secrets
-        .get_opt(&token_secret)
-        .await?
-        .as_ref()
-        .and_then(|s| read_secret_string(s, "token"));
+    let token = observe(
+        &secrets,
+        &token_secret,
+        &identity_of(&agent_labels(&agent, "token")),
+        None,
+    )
+    .await?
+    .as_ref()
+    .and_then(|s| read_secret_string(s, "token"));
     let resolved = match token {
         None => Err(format!(
             "Secret {token_secret} (the agent's Daemon token, minted by the Fleet) does not exist or has no key token"
@@ -263,7 +370,7 @@ async fn apply_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Err
     let (token, credentials) = match resolved {
         Ok(both) => both,
         Err(why) => {
-            let pod = pods.get_opt(&name).await?;
+            let pod = own_pod(&pods, &agent).await?;
             let status = with_condition(
                 &ctx,
                 &agent,
@@ -284,22 +391,41 @@ async fn apply_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Err
         cfg: &ctx.cfg,
     })?;
 
+    // every object by one of the Agent's names judged before any is
+    // written (§26.1): no Pod while its claim, bundle or policy is in
+    // `Conflict`, and the policy before the Pod
     let claims: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), &namespace);
-    if claims.get_opt(&name).await?.is_none() {
-        claims
-            .create(&PostParams::default(), &objects.claim)
-            .await?;
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &namespace);
+    let policies: Api<NetworkPolicy> = Api::namespaced(ctx.client.clone(), &namespace);
+    let claim = observe(
+        &claims,
+        &name,
+        &claim_identity(&agent),
+        agent.uid().as_deref(),
+    )
+    .await?;
+    let bundle = observe_desired(&secrets, &objects.bundle).await?;
+    let policy = observe_desired(&policies, &objects.policy).await?;
+    let existing_pod = observe_desired(&pods, &objects.pod).await?;
+    apply_read(&policies, &objects.policy, policy.as_ref()).await?;
+    apply_read(&secrets, &objects.bundle, bundle.as_ref()).await?;
+    // the claim: created when absent; one an earlier operator made owned
+    // by the Agent is released, so no garbage collector takes it before
+    // the harvest (§26.3)
+    match claim {
+        None => {
+            apply_read(&claims, &objects.claim, None).await?;
+        }
+        Some(claim) => release_claim(&claims, &claim, &agent).await?,
     }
-    apply(&ctx.client, &objects.bundle).await?;
-    apply(&ctx.client, &objects.policy).await?;
 
     // the Pod: created when absent, replaced when its specHash differs
     // (§5.4) or it has ended, as an evicted pod has (§11, #234)
     let mut again = period;
-    let pod = match pods.get_opt(&name).await? {
+    let pod = match existing_pod {
         None => match pods.create(&PostParams::default(), &objects.pod).await {
             Ok(pod) => Some(pod),
-            Err(kube::Error::Api(e)) if e.code == 409 => pods.get_opt(&name).await?,
+            Err(kube::Error::Api(e)) if e.code == 409 => own_pod(&pods, &agent).await?,
             Err(e) => return Err(e.into()),
         },
         Some(pod) if pod.metadata.deletion_timestamp.is_some() => {
@@ -312,7 +438,7 @@ async fn apply_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Err
         }
         Some(pod) if pod.annotations().get(SPEC_HASH_ANNOTATION) != Some(&agent.spec.spec_hash) => {
             tracing::info!(agent = %name, "specHash changed: replacing the pod");
-            pods.delete(&name, &DeleteParams::default()).await?;
+            delete_read(&pods, &pod, DeleteParams::default()).await?;
             again = std::time::Duration::from_secs(2);
             Some(pod)
         }
@@ -340,7 +466,7 @@ async fn replace_ended(
         POD_BACKOFF_ANNOTATION, finished_phase, next_backoff, pod_backoff, pod_lifetime,
     };
     use crate::desired::common::DesiredError;
-    use kube::api::{Patch, PatchParams, Preconditions};
+    use kube::api::{Patch, Preconditions};
     let namespace = agent.namespace().unwrap_or_default();
     let name = agent.name_any();
     let now = ctx.now();
@@ -353,7 +479,7 @@ async fn replace_ended(
             Api::<Agent>::namespaced(ctx.client.clone(), &namespace)
                 .patch(
                     &name,
-                    &PatchParams::default(),
+                    &super::owned::merge_params(),
                     &Patch::Merge(serde_json::json!({ "metadata": { "annotations": {
                         POD_BACKOFF_ANNOTATION: value
                     } } })),
@@ -407,6 +533,36 @@ async fn replace_ended(
     Ok(std::time::Duration::from_secs(2))
 }
 
+/// Drops the Agent's owner reference from its claim, which an earlier
+/// operator set (§26.3). The claim read is the one patched: its uid is a
+/// precondition.
+async fn release_claim(
+    claims: &Api<PersistentVolumeClaim>,
+    claim: &PersistentVolumeClaim,
+    agent: &Agent,
+) -> Result<(), Error> {
+    let uid = agent.uid();
+    let owners = claim.owner_references();
+    if !owners.iter().any(|o| Some(&o.uid) == uid.as_ref()) {
+        return Ok(());
+    }
+    let kept: Vec<_> = owners
+        .iter()
+        .filter(|o| Some(&o.uid) != uid.as_ref())
+        .collect();
+    tracing::info!(agent = %agent.name_any(), "releasing the claim from the Agent's owner reference");
+    claims
+        .patch(
+            &claim.name_any(),
+            &super::owned::merge_params(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "uid": claim.uid(), "ownerReferences": kept }
+            })),
+        )
+        .await?;
+    Ok(())
+}
+
 /// A deletion that waits: the condition written (or the failure to write
 /// it logged), and the `Waiting` that requeues the cleanup in 2 s.
 async fn deleting(ctx: &Context, agent: &Agent, condition: Cond) -> Error {
@@ -433,10 +589,11 @@ async fn cleanup_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, E
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace);
     let claims: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), &namespace);
 
-    // 1. the Pod gone
-    if let Some(pod) = pods.get_opt(&name).await? {
+    // 1. the Pod gone; one by its name that is not its own is left alone
+    let pod = absent_if_foreign(own_pod(&pods, &agent).await, &name)?;
+    if let Some(pod) = pod {
         if pod.metadata.deletion_timestamp.is_none() {
-            pods.delete(&name, &DeleteParams::default()).await?;
+            delete_read(&pods, &pod, DeleteParams::default()).await?;
         }
         return Err(deleting(
             &ctx,
@@ -450,11 +607,28 @@ async fn cleanup_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, E
         .await);
     }
 
-    // 2. nothing to harvest without a claim
-    if claims.get_opt(&name).await?.is_none() {
-        tracing::info!(agent = %name, "removed; it never had a claim");
-        return Ok(Action::await_change());
-    }
+    // 2. nothing to harvest without a claim of its own, or with one this
+    //    finalizer already deleted after its harvest
+    let claim = absent_if_foreign(
+        observe(
+            &claims,
+            &name,
+            &claim_identity(&agent),
+            agent.uid().as_deref(),
+        )
+        .await,
+        &name,
+    )?;
+    let claim = match claim {
+        Some(c) if c.metadata.deletion_timestamp.is_none() => c,
+        found => {
+            tracing::info!(agent = %name, deleting = found.is_some(), "removed; no claim to harvest");
+            return Ok(Action::await_change());
+        }
+    };
+    // a claim an earlier operator made owned by the Agent: released, so
+    // the garbage collector cannot take it before the harvest (§26.3)
+    release_claim(&claims, &claim, &agent).await?;
 
     // 3. the harvest, unless skipped (§8.5)
     let fleets: Api<Fleet> = Api::namespaced(ctx.client.clone(), &namespace);
@@ -514,8 +688,9 @@ async fn cleanup_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, E
         }
     }
 
-    // 4. the claim
-    claims.delete(&name, &DeleteParams::default()).await?;
+    // 4. the claim. The harvest Job is left to its TTL (§26.3): a pass
+    //    from a cache that still shows the finalizer finds it finished.
+    delete_read(&claims, &claim, DeleteParams::default()).await?;
     tracing::info!(agent = %name, "removed");
     Ok(Action::await_change())
 }

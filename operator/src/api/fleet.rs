@@ -19,7 +19,12 @@ use super::common::{empty_object, open_object};
     status = "FleetStatus",
     printcolumn = r#"{"name":"Daemon","type":"string","jsonPath":".spec.daemon"}"#,
     printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
-    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#,
+    // the same names resolution refuses (§4.2), refused at admission too,
+    // on create only: a Fleet made before the rules can still have its
+    // status written, its finalizer removed and be deleted
+    validation = kube::core::Rule::new("oldSelf.hasValue() || self.metadata.name != 'balerix'").optional_old_self(true).message("the name balerix is reserved"),
+    validation = kube::core::Rule::new("oldSelf.hasValue() || !self.metadata.name.startsWith('balerix-')").optional_old_self(true).message("the balerix- prefix is reserved for the operator's own objects")
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FleetSpec {

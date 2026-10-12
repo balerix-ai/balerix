@@ -13,10 +13,11 @@ use std::time::Duration;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PostParams};
 use kube::{Api, Client, Resource, ResourceExt};
 use serde::de::DeserializeOwned;
 
+use super::owned::{delete_read, identity_of, observe};
 use super::{Context, Error};
 use crate::desired::common::JobOutcome;
 use crate::desired::jobs::{job_failed, job_outcome};
@@ -215,7 +216,7 @@ where
             "annotations": { ATTEMPTS_ANNOTATION: value },
         } });
         match api
-            .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+            .patch(&name, &super::owned::merge_params(), &Patch::Merge(patch))
             .await
         {
             Ok(_) => return Ok(after),
@@ -295,7 +296,9 @@ where
     let name = wanted.name_any();
     let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace);
-    let existing = jobs.get_opt(&name).await?;
+    // a Job of that name that is not this one's is a `Conflict` (§26):
+    // neither read as this Job's outcome nor replaced
+    let existing = observe(&jobs, &name, &identity_of(&wanted), owner.uid().as_deref()).await?;
     let soon = Duration::from_secs(5);
     // a Job on its way out (a foreground delete waits for its pods) is
     // neither the wanted one nor a failure to count: wait for it to go
@@ -367,7 +370,9 @@ where
         JobOutcome::Stale => {
             // foreground: the Job stays, deleting, until its pods are gone,
             // so a running predecessor keeps the crew busy (§5.3)
-            jobs.delete(&name, &DeleteParams::foreground()).await?;
+            if let Some(job) = &existing {
+                delete_read(&jobs, job, DeleteParams::foreground()).await?;
+            }
             set_attempt(ctx, owner, &name, |_| None).await?;
             tracing::info!(job = %name, "stale: replaced");
             Ok(Ensured::new(outcome, Duration::from_secs(2)))
@@ -395,7 +400,9 @@ where
             .unwrap_or(now)
                 + delay(attempt).as_secs() as i64;
             if now >= due {
-                jobs.delete(&name, &DeleteParams::background()).await?;
+                if let Some(job) = &existing {
+                    delete_read(&jobs, job, DeleteParams::background()).await?;
+                }
                 let next = set_attempt(ctx, owner, &name, |n| Some(n.unwrap_or(1) + 1)).await?;
                 tracing::warn!(job = %name, attempt = ?next, "failed: {message}; retrying");
                 return Ok(Ensured::new(outcome, Duration::from_secs(2)));

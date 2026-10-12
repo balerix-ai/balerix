@@ -6,12 +6,13 @@
 //! marked `balerix.ai/purge: "true"`, then purges its record on the Daemon
 //! (§25).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use balerix_api::AgentTokens;
 use futures_util::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret};
 use kube::api::{DeleteParams, ListParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::finalizer::{Error as FinalizerError, Event, finalizer};
@@ -20,10 +21,11 @@ use kube::runtime::watcher;
 use kube::{Api, ResourceExt};
 
 use super::agent::{PURGE_ANNOTATION, harvest_escape, purge_marked};
-use super::daemon::{authority_and_token, read_secret_string};
+use super::daemon::{authority_and_token, daemon_identity, read_secret_string};
 use super::jobs::ensure_job;
+use super::owned::{apply_read, delete_read, observe, observe_desired};
 use super::{
-    Context, Error, api_in, apply, bounded, error_policy, patch_status, reconciled,
+    Context, Error, api_in, bounded, error_policy, mark_conflict, patch_status, reconciled,
     replace_condition, report,
 };
 use crate::api::{Agent, Crew, Daemon, Fleet, FleetStatus, Retain};
@@ -32,6 +34,9 @@ use crate::desired::common::{Cond, JobOutcome, conditions, labels, owner_of, typ
 use crate::desired::fleet::{Accepted, FLEET_FINALIZER, FleetPlan, fleet_conditions, plan_fleet};
 use crate::desired::jobs::{JobContext, fleet_pool_job, remove_job};
 use crate::desired::names;
+use crate::desired::ownership::{
+    AGENT_LABEL, COMPONENT_LABEL, CREW_LABEL, FLEET_LABEL, identity_of,
+};
 use crate::pki::new_token;
 
 pub async fn controller(ctx: Arc<Context>, watches: &kube::Client, namespace: Option<&str>) {
@@ -50,6 +55,16 @@ pub async fn controller(ctx: Arc<Context>, watches: &kube::Client, namespace: Op
         watcher::Config::default(),
     )
     .owns(api_in::<Job>(client, namespace), watcher::Config::default())
+    // a cleanup Job has no owner (§26.3): it is mapped by its label
+    .watches(
+        api_in::<Job>(client, namespace),
+        watcher::Config::default().labels(&format!("{COMPONENT_LABEL}=remove")),
+        |job: Job| {
+            job.labels()
+                .get(FLEET_LABEL)
+                .map(|f| ObjectRef::<Fleet>::new(f).within(&job.namespace().unwrap_or_default()))
+        },
+    )
     .watches(
         api_in::<Daemon>(client, namespace),
         watcher::Config::default(),
@@ -103,7 +118,17 @@ pub async fn reconcile(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
     let ctx2 = ctx.clone();
     finalizer(&fleets, FLEET_FINALIZER, fleet, |event| async move {
         match event {
-            Event::Apply(fleet) => apply_fleet(fleet, ctx2).await,
+            Event::Apply(fleet) => {
+                let result = apply_fleet(fleet.clone(), ctx2.clone()).await;
+                if let Err(Error::Conflict(message)) = &result {
+                    let old = fleet
+                        .status
+                        .as_ref()
+                        .map_or(&[][..], |s| s.conditions.as_slice());
+                    mark_conflict(&ctx2, fleet.as_ref(), old, "Ready", message).await;
+                }
+                result
+            }
             Event::Cleanup(fleet) => {
                 let result = cleanup_fleet(fleet.clone(), ctx2.clone()).await;
                 if let Err(e) = &result {
@@ -121,8 +146,57 @@ pub async fn reconcile(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
     })
 }
 
+/// The Crews and Agents of the plan that exist, by name, as read.
+struct Found {
+    crews: BTreeMap<String, Crew>,
+    agents: BTreeMap<String, Agent>,
+}
+
+/// Before anything is sent or applied: every Crew and Agent the plan
+/// names, and the pool Job, is absent or this Fleet's own (§26). Another
+/// object by one of those names is a `Conflict`, and nothing lands. The
+/// objects read are what the children are later written over.
+async fn check_names(ctx: &Context, fleet: &Fleet, plan: &FleetPlan) -> Result<Found, Error> {
+    let namespace = fleet.namespace().unwrap_or_default();
+    let crews: Api<Crew> = Api::namespaced(ctx.client.clone(), &namespace);
+    let agents: Api<Agent> = Api::namespaced(ctx.client.clone(), &namespace);
+    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
+    let mut found = Found {
+        crews: BTreeMap::new(),
+        agents: BTreeMap::new(),
+    };
+    for crew in &plan.crews {
+        if let Some(read) = observe_desired(&crews, crew).await? {
+            found.crews.insert(crew.name_any(), read);
+        }
+    }
+    for agent in &plan.agents {
+        if let Some(read) = observe_desired(&agents, agent).await? {
+            found.agents.insert(agent.name_any(), read);
+        }
+    }
+    observe_desired(&jobs, &pool_job(ctx, fleet, plan)?).await?;
+    Ok(found)
+}
+
+fn pool_job(ctx: &Context, fleet: &Fleet, plan: &FleetPlan) -> Result<Job, Error> {
+    let namespace = fleet.namespace().unwrap_or_default();
+    let job_ctx = JobContext {
+        namespace: &namespace,
+        daemon: &fleet.spec.daemon,
+        images: &ctx.cfg.images,
+        owner: owner_of(fleet)?,
+    };
+    Ok(fleet_pool_job(
+        &job_ctx,
+        &fleet.name_any(),
+        &plan.spec.tools,
+    )?)
+}
+
 /// The tokens of every planned Agent, minted into a Secret owned by the
-/// Fleet when absent (§5.2 step 3).
+/// Fleet when absent (§5.2 step 3). Only a Secret of this Fleet's, by its
+/// labels, is read (§26): another by the name is a `Conflict`.
 async fn ensure_tokens(
     ctx: &Context,
     fleet: &Fleet,
@@ -137,12 +211,23 @@ async fn ensure_tokens(
             agent.spec.fleet, agent.spec.crew, agent.spec.agent
         );
         let name = names::token(&agent.name_any());
-        let token = match secrets
-            .get_opt(&name)
-            .await?
-            .as_ref()
-            .and_then(|s| read_secret_string(s, "token"))
-        {
+        let token_labels = labels(
+            &agent.spec.daemon,
+            "token",
+            &[
+                (FLEET_LABEL, agent.spec.fleet.as_str()),
+                (CREW_LABEL, agent.spec.crew.as_str()),
+                (AGENT_LABEL, agent.spec.agent.as_str()),
+            ],
+        );
+        let found = observe(
+            &secrets,
+            &name,
+            &identity_of(&token_labels),
+            fleet.uid().as_deref(),
+        )
+        .await?;
+        let token = match found.as_ref().and_then(|s| read_secret_string(s, "token")) {
             Some(t) => t,
             None => {
                 let token = new_token();
@@ -152,17 +237,14 @@ async fn ensure_tokens(
                     "metadata": {
                         "name": name,
                         "namespace": namespace,
-                        "labels": labels(&agent.spec.daemon, "token", &[
-                            ("balerix.ai/fleet", agent.spec.fleet.as_str()),
-                            ("balerix.ai/crew", agent.spec.crew.as_str()),
-                            ("balerix.ai/agent", agent.spec.agent.as_str()),
-                        ]),
+                        "labels": token_labels,
                         "ownerReferences": [owner_of(fleet)?],
                     },
                     "type": "Opaque",
                     "stringData": { "token": token },
                 }))?;
-                apply(&ctx.client, &secret).await?;
+                // over the Secret judged just now, or as a create
+                apply_read(&secrets, &secret, found.as_ref()).await?;
                 token
             }
         };
@@ -261,6 +343,7 @@ async fn apply_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, Err
             return Ok(Action::requeue(period));
         }
     };
+    let found = check_names(&ctx, &fleet, &first).await?;
     let tokens = ensure_tokens(&ctx, &fleet, &first).await?;
     let plan = plan_fleet(&fleet, &daemon, &tokens, &ctx.cfg.images)?;
     let request = plan.request.as_ref().ok_or_else(|| {
@@ -288,45 +371,35 @@ async fn apply_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, Err
         return Ok(Action::requeue(period));
     }
 
-    // the children
-    let job_ctx = JobContext {
-        namespace: &namespace,
-        daemon: &fleet.spec.daemon,
-        images: &ctx.cfg.images,
-        owner: owner_of(fleet.as_ref())?,
-    };
+    // the children, judged by `check_names` in this reconcile
     let pool = ensure_job(
         ctx.as_ref(),
         fleet.as_ref(),
-        fleet_pool_job(&job_ctx, &name, &plan.spec.tools)?,
+        pool_job(&ctx, &fleet, &plan)?,
         None,
     )
     .await?;
-    for crew in &plan.crews {
-        apply(&ctx.client, crew).await?;
-    }
-    for agent in &plan.agents {
-        apply(&ctx.client, agent).await?;
-    }
     let crews: Api<Crew> = Api::namespaced(ctx.client.clone(), &namespace);
     let agents: Api<Agent> = Api::namespaced(ctx.client.clone(), &namespace);
+    for crew in &plan.crews {
+        apply_read(&crews, crew, found.crews.get(&crew.name_any())).await?;
+    }
+    for agent in &plan.agents {
+        apply_read(&agents, agent, found.agents.get(&agent.name_any())).await?;
+    }
     let selector = ListParams::default().labels(&format!("balerix.ai/fleet={name}"));
     let wanted_crews: Vec<String> = plan.crews.iter().map(ResourceExt::name_any).collect();
     for crew in crews.list(&selector).await?.items {
         if !wanted_crews.contains(&crew.name_any()) && crew.metadata.deletion_timestamp.is_none() {
             tracing::info!(fleet = %key, crew = %crew.name_any(), "dropped from the Fleet");
-            crews
-                .delete(&crew.name_any(), &DeleteParams::default())
-                .await?;
+            delete_read(&crews, &crew, DeleteParams::default()).await?;
         }
     }
     for agent in agents.list(&selector).await?.items {
         if !wanted_agents.contains(&agent.name_any()) && agent.metadata.deletion_timestamp.is_none()
         {
             tracing::info!(fleet = %key, agent = %agent.name_any(), "dropped from the Fleet");
-            agents
-                .delete(&agent.name_any(), &DeleteParams::default())
-                .await?;
+            delete_read(&agents, &agent, DeleteParams::default()).await?;
         }
     }
     ctx.fleet_agents
@@ -362,6 +435,7 @@ async fn deleting(ctx: &Context, fleet: &Fleet, why: &Error) {
             fleet.name_any(),
             fleet.spec.daemon
         ),
+        Error::Conflict(m) => m.clone(),
         Error::Purge(e) => format!(
             "Fleet {}: Daemon {} did not take the purge: {e}; it is retried, and removing the annotation {PURGE_ANNOTATION} lets the Fleet go with its record kept",
             fleet.name_any(),
@@ -378,7 +452,15 @@ async fn deleting(ctx: &Context, fleet: &Fleet, why: &Error) {
         observed_generation: fleet.metadata.generation,
         conditions: replace_condition(
             old,
-            Cond::no("Ready", "Deleting", &message),
+            Cond::no(
+                "Ready",
+                if matches!(why, Error::Conflict(_)) {
+                    "Conflict"
+                } else {
+                    "Deleting"
+                },
+                &message,
+            ),
             fleet.metadata.generation,
             &ctx.k8s_now(),
         ),
@@ -400,9 +482,7 @@ async fn cleanup_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
     if !remaining.is_empty() {
         for agent in &remaining {
             if agent.metadata.deletion_timestamp.is_none() {
-                agents
-                    .delete(&agent.name_any(), &DeleteParams::default())
-                    .await?;
+                delete_read(&agents, agent, DeleteParams::default()).await?;
             }
         }
         let names: Vec<String> = remaining.iter().map(ResourceExt::name_any).collect();
@@ -427,9 +507,42 @@ async fn cleanup_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
         }
     }
 
-    // 3. `retain: None`: one cleanup Job per crew (§5.2)
-    if fleet.spec.retain == Retain::None {
+    // 3. `retain: None`: one cleanup Job per crew (§5.2): the crews the
+    //    spec names, and any Crew of the Fleet's still listed. Not the
+    //    Crews alone: a foreground deletion has the garbage collector
+    //    delete them before this finalizer runs (§26.3). With no shared
+    //    claim of the Daemon's there is nothing to clean, and no Job
+    //    could start.
+    let shared = if fleet.spec.retain == Retain::None {
+        let claims: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), &namespace);
+        match observe(
+            &claims,
+            &names::shared_claim(&fleet.spec.daemon),
+            &daemon_identity(&fleet.spec.daemon),
+            None,
+        )
+        .await
+        {
+            Err(Error::Conflict(why)) => {
+                tracing::warn!(fleet = %key, "{why}");
+                None
+            }
+            found => found?,
+        }
+    } else {
+        None
+    };
+    if fleet.spec.retain == Retain::None && shared.is_none() {
+        tracing::info!(fleet = %key, daemon = %fleet.spec.daemon, "no cleanup: the Daemon has no shared claim");
+    }
+    if shared.is_some() {
         let crews: Api<Crew> = Api::namespaced(ctx.client.clone(), &namespace);
+        let mut crew_names: Vec<String> = fleet.spec.crews.keys().cloned().collect();
+        for crew in crews.list(&selector).await?.items {
+            if !crew_names.contains(&crew.spec.crew) {
+                crew_names.push(crew.spec.crew.clone());
+            }
+        }
         let job_ctx = JobContext {
             namespace: &namespace,
             daemon: &fleet.spec.daemon,
@@ -437,12 +550,12 @@ async fn cleanup_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
             owner: owner_of(fleet.as_ref())?,
         };
         let mut pending = Vec::new();
-        for crew in crews.list(&selector).await?.items {
+        for crew in &crew_names {
             let ensured = ensure_job(
                 ctx.as_ref(),
                 fleet.as_ref(),
-                remove_job(&job_ctx, &name, &crew.spec.crew)?,
-                Some((&name, &crew.spec.crew)),
+                remove_job(&job_ctx, &name, crew)?,
+                Some((&name, crew)),
             )
             .await?;
             match ensured.outcome {
@@ -450,11 +563,10 @@ async fn cleanup_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
                 // the namespace goes, and the crew's slice is not in it
                 _ if ensured.namespace_terminating => {}
                 JobOutcome::Failed(message) => pending.push(format!(
-                    "{} (Job {} failed: {message})",
-                    crew.spec.crew,
-                    names::remove_job(&name, &crew.spec.crew)
+                    "{crew} (Job {} failed: {message})",
+                    names::remove_job(&name, crew)
                 )),
-                _ => pending.push(crew.spec.crew.clone()),
+                _ => pending.push(crew.clone()),
             }
         }
         if !pending.is_empty() {

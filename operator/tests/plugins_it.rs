@@ -154,6 +154,15 @@ async fn a_listed_plugin_gets_its_objects_and_a_changed_input_rolls_it() {
         deployments.get_opt("balerix-plugin-web").await.unwrap()
     })
     .await;
+    // the reconcile applies the Service and the NetworkPolicy after the
+    // Deployment, each after its own ownership read (§26)
+    wait_for("the NetworkPolicy", Duration::from_secs(60), || async {
+        Api::<NetworkPolicy>::namespaced(c.clone(), &ns)
+            .get_opt("balerix-plugin-web")
+            .await
+            .unwrap()
+    })
+    .await;
     for (kind, found) in [
         (
             "token",

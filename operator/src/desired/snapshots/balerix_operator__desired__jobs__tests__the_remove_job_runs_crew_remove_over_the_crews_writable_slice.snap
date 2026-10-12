@@ -6,7 +6,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   annotations:
-    balerix.ai/input-hash: e87bcb74b68a36130a641d859524c6bcd492640b4f264513cbb0d71b05c03483
+    balerix.ai/input-hash: 15c37a238815d74b7b2b490c61d1296d8ffd659a71d3165053a7fd7b7467c9a7
   labels:
     app.kubernetes.io/managed-by: balerix-operator
     balerix.ai/component: remove
@@ -15,12 +15,6 @@ metadata:
     balerix.ai/fleet: f
   name: f-c-remove
   namespace: team-a
-  ownerReferences:
-    - apiVersion: balerix.ai/v1alpha1
-      controller: true
-      kind: Crew
-      name: payments-backend
-      uid: crew-uid
 spec:
   activeDeadlineSeconds: 3600
   backoffLimit: 0
@@ -106,3 +100,4 @@ spec:
           name: scratch
         - emptyDir: {}
           name: tmp
+  ttlSecondsAfterFinished: 3600

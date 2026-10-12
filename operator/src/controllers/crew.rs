@@ -13,11 +13,15 @@ use kube::{Api, ResourceExt};
 
 use super::fleet::daemon_of;
 use super::jobs::{ensure_job, pods_of};
-use super::{Context, Error, api_in, bounded, error_policy, patch_status, reconciled, report};
+use super::owned::observe;
+use super::{
+    Context, Error, api_in, bounded, error_policy, mark_conflict, patch_status, reconciled, report,
+};
 use crate::api::Crew;
-use crate::desired::common::{JobOutcome, owner_of};
+use crate::desired::common::{JobOutcome, labels, owner_of};
 use crate::desired::jobs::{JobContext, crew_status, crew_sync_job, job_outcome};
 use crate::desired::names;
+use crate::desired::ownership::{FLEET_LABEL, identity_of};
 
 pub async fn controller(ctx: Arc<Context>, watches: &kube::Client, namespace: Option<&str>) {
     let client = watches;
@@ -58,6 +62,8 @@ pub fn crew_ready(crew: &Crew) -> Result<(), String> {
 }
 
 /// What the fleet's pool Job came to, read by name: it is the Fleet's.
+/// A Job by that name that is not the Fleet's pool (§26) is not read: it
+/// counts as absent here, and is the Fleet's `Conflict`.
 async fn fleet_pool_outcome(
     ctx: &Context,
     namespace: &str,
@@ -66,7 +72,16 @@ async fn fleet_pool_outcome(
     let name = names::fleet_pool_job(&crew.spec.fleet);
     let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
-    let Some(existing) = jobs.get_opt(&name).await? else {
+    let pool = labels(
+        &crew.spec.daemon,
+        "pool",
+        &[(FLEET_LABEL, crew.spec.fleet.as_str())],
+    );
+    let existing = match observe(&jobs, &name, &identity_of(&pool), None).await {
+        Err(Error::Conflict(_)) => None,
+        found => found?,
+    };
+    let Some(existing) = existing else {
         return Ok(JobOutcome::Absent);
     };
     let job_pods = pods_of(&pods, Some(&existing)).await?;
@@ -76,6 +91,18 @@ async fn fleet_pool_outcome(
 }
 
 pub async fn reconcile(crew: Arc<Crew>, ctx: Arc<Context>) -> Result<Action, Error> {
+    let result = reconcile_crew(crew.clone(), ctx.clone()).await;
+    if let Err(Error::Conflict(message)) = &result {
+        let old = crew
+            .status
+            .as_ref()
+            .map_or(&[][..], |s| s.conditions.as_slice());
+        mark_conflict(&ctx, crew.as_ref(), old, "CacheReady", message).await;
+    }
+    result
+}
+
+async fn reconcile_crew(crew: Arc<Crew>, ctx: Arc<Context>) -> Result<Action, Error> {
     let namespace = crew.namespace().unwrap_or_default();
     let name = crew.name_any();
     let Some(daemon) = daemon_of(&ctx, &namespace, &crew.spec.daemon).await? else {

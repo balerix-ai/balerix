@@ -14,12 +14,6 @@ metadata:
     balerix.ai/fleet: payments
   name: payments-backend-alice
   namespace: team-a
-  ownerReferences:
-    - apiVersion: balerix.ai/v1alpha1
-      controller: true
-      kind: Agent
-      name: payments-backend-alice
-      uid: agent-uid
 spec:
   accessModes:
     - ReadWriteOnce

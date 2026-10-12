@@ -10,21 +10,21 @@ use futures_util::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use kube::api::{DeleteParams, ListParams, PostParams, Preconditions};
+use kube::api::{DeleteParams, ListParams, Preconditions};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Api, ResourceExt};
 use serde_json::Value;
 
-use super::daemon::{authority_and_token, read_issued, read_secret_string};
-use super::{
-    Context, Error, api_in, apply, bounded, error_policy, patch_status, reconciled, report,
-};
+use super::daemon::{authority_and_token, daemon_identity, read_issued, read_secret_string};
+use super::owned::{apply_read, observe, observe_desired};
+use super::{Context, Error, api_in, bounded, error_policy, patch_status, reconciled, report};
 use crate::api::{Daemon, Plugin, PluginStatus as PluginObjectStatus};
-use crate::desired::common::{MANAGER, conditions};
+use crate::desired::common::{MANAGER, conditions, labels};
 use crate::desired::names;
+use crate::desired::ownership::{Identity, identity_of};
 use crate::desired::plugin::{
-    Listing, PluginInputs, PluginState, check_name, grant, inject_secrets, listing,
+    Listing, PLUGIN_LABEL, PluginInputs, PluginState, check_name, grant, inject_secrets, listing,
     plugin_conditions, plugin_objects,
 };
 use crate::pki::{self, Issued};
@@ -105,30 +105,47 @@ pub async fn read_config(
     Ok(inject_secrets(&plugin.spec.config, &values).map_err(|e| ("InvalidSpec", e)))
 }
 
+/// What a Plugin's own objects carry (§26): its component and its name.
+fn plugin_identity(plugin: &Plugin) -> Identity {
+    identity_of(&labels("", "plugin", &[(PLUGIN_LABEL, &plugin.name_any())]))
+}
+
+/// The plugin's token, from its Secret when that is the Plugin's own
+/// (§26): another object by the name is a `Conflict`.
 pub async fn read_token(
     ctx: &Context,
     namespace: &str,
-    plugin: &str,
+    plugin: &Plugin,
 ) -> Result<Option<String>, Error> {
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
-    Ok(secrets
-        .get_opt(&names::plugin_token(plugin))
-        .await?
-        .as_ref()
-        .and_then(|s| read_secret_string(s, "token")))
+    Ok(observe(
+        &secrets,
+        &names::plugin_token(&plugin.name_any()),
+        &plugin_identity(plugin),
+        plugin.uid().as_deref(),
+    )
+    .await?
+    .as_ref()
+    .and_then(|s| read_secret_string(s, "token")))
 }
 
+/// The plugin's serving certificate, from its Secret when that is the
+/// Plugin's own (§26).
 pub async fn read_serving(
     ctx: &Context,
     namespace: &str,
-    plugin: &str,
+    plugin: &Plugin,
 ) -> Result<Option<Issued>, Error> {
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
     Ok(read_issued(
-        secrets
-            .get_opt(&names::plugin_serving(plugin))
-            .await?
-            .as_ref(),
+        observe(
+            &secrets,
+            &names::plugin_serving(&plugin.name_any()),
+            &plugin_identity(plugin),
+            plugin.uid().as_deref(),
+        )
+        .await?
+        .as_ref(),
         "tls.crt",
         "tls.key",
     ))
@@ -271,11 +288,19 @@ async fn listed(
         return Ok(Err(("InvalidSpec", e)));
     }
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
-    let Some(authority) = read_issued(
-        secrets.get_opt(&names::authority(daemon)).await?.as_ref(),
-        "ca.crt",
-        "ca.key",
-    ) else {
+    let authority = match observe(
+        &secrets,
+        &names::authority(daemon),
+        &daemon_identity(daemon),
+        None,
+    )
+    .await
+    {
+        Ok(found) => found,
+        Err(Error::Conflict(m)) => return Ok(Err(("Conflict", m))),
+        Err(e) => return Err(e),
+    };
+    let Some(authority) = read_issued(authority.as_ref(), "ca.crt", "ca.key") else {
         return Ok(Err((
             "WaitingForDaemon",
             format!("Daemon {daemon} has no authority yet"),
@@ -290,11 +315,17 @@ async fn listed(
     };
     let now = ctx.now();
     let plugin_names = pki::plugin_names(namespace, name);
-    let token = match read_token(ctx, namespace, name).await? {
-        Some(t) => t,
-        None => pki::new_token(),
+    let token = match read_token(ctx, namespace, plugin).await {
+        Ok(Some(t)) => t,
+        Ok(None) => pki::new_token(),
+        Err(Error::Conflict(m)) => return Ok(Err(("Conflict", m))),
+        Err(e) => return Err(e),
     };
-    let serving = match read_serving(ctx, namespace, name).await? {
+    let serving = match read_serving(ctx, namespace, plugin).await {
+        Err(Error::Conflict(m)) => return Ok(Err(("Conflict", m))),
+        other => other?,
+    };
+    let serving = match serving {
         Some(s)
             if pki::verifies(&authority.cert_pem, &s.cert_pem, &plugin_names[0], now)
                 && !pki::needs_renewal(s.not_after, now) =>
@@ -315,24 +346,53 @@ async fn listed(
         Ok(o) => o,
         Err(e) => return Ok(Err(("InvalidSpec", e.to_string()))),
     };
-    apply(&ctx.client, &objects.token).await?;
-    apply(&ctx.client, &objects.serving).await?;
-    if let Some(claim) = &objects.claim {
-        let claims: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
-        // a claim is immutable once bound: created when absent
-        if claims.get_opt(&claim.name_any()).await?.is_none() {
-            claims.create(&PostParams::default(), claim).await?;
+    match apply_objects(ctx, namespace, &objects).await {
+        Ok(deployment) => {
+            let available = deployment
+                .status
+                .and_then(|s| s.available_replicas)
+                .unwrap_or(0)
+                >= 1;
+            Ok(Ok(available))
         }
+        Err(Error::Conflict(m)) => Ok(Err(("Conflict", m))),
+        Err(e) => Err(e),
     }
-    let deployment = apply(&ctx.client, &objects.deployment).await?;
-    apply(&ctx.client, &objects.service).await?;
-    apply(&ctx.client, &objects.policy).await?;
-    let available = deployment
-        .status
-        .and_then(|s| s.available_replicas)
-        .unwrap_or(0)
-        >= 1;
-    Ok(Ok(available))
+}
+
+/// Each object over nothing or the Plugin's own (§26); the Deployment
+/// as applied. Every name is judged before any object is written, so
+/// one in `Conflict` stops the Deployment too, and the policy is written
+/// before the Deployment it covers.
+async fn apply_objects(
+    ctx: &Context,
+    namespace: &str,
+    objects: &crate::desired::plugin::PluginObjects,
+) -> Result<Deployment, Error> {
+    let c = &ctx.client;
+    let secrets: Api<Secret> = Api::namespaced(c.clone(), namespace);
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(c.clone(), namespace);
+    let deployments: Api<Deployment> = Api::namespaced(c.clone(), namespace);
+    let services: Api<Service> = Api::namespaced(c.clone(), namespace);
+    let policies: Api<NetworkPolicy> = Api::namespaced(c.clone(), namespace);
+    let token = observe_desired(&secrets, &objects.token).await?;
+    let serving = observe_desired(&secrets, &objects.serving).await?;
+    let claim = match &objects.claim {
+        Some(claim) => Some(observe_desired(&claims, claim).await?),
+        None => None,
+    };
+    let deployment = observe_desired(&deployments, &objects.deployment).await?;
+    let service = observe_desired(&services, &objects.service).await?;
+    let policy = observe_desired(&policies, &objects.policy).await?;
+    apply_read(&secrets, &objects.token, token.as_ref()).await?;
+    apply_read(&secrets, &objects.serving, serving.as_ref()).await?;
+    // a claim is immutable once bound: created when absent
+    if let (Some(wanted), Some(None)) = (&objects.claim, &claim) {
+        apply_read(&claims, wanted, None).await?;
+    }
+    apply_read(&policies, &objects.policy, policy.as_ref()).await?;
+    apply_read(&services, &objects.service, service.as_ref()).await?;
+    apply_read(&deployments, &objects.deployment, deployment.as_ref()).await
 }
 
 /// The Daemon's rows, or why it could not be asked.

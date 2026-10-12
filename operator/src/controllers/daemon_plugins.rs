@@ -5,8 +5,9 @@
 use kube::api::{DeleteParams, ListParams};
 use kube::{Api, ResourceExt};
 
+use super::owned::{apply_read, delete_read};
 use super::plugin::{read_config, read_serving, read_token};
-use super::{Context, Error, apply};
+use super::{Context, Error};
 use crate::api::{Daemon, Fleet, Plugin};
 use crate::daemon_client::{ClientError, DaemonClient};
 use crate::desired::common::Cond;
@@ -63,10 +64,18 @@ pub async fn send_list(
                 None,
             ));
         }
-        let (Some(token), Some(serving)) = (
-            read_token(ctx, namespace, p).await?,
-            read_serving(ctx, namespace, p).await?,
-        ) else {
+        // another object by a plugin Secret's name holds the list back (§26)
+        let (token, serving) = match (
+            read_token(ctx, namespace, &plugin).await,
+            read_serving(ctx, namespace, &plugin).await,
+        ) {
+            (Err(Error::Conflict(m)), _) | (_, Err(Error::Conflict(m))) => {
+                let message = format!("{p}: {m}");
+                return Ok((Cond::no("PluginsReady", "Conflict", &message), None));
+            }
+            (token, serving) => (token?, serving?),
+        };
+        let (Some(token), Some(serving)) = (token, serving) else {
             if running.is_none() {
                 running = Some(client.plugins().await?);
             }
@@ -158,7 +167,7 @@ pub async fn write_managed(
             .iter()
             .any(|r| r.name == f.name_any() && r.plugin == plugin && r.down.is_none());
         if dropped || (sent.contains(&plugin) && !live) {
-            let deleted = delete_fleet(&fleets, &f.name_any()).await;
+            let deleted = delete_read(&fleets, f, DeleteParams::default()).await;
             let owner = plugins.get_opt(&plugin).await?;
             refused(ctx, owner.as_ref(), &f.name_any(), deleted).await?;
         }
@@ -191,16 +200,18 @@ async fn write_one(
         return Ok(());
     }
     let mut desired = managed_fleet(row, plugin, daemon)?;
-    match &row.down {
-        None => {
-            apply(&ctx.client, &desired).await?;
+    // over the Fleet read above, or as a create: nothing made under the
+    // name since is written over or deleted (§26.1)
+    match (&row.down, &current) {
+        (None, _) => {
+            apply_read(fleets, &desired, current.as_ref()).await?;
         }
-        Some(down) if current.is_some() => {
+        (Some(down), Some(read)) => {
             desired.spec.retain = retain_of(down);
-            apply(&ctx.client, &desired).await?;
-            delete_fleet(fleets, &row.name).await?;
+            apply_read(fleets, &desired, Some(read)).await?;
+            delete_read(fleets, read, DeleteParams::default()).await?;
         }
-        Some(_) => {}
+        (Some(_), None) => {}
     }
     Ok(())
 }
@@ -226,12 +237,4 @@ async fn refused(
         None => tracing::warn!(fleet, "{note}"),
     }
     Ok(())
-}
-
-async fn delete_fleet(fleets: &Api<Fleet>, name: &str) -> Result<(), Error> {
-    match fleets.delete(name, &DeleteParams::default()).await {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
-        Err(e) => Err(e.into()),
-    }
 }

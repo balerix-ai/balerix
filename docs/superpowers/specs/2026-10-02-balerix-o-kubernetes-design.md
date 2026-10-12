@@ -5,7 +5,8 @@
 2026-10-02; the spike's findings recorded in §19; sub-project 2 decisions
 in §7.4; sub-project 3a decisions in §20; sub-project 4 decisions in
 §23; sub-project 5 decisions in §24; the purge of a deleted Fleet's
-record (#135) in §25
+record (#135) in §25; objects found by name, names that meet and
+foreground deletion (#232, #233) in §26
 **Scope:** running balerix on Kubernetes. A `balerix-operator` reconciles
 five custom resources (Daemon, Fleet, Crew, Agent, Plugin) into pods,
 claims, Secrets and Jobs. Each Daemon object is a `balerix serve` instance
@@ -162,9 +163,17 @@ spec:
   names (`[a-z0-9-]+`) and the fixed fields.
 - `runner.type` must be `pod`, and is `pod` when omitted. `tmux` is refused
   with the config path.
-- `balerix` stays a reserved fleet name.
+- `balerix` stays a reserved fleet name, and on Kubernetes a name with
+  the prefix `balerix-` is refused too: the prefix is reserved for the
+  operator's own objects (§26.2). Both are refused at admission by CEL
+  rules on the Fleet definition, on create only (`optionalOldSelf`, so a
+  Fleet made before the rules can still be updated and deleted), and at
+  resolution (`Resolved=False`, `InvalidFleet`) for any Fleet that got
+  past them. The prefix is the
+  operator's alone: a host fleet may still be named `balerix-…`.
 - `<fleet>-<crew>-<agent>` must be at most 63 characters; a longer name
-  fails resolution with the config path.
+  fails resolution with the config path. So do two agents whose names
+  join to the same `<fleet>-<crew>-<agent>` (§26.2).
 - Conditions: `Resolved` (the resolver's message, config path first),
   `Accepted` (plugin activations), `Ready` (every agent `Ready`).
 - A Fleet carries the finalizer `balerix.ai/fleet`.
@@ -613,8 +622,9 @@ existing order (crew, fleet, daemon).
 ### 8.2 The agent claim
 
 ReadWriteOnce, sized by the Daemon's `storage.agent` or the fleet's
-`runner.storage`. It outlives the pod. It is deleted with the Agent, after
-the harvest.
+`runner.storage`. It outlives the pod. The Agent's finalizer deletes it,
+after the harvest; it carries no owner reference, so no garbage collector
+takes it first (§26.3).
 
 ### 8.3 Sync Job
 
@@ -649,6 +659,11 @@ is being deleted: it then skips every Agent's harvest and also purges the
 Daemon's record (§25). An Agent dropped from a live Fleet that carries the
 annotation is still harvested. A Fleet re-created over a kept cache seeds
 new clones from the harvested branches, as today.
+
+The table holds whatever the deletion's propagation: a foreground
+deletion (`kubectl delete --cascade=foreground`, Argo CD's prune) has the
+garbage collector delete a Fleet's Crews and Agents before the Fleet's
+finalizer runs, and the harvest and the cleanup still run (§26.3).
 
 ## 9. Plugins
 
@@ -1408,7 +1423,8 @@ the Pod and wait, then the harvest Job unless `balerix.ai/purge` is on
 the Agent or its Fleet, or the Fleet is being deleted with `retain:
 None`. A failed harvest keeps the finalizer and the message in a
 condition (§8.5); a success deletes the claim and drops the finalizer.
-The other children go with the owner reference.
+The other children go with the owner reference. (§26.3 amends this: the
+claim and the harvest and cleanup Jobs carry no owner reference.)
 
 **The Job rule.** Every Job has `backoffLimit: 0` (§20.5). A `Failed`
 outcome is written into status and retried by the operator: the owner
@@ -2766,3 +2782,220 @@ accumulated on the state claim.
 - **`e2e-k8s` step 6** marks the Fleet before deleting it and waits until
   the Daemon answers 404 for it. This amends §21.4's step 6 and §21.6's
   journey bullet.
+
+## 26. Objects found by name; names that meet; foreground deletion (2026-10, #232, #233)
+
+The controllers find their objects by the names §20.5 gives them. The
+operator uses, writes over or deletes an object only when it carries the
+labels the operator gives that owner's objects. This section is that
+rule, and two fixes that go with it.
+
+### 26.1 Ownership is read from labels
+
+- **Before an object found by name is used, applied over or deleted, its
+  labels are checked** (`desired::ownership`, `controllers::owned`). The
+  identity is `balerix.ai/component` and the `balerix.ai/fleet`,
+  `balerix.ai/crew`, `balerix.ai/agent` and `balerix.ai/plugin` labels the
+  owner gives the object, each present with its value or absent. An object
+  with neither a fleet nor a plugin label is a Daemon's own, and its
+  `balerix.ai/daemon` label is part of its identity too; on the others it
+  is not: a Plugin may be listed by another Daemon and keeps its
+  objects, and a Fleet's are named by the Fleet (its `spec.daemon` is
+  immutable, #235). The agent claim is the exception: it has no owner
+  reference and can outlive its Agent (a finalizer removed by hand), and
+  its data belongs to the Daemon it was made under, so its Daemon label
+  is part of its identity. A later Agent of the same names under another
+  Daemon is a `Conflict` on such a claim until it is removed. These are
+  the labels every object already carried, so nothing new is written.
+- **Labels, not owner references.** The agent claim and the harvest and
+  cleanup Jobs carry no owner reference (§26.3), and a label set exists
+  on every object either way.
+- **Another object by the name is a `Conflict`.** It is not read (a
+  token Secret is not a token, a Job is not this Job's outcome), not
+  applied over (a forced server-side apply would take it over), not
+  patched and not deleted. The owner's `Ready` goes `False`, reason
+  `Conflict`, with "`<Kind> <name>` exists and was not made for this
+  object (`<why>`): it is left alone; rename this object, or remove that
+  one". Where the owner has no `Ready` of its own to say it in, its
+  readiness condition names the object. The reconcile fails with
+  `Error::Conflict` and `error_policy` backs it off.
+- **In a cleanup** an Agent's Pod or claim by name that is not its own
+  counts as absent: the Agent's own cannot exist beside it, and the
+  deletion must not wait on someone else's object. A harvest or cleanup
+  Job whose name is taken is a `Conflict`, and the deletion waits, as on
+  a failed harvest; `balerix.ai/purge` lets it go (§8.5).
+- **Adoption needs the controller reference** (§26.4): an owner reference
+  that is not `controller: true` adopts nothing.
+- **Deletes carry the uid read** as a precondition (`delete_read`), as
+  the Plugin's unlisting already did (§23.9): an object made under the
+  name since is not deleted. A 404 or 409 is done.
+- **Every name is judged before anything is written.** The Fleet judges
+  the Crews, Agents and pool Job of its plan, then the token Secrets,
+  before it mints a token or sends the Daemon anything: a `Conflict`
+  lands nothing, as a rejected `PUT` does (§5.2 step 4). The Daemon
+  judges its Secrets, ConfigMap, claims, Service, NetworkPolicy,
+  StatefulSet and pool Job before it writes any; the Plugin its Secrets,
+  claim, NetworkPolicy, Service and Deployment; the Agent its claim,
+  bundle, NetworkPolicy and Pod. A workload is written after its
+  NetworkPolicy, so one never runs while its policy's name is in
+  `Conflict`.
+- **A write goes over the object read, or over nothing.** A name read as
+  absent is a plain create: an object made under it since is a 409, and
+  the reconcile is retried. A name read as the owner's is written with a
+  forced server-side apply carrying the read object's `metadata.uid`, so
+  the API server refuses an object deleted and made again since
+  (`owned::apply_read`; a 422, "metadata.uid: field is immutable", backed
+  off as any API error, not a `Conflict`). A managed Fleet (§23.4) is
+  written and deleted the same way, over the Fleet its pass read.
+- **A created object's fields are the apply's.** A create records its
+  fields under an `Update` entry in `managedFields`, which would co-own
+  them through every later apply: a label, key or owner reference the
+  desired object drops would stay, and a leftover's old controller
+  reference would sit beside the new one (a 422). So a create is followed
+  at once by an apply, and before any apply the operator's own `Update`
+  entry and `before-first-apply` are folded into its `Apply` entry, as
+  client-go's `csaupgrade` does, with the object's uid and
+  resourceVersion as preconditions (a 409 is read again and retried, up
+  to three times); status is not folded. The operator's merge patches
+  (attempts and back-off annotations, adoption labels, a released claim)
+  go under their own field manager, `balerix-operator-patch`, which is
+  never folded: the next apply keeps what they wrote. An object that was never applied first gets an
+  apply of its identity alone, which starts the tracking. A controller
+  reference to another owner that someone else set stays theirs: the
+  apply's 422 becomes a `Conflict`.
+- **Orphaned objects** (`kubectl delete --cascade=orphan`) lose their
+  owner references and keep their labels: the next owner of the same
+  names judges them its own and writes over them.
+
+### 26.2 Names that meet (#232)
+
+- **Within one Fleet,** crew `b` with agent `c-d` and crew `b-c` with
+  agent `d` both make Agent `f-b-c-d`, one claim and one token Secret.
+  Resolution refuses the Fleet: `Resolved=False`, `InvalidFleet`,
+  "`crews.b-c.agents.d`: the object name f-b-c-d is also
+  `crews.b.agents.c-d`'s: names are joined with `-`, so the two would be
+  one object; rename one". The second agent in resolution order is the
+  one named. Crews cannot meet: distinct crew names make distinct
+  `<fleet>-<crew>`, and each Job kind has its own suffix.
+- **Across Fleets in a namespace,** Fleet `a` (crew `b-c`, agent `d`) and
+  Fleet `a-b` (crew `c`, agent `d`) both make `a-b-c-d`. Neither can see
+  the other at resolution, so §26.1 decides: the first keeps its objects,
+  the second is `Ready=False`, `Conflict`, naming the first object it met
+  (the Crew `a-b-c`), and sends the Daemon nothing. Before, both forced
+  their Agent in turn and its owner and spec changed on every reconcile.
+- **Not a hash suffix.** A suffix on every dashed component would rename
+  every existing object; refusing keeps the names §20.5 documents.
+- **The `balerix-` prefix is reserved** for the operator's own objects:
+  a Fleet named with it is refused (§4.2). The exact name `balerix` is
+  `balerix-config`'s refusal, shared with the host; the prefix is checked
+  in `desired::fleet::resolve_fleet`, so host mode is unchanged.
+
+### 26.3 Foreground deletion (#233)
+
+A foreground deletion has the garbage collector delete a Fleet's
+dependents, the Crews and the Agents, and their dependents in turn,
+before the Fleet's own finalizer runs.
+
+- **The agent claim has no owner reference.** Owned by the Agent, it went
+  with the Agent's other dependents before the harvest, and the finalizer
+  then found nothing to harvest. The finalizer already deletes it (§8.2).
+  A claim an earlier operator made still holds the reference: the Agent
+  controller drops it on the next reconcile, and the finalizer does
+  before it harvests (`release_claim`, the claim's uid a precondition).
+  A claim the collector deleted before that cannot be saved.
+- **The cleanup Jobs' crews come from `spec.crews`,** with any Crew of
+  the Fleet's still listed added. The Crews have no finalizer, so under a
+  foreground deletion the list was empty and no `crew-remove` ran. Taken
+  from the spec, a crew that never synced gets a Job too, which empties
+  slices that hold nothing. When the Daemon's shared claim does not exist
+  there is nothing to clean and no Job could start, so none is made.
+- **The harvest and cleanup Jobs have no owner reference.** A Job owned
+  by an object under foreground deletion is collected as soon as it is
+  made. The Daemon as owner was the other choice; it would keep every
+  finished harvest until the Daemon goes, and a Job of a Daemon object
+  that is already gone would have none anyway. Instead each carries
+  `ttlSecondsAfterFinished: 3600` (`FINISHED_TTL_SECONDS`): the TTL
+  controller deletes it and its pods an hour after it finishes, and
+  `activeDeadlineSeconds` (§21.5) bounds how long that takes. The
+  finalizer does not delete them: a reconcile from a cache that still
+  shows the finalizer would find no Job and make a new one, which nothing
+  would then collect. Within the hour it finds the finished Job. The
+  pool and sync Jobs keep their owners.
+- **An unowned Job's input hash holds its owner's uid.** Nothing else on
+  it names the object it was made for, and it outlives that object by up
+  to an hour: an Agent dropped, harvested, added again and dropped again
+  inside the hour would otherwise read the first harvest's success as its
+  own and delete its claim unharvested, and a `retain: None` Fleet made
+  again under the same name would skip its cleanup. With the uid in the
+  hash the earlier Job is `Stale` and replaced. The owned Jobs' hashes
+  are unchanged: their owner reference says whose they are.
+- **A harvest that runs twice is harmless.** If the TTL removed a
+  finished harvest while the operator was down, the finalizer makes
+  another over the same claim, which is still there (it is deleted only
+  after a success). The harvest fetches the agent's branch into the crew
+  cache again, the same ref to the same commit.
+- **The Agent and Fleet controllers map these Jobs by label,** not by
+  owner: a harvest Job's `balerix.ai/fleet`, `crew` and `agent` name its
+  Agent, a cleanup Job's `balerix.ai/fleet` its Fleet.
+- **A claim that is being deleted is not harvested.** The finalizer
+  deletes the claim after a harvest; a later pass from a stale cache
+  finds it terminating and drops the finalizer, where it used to make a
+  harvest Job no pod could start for.
+
+### 26.4 Upgrading
+
+- **The labels are not new.** Every object the operator has made since
+  it was released (core 0.2.1) carries the identity of §26.1, so an
+  upgrade judges them its own and changes nothing.
+- **An object without them that its owner is the controller owner of**
+  (an owner reference with its uid and `controller: true`) is adopted:
+  the missing labels are added (a merge patch with the read
+  uid as a precondition), and from then it is the owner's. One with a
+  label of another value is never adopted, whatever its references say.
+  An object with neither is a `Conflict`.
+- **Existing agent claims** lose the Agent's owner reference on the next
+  reconcile (§26.3). **Existing harvest and cleanup Jobs** keep their
+  owner; their hash now holds the owner's uid, so one still running at
+  the upgrade is replaced once, and its harvest or cleanup runs again.
+- **Visible to users:** a `Conflict` where the operator used to take an
+  object over, a Fleet refused for agents whose names meet, an agent
+  claim left behind when an Agent's finalizer is removed by hand (it used
+  to go with the Agent), and finished harvest and cleanup Jobs kept for
+  an hour. `CHANGELOG.md`'s "Upgrading" says so.
+
+### 26.5 Testing
+
+- **Unit.** `desired::ownership`: the same labels are the owner's on any
+  Daemon; another value or an extra label is not; the Daemon label counts
+  only where there is no fleet or plugin label; missing labels are
+  adopted only through the owner's controller reference. `desired::jobs`:
+  an unowned Job's hash follows its owner's uid, an owned one's does not. `desired::fleet`: two agents joining to one name are
+  refused with both paths. The snapshots: the agent claim without an
+  owner, the harvest and cleanup Jobs without one and with the TTL.
+- **envtest (`controllers_it`).** A Secret and a claim with an expected
+  name and other labels: the Fleet is `Conflict` and sends nothing, the
+  Secret is not read; once it is removed the Fleet mints its own token;
+  the Agent is `Conflict` and makes no pod; its removal leaves the claim
+  unchanged. A claim with the Agent's owner reference and no labels is
+  labelled and released, same uid. Colliding names within a Fleet are
+  `InvalidFleet` with nothing made. Two Fleets whose names meet: the
+  second is `Conflict`, and the first's Agent keeps its spec and owner
+  while both reconcile. A Fleet deleted in the foreground (the test plays
+  the collector: the Crew deleted, the Agent deleted in the foreground,
+  its pod reaped) with `retain: Branches` gets its harvest, and with
+  `retain: None` its cleanup Job, both without owner and with the TTL.
+  A Fleet named `balerix-x` or `balerix` is refused at admission and
+  nothing is made for it; one named `balerix-old` before the rules is
+  `InvalidFleet`, and its status, annotations and deletion still go
+  through. An object the operator created loses a label, a key and an
+  earlier owner's controller reference the desired object drops, and one
+  never applied after its create does too; another's controller
+  reference is a `Conflict`. An Agent dropped, added again and dropped again gets a new harvest
+  Job, and its claim waits for it; a `retain: None` Fleet made again
+  and deleted runs a new cleanup Job. A NetworkPolicy by the Daemon's
+  name with other labels: the Daemon is `Conflict` and no StatefulSet is
+  made. `apply_read` writes over the object read, and refuses a create
+  over an object made since and an apply over one made again since.
+- **`plugins_it`** waits for the plugin's NetworkPolicy, the last object
+  applied, before it checks the rest: each apply is now preceded by its
+  ownership read.

@@ -134,6 +134,13 @@ spec:
         - spec
         title: Fleet
         type: object
+        x-kubernetes-validations:
+        - message: the name balerix is reserved
+          optionalOldSelf: true
+          rule: oldSelf.hasValue() || self.metadata.name != 'balerix'
+        - message: the balerix- prefix is reserved for the operator's own objects
+          optionalOldSelf: true
+          rule: oldSelf.hasValue() || !self.metadata.name.startsWith('balerix-')
     served: true
     storage: true
     subresources:

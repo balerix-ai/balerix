@@ -83,6 +83,37 @@
   larger fails that call with a 500 (`<agent>: git link: the reply is
   <n> bytes, over the link's limit of 16777216`) where it used to drop
   the link.
+- The operator now checks that an object it finds by name carries the
+  labels it gives its own (`balerix.ai/component` and the fleet, crew,
+  agent or plugin it is for) before it reads, applies over or deletes it
+  (Spec O §26). Another object by that name is left alone, nothing of
+  the owner's is written while it is there, and the owner's readiness
+  condition goes `False`, reason `Conflict`, naming it. Rename the Fleet,
+  crew or agent, or remove the other object. Objects earlier operators
+  made already carry these labels; one without them whose controller
+  owner reference is its owner's is labelled and kept.
+- A Fleet with two agents whose names join to one object name (crew `b`
+  with agent `c-d` and crew `b-c` with agent `d` both make `f-b-c-d`) is
+  now `Resolved=False` (`InvalidFleet`), naming both (#232). Such a Fleet
+  used to run one pod for the two, with one token. Rename one of them.
+  Of two Fleets whose objects take the same names, the second is now
+  `Ready=False`, `Conflict`, and the first keeps its objects; the two
+  used to take the objects from each other on every reconcile.
+- Fleet names starting with `balerix-` are now refused; the prefix is
+  reserved for the operator's own objects. The Fleet definition refuses
+  new ones (and `balerix`) at admission, and the operator at resolution
+  (`Resolved=False`, `InvalidFleet`). An existing `balerix-*` Fleet is
+  marked `InvalidFleet`: recreate it under another name. It can still be
+  deleted. Host fleets are unchanged.
+- A Fleet deleted in the foreground (`kubectl delete
+  --cascade=foreground`, Argo CD's default prune) now harvests with
+  `retain: Branches` and runs the crew cleanup with `retain: None`
+  (#233). The agent claim no longer has an owner reference: the next
+  reconcile removes it from existing claims, and a claim whose Agent's
+  finalizer is removed by hand now stays, to delete by hand. Harvest and
+  cleanup Jobs no longer have one either; they are deleted an hour after
+  they finish (`ttlSecondsAfterFinished: 3600`). A harvest or cleanup
+  still under way at the upgrade starts again once.
 
 ## 0.2.4 - 2026-10-10
 

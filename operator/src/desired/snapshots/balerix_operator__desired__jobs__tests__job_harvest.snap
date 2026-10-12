@@ -6,7 +6,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   annotations:
-    balerix.ai/input-hash: 5b65c36014b82124d722f447cd625755f58292c92aa54281d8fa8bd05f16c8e6
+    balerix.ai/input-hash: 65402761b81bbd86b545afee281b4c7f62dabb33f533db784ded8daad50ab0de
   labels:
     app.kubernetes.io/managed-by: balerix-operator
     balerix.ai/agent: alice
@@ -16,12 +16,6 @@ metadata:
     balerix.ai/fleet: payments
   name: payments-backend-alice-harvest
   namespace: team-a
-  ownerReferences:
-    - apiVersion: balerix.ai/v1alpha1
-      controller: true
-      kind: Crew
-      name: payments-backend
-      uid: crew-uid
 spec:
   activeDeadlineSeconds: 3600
   backoffLimit: 0
@@ -116,3 +110,4 @@ spec:
           persistentVolumeClaim:
             claimName: payments-backend-alice
             readOnly: true
+  ttlSecondsAfterFinished: 3600

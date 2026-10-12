@@ -9,4 +9,5 @@ pub mod daemon;
 pub mod fleet;
 pub mod jobs;
 pub mod names;
+pub mod ownership;
 pub mod plugin;

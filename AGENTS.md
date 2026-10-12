@@ -152,7 +152,13 @@ credentials, hook input, or sandbox rules.
 - The controllers (`operator/src/controllers/`) are the dumb executor:
   observe, call `desired`, apply with server-side apply under the field
   manager `balerix-operator`, patch status. Every Job goes through
-  `controllers::jobs::ensure_job`.
+  `controllers::jobs::ensure_job`. Every object found by name goes
+  through `controllers::owned` (`observe`, `apply`, `delete_read`), which
+  judges its labels first (Spec O §26); never `get_opt` and use, or a
+  raw forced apply. `apply_unchecked` is for an object judged earlier in
+  the same reconcile, or a managed Fleet (its own rule, §23.4). The agent
+  claim and the harvest and cleanup Jobs carry no owner reference
+  (§26.3): never give them one.
 
 ## Gotchas
 - A `desired` function writes its manifest as JSON and returns the

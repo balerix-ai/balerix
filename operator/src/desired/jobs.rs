@@ -36,6 +36,13 @@ pub const AGENT_DIR: &str = "agent";
 /// forever. An hour, for a slow pool install.
 pub const JOB_DEADLINE_SECONDS: i64 = 3600;
 
+/// An unowned Job's `ttlSecondsAfterFinished`: the TTL controller deletes
+/// it, and its pods, an hour after it finishes. Not the finalizer: a pass
+/// from a cache that still shows the finalizer would find no Job and make
+/// it again, with nothing left to collect it. An hour outlasts any such
+/// pass, and `activeDeadlineSeconds` bounds how long it takes to finish.
+pub const FINISHED_TTL_SECONDS: i64 = 3600;
+
 pub struct JobContext<'a> {
     pub namespace: &'a str,
     pub daemon: &'a str,
@@ -61,6 +68,12 @@ fn slice(sub_path: String, at: &'static str, writable: bool) -> Slice {
 
 struct Parts {
     name: String,
+    /// Whether the Job carries `ctx.owner`. A harvest or a cleanup runs
+    /// while its owner is deleted, and under a foreground deletion the
+    /// garbage collector would delete a Job owned by it before it ran:
+    /// those two carry none, and go `FINISHED_TTL_SECONDS` after they
+    /// finish (§26.3).
+    owned: bool,
     component: &'static str,
     extra_labels: Vec<(&'static str, String)>,
     args: Vec<String>,
@@ -117,22 +130,31 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
         json!({ "name": "tmp", "emptyDir": {} }),
     ];
     volumes.extend(parts.volumes);
-    let input = hash(&json!({
+    let mut input = json!({
         "image": ctx.images.agent,
         "args": parts.args,
         "mounts": mounts,
         "volumes": volumes,
-    }));
-    typed(json!({
+    });
+    // an unowned Job outlives its owner by the TTL: one made for an
+    // earlier object of the same name is stale, not this one's outcome
+    if !parts.owned {
+        input["for"] = ctx.owner["uid"].clone();
+    }
+    let input = hash(&input);
+    let mut metadata = json!({
+        "name": parts.name,
+        "namespace": ctx.namespace,
+        "labels": labels,
+        "annotations": { HASH_ANNOTATION: input },
+    });
+    if parts.owned {
+        metadata["ownerReferences"] = json!([ctx.owner]);
+    }
+    let mut job = json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {
-            "name": parts.name,
-            "namespace": ctx.namespace,
-            "labels": labels,
-            "annotations": { HASH_ANNOTATION: input },
-            "ownerReferences": [ctx.owner],
-        },
+        "metadata": metadata,
         "spec": {
             // the operator retries with back-off (§8.3); the Job does not
             "backoffLimit": 0,
@@ -166,7 +188,11 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
                 },
             },
         },
-    }))
+    });
+    if !parts.owned {
+        job["spec"]["ttlSecondsAfterFinished"] = json!(FINISHED_TTL_SECONDS);
+    }
+    typed(job)
 }
 
 /// The cleanup Job (§21.2): `crew-remove` over the crew's cache and pool,
@@ -178,6 +204,7 @@ pub fn remove_job(ctx: &JobContext<'_>, fleet: &str, crew: &str) -> Result<Job, 
         ctx,
         Parts {
             name: names::remove_job(fleet, crew),
+            owned: false,
             component: "remove",
             extra_labels: vec![
                 ("balerix.ai/fleet", fleet.to_string()),
@@ -200,6 +227,7 @@ pub fn daemon_pool_job(ctx: &JobContext<'_>) -> Result<Job, DesiredError> {
         ctx,
         Parts {
             name: names::daemon_pool_job(ctx.daemon),
+            owned: true,
             component: "pool",
             extra_labels: vec![],
             args: strings(&["pool-sync", "--level", "daemon"]),
@@ -223,6 +251,7 @@ pub fn fleet_pool_job(
         ctx,
         Parts {
             name: names::fleet_pool_job(fleet),
+            owned: true,
             component: "pool",
             extra_labels: vec![("balerix.ai/fleet", fleet.to_string())],
             args,
@@ -272,6 +301,7 @@ pub fn crew_sync_job(
         ctx,
         Parts {
             name: names::sync_job(&crew.fleet, &crew.crew),
+            owned: true,
             component: "sync",
             extra_labels: vec![
                 ("balerix.ai/fleet", crew.fleet.clone()),
@@ -304,6 +334,7 @@ pub fn harvest_job(
         ctx,
         Parts {
             name: names::harvest_job(agent_name),
+            owned: false,
             component: "harvest",
             extra_labels: vec![
                 ("balerix.ai/fleet", agent.fleet.clone()),
@@ -577,6 +608,23 @@ mod tests {
         assert_ne!(
             hash_of(&a),
             hash_of(&crew_sync_job(&ctx(&newer), &crew("gh"), Some("gh-token")).unwrap())
+        );
+        // an unowned Job's is also its owner's uid: one made for an
+        // earlier owner of the same name is stale (§26.3)
+        let mut later = ctx(&images);
+        later.owner["uid"] = json!("another-uid");
+        assert_ne!(
+            hash_of(&harvest_job(&c, "payments-backend-alice", &agent()).unwrap()),
+            hash_of(&harvest_job(&later, "payments-backend-alice", &agent()).unwrap())
+        );
+        assert_ne!(
+            hash_of(&remove_job(&c, "payments", "backend").unwrap()),
+            hash_of(&remove_job(&later, "payments", "backend").unwrap())
+        );
+        // an owned Job's is not: its owner reference already says whose
+        assert_eq!(
+            hash_of(&crew_sync_job(&c, &crew("gh"), Some("gh-token")).unwrap()),
+            hash_of(&crew_sync_job(&later, &crew("gh"), Some("gh-token")).unwrap())
         );
     }
 

@@ -10,7 +10,10 @@ pub mod daemon;
 mod daemon_plugins;
 pub mod fleet;
 pub mod jobs;
+pub mod owned;
 pub mod plugin;
+
+pub use owned::apply;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -20,7 +23,7 @@ use std::time::Duration;
 use balerix_api::FleetRecord;
 use futures_util::future::BoxFuture;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
-use kube::api::{Patch, PatchParams};
+use kube::api::Patch;
 use kube::runtime::controller::Action;
 use kube::runtime::events::{Event, EventType, Recorder, Reporter};
 use kube::{Api, Client, Resource, ResourceExt};
@@ -28,9 +31,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::daemon_client::{ClientError, DaemonClient};
-use crate::desired::common::{
-    Cond, DesiredError, Images, MANAGER, OperatorConfig, conditions, hash,
-};
+use crate::desired::common::{Cond, DesiredError, Images, OperatorConfig, conditions, hash};
 use crate::desired::fleet::PlanError;
 use crate::pki::PkiError;
 
@@ -104,6 +105,10 @@ pub enum Error {
     /// or `{what} {name} does not exist`.
     #[error("{0}")]
     Missing(String),
+    /// An object found by name that is not the reconciled object's (§26):
+    /// left alone, said in a `Conflict` condition, and backed off.
+    #[error("{0}")]
+    Conflict(String),
     /// A cleanup that is not finished: requeued in 2 s, not an error.
     #[error("waiting: {0}")]
     Waiting(String),
@@ -435,29 +440,6 @@ pub fn object_key<K: Resource>(object: &K) -> String {
     Context::key(&object.namespace().unwrap_or_default(), &object.name_any())
 }
 
-/// Server-side apply, forced, under the operator's field manager (§5).
-pub async fn apply<K>(client: &Client, object: &K) -> Result<K, Error>
-where
-    K: Resource<Scope = k8s_openapi::NamespaceResourceScope>
-        + Clone
-        + std::fmt::Debug
-        + DeserializeOwned
-        + Serialize,
-    K::DynamicType: Default,
-{
-    let namespace = object.namespace().ok_or_else(|| {
-        Error::Missing(format!("{} has no metadata.namespace", object.name_any()))
-    })?;
-    let api: Api<K> = Api::namespaced(client.clone(), &namespace);
-    Ok(api
-        .patch(
-            &object.name_any(),
-            &PatchParams::apply(MANAGER).force(),
-            &Patch::Apply(object),
-        )
-        .await?)
-}
-
 /// A merge patch of `status` through the subresource.
 pub async fn patch_status<K, S>(client: &Client, object: &K, status: &S) -> Result<(), Error>
 where
@@ -474,7 +456,7 @@ where
     let api: Api<K> = Api::namespaced(client.clone(), &namespace);
     api.patch_status(
         &object.name_any(),
-        &PatchParams::default(),
+        &owned::merge_params(),
         &Patch::Merge(serde_json::json!({ "status": status })),
     )
     .await?;
@@ -497,6 +479,36 @@ pub fn replace_condition(
         }
     }
     all
+}
+
+/// `<type_>=False`, reason `Conflict`, with the conflict's message, the
+/// other conditions as they were (§26). `type_` is `Ready`, or a Crew's
+/// `CacheReady`. A status that cannot be written is logged: the conflict
+/// is the error `error_policy` backs off.
+pub async fn mark_conflict<K>(
+    ctx: &Context,
+    object: &K,
+    old: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+    type_: &'static str,
+    message: &str,
+) where
+    K: Resource<Scope = k8s_openapi::NamespaceResourceScope>
+        + Clone
+        + std::fmt::Debug
+        + DeserializeOwned,
+    K::DynamicType: Default,
+{
+    let generation = object.meta().generation;
+    let conditions = replace_condition(
+        old,
+        Cond::no(type_, "Conflict", message),
+        generation,
+        &ctx.k8s_now(),
+    );
+    let status = serde_json::json!({ "conditions": conditions });
+    if let Err(e) = patch_status(&ctx.client, object, &status).await {
+        tracing::warn!(namespace = %object.namespace().unwrap_or_default(), name = %object.name_any(), "the Conflict condition was not written: {e}");
+    }
 }
 
 /// A reconcile that ended well resets the object's error count.

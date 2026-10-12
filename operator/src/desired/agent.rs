@@ -7,7 +7,7 @@
 use balerix_api::{AgentBundle, AgentSettings, CredentialBundle, GitSettings, RunnerSettings};
 use k8s_openapi::api::core::v1::{ContainerStatus, PersistentVolumeClaim, Pod, Secret};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -85,14 +85,16 @@ pub fn agent_objects(inputs: &AgentInputs<'_>) -> Result<AgentObjects, DesiredEr
     });
 
     // §8.2: sized by the fleet's `runner.storage`, else the Daemon's
-    // `storage.agent`; deleted with the Agent, after the harvest.
+    // `storage.agent`; deleted by the Agent's finalizer, after the harvest.
+    // It carries no owner reference: under a foreground deletion the
+    // garbage collector would delete it before the harvest (§26.3).
     let default = &inputs.daemon.spec.storage.agent;
     let size = storage
         .as_ref()
         .and_then(|s| s.get("size"))
         .and_then(Value::as_str)
         .unwrap_or(&default.size);
-    let mut agent_claim = claim(
+    let agent_claim = claim(
         namespace,
         name,
         labels,
@@ -102,8 +104,6 @@ pub fn agent_objects(inputs: &AgentInputs<'_>) -> Result<AgentObjects, DesiredEr
         },
         "ReadWriteOnce",
     )?;
-    // `common::claim` leaves its claims unowned; the agent's goes with it.
-    agent_claim.metadata.owner_references = Some(vec![typed::<OwnerReference>(owner)?]);
 
     let bundle = AgentBundle {
         agent: format!("{}/{}/{}", spec.fleet, spec.crew, spec.agent),
@@ -606,11 +606,16 @@ mod tests {
     }
 
     #[test]
-    fn the_claim_is_owned_by_the_agent_and_the_pod_carries_the_daemon_label() {
+    fn the_claim_has_no_owner_and_the_pod_carries_the_daemon_label() {
         let o = objects(json!({ "type": "pod" }));
-        let owners = o.claim.metadata.owner_references.unwrap();
-        assert_eq!(owners[0].kind, "Agent");
-        assert_eq!(owners[0].name, "payments-backend-alice");
+        // the finalizer deletes it after the harvest; an owner reference
+        // would let the garbage collector delete it first (§26.3)
+        assert_eq!(o.claim.metadata.owner_references, None);
+        let claim_labels = o.claim.metadata.labels.unwrap();
+        assert_eq!(claim_labels["balerix.ai/agent"], "alice");
+        assert_eq!(claim_labels["balerix.ai/component"], "agent");
+        // the rest are the Agent's
+        assert_eq!(o.bundle.metadata.owner_references.unwrap()[0].kind, "Agent");
         let labels = o.pod.metadata.labels.unwrap();
         assert_eq!(labels["balerix.ai/daemon"], "default");
         assert_eq!(labels["balerix.ai/component"], "agent");

@@ -3,6 +3,8 @@
 //! the generated Crew and Agent objects; and the `PUT` body, built only
 //! once every agent has a token.
 
+use std::collections::BTreeMap;
+
 use balerix_api::{AgentTokens, FleetRequest, RunnerKind, RunnerSettings};
 use balerix_config::{ConfigError, ResolveOptions};
 use k8s_openapi::api::core::v1::{ResourceRequirements, Toleration};
@@ -47,8 +49,10 @@ fn invalid(path: impl Into<String>, message: impl Into<String>) -> ConfigError {
 
 /// The Fleet's `spec` as the fleet file it is (§4.2), resolved beneath
 /// the Daemon's `defaults` with `runner: { type: pod }` at the bottom.
-/// Then what only Kubernetes can refuse: an object name over 63
-/// characters, and runner shapes that are not Kubernetes'.
+/// Then what only Kubernetes can refuse: a name with the `balerix-`
+/// prefix, the operator's own objects' (§26.2), an object name over 63
+/// characters, two agents whose names join to one object name
+/// (§26.2), and runner shapes that are not Kubernetes'.
 pub fn resolve_fleet(
     fleet: &Fleet,
     daemon_defaults: &Value,
@@ -58,6 +62,14 @@ pub fn resolve_fleet(
         .name
         .clone()
         .ok_or_else(|| invalid("metadata.name", "required"))?;
+    // the exact name `balerix` is refused by `balerix-config`, as on a
+    // host; the prefix only here, where the operator names objects
+    if name.starts_with("balerix-") {
+        return Err(invalid(
+            "name",
+            format!("{name:?}: the `balerix-` prefix is reserved for the operator's own objects"),
+        ));
+    }
     let crews: serde_json::Map<String, Value> = fleet
         .spec
         .crews
@@ -95,10 +107,15 @@ pub fn resolve_fleet(
             ..Default::default()
         },
     )?;
+    // an Agent's object name to the config path that made it: `-` joins
+    // the parts, and a part may hold `-` itself. Crews cannot collide:
+    // distinct crew names make distinct `<fleet>-<crew>`.
+    let mut taken: BTreeMap<String, String> = BTreeMap::new();
     for (crew_name, crew) in &spec.crews {
         for (agent_name, settings) in &crew.agents {
             let path = format!("crews.{crew_name}.agents.{agent_name}");
             let object = names::agent(&name, crew_name, agent_name);
+            refuse_taken(&mut taken, object.clone(), path.clone())?;
             if object.len() > 63 {
                 return Err(invalid(
                     path,
@@ -112,6 +129,25 @@ pub fn resolve_fleet(
         }
     }
     Ok(spec)
+}
+
+/// `object` for `path`, unless an earlier path already made that name:
+/// the two would be one object, one claim and one token (#232).
+fn refuse_taken(
+    taken: &mut BTreeMap<String, String>,
+    object: String,
+    path: String,
+) -> Result<(), ConfigError> {
+    if let Some(first) = taken.get(&object) {
+        return Err(invalid(
+            path,
+            format!(
+                "the object name {object} is also {first}'s: names are joined with `-`, so the two would be one object; rename one"
+            ),
+        ));
+    }
+    taken.insert(object, path);
+    Ok(())
 }
 
 /// `balerix-api` keeps the pod's shapes opaque; here they get their
@@ -397,6 +433,46 @@ mod tests {
         assert_eq!(crew.tools["python"], "3.12.8");
     }
 
+    /// #232: crew `b` agent `c-d` and crew `b-c` agent `d` both join to
+    /// `f-b-c-d`; the second in resolution order is refused.
+    #[test]
+    fn two_agents_whose_names_join_to_one_object_are_refused() {
+        let spec = json!({
+            "daemon": "default",
+            "crews": {
+                "b": { "repo": "acme/api", "agents": { "c-d": {} } },
+                "b-c": { "repo": "acme/api", "agents": { "d": {} } }
+            }
+        });
+        let e = plan_fleet(
+            &fleet("f", spec),
+            &daemon(json!({})),
+            &tokens(&[]),
+            &images(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            e.to_string(),
+            "crews.b-c.agents.d: the object name f-b-c-d is also crews.b.agents.c-d's: names are joined with `-`, so the two would be one object; rename one"
+        );
+        // the same parts without the overlap resolve
+        let fine = json!({
+            "daemon": "default",
+            "crews": {
+                "b": { "repo": "acme/api", "agents": { "c-d": {} } },
+                "b-c": { "repo": "acme/api", "agents": { "e": {} } }
+            }
+        });
+        plan_fleet(
+            &fleet("f", fine),
+            &daemon(json!({})),
+            &tokens(&[]),
+            &images(),
+        )
+        .unwrap();
+    }
+
     /// Review focus 5: each of these refuses the whole Fleet.
     #[test]
     fn a_fleet_that_cannot_run_as_pods_fails_with_the_config_path() {
@@ -474,6 +550,27 @@ mod tests {
         .unwrap()
         .to_string();
         assert!(e.starts_with("name: "), "the reserved name: {e}");
+
+        let e = plan_fleet(
+            &fleet("balerix-x", payments()),
+            &daemon(json!({})),
+            &tokens(&[]),
+            &images(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            e.to_string(),
+            "name: \"balerix-x\": the `balerix-` prefix is reserved for the operator's own objects"
+        );
+        // only the prefix: a name that merely holds `balerix` resolves
+        plan_fleet(
+            &fleet("my-balerix", payments()),
+            &daemon(json!({})),
+            &tokens(&[]),
+            &images(),
+        )
+        .unwrap();
     }
 
     #[test]

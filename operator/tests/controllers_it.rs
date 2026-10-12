@@ -19,7 +19,7 @@ use support::envtest::envtest;
 use support::stub_daemon::StubDaemon;
 use support::{
     TestClock, expire_job, finish_job, hold_for, make_daemon_ready, namespace, reap_claim,
-    reap_pod, reap_pod_uid, spawn_operator, wait_for,
+    reap_job, reap_pod, reap_pod_uid, spawn_operator, wait_for,
 };
 
 /// What the Daemon's pod template rolls on: its serving certificate.
@@ -2802,6 +2802,976 @@ async fn a_missing_or_malformed_credentials_secret_is_on_the_agent() {
     operator.abort();
 }
 
+/// The Fleet's and the Agent's `Ready` condition, once it has `reason`.
+async fn ready_with<K>(
+    api: &Api<K>,
+    name: &str,
+    reason: &str,
+) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition
+where
+    K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
+        + Clone
+        + std::fmt::Debug
+        + serde::de::DeserializeOwned
+        + serde::Serialize,
+    K::DynamicType: Default,
+{
+    wait_for(
+        &format!("{name} Ready/{reason}"),
+        Duration::from_secs(60),
+        || async {
+            let object = serde_json::to_value(api.get(name).await.unwrap()).unwrap();
+            let conditions = object["status"]["conditions"].as_array()?.clone();
+            let ready = conditions.iter().find(|c| c["type"] == "Ready")?;
+            (ready["reason"] == reason).then(|| serde_json::from_value(ready.clone()).unwrap())
+        },
+    )
+    .await
+}
+
+/// §26: an object found by an expected name whose labels are not the
+/// owner's is neither read, patched nor deleted, and the owner says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_object_with_the_right_name_but_foreign_labels_is_left_alone() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("foreign").await;
+    let client = env.client.clone();
+    let foreign = serde_json::json!({ "app": "something-else" });
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), &ns);
+    let secret: Secret = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1", "kind": "Secret",
+        "metadata": { "name": "f-c-b-token", "namespace": ns, "labels": foreign },
+        "stringData": { "token": "not-the-fleets" },
+    }))
+    .unwrap();
+    let secret = secrets
+        .create(&PostParams::default(), &secret)
+        .await
+        .unwrap();
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+    let claim: PersistentVolumeClaim = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": { "name": "f-c-a", "namespace": ns, "labels": foreign },
+        "spec": { "accessModes": ["ReadWriteOnce"], "resources": { "requests": { "storage": "1Gi" } } },
+    }))
+    .unwrap();
+    let claim = claims.create(&PostParams::default(), &claim).await.unwrap();
+
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new(
+                "f",
+                fleet_spec("default", &[("c", &["a", "b"])], "Branches"),
+            ),
+        )
+        .await
+        .unwrap();
+    // the Secret is not read as the agent's token: nothing is sent
+    let ready = ready_with(&fleets, "f", "Conflict").await;
+    assert_eq!(ready.status, "False");
+    assert!(
+        ready.message.starts_with(
+            "Secret f-c-b-token exists and was not made for this object (it has no label"
+        ) && ready
+            .message
+            .ends_with("it is left alone; rename this object, or remove that one"),
+        "{}",
+        ready.message
+    );
+    hold_for("a PUT", Duration::from_secs(3), || async {
+        (!stub.puts().is_empty()).then_some(())
+    })
+    .await;
+    let kept = secrets.get("f-c-b-token").await.unwrap();
+    assert_eq!(
+        kept.metadata.resource_version,
+        secret.metadata.resource_version
+    );
+
+    // once it is gone the Fleet mints its own
+    secrets
+        .delete("f-c-b-token", &DeleteParams::default())
+        .await
+        .unwrap();
+    let put = wait_for("a PUT", Duration::from_secs(60), || async {
+        stub.puts().into_iter().next()
+    })
+    .await;
+    assert_ne!(put.agent_tokens.unwrap()["f/c/b"], "not-the-fleets");
+
+    // the claim is not the Agent's: no pod is made on it
+    crew_ready(&client, &ns, "f", "c").await;
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let ready = ready_with(&agents, "f-c-a", "Conflict").await;
+    assert!(
+        ready
+            .message
+            .starts_with("PersistentVolumeClaim f-c-a exists and was not made for this object"),
+        "{}",
+        ready.message
+    );
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    wait_for("the other agent's pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-b").await.unwrap()
+    })
+    .await;
+    assert!(pods.get_opt("f-c-a").await.unwrap().is_none());
+
+    // the agent leaves: its deletion leaves the claim as it was
+    fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(
+                serde_json::json!({ "spec": { "crews": { "c": { "agents": { "a": null } } } } }),
+            ),
+        )
+        .await
+        .unwrap();
+    wait_for("Agent f-c-a gone", Duration::from_secs(60), || async {
+        agents
+            .get_opt("f-c-a")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    let after = claims.get("f-c-a").await.unwrap();
+    assert_eq!(after.metadata.uid, claim.metadata.uid);
+    assert!(after.metadata.deletion_timestamp.is_none());
+    assert_eq!(
+        after.metadata.resource_version,
+        claim.metadata.resource_version
+    );
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_none());
+    operator.abort();
+}
+
+/// §26.4: a claim an earlier operator made, owned by its Agent and
+/// without the labels, is adopted: labelled, and released from the owner
+/// reference, with the same uid.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unlabelled_object_the_owner_references_is_adopted_and_labelled() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, _clock, operator) = world("adopt").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let agent = wait_for("Agent f-c-a", Duration::from_secs(60), || async {
+        agents.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+    let claim: PersistentVolumeClaim = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": { "name": "f-c-a", "namespace": ns, "ownerReferences": [{
+            "apiVersion": "balerix.ai/v1alpha1", "kind": "Agent", "name": "f-c-a",
+            "uid": agent.metadata.uid.clone().unwrap(), "controller": true,
+        }] },
+        "spec": { "accessModes": ["ReadWriteOnce"], "resources": { "requests": { "storage": "2Gi" } } },
+    }))
+    .unwrap();
+    let claim = claims.create(&PostParams::default(), &claim).await.unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    wait_for("the pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    let adopted = wait_for("the claim released", Duration::from_secs(30), || async {
+        let c = claims.get("f-c-a").await.unwrap();
+        c.metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or(&[])
+            .is_empty()
+            .then_some(c)
+    })
+    .await;
+    assert_eq!(adopted.metadata.uid, claim.metadata.uid);
+    let labels = adopted.metadata.labels.unwrap();
+    assert_eq!(labels["balerix.ai/component"], "agent");
+    assert_eq!(labels["balerix.ai/fleet"], "f");
+    assert_eq!(labels["balerix.ai/crew"], "c");
+    assert_eq!(labels["balerix.ai/agent"], "a");
+    assert_eq!(labels["balerix.ai/daemon"], "default");
+    operator.abort();
+}
+
+/// #232: two agents whose names join to one object name refuse the Fleet.
+#[tokio::test(flavor = "multi_thread")]
+async fn colliding_names_within_a_fleet_are_refused() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("collide").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new(
+                "f",
+                fleet_spec("default", &[("b", &["c-d"]), ("b-c", &["d"])], "Branches"),
+            ),
+        )
+        .await
+        .unwrap();
+    let status = wait_for("Resolved=False", Duration::from_secs(60), || async {
+        let s = fleets.get("f").await.unwrap().status?;
+        (condition(&s.conditions, "Resolved").status == "False").then_some(s)
+    })
+    .await;
+    let resolved = condition(&status.conditions, "Resolved");
+    assert_eq!(resolved.reason, "InvalidFleet");
+    assert_eq!(
+        resolved.message,
+        "crews.b-c.agents.d: the object name f-b-c-d is also crews.b.agents.c-d's: names are joined with `-`, so the two would be one object; rename one"
+    );
+    assert!(stub.puts().is_empty());
+    assert!(
+        Api::<Agent>::namespaced(client.clone(), &ns)
+            .list(&Default::default())
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(secrets_named(&client, &ns, "f-b-c-d-token").await.is_none());
+    operator.abort();
+}
+
+async fn secrets_named(client: &kube::Client, ns: &str, name: &str) -> Option<Secret> {
+    Api::<Secret>::namespaced(client.clone(), ns)
+        .get_opt(name)
+        .await
+        .unwrap()
+}
+
+/// #232: a second Fleet whose objects take the first's names does not
+/// take them over; the first keeps them, unchanged, and the second says
+/// `Conflict`.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_fleets_whose_names_meet_do_not_flip_flop() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("meet").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("a", fleet_spec("default", &[("b-c", &["d"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let first = wait_for("Agent a-b-c-d", Duration::from_secs(60), || async {
+        agents.get_opt("a-b-c-d").await.unwrap()
+    })
+    .await;
+    let token = wait_for("its token", Duration::from_secs(30), || async {
+        secrets_named(&client, &ns, "a-b-c-d-token").await
+    })
+    .await;
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("a-b", fleet_spec("default", &[("c", &["d"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    let ready = ready_with(&fleets, "a-b", "Conflict").await;
+    assert_eq!(ready.status, "False");
+    assert!(
+        ready.message.contains("a-b-c") && ready.message.contains("was not made for this object"),
+        "{}",
+        ready.message
+    );
+    // the first Fleet's objects stay its own while both reconcile
+    hold_for("the Agent taken over", Duration::from_secs(8), || async {
+        let a = agents.get("a-b-c-d").await.unwrap();
+        let owner = a.metadata.owner_references.clone().unwrap_or_default();
+        (a.spec.fleet != "a"
+            || a.spec.crew != "b-c"
+            || owner.len() != 1
+            || owner[0].uid != first.metadata.owner_references.as_ref().unwrap()[0].uid)
+            .then_some(())
+    })
+    .await;
+    assert_eq!(
+        secrets_named(&client, &ns, "a-b-c-d-token")
+            .await
+            .unwrap()
+            .data,
+        token.data
+    );
+    assert!(stub.puts().iter().all(|p| p.spec.name == "a"));
+    operator.abort();
+}
+
+/// What the garbage collector does under a foreground deletion, for
+/// envtest, which has none: an owner's dependents deleted (the pod is the
+/// kubelet's to reap) before the owner's own finalizers run.
+async fn collect_dependents(client: &kube::Client, ns: &str) {
+    Api::<Crew>::namespaced(client.clone(), ns)
+        .delete("f-c", &DeleteParams::default())
+        .await
+        .unwrap();
+    Api::<Agent>::namespaced(client.clone(), ns)
+        .delete("f-c-a", &DeleteParams::foreground())
+        .await
+        .unwrap();
+    reap_pod(client, ns, "f-c-a", Duration::from_secs(60)).await;
+}
+
+/// Once the harvest finalizer is off, the garbage collector's comes off
+/// too (when the API server kept it: the Fleet's finalizer may have
+/// deleted the Agent first, in the background).
+async fn finish_foreground(client: &kube::Client, ns: &str) {
+    let agents: Api<Agent> = Api::namespaced(client.clone(), ns);
+    let left = wait_for(
+        "the harvest finalizer off",
+        Duration::from_secs(60),
+        || async {
+            match agents.get_opt("f-c-a").await.unwrap() {
+                None => Some(None),
+                Some(a) => {
+                    let finalizers = a.metadata.finalizers.unwrap_or_default();
+                    (!finalizers.iter().any(|f| f == "balerix.ai/harvest"))
+                        .then_some(Some(finalizers))
+                }
+            }
+        },
+    )
+    .await;
+    if left.is_some() {
+        agents
+            .patch(
+                "f-c-a",
+                &PatchParams::default(),
+                &Patch::Merge(serde_json::json!({ "metadata": { "finalizers": null } })),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// #233: a Fleet deleted in the foreground (`kubectl delete
+/// --cascade=foreground`, Argo CD's prune) with `retain: Branches`
+/// still harvests: the claim has no owner for the collector to follow,
+/// and the harvest Job none to be collected with.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreground_deletion_with_retain_branches_still_harvests() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("fgbranches").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    wait_for("the pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+    assert_eq!(
+        claims.get("f-c-a").await.unwrap().metadata.owner_references,
+        None
+    );
+
+    fleets
+        .delete("f", &DeleteParams::foreground())
+        .await
+        .unwrap();
+    collect_dependents(&client, &ns).await;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let harvest = wait_for("the harvest Job", Duration::from_secs(60), || async {
+        jobs.get_opt("f-c-a-harvest").await.unwrap()
+    })
+    .await;
+    assert_eq!(harvest.metadata.owner_references, None);
+    finish_job(
+        &client,
+        &ns,
+        "f-c-a-harvest",
+        true,
+        Some("harvested balerix/a"),
+    )
+    .await;
+    finish_foreground(&client, &ns).await;
+    // after the harvest: the claim deleted, the Job too
+    wait_for("the claim deleted", Duration::from_secs(30), || async {
+        match claims.get_opt("f-c-a").await.unwrap() {
+            None => Some(()),
+            Some(c) => c.metadata.deletion_timestamp.map(|_| ()),
+        }
+    })
+    .await;
+    // the TTL controller's to collect: envtest has none
+    assert_eq!(
+        harvest.spec.as_ref().unwrap().ttl_seconds_after_finished,
+        Some(3600)
+    );
+    wait_for(
+        "the Fleet's finalizer off",
+        Duration::from_secs(60),
+        || async {
+            let f = fleets.get_opt("f").await.unwrap();
+            f.is_none_or(|f| {
+                !f.metadata
+                    .finalizers
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|x| x == "balerix.ai/fleet")
+            })
+            .then_some(())
+        },
+    )
+    .await;
+    assert!(stub.deletes().contains(&"f".to_string()));
+    assert!(jobs.get_opt("f-c-remove").await.unwrap().is_none());
+    operator.abort();
+}
+
+/// #233: with `retain: None`, a foreground deletion still runs the crew
+/// cleanup: its crews come from the Fleet's spec, not from the Crews the
+/// collector deleted first, and the Job has no owner to be collected with.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreground_deletion_with_retain_none_still_runs_the_crew_cleanup() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("fgnone").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "None")),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    wait_for("the pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+
+    fleets
+        .delete("f", &DeleteParams::foreground())
+        .await
+        .unwrap();
+    collect_dependents(&client, &ns).await;
+    finish_foreground(&client, &ns).await;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_none());
+    let remove = wait_for("the cleanup Job", Duration::from_secs(60), || async {
+        jobs.get_opt("f-c-remove").await.unwrap()
+    })
+    .await;
+    assert_eq!(remove.metadata.owner_references, None);
+    assert!(stub.deletes().contains(&"f".to_string()));
+    finish_job(&client, &ns, "f-c-remove", true, Some("removed")).await;
+    wait_for(
+        "the Fleet's finalizer off",
+        Duration::from_secs(60),
+        || async {
+            let f = fleets.get_opt("f").await.unwrap();
+            f.is_none_or(|f| {
+                !f.metadata
+                    .finalizers
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|x| x == "balerix.ai/fleet")
+            })
+            .then_some(())
+        },
+    )
+    .await;
+    // the TTL controller's to collect: envtest has none
+    assert_eq!(
+        remove.spec.as_ref().unwrap().ttl_seconds_after_finished,
+        Some(3600)
+    );
+    operator.abort();
+}
+
+/// §26.3: a finished harvest Job of an earlier Agent of the same name,
+/// still there until its TTL, is not this Agent's harvest: it is
+/// replaced, and the claim waits for the new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_earlier_agents_finished_harvest_is_not_the_next_ones() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, _clock, operator) = world("reharvest").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new(
+                "f",
+                fleet_spec("default", &[("c", &["a", "b"])], "Branches"),
+            ),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let set_agents = |agents: serde_json::Value| {
+        Patch::Merge(serde_json::json!({ "spec": { "crews": { "c": { "agents": agents } } } }))
+    };
+    // the first Agent f-c-a: dropped, harvested, gone
+    wait_for("the pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &set_agents(serde_json::json!({ "a": null })),
+        )
+        .await
+        .unwrap();
+    reap_pod(&client, &ns, "f-c-a", Duration::from_secs(60)).await;
+    let first = wait_for("the first harvest", Duration::from_secs(60), || async {
+        jobs.get_opt("f-c-a-harvest").await.unwrap()
+    })
+    .await;
+    finish_job(
+        &client,
+        &ns,
+        "f-c-a-harvest",
+        true,
+        Some("harvested balerix/a"),
+    )
+    .await;
+    wait_for("the first Agent gone", Duration::from_secs(60), || async {
+        agents
+            .get_opt("f-c-a")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    reap_claim(&client, &ns, "f-c-a", Duration::from_secs(30)).await;
+    // the collector's part: the first Agent's bundle and policy go with it
+    Api::<Secret>::namespaced(client.clone(), &ns)
+        .delete("f-c-a-bundle", &DeleteParams::default())
+        .await
+        .unwrap();
+    Api::<NetworkPolicy>::namespaced(client.clone(), &ns)
+        .delete("f-c-a", &DeleteParams::default())
+        .await
+        .unwrap();
+
+    // a second Agent of the same name, dropped within the hour
+    fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &set_agents(serde_json::json!({ "a": {} })),
+        )
+        .await
+        .unwrap();
+    let second = wait_for("the second pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    let claim = claims.get("f-c-a").await.unwrap();
+    fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &set_agents(serde_json::json!({ "a": null })),
+        )
+        .await
+        .unwrap();
+    reap_pod_uid(
+        &client,
+        &ns,
+        "f-c-a",
+        second.metadata.uid.as_deref().unwrap(),
+        Duration::from_secs(60),
+    )
+    .await;
+    // the earlier Job is stale: deleted in the foreground, then replaced
+    reap_job(
+        &client,
+        &ns,
+        "f-c-a-harvest",
+        first.metadata.uid.as_deref().unwrap(),
+        Duration::from_secs(60),
+    )
+    .await;
+    wait_for("the second harvest", Duration::from_secs(60), || async {
+        let j = jobs.get_opt("f-c-a-harvest").await.unwrap()?;
+        (j.metadata.uid != first.metadata.uid).then_some(())
+    })
+    .await;
+    let kept = claims.get("f-c-a").await.unwrap();
+    assert_eq!(kept.metadata.uid, claim.metadata.uid);
+    assert!(
+        kept.metadata.deletion_timestamp.is_none(),
+        "the claim waits for its own harvest"
+    );
+    finish_job(
+        &client,
+        &ns,
+        "f-c-a-harvest",
+        true,
+        Some("harvested balerix/a"),
+    )
+    .await;
+    wait_for("the second Agent gone", Duration::from_secs(60), || async {
+        agents
+            .get_opt("f-c-a")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    operator.abort();
+}
+
+/// A `retain: None` Fleet `f` with one crew, deleted; its cleanup
+/// Job finished once it is the one made after `not`; returns that Job.
+async fn delete_and_clean(client: &kube::Client, ns: &str, not: Option<&Job>) -> Job {
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "None")),
+        )
+        .await
+        .unwrap();
+    let agents: Api<Agent> = Api::namespaced(client.clone(), ns);
+    wait_for("Agent f-c-a", Duration::from_secs(60), || async {
+        agents.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    // the crew's sync holds its cleanup until it is finished; envtest
+    // collects nothing, so the first round's finished Jobs stay
+    if not.is_none() {
+        crew_ready(client, ns, "f", "c").await;
+    }
+    fleets.delete("f", &DeleteParams::default()).await.unwrap();
+    if let Some(earlier) = not {
+        reap_job(
+            client,
+            ns,
+            "f-c-remove",
+            earlier.metadata.uid.as_deref().unwrap(),
+            Duration::from_secs(60),
+        )
+        .await;
+    }
+    let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
+    let job = wait_for("the cleanup Job", Duration::from_secs(60), || async {
+        let j = jobs.get_opt("f-c-remove").await.unwrap()?;
+        (j.metadata.uid != not.and_then(|n| n.metadata.uid.clone())).then_some(j)
+    })
+    .await;
+    finish_job(client, ns, "f-c-remove", true, Some("removed")).await;
+    wait_for("the Fleet gone", Duration::from_secs(60), || async {
+        fleets.get_opt("f").await.unwrap().is_none().then_some(())
+    })
+    .await;
+    // the collector's part: the Fleet's Crew goes with it
+    Api::<Crew>::namespaced(client.clone(), ns)
+        .delete("f-c", &DeleteParams::default())
+        .await
+        .unwrap();
+    job
+}
+
+/// §26.3: a `retain: None` Fleet made again under the same name and
+/// deleted within the hour runs its own cleanup, not the earlier one's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fleet_made_again_runs_its_own_cleanup() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, _clock, operator) = world("reclean").await;
+    let client = env.client.clone();
+    let first = delete_and_clean(&client, &ns, None).await;
+    let second = delete_and_clean(&client, &ns, Some(&first)).await;
+    assert_ne!(second.metadata.uid, first.metadata.uid);
+    operator.abort();
+}
+
+/// §26.1: a NetworkPolicy by the Daemon's name and with other labels
+/// stops the Daemon before anything is made: no StatefulSet runs without
+/// its policy.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_whose_policy_name_is_taken_makes_no_statefulset() {
+    let Some(env) = envtest().await else { return };
+    let ns = namespace(&env.client, "policytaken").await;
+    let client = env.client.clone();
+    let policy: NetworkPolicy = serde_json::from_value(serde_json::json!({
+        "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+        "metadata": { "name": "balerix-default", "namespace": ns,
+            "labels": { "app": "something-else" } },
+        "spec": { "podSelector": {}, "policyTypes": ["Ingress"] },
+    }))
+    .unwrap();
+    let policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), &ns);
+    let policy = policies
+        .create(&PostParams::default(), &policy)
+        .await
+        .unwrap();
+    let daemons: Api<Daemon> = Api::namespaced(client.clone(), &ns);
+    daemons
+        .create(
+            &PostParams::default(),
+            &Daemon::new("default", daemon_spec()),
+        )
+        .await
+        .unwrap();
+    let clock = TestClock::default();
+    let operator = spawn_operator(env, &ns, None, &clock);
+    let ready = ready_with(&daemons, "default", "Conflict").await;
+    assert!(
+        ready
+            .message
+            .starts_with("NetworkPolicy balerix-default exists and was not made for this object"),
+        "{}",
+        ready.message
+    );
+    let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), &ns);
+    hold_for("a StatefulSet", Duration::from_secs(3), || async {
+        statefulsets.get_opt("balerix-default").await.unwrap()
+    })
+    .await;
+    assert_eq!(
+        policies
+            .get("balerix-default")
+            .await
+            .unwrap()
+            .metadata
+            .resource_version,
+        policy.metadata.resource_version
+    );
+    operator.abort();
+}
+
+/// §26.1: a write goes only over the object read. One deleted and made
+/// again under the name since is refused (its uid differs), and so is a
+/// create over an object made since a read found none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_over_an_object_replaced_since_it_was_read_is_refused() {
+    use balerix_operator::controllers::owned::apply_read;
+    let Some(env) = envtest().await else { return };
+    let ns = namespace(&env.client, "readwrite").await;
+    let maps: Api<ConfigMap> = Api::namespaced(env.client.clone(), &ns);
+    let map = |value: &str| -> ConfigMap {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": { "name": "m", "namespace": ns },
+            "data": { "k": value },
+        }))
+        .unwrap()
+    };
+    let read = apply_read(&maps, &map("one"), None).await.unwrap();
+    // over the object read: written
+    apply_read(&maps, &map("two"), Some(&read)).await.unwrap();
+    assert_eq!(maps.get("m").await.unwrap().data.unwrap()["k"], "two");
+    // a read that found none, and an object made since: a 409
+    let e = apply_read(&maps, &map("three"), None).await.unwrap_err();
+    assert!(e.to_string().contains("already exists"), "{e}");
+    // made again under the name since the read: refused, left as it is
+    maps.delete("m", &DeleteParams::default()).await.unwrap();
+    maps.create(&PostParams::default(), &map("theirs"))
+        .await
+        .unwrap();
+    let e = apply_read(&maps, &map("four"), Some(&read))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().to_lowercase().contains("uid"), "{e}");
+    assert_eq!(maps.get("m").await.unwrap().data.unwrap()["k"], "theirs");
+}
+
+/// §4.2: a Fleet named `balerix` or with the `balerix-` prefix is
+/// refused at admission (the CRD's CEL rules), so nothing is made for it;
+/// resolution refuses it too, for a cluster whose definitions are older.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fleet_with_the_reserved_prefix_is_refused() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("reserved").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    for (name, why) in [
+        (
+            "balerix-x",
+            "the balerix- prefix is reserved for the operator's own objects",
+        ),
+        ("balerix", "the name balerix is reserved"),
+    ] {
+        let e = fleets
+            .create(
+                &PostParams::default(),
+                &Fleet::new(name, fleet_spec("default", &[("c", &["a"])], "Branches")),
+            )
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains(why), "{name}: {e}");
+    }
+    hold_for("an object for it", Duration::from_secs(3), || async {
+        let agents = Api::<Agent>::namespaced(client.clone(), &ns)
+            .list(&Default::default())
+            .await
+            .unwrap();
+        let crews = Api::<Crew>::namespaced(client.clone(), &ns)
+            .list(&Default::default())
+            .await
+            .unwrap();
+        (!agents.items.is_empty() || !crews.items.is_empty() || !stub.puts().is_empty())
+            .then_some(())
+    })
+    .await;
+    assert!(
+        secrets_named(&client, &ns, "balerix-x-c-a-token")
+            .await
+            .is_none()
+    );
+    operator.abort();
+}
+
+/// The Fleet definition with its `x-kubernetes-validations` taken out
+/// (`strip`) or put back from the Rust types.
+async fn fleet_rules(client: &kube::Client, strip: bool) {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+    use kube::CustomResourceExt;
+    let rules = |c: &CustomResourceDefinition| {
+        c.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|s| s.x_kubernetes_validations.clone())
+    };
+    let crds: Api<CustomResourceDefinition> = Api::all(client.clone());
+    let mut crd = crds.get("fleets.balerix.ai").await.unwrap();
+    let wanted = if strip { None } else { rules(&Fleet::crd()) };
+    if let Some(schema) = crd.spec.versions[0]
+        .schema
+        .as_mut()
+        .and_then(|s| s.open_api_v3_schema.as_mut())
+    {
+        schema.x_kubernetes_validations = wanted;
+    }
+    crds.replace("fleets.balerix.ai", &PostParams::default(), &crd)
+        .await
+        .unwrap();
+}
+
+/// §4.2: the reserved-name rules hold on create only. A Fleet
+/// named before them can still have its status and metadata written and
+/// be deleted; resolution marks it `InvalidFleet`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fleet_named_before_the_rules_can_still_be_written_and_deleted() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, _clock, operator) = world("oldname").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleet_rules(&client, true).await;
+    // the definition's change takes a moment to reach the validator
+    wait_for("the rules gone", Duration::from_secs(30), || async {
+        fleets
+            .create(
+                &PostParams::default(),
+                &Fleet::new(
+                    "balerix-old",
+                    fleet_spec("default", &[("c", &["a"])], "Branches"),
+                ),
+            )
+            .await
+            .ok()
+    })
+    .await;
+    fleet_rules(&client, false).await;
+    wait_for("the rules back", Duration::from_secs(30), || async {
+        fleets
+            .create(
+                &PostParams::default(),
+                &Fleet::new(
+                    "balerix-new",
+                    fleet_spec("default", &[("c", &["a"])], "Branches"),
+                ),
+            )
+            .await
+            .err()
+    })
+    .await;
+    let status = wait_for("Resolved=False", Duration::from_secs(60), || async {
+        let s = fleets.get("balerix-old").await.unwrap().status?;
+        (condition(&s.conditions, "Resolved").reason == "InvalidFleet").then_some(s)
+    })
+    .await;
+    assert_eq!(
+        condition(&status.conditions, "Resolved").message,
+        "name: \"balerix-old\": the `balerix-` prefix is reserved for the operator's own objects"
+    );
+    fleets
+        .patch(
+            "balerix-old",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "metadata": { "annotations": { "x": "y" } } })),
+        )
+        .await
+        .unwrap();
+    fleets
+        .delete("balerix-old", &DeleteParams::default())
+        .await
+        .unwrap();
+    wait_for("the Fleet gone", Duration::from_secs(60), || async {
+        fleets
+            .get_opt("balerix-old")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    operator.abort();
+}
+
 #[test]
 fn the_harness_sweeps_the_roots_of_dead_test_processes() {
     let tmp = support::temp_root("sweep");
@@ -2817,4 +3787,147 @@ fn the_harness_sweeps_the_roots_of_dead_test_processes() {
     assert_eq!(removed, vec![dead.clone()]);
     assert!(!dead.exists() && live.is_dir() && other.is_dir());
     std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+/// A ConfigMap `m` with these labels, data and controller owner uid.
+fn owned_map(ns: &str, labels: &[&str], data: &[&str], owner: &str) -> ConfigMap {
+    let pairs = |keys: &[&str]| -> serde_json::Map<String, serde_json::Value> {
+        keys.iter()
+            .map(|k| (k.to_string(), serde_json::json!("v")))
+            .collect()
+    };
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": { "name": "m", "namespace": ns, "labels": pairs(labels),
+            "ownerReferences": [{ "apiVersion": "v1", "kind": "ConfigMap", "name": "o",
+                "uid": owner, "controller": true }] },
+        "data": pairs(data),
+    }))
+    .unwrap()
+}
+
+/// §26.1: an object the operator created is the operator's to change: a
+/// label or key the desired object drops goes on the next write, and so
+/// does a controller reference to an earlier owner (a leftover, or one
+/// made by a create no apply followed).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_field_dropped_from_the_desired_object_goes_on_the_next_write() {
+    use balerix_operator::controllers::owned::apply_read;
+    let Some(env) = envtest().await else { return };
+    let ns = namespace(&env.client, "dropfield").await;
+    let maps: Api<ConfigMap> = Api::namespaced(env.client.clone(), &ns);
+    let read = apply_read(
+        &maps,
+        &owned_map(&ns, &["keep", "drop"], &["a", "b"], "u1"),
+        None,
+    )
+    .await
+    .unwrap();
+    let written = apply_read(&maps, &owned_map(&ns, &["keep"], &["a"], "u1"), Some(&read))
+        .await
+        .unwrap();
+    assert_eq!(
+        written
+            .metadata
+            .labels
+            .as_ref()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["keep"]
+    );
+    assert_eq!(
+        written.data.as_ref().unwrap().keys().collect::<Vec<_>>(),
+        ["a"]
+    );
+
+    // a merge patch's field (an attempts annotation) is the patch's: a
+    // later write keeps it
+    let patched = maps
+        .patch(
+            "m",
+            &balerix_operator::controllers::owned::merge_params(),
+            &Patch::Merge(serde_json::json!({ "metadata": { "annotations": { "balerix.ai/attempts": "{}" } } })),
+        )
+        .await
+        .unwrap();
+    let kept = apply_read(
+        &maps,
+        &owned_map(&ns, &["keep"], &["a"], "u1"),
+        Some(&patched),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        kept.metadata.annotations.as_ref().unwrap()["balerix.ai/attempts"],
+        "{}"
+    );
+    let written = kept;
+
+    // a later owner of the same names: the earlier one's reference goes
+    let again = apply_read(
+        &maps,
+        &owned_map(&ns, &["keep"], &["a"], "u2"),
+        Some(&written),
+    )
+    .await
+    .unwrap();
+    let owners = again.metadata.owner_references.unwrap();
+    assert_eq!((owners.len(), owners[0].uid.as_str()), (1, "u2"));
+
+    // made by the operator's own create, which no apply followed (a pass
+    // that ended between the two): the same
+    maps.delete("m", &DeleteParams::default()).await.unwrap();
+    let operator_create = PostParams {
+        field_manager: Some("balerix-operator".into()),
+        ..PostParams::default()
+    };
+    let made = maps
+        .create(
+            &operator_create,
+            &owned_map(&ns, &["keep", "drop"], &["a", "b"], "u3"),
+        )
+        .await
+        .unwrap();
+    let written = apply_read(&maps, &owned_map(&ns, &["keep"], &["a"], "u4"), Some(&made))
+        .await
+        .unwrap();
+    let owners = written.metadata.owner_references.clone().unwrap();
+    assert_eq!((owners.len(), owners[0].uid.as_str()), (1, "u4"));
+    assert_eq!(
+        written.metadata.labels.unwrap().keys().collect::<Vec<_>>(),
+        ["keep"]
+    );
+    assert_eq!(written.data.unwrap().keys().collect::<Vec<_>>(), ["a"]);
+
+    // a controller reference someone else set is theirs: a Conflict, and
+    // the object is left as it was
+    maps.delete("m", &DeleteParams::default()).await.unwrap();
+    let theirs = maps
+        .create(
+            &PostParams::default(),
+            &owned_map(&ns, &["keep"], &["a"], "u5"),
+        )
+        .await
+        .unwrap();
+    let e = apply_read(
+        &maps,
+        &owned_map(&ns, &["keep"], &["a"], "u6"),
+        Some(&theirs),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&e, balerix_operator::controllers::Error::Conflict(m)
+            if m.contains("controller owner reference to another owner")),
+        "{e}"
+    );
+    let left = maps
+        .get("m")
+        .await
+        .unwrap()
+        .metadata
+        .owner_references
+        .unwrap();
+    assert_eq!((left.len(), left[0].uid.as_str()), (1, "u5"));
 }

@@ -11,22 +11,24 @@ use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
-use kube::api::PostParams;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Api, ResourceExt};
 
 use super::jobs::ensure_job;
+use super::owned::{apply_read, observe, observe_desired};
 use super::{
-    Context, Error, api_in, apply, bounded, error_policy, patch_status, reconciled, report,
+    Context, Error, api_in, apply, bounded, error_policy, mark_conflict, patch_status, reconciled,
+    report,
 };
 use crate::api::Daemon;
-use crate::desired::common::{Cond, conditions};
+use crate::desired::common::{Cond, conditions, labels};
 use crate::desired::daemon::{
     DaemonObserved, Material, NOT_AFTER_ANNOTATION, daemon_objects, daemon_secrets, daemon_status,
     version_ok,
 };
 use crate::desired::names;
+use crate::desired::ownership::{Identity, identity_of};
 use crate::pki::{self, Issued};
 
 pub async fn controller(ctx: Arc<Context>, watches: &kube::Client, namespace: Option<&str>) {
@@ -85,22 +87,48 @@ pub(crate) fn read_issued(
     })
 }
 
+/// What a Daemon's own objects carry (§26): the component `daemon` and
+/// the Daemon's label, no fleet and no plugin.
+pub fn daemon_identity(daemon: &str) -> Identity {
+    identity_of(&labels(daemon, "daemon", &[]))
+}
+
+/// The Daemon's object of `kind` called `name`, when it is the Daemon's
+/// own (§26).
+async fn daemons_own<K>(
+    ctx: &Context,
+    namespace: &str,
+    daemon: &str,
+    name: &str,
+    uid: Option<&str>,
+) -> Result<Option<K>, Error>
+where
+    K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
+        + Clone
+        + std::fmt::Debug
+        + serde::de::DeserializeOwned,
+    K::DynamicType: Default,
+{
+    let api: Api<K> = Api::namespaced(ctx.client.clone(), namespace);
+    observe(&api, name, &daemon_identity(daemon), uid).await
+}
+
 /// The authority's certificate (from the ConfigMap) and the admin token:
-/// what a client of this Daemon is built from.
+/// what a client of this Daemon is built from, each from the Daemon's own
+/// object (§26).
 pub async fn authority_and_token(
     ctx: &Context,
     namespace: &str,
     daemon: &str,
 ) -> Result<(String, String), Error> {
-    let configmaps: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
-    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
-    let authority = configmaps
-        .get_opt(&names::authority(daemon))
-        .await?
-        .and_then(|c| c.data?.get("ca.crt").cloned())
-        .ok_or_else(|| Error::Missing(format!("Daemon {daemon} has no authority ConfigMap yet")))?;
-    let token = secrets
-        .get_opt(&names::admin(daemon))
+    let authority =
+        daemons_own::<ConfigMap>(ctx, namespace, daemon, &names::authority(daemon), None)
+            .await?
+            .and_then(|c| c.data?.get("ca.crt").cloned())
+            .ok_or_else(|| {
+                Error::Missing(format!("Daemon {daemon} has no authority ConfigMap yet"))
+            })?;
+    let token = daemons_own::<Secret>(ctx, namespace, daemon, &names::admin(daemon), None)
         .await?
         .as_ref()
         .and_then(|s| read_secret_string(s, "token"))
@@ -116,10 +144,14 @@ async fn ensure_material(
     namespace: &str,
     name: &str,
 ) -> Result<Issued, Error> {
-    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+    let uid = daemon.uid();
+    let own = |object: String| {
+        let uid = uid.clone();
+        async move { daemons_own::<Secret>(ctx, namespace, name, &object, uid.as_deref()).await }
+    };
     let now = ctx.now();
     let read = read_issued(
-        secrets.get_opt(&names::authority(name)).await?.as_ref(),
+        own(names::authority(name)).await?.as_ref(),
         "ca.crt",
         "ca.key",
     );
@@ -142,7 +174,7 @@ async fn ensure_material(
     // a reconcile dropped before it applied the serving Secret is followed
     let serving_names = pki::daemon_names(namespace, name);
     let existing = read_issued(
-        secrets.get_opt(&names::serving(name)).await?.as_ref(),
+        own(names::serving(name)).await?.as_ref(),
         "tls.crt",
         "tls.key",
     );
@@ -161,8 +193,7 @@ async fn ensure_material(
             pki::issue_serving(&authority, namespace, name, &serving_names, now)?
         }
     };
-    let admin_token = match secrets
-        .get_opt(&names::admin(name))
+    let admin_token = match own(names::admin(name))
         .await?
         .as_ref()
         .and_then(|s| read_secret_string(s, "token"))
@@ -200,31 +231,84 @@ fn with_condition(computed: &mut [Condition], daemon: &Daemon, cond: Cond, now: 
 }
 
 pub async fn reconcile(daemon: Arc<Daemon>, ctx: Arc<Context>) -> Result<Action, Error> {
+    let result = reconcile_daemon(daemon.clone(), ctx.clone()).await;
+    if let Err(Error::Conflict(message)) = &result {
+        let old = daemon
+            .status
+            .as_ref()
+            .map_or(&[][..], |s| s.conditions.as_slice());
+        mark_conflict(&ctx, daemon.as_ref(), old, "Ready", message).await;
+    }
+    result
+}
+
+/// Every name the Daemon's objects take, judged before any is written
+/// (§26.1): one in `Conflict` stops the reconcile before the StatefulSet,
+/// or anything else, is made.
+async fn check_names(
+    ctx: &Context,
+    daemon: &Daemon,
+    namespace: &str,
+    name: &str,
+) -> Result<(), Error> {
+    let uid = daemon.uid();
+    let uid = uid.as_deref();
+    for secret in [
+        names::authority(name),
+        names::serving(name),
+        names::admin(name),
+    ] {
+        daemons_own::<Secret>(ctx, namespace, name, &secret, uid).await?;
+    }
+    daemons_own::<ConfigMap>(ctx, namespace, name, &names::authority(name), uid).await?;
+    for claim in [names::state_claim(name), names::shared_claim(name)] {
+        daemons_own::<PersistentVolumeClaim>(ctx, namespace, name, &claim, uid).await?;
+    }
+    let object = names::daemon(name);
+    daemons_own::<Service>(ctx, namespace, name, &object, uid).await?;
+    daemons_own::<NetworkPolicy>(ctx, namespace, name, &object, uid).await?;
+    daemons_own::<StatefulSet>(ctx, namespace, name, &object, uid).await?;
+    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    observe(
+        &jobs,
+        &names::daemon_pool_job(name),
+        &identity_of(&labels(name, "pool", &[])),
+        uid,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn reconcile_daemon(daemon: Arc<Daemon>, ctx: Arc<Context>) -> Result<Action, Error> {
     let namespace = daemon.namespace().unwrap_or_default();
     let name = daemon.name_any();
     let claims: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), &namespace);
     let statefulsets: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), &namespace);
 
     let (observed_pool, again) = if version_ok(&daemon, &ctx.cfg) {
+        check_names(&ctx, &daemon, &namespace, &name).await?;
         let serving = ensure_material(&ctx, &daemon, &namespace, &name).await?;
         let objects = daemon_objects(&daemon, &ctx.cfg, &serving.cert_pem)?;
         // a claim is immutable once bound: created when absent, never re-applied
         for claim in &objects.claims {
-            if claims.get_opt(&claim.name_any()).await?.is_none() {
-                claims.create(&PostParams::default(), claim).await?;
+            if observe_desired(&claims, claim).await?.is_none() {
+                apply_read(&claims, claim, None).await?;
             }
         }
         apply(&ctx.client, &objects.service).await?;
-        apply(&ctx.client, &objects.statefulset).await?;
+        // the policy before the pod it admits to
         apply(&ctx.client, &objects.policy).await?;
+        apply(&ctx.client, &objects.statefulset).await?;
         let pool = ensure_job(ctx.as_ref(), daemon.as_ref(), objects.pool_job, None).await?;
         (pool.outcome, pool.again)
     } else {
         (crate::desired::common::JobOutcome::Absent, ctx.run.period)
     };
 
-    let shared = claims.get_opt(&names::shared_claim(&name)).await?;
-    let statefulset = statefulsets.get_opt(&names::daemon(&name)).await?;
+    let uid = daemon.uid();
+    let own = daemon_identity(&name);
+    let shared = observe(&claims, &names::shared_claim(&name), &own, uid.as_deref()).await?;
+    let statefulset = observe(&statefulsets, &names::daemon(&name), &own, uid.as_deref()).await?;
     let observed = DaemonObserved {
         shared_claim: shared.as_ref(),
         statefulset: statefulset.as_ref(),

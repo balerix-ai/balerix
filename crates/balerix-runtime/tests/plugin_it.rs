@@ -9,7 +9,7 @@ use std::process::Command;
 
 use balerix_api::PluginManifest;
 use balerix_core::{HookTarget, Materializer, ResolvedPlugin};
-use balerix_runtime::Runtime;
+use balerix_runtime::{Runtime, sh_quote};
 
 const MANIFEST: &str = "apiVersion: balerix/v1\nkind: Plugin\nname: probe\nversion: 0.0.1\nprotocol: 1\nstart: serve\n";
 const MISE_TOML: &str = r#"[tools]
@@ -73,8 +73,17 @@ fn a_package_runs_its_start_task_inside_the_sandbox() {
     let launch = fs::read_to_string(&paths.launch).unwrap();
     assert!(!launch.contains("tok-secret"), "token in launch.sh");
 
+    // `launch.sh` starts under `balerix agent-supervise` (#119), and the
+    // `balerix` slot here is this test executable, which must not run it
+    // (AGENTS.md): run the script with the wrapper's three words taken
+    // out, which is exactly what the wrapper would run. The wrapper in
+    // front of a real plugin is `crates/balerix/tests/cli_supervise.rs`.
+    let wrapper = format!("{} 'agent-supervise' '--' ", sh_quote(&plan.argv[0]));
+    assert_eq!(plan.argv[1..3], ["agent-supervise", "--"]);
+    assert!(launch.contains(&wrapper), "{launch}");
     let out = Command::new("/bin/sh")
-        .arg(&plan.script)
+        .arg("-c")
+        .arg(launch.replacen(&wrapper, "", 1))
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .output()

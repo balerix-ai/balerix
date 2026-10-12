@@ -130,9 +130,9 @@ cache fetch + private clone (`--reference` to the crew's object cache) →
 hosts.yml) → `mise.toml` + `mise install` → `nono-profile.json` + validate →
 `launch.sh`. `AgentRunner` (`TmuxRunner`) makes processes: session per crew,
 window per agent, `remain-on-exit`, `respawn-window`.
-`agent-supervise` is a child subreaper in front of nono: `stop` and a
-restart wait for it, and it exits only when nothing the agent started is
-left (Spec N amendment §13). `balerix dev
+`agent-supervise` is a child subreaper in front of nono, for agents and
+plugins alike: `stop` and a restart wait for it, and it exits only when
+nothing the agent started is left (Spec N amendment §13). `balerix dev
 materialize` runs the file half alone.
 
 **Control plane (Phase 3):** `up` resolves the file exactly like `config resolve`,
@@ -151,8 +151,8 @@ validates manifests — and renders the list as a synthetic fleet
 `balerix`/`plugins`/`<name>` that an ordinary fleet actor reconciles.
 `PluginMaterializer` maps each synthetic agent back to its plugin and the
 runtime materializes it like an agent under `plugins/<name>/` (`home/`,
-profile, `launch.sh` running `nono run → mise run <start>` from the package
-root). The actor's per-agent hook secret is the plugin's token;
+profile, `launch.sh` running `agent-supervise → nono run → mise run
+<start>` from the package root). The actor's per-agent hook secret is the plugin's token;
 `POST /v1/plugin-host/hello` verifies it and is the plugin's `SessionStart`.
 
 **Event protocol (Spec B, phase 2a):** `up` resolves the spec and the daemon,

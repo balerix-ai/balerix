@@ -1,17 +1,21 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! `balerix agent-supervise` against real processes (Spec N amendment
-//! §13.7). The wrapper is a child subreaper, so it is always its own
-//! process here, never the test's.
+//! §13.7), and in front of an agent's and a plugin's tmux window (#119).
+//! The wrapper is a child subreaper, so it is always its own process
+//! here, never the test's.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use balerix_core::{AgentId, AgentRunner, LaunchPlan};
-use balerix_runtime::TmuxRunner;
+use balerix_api::PluginManifest;
+use balerix_core::{
+    AgentId, AgentRunner, HookTarget, LaunchPlan, Materializer, ResolvedPlugin, plugin_id,
+};
 use balerix_runtime::testing::pid_alive;
+use balerix_runtime::{Runtime, StateLayout, TmuxRunner, ToolPaths};
 
 const BALERIX: &str = env!("CARGO_BIN_EXE_balerix");
 
@@ -105,24 +109,30 @@ impl Wrapper {
     }
 }
 
+/// SIGKILLs every process carrying `marker`, repeatedly: a process that
+/// forks can outrun one pass. Called from the guards' drops, maybe while
+/// unwinding, so no unwrap.
+fn kill_marked(marker: &str) {
+    let start = Instant::now();
+    loop {
+        let left = with_cmdline(marker);
+        if left.is_empty() || start.elapsed() > Duration::from_secs(2) {
+            break;
+        }
+        for (pid, _) in left {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 impl Drop for Wrapper {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // repeated: a process that forks can outrun one pass
-        let start = Instant::now();
-        loop {
-            let left = with_cmdline(&self.marker);
-            if left.is_empty() || start.elapsed() > Duration::from_secs(2) {
-                break;
-            }
-            for (pid, _) in left {
-                let _ = Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status();
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        kill_marked(&self.marker);
     }
 }
 
@@ -430,4 +440,177 @@ fn a_restart_leaves_no_process_of_the_old_agent() {
     );
     wait_for(|| sleepers(&m).len() == 2);
     a.r.stop_crew(&a.id.crew_ref()).unwrap();
+}
+
+// -- plugins under the wrapper (#119) --
+
+/// Every process carrying the marker is killed on drop, whether the test
+/// passed or an assertion failed.
+struct Marked(String);
+
+impl Drop for Marked {
+    fn drop(&mut self) {
+        kill_marked(&self.0);
+    }
+}
+
+fn required() -> bool {
+    std::env::var_os("BALERIX_REQUIRE_TOOLS").is_some_and(|v| v == "1")
+}
+
+/// git, gh, mise, nono and tmux from PATH, and this crate's `balerix` in
+/// the `balerix` slot, so the wrapper a plugin's `launch.sh` names is the
+/// real one; otherwise skips (or panics under `BALERIX_REQUIRE_TOOLS=1`).
+fn real_tools() -> Option<ToolPaths> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    match ToolPaths::discover_in(&path, Path::new(BALERIX)) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            assert!(!required(), "{e} (BALERIX_REQUIRE_TOOLS=1)");
+            eprintln!("skip: {e}");
+            None
+        }
+    }
+}
+
+/// Whether nono can sandbox here (Landlock); see
+/// `balerix-runtime/tests/support/mod.rs::landlock_works`. The probe's
+/// home sits beside its cwd, not inside: nono refuses its own deny rules
+/// for the home under an allowed cwd.
+fn landlock_works(nono: &Path, root: &Path) -> bool {
+    let (cwd, home) = (root.join("nono-probe"), root.join("nono-probe-home"));
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let ok = Command::new(nono)
+        .args(["-s", "run", "--allow-cwd", "--", "/bin/true"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .current_dir(&cwd)
+        .status()
+        .is_ok_and(|s| s.success());
+    let _ = std::fs::remove_dir_all(&cwd);
+    let _ = std::fs::remove_dir_all(&home);
+    if !ok {
+        assert!(
+            !required(),
+            "landlock is required (BALERIX_REQUIRE_TOOLS=1)"
+        );
+        eprintln!("skip: landlock not available");
+    }
+    ok
+}
+
+const PROBE_MANIFEST: &str = "apiVersion: balerix/v1\nkind: Plugin\nname: probe\nversion: 0.0.1\nprotocol: 1\nstart: serve\n";
+
+struct RunningPlugin {
+    r: TmuxRunner,
+    id: AgentId,
+    rt: Runtime,
+    plugin: ResolvedPlugin,
+    _marked: Marked,
+    _server: KillServer,
+    _dir: tempfile::TempDir,
+}
+
+/// A real plugin package materialized by the runtime, its rendered
+/// `launch.sh` started in a tmux window as the plugin host starts it
+/// (`ensure_agent` on the plugin's id), its start task `task`. Returns
+/// once `up` sleepers carrying `m` are running.
+fn running_plugin(label: &str, m: &str, task: &str, up: usize) -> Option<RunningPlugin> {
+    let tools = real_tools()?;
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    if !landlock_works(&tools.nono, dir.path()) {
+        return None;
+    }
+    let marked = Marked(m.to_string());
+    let layout = StateLayout::xdg(
+        dir.path().join("state"),
+        dir.path().join("data"),
+        dir.path().join("config"),
+    );
+    std::fs::create_dir_all(&layout.config_root).unwrap();
+    let package = dir.path().join("pkg");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("balerix-plugin.yaml"), PROBE_MANIFEST).unwrap();
+    std::fs::write(
+        package.join("mise.toml"),
+        format!("[tools]\n\n[tasks.serve]\nrun = '''{task}'''\n"),
+    )
+    .unwrap();
+    let manifest: PluginManifest = serde_norway::from_str(PROBE_MANIFEST).unwrap();
+    let plugin = ResolvedPlugin {
+        name: "probe".parse().unwrap(),
+        package,
+        manifest,
+        config: serde_json::json!({}),
+        fleet_defaults: serde_json::json!({}),
+        digest: None,
+    };
+    let host = HookTarget {
+        url: "http://127.0.0.1:1".into(),
+        secret: "tok-secret".into(),
+    };
+    let tmux = tools.tmux.clone();
+    let rt = Runtime::new(layout, tools);
+    let plan = rt.materialize_plugin(&plugin, &host).unwrap();
+    assert_eq!(
+        plan.argv[..3],
+        [BALERIX, "agent-supervise", "--"].map(String::from),
+        "a plugin starts under the wrapper"
+    );
+    let socket = format!("balerix-test-{label}-{}", std::process::id());
+    let guard = KillServer {
+        tmux: tmux.clone(),
+        socket: socket.clone(),
+    };
+    let r = TmuxRunner::new(tmux, socket);
+    let id = plugin_id(&plugin.name);
+    r.ensure_crew(&id.crew_ref()).unwrap();
+    r.ensure_agent(&id, &plan).unwrap();
+    wait_for(|| sleepers(m).len() == up);
+    Some(RunningPlugin {
+        r,
+        id,
+        rt,
+        plugin,
+        _marked: marked,
+        _server: guard,
+        _dir: dir,
+    })
+}
+
+/// #119: a plugin process that ignores the hangup kept nono alive past
+/// the stop. Under the wrapper it is killed after the grace, and the stop
+/// returns only then.
+#[test]
+fn stop_agent_leaves_no_process_of_a_plugin_that_ignores_the_hangup() {
+    let m = marker(21);
+    let task = format!("trap '' HUP; sleep {m}");
+    let Some(p) = running_plugin("plug-hup", &m, &task, 1) else {
+        return;
+    };
+    let start = Instant::now();
+    p.r.stop_agent(&p.id).unwrap();
+    let took = start.elapsed();
+    assert!(with_cmdline(&m).is_empty(), "{:?}", with_cmdline(&m));
+    assert!(
+        took >= Duration::from_secs(2),
+        "the sleeper outlived the hangup, so the stop waited out the grace: {took:?}"
+    );
+    p.rt.purge_plugin(&p.plugin.name).unwrap();
+}
+
+/// #119: plugin processes that detach (`setsid`, a double fork) outlived
+/// nono and the stop. Under the wrapper none of them survives it.
+#[test]
+fn stop_agent_leaves_no_process_of_a_plugin_that_detached_sleepers() {
+    let m = marker(22);
+    let task = format!("setsid sleep {m} & ( setsid sh -c 'sleep {m} &' & ); exec sleep {m}");
+    let Some(p) = running_plugin("plug-setsid", &m, &task, 3) else {
+        return;
+    };
+    p.r.stop_agent(&p.id).unwrap();
+    assert!(with_cmdline(&m).is_empty(), "{:?}", with_cmdline(&m));
+    p.rt.purge_plugin(&p.plugin.name).unwrap();
 }

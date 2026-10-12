@@ -492,9 +492,21 @@ Stated in `docs/THREAT-MODEL.md`:
   survivors are not found. No restart is forced.
 - Plugin windows (`render_plugin_launch`, unchanged) have no wrapper:
   the pane's process is nono itself, so a plugin process that ignores the
-  hangup or detaches survives the stop as before this amendment; the stop
-  fails once with `StillRunning` and the retry returns `Ok`. Plugins
-  under the wrapper: a follow-up.
+  hangup or detaches survives the stop as before this amendment. One
+  that ignores the hangup keeps nono alive, so the stop fails once with
+  `StillRunning` and the retry returns `Ok`; one that detaches outlives
+  nono, and the stop returns `Ok` at once. Plugins under the wrapper: a
+  follow-up. — Resolved by #119: `render_plugin_launch` puts
+  `<balerix> agent-supervise --` in front of nono as §13.4 does for an
+  agent, and a plugin's stop and restart are already `stop_agent` and
+  `ensure_agent` on its window, so they wait as §13.5 says and `plugin
+  remove --purge` deletes nothing while the tree is alive (short of a
+  timed-out stop, as for an agent). A plugin launched before the upgrade
+  has no wrapper until its next launch; the upgraded daemon starts with
+  an empty plugin record, so its first pass restarts every running
+  plugin. `cli_supervise.rs` starts a real plugin package in tmux, one
+  whose start task ignores the hangup and one that detaches, and asserts
+  nothing of either is alive when `stop_agent` returns.
 - Linux only, like the sandbox.
 
 ### 13.7 Tests

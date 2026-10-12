@@ -585,7 +585,12 @@ the Daemon's Secret.
   connect at 10 s. The Daemon likewise drops a link that has brought it
   nothing, not even a pong, for three of its pings: the agent is then
   link-down and calls to it fail at once rather than at their timeout
-  (#230); its sends count against the same deadline. Workspace and runner error text crosses the link
+  (#230). On both ends a send counts against the same deadline, so a
+  send blocked on a peer that stopped reading (a large reply on its way
+  to a lost node) cannot hold the link open past it (#231). A full-size
+  reply (about 8.1 MiB) must therefore arrive within what is left of
+  that window once the sidecar has read the request, at least a minute
+  after a diff's 25 s budget: roughly 140 KB/s. Workspace and runner error text crosses the link
   without the id prefix, which the Daemon adds back.
 
 ## 8. Storage

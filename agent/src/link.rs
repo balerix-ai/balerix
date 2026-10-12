@@ -144,8 +144,20 @@ pub async fn run_with_idle(deps: Arc<LinkDeps>, idle: Duration) {
     }
 }
 
-async fn send(ws: &mut Ws, frame: &SidecarFrame) -> Result<()> {
-    ws.send(Message::Text(frame_text(frame)?.into())).await?;
+/// `frame` on the link, given up at `deadline`, the session's idle limit:
+/// a send blocked on a Daemon that stopped reading (a node lost while a
+/// large reply is on its way) must not keep the session from noticing,
+/// and the `select!` in `session` does not poll its deadline while one of
+/// its arms is sending (#231).
+async fn send(ws: &mut Ws, frame: &SidecarFrame, deadline: tokio::time::Instant) -> Result<()> {
+    let text = frame_text(frame)?;
+    send_message(ws, Message::Text(text.into()), deadline).await
+}
+
+async fn send_message(ws: &mut Ws, msg: Message, deadline: tokio::time::Instant) -> Result<()> {
+    tokio::time::timeout_at(deadline, ws.send(msg))
+        .await
+        .map_err(|_| anyhow::anyhow!("the Daemon took nothing before the idle limit"))??;
     Ok(())
 }
 
@@ -192,33 +204,20 @@ async fn session(deps: Arc<LinkDeps>, mut ws: Ws, idle: Duration) {
     // the current status first, before any request is read: the Daemon
     // reconciles the stopped set on each connection's first status, and a
     // Daemon that restarted sees the agent at once
+    // reset by every frame the Daemon sends, its pings among them; what
+    // the sidecar sends proves nothing about the other end. Every send is
+    // bounded by it too.
+    let mut deadline = tokio::time::Instant::now() + idle;
     let current = status.borrow_and_update().clone();
-    if send(&mut ws, &SidecarFrame::Status(current)).await.is_err() {
+    if let Err(e) = send(&mut ws, &SidecarFrame::Status(current), deadline).await {
+        tracing::warn!("link: {e}");
         return;
     }
-    // reset by every frame the Daemon sends, its pings among them; what
-    // the sidecar sends proves nothing about the other end
-    let mut deadline = tokio::time::Instant::now() + idle;
     loop {
         tokio::select! {
-            () = tokio::time::sleep_until(deadline) => {
-                tracing::warn!("link: nothing from the Daemon in {} s", idle.as_secs());
-                return;
-            }
-            changed = status.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                let frame = SidecarFrame::Status(status.borrow_and_update().clone());
-                if send(&mut ws, &frame).await.is_err() {
-                    return;
-                }
-            }
-            Some(frame) = out_rx.recv() => {
-                if send(&mut ws, &frame).await.is_err() {
-                    return;
-                }
-            }
+            // a frame that is already here counts before the deadline
+            // is judged: a loaded host can be late to both
+            biased;
             msg = ws.next() => {
                 if matches!(msg, Some(Ok(_))) {
                     deadline = tokio::time::Instant::now() + idle;
@@ -238,12 +237,33 @@ async fn session(deps: Arc<LinkDeps>, mut ws: Ws, idle: Duration) {
                         Err(e) => tracing::warn!("link: not a request: {e}"),
                     },
                     Some(Ok(Message::Ping(p))) => {
-                        if ws.send(Message::Pong(p)).await.is_err() {
+                        if let Err(e) = send_message(&mut ws, Message::Pong(p), deadline).await {
+                            tracing::warn!("link: {e}");
                             return;
                         }
                     }
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
                     Some(Ok(_)) => {}
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                tracing::warn!("link: nothing from the Daemon in {} s", idle.as_secs());
+                return;
+            }
+            changed = status.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let frame = SidecarFrame::Status(status.borrow_and_update().clone());
+                if let Err(e) = send(&mut ws, &frame, deadline).await {
+                    tracing::warn!("link: {e}");
+                    return;
+                }
+            }
+            Some(frame) = out_rx.recv() => {
+                if let Err(e) = send(&mut ws, &frame, deadline).await {
+                    tracing::warn!("link: {e}");
+                    return;
                 }
             }
         }

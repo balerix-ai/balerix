@@ -350,9 +350,9 @@ makes an existing remote branch its clone's branch and start point
   it. `MISE_AUTO_INSTALL=false` keeps installing an explicit act rather than
   a side effect of launch.
 - **Plugins ride the reconciler as a synthetic fleet.** `plugin_fleet()`
-  renders plugins as agents whose only setting is the plugin hash;
-  `plan`/`execute`/`apply` were not touched, and `cargo mutants` still covers
-  them for plugins too (PB-5).
+  renders plugins as agents whose only setting is the plugin hash.
+  `plan`/`execute`/`apply` were not touched, so `cargo mutants` covers the
+  plugin path through them too (PB-5).
 - **The plugin token is the hook secret.** One minting path, one index, one
   constant-time check; `hello` is authenticated exactly like a hook event.
 - **`balerix` is a reserved fleet name.** Rejected client-side (`config

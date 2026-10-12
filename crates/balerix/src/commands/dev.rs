@@ -379,7 +379,20 @@ impl balerix_plugin_sdk::Plugin for FakePlugin {
 
     /// The `hello` reply: written to scratch, then `config.manage` applied
     /// off the serving path (an apply may take the SDK's 120 s).
+    /// `config.try_escape` first tries to write `escape` into the package
+    /// (the working directory) and leaves the outcome in
+    /// `scratch/fake-plugin.escape`, before the hello file appears.
     async fn configure(&self, config: Value) -> Result<(), String> {
+        if config["try_escape"].as_bool() == Some(true) {
+            let outcome = match std::env::current_dir()
+                .and_then(|pwd| std::fs::write(pwd.join("escape"), "escaped\n"))
+            {
+                Ok(()) => "written".to_string(),
+                Err(e) => format!("refused: {e}"),
+            };
+            std::fs::write(self.scratch.join("fake-plugin.escape"), outcome)
+                .map_err(|e| e.to_string())?;
+        }
         std::fs::write(
             self.scratch.join("fake-plugin.hello"),
             serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?,

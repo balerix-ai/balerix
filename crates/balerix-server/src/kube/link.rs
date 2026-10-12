@@ -268,9 +268,7 @@ impl LinkHub {
                 .await;
             return;
         };
-        let (to_pty_tx, to_pty_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        let (from_pty_tx, from_pty_rx) = mpsc::unbounded_channel::<super::pty::Outbound>();
-        let pty = super::pty::WsPty::new(to_pty_rx, from_pty_tx);
+        let (pty, ends) = super::pty::pair();
         if waiter.try_send(pty).is_err() {
             // the blocking attach gave up (ATTACH_WAIT)
             let _ = socket
@@ -281,7 +279,7 @@ impl LinkHub {
                 .await;
             return;
         }
-        super::pty::pump(socket, to_pty_tx, from_pty_rx).await;
+        super::pty::pump(socket, ends).await;
     }
 }
 
@@ -576,5 +574,8 @@ pub(crate) async fn link_attach(
         Ok(ok) => ok,
         Err(refusal) => return *refusal,
     };
-    ws.on_upgrade(move |socket| hub.attach_arrived(id, session, socket))
+    // the sidecar's client sets the same limits (`agent/src/attach.rs`)
+    ws.max_message_size(balerix_api::link::ATTACH_MAX_MESSAGE)
+        .max_frame_size(balerix_api::link::ATTACH_MAX_MESSAGE)
+        .on_upgrade(move |socket| hub.attach_arrived(id, session, socket))
 }

@@ -7,7 +7,9 @@
 
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
+use balerix_api::link::ATTACH_MAX_MESSAGE;
 use balerix_api::{LinkResult, ResizeFrame, TextFrame};
 use balerix_core::PtyStream;
 use futures_util::{SinkExt, StreamExt};
@@ -30,7 +32,7 @@ pub async fn open(deps: &Arc<LinkDeps>, session: &str) -> LinkResult {
         Err(e) => return runner_failed(format!("task failed: {e}")),
     };
     let path = format!("/v1/agents/{}/link/attach/{session}", deps.id);
-    let ws = match connect(deps, &path).await {
+    let ws = match connect(deps, &path, Some(ATTACH_MAX_MESSAGE)).await {
         Ok(ws) => ws,
         Err(e) => {
             let _ = tokio::task::spawn_blocking(move || drop(stream)).await;
@@ -41,12 +43,21 @@ pub async fn open(deps: &Arc<LinkDeps>, session: &str) -> LinkResult {
     LinkResult::Ok
 }
 
+/// How long the bridge gives its close frame to leave.
+const CLOSE_WAIT: Duration = Duration::from_secs(5);
+
 /// Mirrors `balerix-server`'s `attach::bridge` with the roles reversed.
-pub async fn bridge(mut ws: Ws, stream: Box<dyn PtyStream>) {
+///
+/// Reading and writing never wait on each other: the PTY's output goes
+/// out from a task of its own, so a send the Daemon is not reading yet
+/// does not stop the viewer's input from reaching the PTY, and the other
+/// way round.
+pub async fn bridge(ws: Ws, stream: Box<dyn PtyStream>) {
+    let (mut sink, mut source) = ws.split();
     let (reader, mut writer) = match (stream.reader(), stream.writer()) {
         (Ok(r), Ok(w)) => (r, w),
         _ => {
-            let _ = ws.close(None).await;
+            let _ = tokio::time::timeout(CLOSE_WAIT, sink.close()).await;
             let _ = tokio::task::spawn_blocking(move || drop(stream)).await;
             return;
         }
@@ -66,21 +77,23 @@ pub async fn bridge(mut ws: Ws, stream: Box<dyn PtyStream>) {
             }
         }
     });
+    let mut outbound = tokio::spawn(async move {
+        while let Some(bytes) = rx.recv().await {
+            if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                return;
+            }
+        }
+        // the window closed
+        let _ = tokio::time::timeout(CLOSE_WAIT, sink.close()).await;
+    });
+    let mut outbound_done = false;
     loop {
         tokio::select! {
-            chunk = rx.recv() => match chunk {
-                Some(bytes) => {
-                    if ws.send(Message::Binary(bytes.into())).await.is_err() {
-                        break;
-                    }
-                }
-                None => {
-                    // the window closed
-                    let _ = ws.close(None).await;
-                    break;
-                }
-            },
-            msg = ws.next() => match msg {
+            _ = &mut outbound => {
+                outbound_done = true;
+                break;
+            }
+            msg = source.next() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
                     match tokio::task::spawn_blocking(move || {
                         let result = writer.write_all(&bytes).and_then(|()| writer.flush());
@@ -101,13 +114,15 @@ pub async fn bridge(mut ws: Ws, stream: Box<dyn PtyStream>) {
                     TextFrame::ZeroSized => {}
                     TextFrame::Malformed => break,
                 },
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
+                // a ping's pong is queued by tungstenite and leaves with
+                // the next write
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                 Some(Ok(_)) => {}
             },
         }
+    }
+    if !outbound_done {
+        outbound.abort();
     }
     drop(pump);
     // the tmux stream's drop kills its client and waits for it: off the

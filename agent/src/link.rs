@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
 };
@@ -81,16 +82,31 @@ pub fn ws_url(daemon_url: &str, path: &str) -> String {
     format!("{base}{path}")
 }
 
+/// A socket's limit on each message and frame, as the Daemon's upgrade
+/// sets it; `None` keeps tungstenite's defaults.
+fn ws_config(max_message: Option<usize>) -> Option<WebSocketConfig> {
+    max_message.map(|max| {
+        WebSocketConfig::default()
+            .max_message_size(Some(max))
+            .max_frame_size(Some(max))
+    })
+}
+
 /// A socket to the Daemon at `path`, with the token and the protocol,
-/// within `CONNECT_TIMEOUT`.
-pub async fn connect(deps: &LinkDeps, path: &str) -> Result<Ws> {
+/// within `CONNECT_TIMEOUT`, accepting messages of up to `max_message`
+/// (`ATTACH_MAX_MESSAGE` for an attach socket).
+pub async fn connect(deps: &LinkDeps, path: &str, max_message: Option<usize>) -> Result<Ws> {
     let mut req = ws_url(&deps.daemon_url, path).into_client_request()?;
     req.headers_mut()
         .insert(AUTHORIZATION, format!("Bearer {}", deps.token).parse()?);
     req.headers_mut()
         .insert(LINK_PROTOCOL_HEADER, LINK_PROTOCOL.to_string().parse()?);
-    let connecting =
-        connect_async_tls_with_config(req, None, false, Some(Connector::Rustls(deps.tls.clone())));
+    let connecting = connect_async_tls_with_config(
+        req,
+        ws_config(max_message),
+        false,
+        Some(Connector::Rustls(deps.tls.clone())),
+    );
     let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
         .await
         .map_err(|_| anyhow::anyhow!("no answer within {} s", CONNECT_TIMEOUT.as_secs()))??;
@@ -107,7 +123,7 @@ pub async fn run(deps: Arc<LinkDeps>) {
 pub async fn run_with_idle(deps: Arc<LinkDeps>, idle: Duration) {
     let mut backoff = RECONNECT_MIN;
     loop {
-        match connect(&deps, &format!("/v1/agents/{}/link", deps.id)).await {
+        match connect(&deps, &format!("/v1/agents/{}/link", deps.id), None).await {
             Ok(ws) => {
                 tracing::info!("link up");
                 backoff = RECONNECT_MIN;

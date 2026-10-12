@@ -6,13 +6,15 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use balerix_api::link::ATTACH_MAX_MESSAGE;
 use balerix_api::{
     AgentSettings, CrewSpec, FleetSpec, LINK_PROTOCOL_HEADER, LinkOp, LinkReply, LinkRequest,
     LinkResult, SidecarFrame,
 };
-use balerix_core::{AgentId, AgentRunner, PassThrough, RunnerError};
+use balerix_core::{AgentId, AgentRunner, PassThrough, PtyStream, RunnerError};
 use balerix_server::testing::Harness;
 use balerix_server::{Daemon, router, serve};
 use futures_util::{SinkExt, StreamExt};
@@ -340,4 +342,237 @@ async fn the_attach_route_refuses_like_the_link_route() {
             serde_json::json!({"error": "not a daemon in kubernetes mode"})
         )
     );
+}
+
+/// A linked sidecar for `f/c/a` and an attach through it: the plugin's
+/// stream, the attach socket (the sidecar's end) and the link.
+async fn attached(w: &World) -> (Box<dyn PtyStream>, Ws, Ws) {
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let hub = w.daemon.kube().unwrap().clone();
+    let mut link = ws(w.port, "/v1/agents/f/c/a/link").await.unwrap();
+    let start = Instant::now();
+    while !hub.linked(&id) {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (hub2, id2) = (hub.clone(), id.clone());
+    let attach = tokio::task::spawn_blocking(move || hub2.attach(&id2));
+    let req = next_request(&mut link).await;
+    let LinkOp::Attach { session } = &req.op else {
+        panic!("{req:?}");
+    };
+    let pty_ws = ws(w.port, &format!("/v1/agents/f/c/a/link/attach/{session}"))
+        .await
+        .unwrap();
+    link.send(Message::Text(
+        serde_json::to_string(&SidecarFrame::Reply(LinkReply {
+            id: req.id,
+            result: LinkResult::Ok,
+        }))
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let stream = attach.await.unwrap().unwrap();
+    (stream, pty_ws, link)
+}
+
+/// Waits until `sent` stops moving for 2 s, asserting it stays under
+/// `bound`; answers where it stopped.
+async fn until_stalled(sent: &AtomicUsize, bound: usize) -> usize {
+    let mut last = usize::MAX;
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let now = sent.load(Ordering::SeqCst);
+        assert!(
+            now < bound,
+            "the Daemon took {} MiB with the viewer not reading",
+            now >> 20
+        );
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+}
+
+const CHUNK: usize = ATTACH_MAX_MESSAGE;
+/// Far more than the Daemon may hold: 64 messages of `CHUNK` (4 MiB) plus
+/// both ends' socket buffers stay well under `BOUND`.
+const OFFERED: usize = 256 << 20;
+const BOUND: usize = 32 << 20;
+
+/// Chunk `i` is filled with `i % 251`, so order and loss both show.
+fn chunk(i: usize) -> Vec<u8> {
+    vec![u8::try_from(i % 251).unwrap(); CHUNK]
+}
+
+fn assert_chunks(got: &[u8]) {
+    for (i, c) in got.chunks(CHUNK).enumerate() {
+        assert_eq!(c, chunk(i).as_slice(), "chunk {i}");
+    }
+}
+
+/// A viewer that does not read holds the sidecar's terminal bytes back
+/// over TCP: the Daemon keeps a bounded number of messages for it and
+/// stops reading the sidecar's socket. Once the viewer reads, every byte
+/// arrives, in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_viewer_applies_backpressure_to_the_sidecar() {
+    let w = world().await;
+    let (stream, mut pty_ws, _link) = attached(&w).await;
+    let mut reader = stream.reader().unwrap(); // taken, not read yet
+
+    // the sidecar sends until told to stop, then closes; it answers how
+    // many bytes it sent
+    let sent = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sidecar = tokio::spawn({
+        let (sent, stop) = (sent.clone(), stop.clone());
+        async move {
+            let mut i = 0;
+            while !stop.load(Ordering::SeqCst) && i * CHUNK < OFFERED {
+                pty_ws.send(Message::Binary(chunk(i).into())).await.unwrap();
+                i += 1;
+                sent.store(i * CHUNK, Ordering::SeqCst);
+            }
+            pty_ws.close(None).await.unwrap();
+            i * CHUNK
+        }
+    });
+    until_stalled(&sent, BOUND).await;
+    stop.store(true, Ordering::SeqCst);
+
+    // the viewer reads now: everything sent arrives, in order, then EOF
+    let read = tokio::task::spawn_blocking(move || {
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        got
+    });
+    let sent = tokio::time::timeout(Duration::from_secs(30), sidecar)
+        .await
+        .expect("the sidecar's sends complete once the viewer reads")
+        .unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(30), read)
+        .await
+        .expect("the viewer read to the end")
+        .unwrap();
+    assert_eq!(got.len(), sent, "every byte sent was read");
+    assert_chunks(&got);
+    tokio::task::spawn_blocking(move || drop(stream))
+        .await
+        .unwrap();
+}
+
+/// The attach socket takes messages of at most `ATTACH_MAX_MESSAGE`: a
+/// larger one ends the session, and nothing of it reaches the viewer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_attach_socket_refuses_a_message_over_its_limit() {
+    let w = world().await;
+    let (stream, mut pty_ws, _link) = attached(&w).await;
+    let mut reader = stream.reader().unwrap();
+    let big = vec![b'x'; ATTACH_MAX_MESSAGE * 16];
+    let mut sent = 0usize;
+    while sent < OFFERED {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            pty_ws.send(Message::Binary(big.clone().into())),
+        )
+        .await
+        {
+            Ok(Ok(())) => sent += big.len(),
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    assert!(
+        sent < BOUND,
+        "the Daemon took {} MiB in messages over its limit",
+        sent >> 20
+    );
+    let got = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || {
+            let mut got = Vec::new();
+            let _ = reader.read_to_end(&mut got);
+            got
+        }),
+    )
+    .await
+    .expect("the session ended")
+    .unwrap();
+    assert!(got.is_empty(), "{} bytes reached the viewer", got.len());
+    tokio::task::spawn_blocking(move || drop(stream))
+        .await
+        .unwrap();
+}
+
+/// The viewer pastes 4 MiB while it is not reading, and the sidecar is in
+/// a send the Daemon is not reading yet. This sidecar does one thing at a
+/// time (the real one sends without stopping reads), so only the Daemon
+/// reading while it sends keeps the session moving. Once the viewer
+/// reads, both directions finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paste_while_the_viewer_is_not_reading_does_not_hang_the_session() {
+    const OUTPUT: usize = 64 << 20;
+    const PASTE: usize = 4 << 20;
+    let w = world().await;
+    let (stream, mut pty_ws, _link) = attached(&w).await;
+    let mut reader = stream.reader().unwrap();
+    let mut writer = stream.writer().unwrap();
+
+    // a sidecar that does one thing at a time: all its output, then the
+    // viewer's input
+    let sent = Arc::new(AtomicUsize::new(0));
+    let sidecar = tokio::spawn({
+        let sent = sent.clone();
+        async move {
+            for i in 0..OUTPUT / CHUNK {
+                pty_ws.send(Message::Binary(chunk(i).into())).await.unwrap();
+                sent.store((i + 1) * CHUNK, Ordering::SeqCst);
+            }
+            let mut pasted = Vec::new();
+            while pasted.len() < PASTE {
+                match pty_ws.next().await.unwrap().unwrap() {
+                    Message::Binary(b) => pasted.extend_from_slice(&b),
+                    Message::Ping(_) | Message::Pong(_) => {}
+                    other => panic!("{other:?}"),
+                }
+            }
+            pasted
+        }
+    });
+    until_stalled(&sent, BOUND).await;
+
+    // the paste, with nothing read yet
+    let paste = tokio::task::spawn_blocking(move || {
+        let bytes: Vec<u8> = (0..PASTE).map(|i| (i % 253) as u8).collect();
+        writer.write_all(&bytes).unwrap();
+        bytes
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // the viewer reads: the output arrives, then the sidecar reads the paste
+    let read = tokio::task::spawn_blocking(move || {
+        let mut got = vec![0u8; OUTPUT];
+        reader.read_exact(&mut got).unwrap();
+        got
+    });
+    let got = tokio::time::timeout(Duration::from_secs(60), read)
+        .await
+        .expect("the viewer read the sidecar's output")
+        .unwrap();
+    assert_chunks(&got);
+    let pasted = tokio::time::timeout(Duration::from_secs(60), sidecar)
+        .await
+        .expect("the sidecar read the paste")
+        .unwrap();
+    let bytes = tokio::time::timeout(Duration::from_secs(10), paste)
+        .await
+        .expect("the paste was taken")
+        .unwrap();
+    assert_eq!(pasted, bytes);
+    tokio::task::spawn_blocking(move || drop(stream))
+        .await
+        .unwrap();
 }

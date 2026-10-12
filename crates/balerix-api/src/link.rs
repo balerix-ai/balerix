@@ -129,6 +129,13 @@ pub enum FailureKind {
     Runner,
 }
 
+/// The largest message, and the largest frame, either end of an attach
+/// socket accepts (set on the Daemon's upgrade and the sidecar's client).
+/// Terminal bytes travel in pieces no larger: the sidecar sends what one
+/// PTY read gives (8 KiB at most), and the Daemon cuts the viewer's input
+/// to this size.
+pub const ATTACH_MAX_MESSAGE: usize = 64 << 10;
+
 /// Sidecar → Daemon on every change: the agent's status as the sidecar's
 /// own planner keeps it, the pane's pid as tmux reports it (opaque to the
 /// Daemon, §6.3), and how many hooks the sidecar answered for a Daemon it

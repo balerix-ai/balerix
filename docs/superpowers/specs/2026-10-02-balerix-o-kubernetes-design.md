@@ -4,7 +4,8 @@
 **Status:** Design approved in brainstorm 2026-10-02; written spec approved
 2026-10-02; the spike's findings recorded in §19; sub-project 2 decisions
 in §7.4; sub-project 3a decisions in §20; sub-project 4 decisions in
-§23; sub-project 5 decisions in §24
+§23; sub-project 5 decisions in §24; the purge of a deleted Fleet's
+record (#135) in §25
 **Scope:** running balerix on Kubernetes. A `balerix-operator` reconciles
 five custom resources (Daemon, Fleet, Crew, Agent, Plugin) into pods,
 claims, Secrets and Jobs. Each Daemon object is a `balerix serve` instance
@@ -260,7 +261,8 @@ Plugin, or a referenced Secret changes.
 
 On deletion the finalizer waits until every Agent is gone (§8.5), deletes
 the fleet on the Daemon, and with `retain: None` removes the crews'
-directories from the shared volume through a cleanup Job.
+directories from the shared volume through a cleanup Job. A Fleet marked
+`balerix.ai/purge: "true"` then has its record purged on the Daemon (§25).
 
 A Daemon that does not answer sets `Ready=False`, reason
 `DaemonUnavailable`, and the reconcile is retried with back-off. Existing
@@ -618,9 +620,12 @@ fetch from inside the cache under the git nono profile, exactly as
 | Fleet deleted, `retain: None` | no | deleted | deleted |
 
 A failed harvest blocks the Agent's finalizer with a condition carrying
-the message. The annotation `balerix.ai/purge: "true"` on the Agent or
-Fleet skips the harvest, as `--purge` does. A Fleet re-created over a kept
-cache seeds new clones from the harvested branches, as today.
+the message. The annotation `balerix.ai/purge: "true"` on the Agent skips
+its harvest, as `--purge` does. On the Fleet it counts only while the Fleet
+is being deleted: it then skips every Agent's harvest and also purges the
+Daemon's record (§25). An Agent dropped from a live Fleet that carries the
+annotation is still harvested. A Fleet re-created over a kept cache seeds
+new clones from the harvested branches, as today.
 
 ## 9. Plugins
 
@@ -1479,7 +1484,9 @@ Cases:
      the shared claim;
   6. the Fleet deleted with `retain: None`; the crew's directories are
      gone and the Daemon still lists the fleet, down (O-16: `retain: None`
-     is a plain `down`, which keeps the record).
+     is a plain `down`, which keeps the record). §25 amends this step: the
+     Fleet is marked `balerix.ai/purge: "true"` first, and the Daemon no
+     longer has the fleet.
   `kind`'s network plugin does not enforce NetworkPolicy, so the policies
   are inert here; the test says so. §15's flow-rule step arrives with
   plugins; `verify-k8s` waits for a cluster.
@@ -1568,7 +1575,9 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
   message), the Agent's pod, its unfinished harvest Job. The Fleet's other
   conditions stay as they were. The Agent's harvest messages, `Deleting` and
   `HarvestFailed` both, and the Fleet's "agents remain" name the escape: the
-  annotation `balerix.ai/purge=true` on the Agent or its Fleet.
+  annotation `balerix.ai/purge=true` on the Agent skips its harvest; on the
+  Fleet, while the Fleet is deleted, it skips every harvest and also purges
+  the Fleet's record on the Daemon (amended by §25).
 - **Every Job has `activeDeadlineSeconds: 3600`.** A pod that never starts
   (an image that cannot be pulled, a claim that is gone) fails the Job
   under the Job rule instead of leaving it running forever; a failed Job
@@ -1649,7 +1658,9 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
   the fleet, down with no agents (O-16: a plain `down` keeps the record):
   `GET /v1/fleets/f` answers it to a `DaemonClient` built from the
   `balerix-default-admin` Secret and the `balerix-default-ca` ConfigMap,
-  through the port-forward under the Service's name.
+  through the port-forward under the Service's name. Amended by §25: the
+  Fleet is marked for a purge and the same `GET` answers 404; the kept
+  record is checked in `client_it` against a real Daemon instead.
 - **`scripts/operator.sh check` leaves the journey out** with `-E 'not
   binary(e2e_k8s)'`; `e2e` runs it alone under a nextest profile `e2e-k8s`
   (45 minutes per test). The CI job has `timeout-minutes: 90`.
@@ -1688,9 +1699,10 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
 
 Known in 3b and left open:
 
-- On Kubernetes nothing purges a down record once the Fleet object is
-  gone, so down records accumulate on the Daemon's volume until a purge
-  path exists (an issue).
+- Done in §25 (#135): on Kubernetes nothing purges a down record once the
+  Fleet object is gone, so down records accumulate on the Daemon's volume
+  until a purge path exists. The annotation `balerix.ai/purge: "true"` on
+  the Fleet is that path.
 - `fsGroupChangePolicy` on a CSI class may re-add group bits to the agent's
   0700 tree. Not exercised: the journey runs on kind's local-path only.
 - The harvest Job and its pod are collected with the Agent, so the outcome
@@ -2611,3 +2623,118 @@ The operator runs as one replica with no leader election and no metrics
 - **The first charts release** follows the first core release that ships
   `balerix-operator`. `appVersion` 0.2.0 has no operator image, and the
   check job would fail on it.
+
+## 25. Purging a deleted Fleet's record (2026-10, #135)
+
+§21.6 left one item open. O-16 makes a Fleet's deletion a plain `down`,
+and the Daemon keeps a downed fleet's record (`desired = Down`) until a
+purge. On a host, `balerix down f --purge` removes it. On Kubernetes,
+once the Fleet object is gone, nothing could purge the record without a
+shell on the Daemon's pod, so down records and their sealed secrets
+accumulated on the state claim.
+
+### 25.1 The annotation
+
+- **Opt-in, on the Fleet.** `balerix.ai/purge: "true"`, the annotation
+  §8.5 already reads to skip the harvest, now also purges the Fleet's
+  record. Any other value, or none, leaves deletion a plain `down`: O-16
+  is unchanged. On the Fleet it is read only once the Fleet is being
+  deleted (§25.3), so a manifest may carry it from the start. The other two options in #135 were rejected. Purging every
+  deleted Fleet changes O-16 and loses a record someone may still want to
+  read. A Daemon that expires `kubernetes`-owned records needs a clock and
+  a policy in the Daemon for one operator need.
+- **The purge is last.** The finalizer first waits until the Agents are
+  gone (§8.5; the same annotation skips their harvest). It then downs the
+  fleet (`DELETE …?force=true`) and runs `retain: None`'s cleanup Jobs to
+  success. Only then does it send `DELETE
+  /v1/fleets/{name}?force=true&purge=true`. The finalizer is removed only
+  after the Daemon takes the purge. Purging last keeps the record
+  readable while a cleanup Job fails. In a terminating namespace an
+  unfinished cleanup Job counts as done (§21.6), so the purge can go out
+  while that Job still runs. That is harmless: a purge never touches the
+  shared claim the Job works on.
+- **What a purge removes on Kubernetes.** The Daemon's
+  `fleets/<fleet>/` directory on the state claim: the record and its
+  sealed secrets, and the fleet's hook secrets in memory. Nothing on the
+  shared claim: a Kubernetes-mode Daemon materialises nothing (`NoFiles`),
+  and the crews' directories belong to the cleanup Job.
+- **The Daemon answers before it removes.** The `DELETE` replies once the
+  record is settled `Down { purge: true }`, and the actor removes the
+  directory right after. A `GET` can still return the record for that
+  moment. The operator does not wait for it.
+
+### 25.2 Failures and repeats
+
+- **Idempotent.** A 404 means the record is already purged, so it counts
+  as success, as the down's 404 does. A second purge after a successful
+  one gets a 404. If the finalizer's patch is lost, the cleanup runs
+  again: the down gets a 404, the Jobs are already done, and the purge
+  gets a 404.
+- **A purge that fails** (no answer, or any other status) is
+  `Error::Purge`, retried as a failed down is. The Fleet's `Ready` is
+  `False`, reason `Deleting`, with the message "Fleet <f>: Daemon <d> did
+  not take the purge: …". Writing that condition changes the Fleet, and
+  the change wakes the controller at once, so the first retry comes
+  straight away rather than after the back-off. Once the condition stops
+  changing, the next retries wait `error_policy`'s back-off (5 s, doubling
+  to 5 min). The message names the escape: removing the annotation lets
+  the Fleet go and keeps its record. This amends §21.6's deletion bullet,
+  which named only "the Daemon that did not take the down".
+- **No 503 path.** The fleet `DELETE` never waits on a tool pool. It
+  waits only for an earlier purge of the same fleet (`settle_purge`), and
+  otherwise answers 500 "its purge has not finished; try again", which is
+  retried as above. The 503 that #178's CLI retries belongs to `balerix
+  plugin purge` against the one-machine plugin host, which a
+  Kubernetes-mode Daemon does not have.
+- **A Daemon object that is gone, or has no authority yet,** got no down
+  in the cleanup's second step and gets no purge either. The Fleet goes,
+  as before.
+
+### 25.3 `retain: Branches` with the annotation
+
+- **On a host**, `down --keep-repos` followed by `down --purge` destroys
+  the kept repositories: the store's purge removes the fleet's whole
+  directory (`FleetStore::purge`). **On Kubernetes** the kept crew cache
+  is not under the Daemon's record. It lives on the shared claim, and
+  `retain` alone decides what happens to it. So `Branches` with the
+  annotation keeps the crew cache and the branches that earlier harvests
+  put there. It runs no cleanup Job and purges only the record. The
+  annotation is not refused.
+- **What the annotation does lose:** once the Fleet is being deleted, it
+  skips every Agent's harvest (§8.5). Branches not harvested before the
+  deletion are deleted with the agent claims.
+- **The Fleet's mark counts only while the Fleet is deleted.** Before
+  §25 an Agent skipped its harvest whenever its Fleet carried the
+  annotation. A GitOps manifest that carries it from the start, meaning
+  "purge on delete", would then lose the unharvested branches of every
+  Agent dropped during the Fleet's life. So an Agent honours its own
+  annotation at any time, and its Fleet's only when the Fleet has a
+  `deletionTimestamp`. The Fleet's own purge reads the Fleet's annotation,
+  which it only does while deleting. The stuck-harvest messages say this:
+  set the annotation on the Agent to unstick one Agent; on the Fleet,
+  while deleting it, to give up every harvest, which also purges the
+  Fleet's Daemon record. This amends §8.5 and §21.6.
+- **Why not follow the host.** The annotation is the escape §21.6 names
+  for a stuck harvest. If it also deleted a kept cache, that escape would
+  lose data. A user who wants the whole of the host's `--purge` uses
+  `retain: None`.
+
+### 25.4 Testing
+
+- **envtest (`controllers_it`).** A marked Fleet with `retain: None` gets
+  a forced down, then its cleanup Job, then a forced purge only after the
+  Job succeeds. A Fleet marked `"yes"` is downed and not purged, and the
+  existing `retain: None` test asserts no purge. With `Branches`, a purge
+  answering 500 holds the Fleet with `Deleting` until the test switches
+  the stub to 404, and then the Fleet goes, with no cleanup Job and no
+  harvest Job. A `Branches` Fleet marked from the start harvests an Agent
+  dropped from its spec, and its deletion skips the remaining harvest and
+  purges the record. The stub Daemon records each `DELETE`'s query and
+  answers purges with the statuses a test sets, the last one repeated
+  until the test changes it.
+- **`client_it`.** Against the stub, a 404 and a 500 on a purge. Against
+  a real Kubernetes-mode Daemon: a down keeps the record, a purge drops
+  it, and a second purge is fine.
+- **`e2e-k8s` step 6** marks the Fleet before deleting it and waits until
+  the Daemon answers 404 for it. This amends §21.4's step 6 and §21.6's
+  journey bullet.

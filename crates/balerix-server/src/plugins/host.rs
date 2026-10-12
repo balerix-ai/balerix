@@ -632,6 +632,47 @@ mod tests {
         );
     }
 
+    /// #178: a pool that drops out after the purge passed its readiness
+    /// wait and queued its barrier makes the actor skip that pass, and the
+    /// purge answers 503 without deleting. Current-thread runtime: the
+    /// actor does not run until the purge is awaited, so the barrier is
+    /// queued under `Ready` and handled under `Unready`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pool_that_drops_out_before_the_barrier_runs_fails_the_purge() {
+        use futures_util::FutureExt;
+        let h = crate::testing::Harness::new(Duration::from_secs(3600));
+        let dir = tempfile::tempdir().unwrap();
+        let config = host_config(dir.path(), &dir.path().join("hello"));
+        let (shared, _purged, pool_tx) =
+            crate::actor::shared(crate::metrics::Metrics::new().unwrap());
+        pool_tx.send(SystemPoolState::Ready).unwrap();
+        let host = PluginHost::start(config, &h.ports, shared, h.registry.clone());
+        let name: AgentName = "hello".parse().unwrap();
+        let purge = host.purge(&name);
+        tokio::pin!(purge);
+        // past the readiness wait and the sync lock, the barrier queued
+        assert!((&mut purge).now_or_never().is_none());
+        pool_tx
+            .send(SystemPoolState::Unready {
+                reason: "gone".into(),
+            })
+            .unwrap();
+        match purge.await {
+            Err(PluginError::Unavailable(m)) => {
+                assert!(m.contains("no reconcile pass ran"), "{m}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        assert!(
+            !h.materializer
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("purge_plugin")),
+            "{:?}",
+            h.materializer.calls()
+        );
+    }
+
     /// The plugin agent `balerix/plugins/hello` in `phase`, its record
     /// stamped with the `hello` generation the actor last took.
     fn plugin_record(phase: Option<AgentPhase>, hello: u64) -> FleetRecord {

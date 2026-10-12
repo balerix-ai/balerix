@@ -11,7 +11,7 @@ use std::process::Command;
 use balerix_api::{AgentSettings, CredentialBundle, GitAuth, GitSettings};
 use balerix_core::{AgentId, HookTarget, MaterializeError, Materializer, RepoRef, ResolvedAgent};
 use balerix_runtime::sandbox::{SelfTestError, sandbox_self_test};
-use balerix_runtime::{Runtime, StateLayout};
+use balerix_runtime::{RenderOptions, Runtime, StateLayout};
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -302,4 +302,75 @@ fn a_pod_ensure_crew_writes_the_gh_config_before_it_checks_the_cache() {
     .unwrap_err();
     let hosts = layout.fleet_gh_dir(&id.crew_ref().fleet).join("hosts.yml");
     assert!(std::fs::read_to_string(hosts).unwrap().contains("gho_T"));
+}
+
+/// #187: in a pod the roots are under the agent claim's `.balerix/` (the
+/// sidecar's secret is in `state/sidecar/`), and a fleet block reaching
+/// them is refused before the profile is written; the agent's own
+/// grants on the claim and the shared mount pass.
+#[test]
+fn a_pod_fleet_block_reaching_the_claims_roots_is_refused() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git+mise+nono", false));
+        return;
+    };
+    let root = support::temp_root("materialize-pod-roots");
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let layout = support::pod_layout(&root, &id);
+    let rt = Runtime::new(layout.clone(), tools);
+    let hooks = HookTarget {
+        url: "http://127.0.0.1:7643".into(),
+        secret: "s".into(),
+    };
+    let render = |sandbox: serde_json::Value| {
+        let mut a = agent(&id, RepoRef::parse("acme/api").unwrap());
+        a.settings.sandbox = sandbox;
+        rt.render_agent(
+            &a,
+            &CredentialBundle::default(),
+            &hooks,
+            &RenderOptions::default(),
+        )
+    };
+    let sidecar = layout.state_root.join("sidecar");
+    let e = render(serde_json::json!({ "filesystem": { "read": [sidecar] } })).unwrap_err();
+    assert!(
+        matches!(e, MaterializeError::SandboxConflict { .. }),
+        "{e:?}"
+    );
+    assert!(
+        e.to_string().starts_with(&format!(
+            "f/c/a: sandbox.filesystem.read[0]: {} is inside balerix's state root {}; ",
+            sidecar.display(),
+            layout.state_root.display()
+        )),
+        "{e}"
+    );
+    assert!(!layout.agent(&id).profile.exists());
+    // the claim root holds the roots: granting it covers them
+    let e =
+        render(serde_json::json!({ "filesystem": { "read": [root.join("agent")] } })).unwrap_err();
+    assert!(e.to_string().contains("covers balerix's state root"), "{e}");
+    // the run directory the two containers share is off limits too
+    let run = root.join("run");
+    for block in [
+        serde_json::json!({ "filesystem": { "unix_socket": [run.join("tmux.sock")] } }),
+        serde_json::json!({ "filesystem": { "read": [run.join("started")] } }),
+    ] {
+        let e = render(block).unwrap_err().to_string();
+        assert!(
+            e.contains(&format!(
+                "is inside balerix's run directory {}; sandbox grants may not name it",
+                run.display()
+            )),
+            "{e}"
+        );
+    }
+    let a = layout.agent(&id);
+    render(serde_json::json!({ "filesystem": {
+        "allow": [a.workspace.join("sub")],
+        "read": [layout.crew(&id.crew_ref()).cache_objects()],
+    } }))
+    .unwrap();
+    assert!(a.profile.is_file());
 }

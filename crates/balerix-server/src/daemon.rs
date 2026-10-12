@@ -2822,6 +2822,31 @@ mod tests {
         assert!(w.daemon.get(&name).await.is_none());
     }
 
+    /// #187: a resolved spec whose agent `sandbox` block is off the fleet
+    /// allowlist (the operator's `fleetDefaults` reach it unrestricted)
+    /// is a 400 naming the path, and nothing lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_sandbox_key_from_the_resolver_lands_nothing() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let mut s = spec(&[("a", &[])]);
+        s.crews
+            .get_mut("c")
+            .unwrap()
+            .agents
+            .get_mut("a")
+            .unwrap()
+            .sandbox = json!({ "extends": "default" });
+        w.h.resolver.set(Ok(s));
+        assert_eq!(
+            manage(&w, "flow", file()).await.unwrap_err(),
+            DaemonError::Invalid(
+                "crews.c.agents.a.sandbox.extends: not accepted in a fleet's sandbox block".into()
+            )
+        );
+        assert!(w.daemon.get(&name).await.is_none(), "no actor was spawned");
+    }
+
     /// Review focus 5.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reserved_names_are_refused_by_the_manage_path() {

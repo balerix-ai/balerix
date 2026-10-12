@@ -894,6 +894,59 @@ async fn a_fleet_naming_no_daemon_is_not_resolved() {
     operator.abort();
 }
 
+/// #187: a Fleet whose `sandbox` block is off the fleet allowlist is
+/// refused up front by the same check the Daemon runs, as the Fleet's
+/// `Resolved=False` naming the path; nothing is sent or made.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fleet_with_a_refused_sandbox_key_is_not_resolved() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("sandbox").await;
+    let fleets: Api<Fleet> = Api::namespaced(env.client.clone(), &ns);
+    let spec: FleetSpec = serde_json::from_value(serde_json::json!({
+        "daemon": "default",
+        "retain": "Branches",
+        "crews": { "c": {
+            "repo": "acme/api",
+            "git": { "auth": "none" },
+            "agents": { "a": { "sandbox": { "network": { "tls_intercept": {} } } } },
+        } },
+    }))
+    .unwrap();
+    fleets
+        .create(&PostParams::default(), &Fleet::new("f", spec))
+        .await
+        .unwrap();
+    let status = wait_for("Resolved=False", Duration::from_secs(60), || async {
+        let s = fleets.get("f").await.unwrap().status?;
+        (!s.conditions.is_empty()).then_some(s)
+    })
+    .await;
+    let resolved = condition(&status.conditions, "Resolved");
+    assert_eq!(
+        (
+            resolved.status.as_str(),
+            resolved.reason.as_str(),
+            resolved.message.as_str()
+        ),
+        (
+            "False",
+            "InvalidFleet",
+            "crews.c.agents.a.sandbox.network.tls_intercept: not accepted in a fleet's sandbox block"
+        )
+    );
+    assert!(stub.puts().is_empty());
+    assert!(
+        Api::<Crew>::namespaced(env.client.clone(), &ns)
+            .get_opt("f-c")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    operator.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn watch_namespaces_ignores_another_namespace() {
     if envtest().await.is_none() {

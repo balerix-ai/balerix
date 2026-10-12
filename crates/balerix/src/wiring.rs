@@ -62,6 +62,7 @@ pub fn resolve_file(
             name_override: Some(name.to_string()),
             host_claude_settings: defaults.claude_settings.clone(),
             operator_layer: Some(layer.clone()),
+            operator_layer_name: None,
             restricted: true,
             runner: Default::default(),
         },

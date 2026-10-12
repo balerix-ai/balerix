@@ -391,7 +391,9 @@ fn run(
         let runtime = Arc::new(
             Runtime::new(layout.clone(), tools.clone())
                 .with_git_read(config.git_read.clone())
-                .with_socket_policy(socket_policy),
+                .with_socket_policy(socket_policy)
+                // where the daemon's tmux server puts its socket (#187)
+                .with_tmux_tmpdir(std::env::var_os("TMUX_TMPDIR").map(PathBuf::from)),
         );
         let ports = Ports {
             materializer: runtime.clone(),

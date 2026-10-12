@@ -89,6 +89,8 @@ pub fn resolve_fleet(
         &file,
         &ResolveOptions {
             operator_layer: Some(layer),
+            // what a refusal in it names (#187)
+            operator_layer_name: Some("Daemon spec.defaults".into()),
             runner: RunnerKind::Pod,
             ..Default::default()
         },
@@ -570,6 +572,34 @@ mod tests {
             other.agents[1].spec.spec_hash, plan.agents[1].spec.spec_hash,
             "bob sets his own"
         );
+    }
+
+    /// #187: a Fleet's `sandbox` block, and the Daemon's `defaults`
+    /// beneath it, are held to the fleet allowlist the Daemon applies, so
+    /// a bad one is `Resolved=False` before anything is sent.
+    #[test]
+    fn a_refused_sandbox_key_fails_resolution_naming_its_path() {
+        let mut spec = payments();
+        spec["crews"]["backend"]["defaults"]["sandbox"] = json!({ "extends": "default" });
+        assert_eq!(
+            resolve_fleet(&fleet("payments", spec), &json!({}))
+                .unwrap_err()
+                .to_string(),
+            "crews.backend.defaults.sandbox.extends: not accepted in a fleet's sandbox block"
+        );
+        let e = resolve_fleet(
+            &fleet("payments", payments()),
+            &json!({ "sandbox": { "filesystem": { "read": ["/var/*"] } } }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.starts_with("Daemon spec.defaults.sandbox.filesystem.read[0]: /var/*: glob"),
+            "{e}"
+        );
+        let mut spec = payments();
+        spec["defaults"]["sandbox"] = json!({ "network": { "block": false } });
+        resolve_fleet(&fleet("payments", spec), &json!({})).unwrap();
     }
 
     #[test]

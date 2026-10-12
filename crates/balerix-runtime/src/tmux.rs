@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -973,6 +973,17 @@ fn proc_error(id: &str, e: &std::io::Error) -> RunnerError {
         id: id.to_string(),
         message: e.to_string(),
     }
+}
+
+/// Where tmux keeps its `-L` sockets: `<$TMUX_TMPDIR or /tmp>/tmux-<uid>`,
+/// as tmux itself resolves it (an empty `TMUX_TMPDIR` is `/tmp`). The
+/// caller passes the daemon's `TMUX_TMPDIR`.
+pub fn tmux_socket_dir(tmux_tmpdir: Option<&Path>) -> PathBuf {
+    let uid = rustix::process::getuid().as_raw();
+    tmux_tmpdir
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("/tmp"))
+        .join(format!("tmux-{uid}"))
 }
 
 #[cfg(test)]

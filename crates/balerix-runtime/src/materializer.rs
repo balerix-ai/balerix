@@ -14,7 +14,9 @@ use crate::env::agent_env;
 use crate::home::{HomeInputs, write_home};
 use crate::launch::{hooks_port, render_launch, wants_continue, write_launch};
 use crate::layout::StateLayout;
-use crate::sandbox::{balerix_grants, render_profile, validate_profile, write_profile};
+use crate::sandbox::{
+    balerix_grants, check_fleet_sandbox, render_profile, validate_profile, write_profile,
+};
 use crate::socket_policy::{SocketPolicy, apply_to_profile};
 use crate::toolchain::{Toolchain, drop_stale_marker, system_tools};
 use crate::tools::ToolPaths;
@@ -29,6 +31,9 @@ pub struct Runtime {
     /// sandboxes may use (spec 2026-10-08). `Open` from `new`; `serve`
     /// and the pod sidecar set it with `with_socket_policy`.
     pub socket_policy: SocketPolicy,
+    /// The daemon's `TMUX_TMPDIR`, where its tmux server's socket lives
+    /// (`socket_dirs`). None (`/tmp`) from `new`; `serve` sets it.
+    pub tmux_tmpdir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -54,7 +59,37 @@ impl Runtime {
             tools,
             git_read: Vec::new(),
             socket_policy: SocketPolicy::Open,
+            tmux_tmpdir: None,
         }
+    }
+
+    /// The daemon's `TMUX_TMPDIR`, as its tmux server resolves its socket.
+    #[must_use]
+    pub fn with_tmux_tmpdir(mut self, tmux_tmpdir: Option<PathBuf>) -> Self {
+        self.tmux_tmpdir = tmux_tmpdir;
+        self
+    }
+
+    /// The directories holding the tmux server balerix drives, named for
+    /// the error message: sandbox grants may not name them (#187). On one
+    /// machine tmux's socket directory for this uid; in a pod the run
+    /// directory both containers share (the socket and the markers).
+    pub fn socket_dirs(&self) -> Vec<(&'static str, PathBuf)> {
+        match self.layout.pod_layout() {
+            Some(pod) => vec![("run directory", pod.mounts.run.clone())],
+            None => vec![(
+                "tmux socket directory",
+                crate::tmux::tmux_socket_dir(self.tmux_tmpdir.as_deref()),
+            )],
+        }
+    }
+
+    /// `socket_dirs` in the shape the sandbox checks take.
+    pub(crate) fn with_socket_dirs<T>(&self, f: impl FnOnce(&crate::sandbox::Roots<'_>) -> T) -> T {
+        let dirs = self.socket_dirs();
+        let named: Vec<(&str, &std::path::Path)> =
+            dirs.iter().map(|(w, p)| (*w, p.as_path())).collect();
+        f(&named)
     }
 
     /// The daemon's `[sandbox] git_read` (#111), validated by the caller.
@@ -115,19 +150,36 @@ impl Runtime {
             &hooks.secret,
             &agent.settings.env,
         );
+        let grants = balerix_grants(
+            id,
+            &paths,
+            &crew,
+            &self.layout,
+            &self.tools.balerix,
+            &self.tools.mise,
+        );
+        // before anything is written from the fleet's block (#187), as
+        // `render_plugin` does for a manifest's
+        let layout = &self.layout;
+        self.with_socket_dirs(|sockets| {
+            check_fleet_sandbox(
+                id,
+                &agent.settings.sandbox,
+                &[
+                    ("state", &layout.state_root),
+                    ("data", &layout.data_root),
+                    ("config", &layout.config_root),
+                ],
+                sockets,
+                &grants,
+            )
+        })?;
         // the policy last, over the merged fleet block, so nothing the
         // block carries can re-set what it pins
         let profile = apply_to_profile(
             render_profile(
                 id,
-                &balerix_grants(
-                    id,
-                    &paths,
-                    &crew,
-                    &self.layout,
-                    &self.tools.balerix,
-                    &self.tools.mise,
-                ),
+                &grants,
                 hooks_port(&hooks.url),
                 &env,
                 &agent.settings.sandbox,
@@ -685,16 +737,19 @@ mod tests {
     }
 
     /// The policy is applied to the profile as written, after the fleet's
-    /// block is merged: a block that replaces the `linux` objects (a
-    /// string is not refused) still ends with pathname mediation pinned.
+    /// block is merged: the block's own per-OS keys and socket grants are
+    /// kept and pathname mediation is still pinned. (A block that names
+    /// `linux` at all is refused before this, #187; the policy over a
+    /// non-object `linux` block is
+    /// `socket_policy::mediate_pins_pathname_over_non_object_linux_blocks`.)
     #[test]
     fn mediate_is_applied_after_the_fleets_sandbox_block() {
         let dir = tempfile::tempdir().unwrap();
         let rt = runtime(dir.path()).with_socket_policy(SocketPolicy::Mediate);
         let mut a = agent(&[]);
         a.settings.sandbox = serde_json::json!({
-            "linux": "off",
-            "platform_overrides": { "linux": { "linux": "off", "network": { "block": true } } },
+            "filesystem": { "unix_socket": ["/run/pg.sock"] },
+            "platform_overrides": { "linux": { "network": { "block": true } } },
         });
         rt.render_agent(
             &a,
@@ -711,8 +766,89 @@ mod tests {
         assert_eq!(linux["linux"]["af_unix_mediation"], "pathname");
         assert_eq!(linux["network"]["block"], true, "the fleet's own keys kept");
         assert_eq!(
+            p["filesystem"]["unix_socket"],
+            serde_json::json!(["/run/pg.sock"])
+        );
+        assert_eq!(
             p["filesystem"]["unix_socket_subtree_bind"],
             serde_json::json!([paths.home, paths.workspace])
+        );
+    }
+
+    /// #187: the fleet's block is held to the fleet allowlist and kept off
+    /// balerix's roots on every render, before the profile is written,
+    /// whatever `Fleet::try_from` let through when the record was stored.
+    #[test]
+    fn a_fleet_block_reaching_the_roots_or_off_the_allowlist_is_refused_before_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path());
+        let server = rt.layout.server_dir().join("token");
+        for (block, expected) in [
+            (
+                serde_json::json!({ "linux": "off" }),
+                "f/c/a: sandbox.linux: not accepted in a fleet's sandbox block".to_string(),
+            ),
+            (
+                serde_json::json!({ "filesystem": { "read": [server] } }),
+                format!(
+                    "f/c/a: sandbox.filesystem.read[0]: {} is inside balerix's state root {}; \
+                     an agent may name only paths in its home/ or workspace/ there, or read \
+                     its tool pools, its mise.toml or its crew's object cache",
+                    server.display(),
+                    rt.layout.state_root.display()
+                ),
+            ),
+        ] {
+            let mut a = agent(&[]);
+            a.settings.sandbox = block;
+            let e = rt
+                .render_agent(
+                    &a,
+                    &CredentialBundle::default(),
+                    &hooks(),
+                    &RenderOptions::default(),
+                )
+                .unwrap_err();
+            assert_eq!(e.to_string(), expected);
+            assert!(!rt.layout.agent(&a.id).profile.exists());
+        }
+    }
+
+    /// #187 review: the daemon's tmux socket directory, as its own
+    /// `TMUX_TMPDIR` places it, is off limits to the fleet's block.
+    #[test]
+    fn a_fleet_block_naming_the_daemons_tmux_socket_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpdir = dir.path().join("tmuxtmp");
+        let rt = runtime(dir.path()).with_tmux_tmpdir(Some(tmpdir.clone()));
+        let socket_dir = crate::tmux::tmux_socket_dir(Some(&tmpdir));
+        assert_eq!(
+            rt.socket_dirs(),
+            vec![("tmux socket directory", socket_dir.clone())]
+        );
+        let mut a = agent(&[]);
+        a.settings.sandbox =
+            serde_json::json!({ "filesystem": { "unix_socket": [socket_dir.join("balerix-x")] } });
+        let e = rt
+            .render_agent(
+                &a,
+                &CredentialBundle::default(),
+                &hooks(),
+                &RenderOptions::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(&format!(
+                "is inside balerix's tmux socket directory {}; sandbox grants may not name it",
+                socket_dir.display()
+            )),
+            "{e}"
+        );
+        assert_eq!(
+            runtime(dir.path()).socket_dirs()[0].1,
+            crate::tmux::tmux_socket_dir(None),
+            "/tmp without TMUX_TMPDIR"
         );
     }
 

@@ -404,7 +404,7 @@ impl Cmd {
                 let logged_stdout = if self.log_stdout { stdout.as_str() } else { "" };
                 let _ = writeln!(
                     f,
-                    "$ {} {}\n{logged_stdout}{stderr}[exit {}]",
+                    "$ {} {}\n{logged_stdout}{stderr}[{}]",
                     self.tool(),
                     self.args.join(" "),
                     status
@@ -414,7 +414,8 @@ impl Cmd {
         let code = status.code().filter(|c| accepted.contains(c));
         let Some(code) = code else {
             return Err(failure(if stderr.trim().is_empty() {
-                format!("exit status {}", status)
+                // `ExitStatus` displays as `exit status: 3` (or `signal: 9`)
+                status.to_string()
             } else {
                 stderr
             }));
@@ -492,7 +493,13 @@ mod tests {
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(logged.contains("$ sh -c echo out"));
         assert!(logged.contains("err\n"), "stderr is logged even on success");
-        assert!(logged.contains("[exit exit status: 3]"));
+        assert!(logged.contains("[exit status: 3]"), "{logged}");
+        // with nothing on stderr, the status is the message, said once
+        let err = Cmd::new(Path::new("/bin/sh"))
+            .args(["-c", "exit 127"])
+            .run()
+            .unwrap_err();
+        assert_eq!(err.stderr, "exit status: 127");
     }
 
     /// `log_argv_only` keeps the command and its exit status (and stderr,
@@ -518,7 +525,7 @@ mod tests {
         );
         assert!(logged.contains("$ sh -c echo the-diff | tr a-z A-Z; echo loud >&2"));
         assert!(logged.contains("loud\n"), "stderr is still logged");
-        assert!(logged.contains("[exit exit status: 0]"));
+        assert!(logged.contains("[exit status: 0]"), "{logged}");
     }
 
     #[test]

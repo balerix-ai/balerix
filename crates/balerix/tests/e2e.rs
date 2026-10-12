@@ -480,6 +480,7 @@ fn serve_up_update_down_journey() {
     let secrets = hook_secrets(&w);
     let token = fs::read_to_string(w.state().join("server/token")).unwrap();
     let log = fs::read_to_string(w.state().join("server/server.log")).unwrap();
+    assert!(!log.is_empty(), "server.log is empty");
     for s in secrets
         .iter()
         .chain(std::iter::once(&token.trim().to_string()))
@@ -581,7 +582,7 @@ fn plugin_hello_journey() {
     fs::write(
         cfg.join("plugins.yaml"),
         format!(
-            "plugins:\n  - name: hello\n    source: \"{}\"\n    config: {{ greeting: hi }}\n",
+            "plugins:\n  - name: hello\n    source: \"{}\"\n    config: {{ greeting: hi, try_escape: true }}\n",
             pkg.display()
         ),
     )
@@ -605,7 +606,15 @@ fn plugin_hello_journey() {
     // Ready through hello, with a real loopback listen address
     let list = wait_plugin_ready(&w, "hello", &plugin_dir);
     assert!(list.contains("hello  0.1.0    ready"), "{list}");
-    assert!(list.contains("127.0.0.1:"), "{list}");
+    // LISTEN is the fourth column; port 0 is the bind-failure sentinel
+    let listen: std::net::SocketAddr = list
+        .lines()
+        .find(|l| l.starts_with("hello"))
+        .and_then(|l| l.split_whitespace().nth(3))
+        .and_then(|a| a.parse().ok())
+        .unwrap_or_else(|| panic!("no LISTEN address: {list}"));
+    assert_eq!(listen.ip(), std::net::Ipv4Addr::LOCALHOST, "{list}");
+    assert_ne!(listen.port(), 0, "bind-failure sentinel: {list}");
     assert!(
         !plugin_dir.join("scratch/fake-plugin.bind-failed").exists(),
         "spec §11.1 row 1 FAILED: a sandboxed plugin could not bind a loopback listener; record the verdict and take the Unix-socket fallback in phase 2: {}",
@@ -646,11 +655,13 @@ fn plugin_hello_journey() {
             .unwrap()
             .contains(&token)
     );
-    assert!(
-        !fs::read_to_string(w.state().join("server/server.log"))
-            .unwrap()
-            .contains(&token)
-    );
+    let log = fs::read_to_string(w.state().join("server/server.log")).unwrap();
+    assert!(!log.is_empty(), "server.log is empty");
+    assert!(!log.contains(&token), "plugin token in server.log");
+    // the plugin tried to write into its package (before its hello reply)
+    // and the sandbox refused
+    let escape = fs::read_to_string(plugin_dir.join("scratch/fake-plugin.escape")).unwrap();
+    assert!(escape.starts_with("refused"), "{escape}");
     assert!(!pkg.join("escape").exists());
 
     // metrics
@@ -704,12 +715,14 @@ fn plugin_hello_journey() {
             ])
             .output()
             .unwrap();
-        if !String::from_utf8_lossy(&windows.stdout).contains("hello") {
+        let listed = String::from_utf8_lossy(&windows.stdout);
+        if !listed.contains("hello") {
             break;
         }
         assert!(
             start.elapsed() < Duration::from_secs(30),
-            "plugin window still present"
+            "plugin window still present; list-windows:\n{listed}{}",
+            String::from_utf8_lossy(&windows.stderr)
         );
         std::thread::sleep(Duration::from_millis(250));
     }

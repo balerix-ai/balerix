@@ -319,6 +319,68 @@ async fn the_bridge_relays_bytes_and_resizes_to_the_daemon_attach() {
     assert_eq!(fake.attaches().len(), 1);
 }
 
+/// #227: a daemon that takes the attach connection and never answers the
+/// handshake no longer holds the bridge: after the SDK's 10 s the browser
+/// gets 1011 with the reason, and no terminal was counted open.
+#[tokio::test]
+async fn an_attach_the_daemon_never_answers_closes_the_browser_with_1011() {
+    let stuck = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stuck_addr = stuck.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = stuck.accept().await {
+            held.push(socket);
+        }
+    });
+    let fake = FakeHost::start("tok", json!({}), vec![]).await;
+    let env = fake.env("web", std::path::Path::new("/s"));
+    let daemon = Env {
+        api_url: format!("http://{stuck_addr}"),
+        ..env.clone()
+    };
+    let plugin = WebPlugin::new(Host::new(daemon).unwrap()).unwrap();
+    let h = Harness::start(&env, plugin).await;
+    h.activate(ALICE, json!({})).await.unwrap();
+    let mut req = format!("ws://{}/v1/routes/agents/e2e/c/alice/ws", h.listen())
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", env.token).parse().unwrap(),
+    );
+    let (mut ws, _) = connect_async(req).await.unwrap();
+    let started = std::time::Instant::now();
+    let close = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(f))) => return f,
+                Some(Ok(_)) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the bridge gave up within 20 s")
+    .expect("with a frame");
+    assert!(
+        started.elapsed() >= Duration::from_secs(9),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(u16::from(close.code), 1011);
+    assert!(
+        close.reason.starts_with(
+            "attach: daemon: agents/e2e/c/alice/attach: no WebSocket handshake within 10s"
+        ),
+        "{}",
+        close.reason
+    );
+    assert_eq!(
+        metric(&h.metrics().await, "balerix_plugin_web_terminals_open", &[]),
+        Some(0.0)
+    );
+}
+
 #[tokio::test]
 async fn observed_events_feed_the_activity_column_of_enabled_agents() {
     let (fake, _, h, _watch) = world().await;

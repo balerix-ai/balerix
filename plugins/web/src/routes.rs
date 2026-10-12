@@ -1011,7 +1011,9 @@ fn forwardable(code: u16) -> u16 {
 /// One browser tab ↔ one daemon attach: binary both ways, the browser's
 /// resize text frames forwarded as resizes, everything else ignored.
 /// Ends when either side closes; the daemon's close code and reason
-/// reach the browser, so the page can say why.
+/// reach the browser, so the page can say why. An attach that fails,
+/// the SDK's 10 s handshake deadline included (#227), closes the browser
+/// with 1011 before anything is counted open.
 pub async fn bridge(mut browser: WebSocket, shared: Arc<Shared>, agent: String) {
     let attach = match shared.host.attach(&agent).await {
         Ok(a) => a,

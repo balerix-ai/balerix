@@ -358,7 +358,24 @@ impl Host {
 
     /// Opens one of the daemon's WebSocket routes with the bearer; a
     /// refused handshake is the daemon's status and error, as for HTTP.
+    /// The HTTP calls' `TIMEOUT` bounds the handshake: a daemon that
+    /// accepts the connection and never answers, or a half-open link,
+    /// fails it instead of holding the caller forever (#227).
     async fn connect(&self, path: &str) -> Result<Socket, SdkError> {
+        self.connect_within(path, TIMEOUT).await
+    }
+
+    async fn connect_within(&self, path: &str, deadline: Duration) -> Result<Socket, SdkError> {
+        tokio::time::timeout(deadline, self.handshake(path))
+            .await
+            .unwrap_or_else(|_| {
+                Err(SdkError::Transport(format!(
+                    "{path}: no WebSocket handshake within {deadline:?}"
+                )))
+            })
+    }
+
+    async fn handshake(&self, path: &str) -> Result<Socket, SdkError> {
         let mut req = self
             .ws_url(path)
             .into_client_request()
@@ -381,9 +398,14 @@ impl Host {
     /// `GET agents/{id}/attach` (WS): a terminal on the agent's window
     /// (plugin-protocol §3 "Streams"). Needs the `attach` capability and
     /// an active pair.
+    /// The handshake gives up after the HTTP calls' 10 s (#227).
     pub async fn attach(&self, agent: &str) -> Result<Attach, SdkError> {
+        self.attach_within(agent, TIMEOUT).await
+    }
+
+    async fn attach_within(&self, agent: &str, deadline: Duration) -> Result<Attach, SdkError> {
         let (tx, rx) = self
-            .connect(&format!("agents/{agent}/attach"))
+            .connect_within(&format!("agents/{agent}/attach"), deadline)
             .await?
             .split();
         Ok(Attach {
@@ -666,6 +688,52 @@ mod tests {
             crews: BTreeMap::new(),
             ..Default::default()
         })
+    }
+
+    /// #227: a daemon that takes the connection and never answers the
+    /// handshake fails `attach` at the deadline instead of holding it.
+    #[tokio::test]
+    async fn an_attach_the_daemon_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+                let _ = accepted_tx.send(());
+            }
+        });
+        let host = Host::new(Env {
+            api_url: format!("http://{addr}"),
+            name: "web".into(),
+            token: "t".into(),
+            scratch: "/s".into(),
+            ca: None,
+            tls: None,
+            listen: "127.0.0.1:0".into(),
+            revision: None,
+        })
+        .unwrap();
+        let deadline = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let err = match tokio::time::timeout(
+            Duration::from_secs(5),
+            host.attach_within("f/c/a", deadline),
+        )
+        .await
+        {
+            Ok(Err(e)) => e,
+            Ok(Ok(_)) => panic!("attached to a server that never answered"),
+            Err(_) => panic!("attach still pending after 5 s"),
+        };
+        assert!(started.elapsed() >= deadline);
+        assert!(accepted.try_recv().is_ok(), "the connection was made");
+        assert_eq!(
+            err,
+            SdkError::Transport("agents/f/c/a/attach: no WebSocket handshake within 300ms".into())
+        );
+        assert_eq!(TIMEOUT, Duration::from_secs(10), "attach's own deadline");
     }
 
     #[test]

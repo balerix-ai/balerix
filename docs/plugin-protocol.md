@@ -178,7 +178,13 @@ patch, truncated }` with `status` one of `added`, `modified`, `deleted`,
 `renamed`, `copied`, `typechange`; untracked files are `added` and
 `uncommitted`; a patch is unified with three lines of context, empty for a
 binary, cut at 256 KiB (`truncated`), and the list stops at 500 files
-(top-level `truncated`). `file` answers the bytes of one regular file, 404
+(top-level `truncated`). An untracked symlink is shown as git shows a
+new one, its target text the one added line, but one that git would
+follow (to a FIFO or a directory) or that leaves the worktree is never
+given to git: its patch is built from the link alone, without the
+`index` line. An untracked directory (a nested repository included) or
+other file that is not a regular file is never read: its patch is `not
+a regular file, skipped`. `file` answers the bytes of one regular file, 404
 `no such path`, 400 `not a regular file` (a symlink is never followed),
 413 `file larger than 1 MiB`. `tree` lists one directory (`{ name, kind:
 file|dir|symlink|other, size }`, sorted, `.git` never listed, never
@@ -189,7 +195,13 @@ texts: `no workspace for agent <id>` (no worktree) and `no such path`.
 `version` (Spec D) answers `{ head, fingerprint }`: `head` is the
 worktree's `HEAD`, `fingerprint` 64 hex chars over `HEAD`, the merge-base
 and the size and mtime of every changed or untracked path — equal values
-mean `diff` would answer the same; compare, never parse.
+mean `diff` would answer the same; compare, never parse. `diff` and
+`version` answer 504 `<agent>: workspace <diff|version>: timed out after
+<n>s` when the daemon's git for them runs out of its budget: 25 s for a
+whole `diff` and 6 s for a `version`, under the SDK's 30 s and 10 s
+request timeouts, so a plugin on the SDK gets this answer rather than a
+timeout of its own. A daemon in Kubernetes mode answers it as a 500,
+`<agent>: git link: workspace <diff|version>: timed out after <n>s`.
 
 **Managed fleets** (Spec L). `PUT fleets/{name}` takes the unresolved
 fleet file — exactly what `balerix up -f` reads, as JSON — and does what

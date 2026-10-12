@@ -35,6 +35,11 @@ use crate::daemon::Daemon;
 
 /// How long a blocking call waits for the sidecar's reply.
 pub const LINK_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// `LINK_CALL_TIMEOUT` for a workspace diff: above the reader's own
+/// 25 s budget for one (`balerix_runtime::inspect::DIFF_BUDGET`, which
+/// this crate does not import), so the sidecar's answer, a timeout
+/// included, arrives first; under the plugin SDK's 30 s for a diff.
+pub const DIFF_LINK_TIMEOUT: Duration = Duration::from_secs(28);
 /// How long `attach` waits for the sidecar's second socket once it has
 /// answered `Attach`.
 pub const ATTACH_WAIT: Duration = Duration::from_secs(5);
@@ -67,8 +72,8 @@ pub struct LinkHub {
 pub enum LinkError {
     #[error("link down")]
     Down,
-    #[error("the sidecar did not answer within {} s", LINK_CALL_TIMEOUT.as_secs())]
-    Timeout,
+    #[error("the sidecar did not answer within {} s", .0.as_secs())]
+    Timeout(Duration),
     #[error("{}", .0.message)]
     Failed(LinkFailure),
     #[error("unexpected reply to {0}")]
@@ -134,6 +139,16 @@ impl LinkHub {
     /// daemon calls them in `spawn_blocking`; never call this on a tokio
     /// worker.
     pub fn call(&self, agent: &AgentId, op: LinkOp) -> Result<LinkResult, LinkError> {
+        self.call_within(agent, op, LINK_CALL_TIMEOUT)
+    }
+
+    /// `call`, waiting `timeout` for the reply.
+    pub fn call_within(
+        &self,
+        agent: &AgentId,
+        op: LinkOp,
+        timeout: Duration,
+    ) -> Result<LinkResult, LinkError> {
         let (tx, rx) = sync_channel(1);
         let (sender, pending, id) = {
             let conns = lock(&self.conns);
@@ -146,12 +161,12 @@ impl LinkHub {
             lock(&pending).remove(&id);
             return Err(LinkError::Down);
         }
-        match rx.recv_timeout(LINK_CALL_TIMEOUT) {
+        match rx.recv_timeout(timeout) {
             Ok(LinkResult::Failed { failure }) => Err(LinkError::Failed(failure)),
             Ok(r) => Ok(r),
             Err(RecvTimeoutError::Timeout) => {
                 lock(&pending).remove(&id);
-                Err(LinkError::Timeout)
+                Err(LinkError::Timeout(timeout))
             }
             Err(RecvTimeoutError::Disconnected) => Err(LinkError::Down),
         }
@@ -423,11 +438,12 @@ impl AgentRunner for LinkHub {
 
 impl WorkspaceReader for LinkHub {
     fn diff(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceDiff, WorkspaceError> {
-        match self.call(
+        match self.call_within(
             agent,
             LinkOp::WorkspaceDiff {
                 base_ref: base_ref.into(),
             },
+            DIFF_LINK_TIMEOUT,
         ) {
             Ok(LinkResult::Diff { diff }) => Ok(diff),
             Ok(_) => Err(workspace_err(

@@ -285,7 +285,24 @@ credentials, hook input, or sandbox rules.
   frame that `SectionReader` reads as it streams); only a file the
   combined diff cannot name (a quoted or ambiguous header) costs a start
   of its own, and untracked paths past 256 KiB of arguments a further
-  patch start; keep it that way. Tests that run git in an existing
+  patch start; keep it that way. A read has one time budget, shared by
+  its starts (`inspect::VERSION_BUDGET` 6 s, `DIFF_BUDGET` 25 s, #213;
+  under the SDK's 10 s and 30 s, and the pod link waits 28 s for a diff,
+  `DIFF_LINK_TIMEOUT`): each start's `Cmd::timeout` is what is left less
+  `TIMEOUT_GRACE`, which SIGTERMs nono (it forwards it), waits the grace,
+  then SIGKILLs through pidfds every process it tracked below nono
+  (`supervise::terminate_tree`; SIGKILL to nono alone would leave the
+  sandboxed shell running), and the read fails `WorkspaceError::TimedOut`
+  (504). An untracked path goes to `--no-index` only when it is a regular
+  file or a link that resolves, inside the worktree, to one or to nothing
+  (`inspect::untracked_patch`, an `O_PATH|O_NOFOLLOW` walk from the
+  worktree's directory): git follows a link to a FIFO and blocks reading
+  it, so any other link gets a patch built from `readlinkat`
+  (`symlink_patch`). Every `Cmd` keeps only the last 64 KiB of stderr
+  (`StderrTail`). A probe that exits 126/127 (`GIT_CANNOT_RUN`), or a
+  section that does, gets the canary's `sandbox.git_read` hint; stderr's
+  text never decides it
+  (`workspace::git_read_hint`, #214). Tests that run git in an existing
   clone need Landlock and gate on `support::landlock_works`. Go through
   `Workspace::prepare_sandbox` before the first sandboxed call: it writes
   the profile, then runs one `git version` that must exit 0. The yes/no

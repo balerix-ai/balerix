@@ -4,10 +4,16 @@
 //! `.git/config` and `.gitattributes`, and this code runs as the daemon.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Component, Path};
+use std::time::{Duration, Instant};
 
+use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, openat, readlinkat, statat};
+use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
 use balerix_api::{
@@ -18,9 +24,71 @@ use balerix_core::{AgentId, MaterializeError, WorkspaceError, WorkspaceReader};
 
 use crate::layout::{AgentPaths, CrewPaths};
 use crate::materializer::Runtime;
-use crate::sandbox::write_git_profile;
-use crate::tools::CmdOutput;
-use crate::workspace::{GitLog, StdoutSink, sandboxed_git, sandboxed_git_script};
+use crate::sandbox::{lexical, write_git_profile};
+use crate::tools::{CmdOutput, TIMEOUT_GRACE};
+use crate::workspace::{
+    GitFailure, GitLog, StdoutSink, git_read_hint, sandboxed_git, sandboxed_git_script,
+};
+
+/// The most a `version` may take, its sandbox start and the end of a
+/// timed-out one included (#213): its four git calls are cheap, so past
+/// this something is hung (a lock, a filesystem that stopped answering),
+/// and the review page's poll, which holds one `version` per agent in
+/// flight, would wait on it for good. Under the plugin SDK's 10 s request
+/// timeout, so the plugin gets the daemon's answer (`TimedOut`, a 504)
+/// rather than a timeout of its own.
+pub const VERSION_BUDGET: Duration = Duration::from_secs(6);
+
+/// `VERSION_BUDGET` for a whole `diff`, shared by its sandbox starts (the
+/// listing, the patches, and a file diffed on its own): each start gets
+/// what is left. Under the SDK's 30 s for a diff.
+pub const DIFF_BUDGET: Duration = Duration::from_secs(25);
+
+/// One read under way: its name in a `TimedOut`, its budget, and when
+/// that runs out.
+#[derive(Debug, Clone, Copy)]
+struct ReadOp {
+    name: &'static str,
+    budget: Duration,
+    by: Instant,
+}
+
+impl ReadOp {
+    fn version() -> Self {
+        Self::new("version", VERSION_BUDGET)
+    }
+
+    fn diff() -> Self {
+        Self::new("diff", DIFF_BUDGET)
+    }
+
+    fn new(name: &'static str, budget: Duration) -> Self {
+        Self {
+            name,
+            budget,
+            by: Instant::now() + budget,
+        }
+    }
+
+    fn left(self) -> Duration {
+        self.by.saturating_duration_since(Instant::now())
+    }
+
+    /// The `Cmd::timeout` for the next sandbox start: what is left less
+    /// `TIMEOUT_GRACE`, so a start ended at it is gone by the budget's
+    /// end; `None` once nothing is.
+    fn start_deadline(self) -> Option<Duration> {
+        Some(self.left().saturating_sub(TIMEOUT_GRACE)).filter(|d| !d.is_zero())
+    }
+
+    fn timed_out(self, id: &str) -> WorkspaceError {
+        WorkspaceError::TimedOut {
+            id: id.to_string(),
+            subcommand: self.name.to_string(),
+            after: self.budget,
+        }
+    }
+}
 
 /// Command-line config beats every config file: whatever an agent wrote
 /// into its clone's `.git/config`, no program runs from it here (the rest
@@ -144,8 +212,12 @@ impl Runtime {
         id: &str,
         crew: &CrewPaths,
         paths: &AgentPaths,
+        op: ReadOp,
         args: &[&str],
     ) -> Result<String, WorkspaceError> {
+        let Some(deadline) = op.start_deadline() else {
+            return Err(op.timed_out(id));
+        };
         let mut argv: Vec<&str> = CONFIG.to_vec();
         argv.extend(args);
         sandboxed_git(
@@ -156,30 +228,85 @@ impl Runtime {
             &argv,
             &[0],
             GitLog::ArgvOnly,
+            Some(deadline),
         )
         .map(|out| out.stdout)
-        .map_err(|f| WorkspaceError::Tool {
+        .map_err(|f| self.read_failure(id, op, f))
+    }
+
+    /// A failed sandbox start as the read's error: `TimedOut` past its
+    /// deadline, else the start's `Tool` error. No hint here: a start
+    /// that fails outright has no git exit code to judge by.
+    fn read_failure(&self, id: &str, op: ReadOp, f: GitFailure) -> WorkspaceError {
+        if f.timed_out.is_some() {
+            return op.timed_out(id);
+        }
+        WorkspaceError::Tool {
             id: id.to_string(),
             subcommand: f.subcommand,
             args: f.args,
             stderr: f.stderr,
-        })
+        }
+    }
+
+    /// `e` with the `sandbox.git_read` hint before its stderr (#214) when
+    /// `cannot_run`: git exited 126 (the shell could not execute it) or
+    /// 127 (it could not load what it needs), and only when the sandbox
+    /// itself starts (`workspace::git_read_hint`, asked within what is
+    /// left of `op`), as the clone step's canary says it (#111). Never
+    /// from stderr's text: a git that ran and could not read a file the
+    /// agent made unreadable prints `Permission denied` too. Any other
+    /// error is returned as it is.
+    fn hinted(
+        &self,
+        crew: &CrewPaths,
+        paths: &AgentPaths,
+        op: ReadOp,
+        e: WorkspaceError,
+        cannot_run: bool,
+    ) -> WorkspaceError {
+        match e {
+            WorkspaceError::Tool {
+                id,
+                subcommand,
+                args,
+                stderr,
+            } if cannot_run && !op.left().is_zero() => {
+                let hint = git_read_hint(&self.tools, self.socket_policy, crew, paths, op.left());
+                let stderr = match hint {
+                    Some(hint) => format!("{hint}: {stderr}"),
+                    None => stderr,
+                };
+                WorkspaceError::Tool {
+                    id,
+                    subcommand,
+                    args,
+                    stderr,
+                }
+            }
+            other => other,
+        }
     }
 
     /// One of the reader's scripts in one sandbox start
-    /// (`workspace::sandboxed_git_script`), git's options `CONFIG`'s; a
-    /// failure of the start itself is reported as `sh`'s.
+    /// (`workspace::sandboxed_git_script`) within what is left of `op`, git's
+    /// options `CONFIG`'s; a failure of the start itself is reported as
+    /// `sh`'s.
     #[allow(clippy::too_many_arguments)]
     fn inspect_script(
         &self,
         id: &str,
         crew: &CrewPaths,
         paths: &AgentPaths,
+        op: ReadOp,
         script: &'static str,
         leading: &[&str],
         accepted: &[i32],
         sink: Option<StdoutSink<'_>>,
     ) -> Result<CmdOutput, WorkspaceError> {
+        let Some(deadline) = op.start_deadline() else {
+            return Err(op.timed_out(id));
+        };
         sandboxed_git_script(
             &self.tools,
             self.socket_policy,
@@ -190,13 +317,9 @@ impl Runtime {
             CONFIG,
             accepted,
             sink,
+            deadline,
         )
-        .map_err(|f| WorkspaceError::Tool {
-            id: id.to_string(),
-            subcommand: f.subcommand,
-            args: f.args,
-            stderr: f.stderr,
-        })
+        .map_err(|f| self.read_failure(id, op, f))
     }
 
     /// A listing script (`VERSION_SCRIPT` with `VERSION_LISTING`,
@@ -209,6 +332,7 @@ impl Runtime {
         id: &str,
         crew: &CrewPaths,
         paths: &AgentPaths,
+        op: ReadOp,
         (script, listing): (&'static str, &[&str]),
         base_ref: &str,
     ) -> Result<String, WorkspaceError> {
@@ -216,9 +340,10 @@ impl Runtime {
             id,
             crew,
             paths,
+            op,
             script,
             &[base_ref, FILTER_KEYS],
-            &[0, VERSION_FILTER, 81, 82, 83, 84],
+            &[0, VERSION_FILTER, 81, 82, 83, 84, GIT_CANNOT_RUN],
             None,
         )?;
         let tool_error =
@@ -252,7 +377,13 @@ impl Runtime {
             });
         }
         if let Some(stage) = version_stage(out.code) {
-            return Err(tool_error(stage, stage_args(stage), out.stderr));
+            return Err(self.hinted(
+                crew,
+                paths,
+                op,
+                tool_error(stage, stage_args(stage), out.stderr),
+                out.code == GIT_CANNOT_RUN,
+            ));
         }
         Ok(out.stdout)
     }
@@ -272,6 +403,7 @@ impl Runtime {
         id: &str,
         crew: &CrewPaths,
         paths: &AgentPaths,
+        op: ReadOp,
         merge_base: &str,
         mode: &str,
         pathspecs: &[&str],
@@ -301,9 +433,10 @@ impl Runtime {
                 id,
                 crew,
                 paths,
+                op,
                 DIFF_PATCH_SCRIPT,
                 &leading,
-                &[0, VERSION_FILTER, 81],
+                &[0, VERSION_FILTER, 81, GIT_CANNOT_RUN],
                 Some(&mut |chunk| reader.feed(chunk)),
             )?;
             let probe_args = || -> Vec<String> {
@@ -325,13 +458,19 @@ impl Runtime {
                     },
                 });
             }
-            if out.code == 81 {
-                return Err(WorkspaceError::Tool {
-                    id: id.to_string(),
-                    subcommand: "config".into(),
-                    args: probe_args(),
-                    stderr: out.stderr,
-                });
+            if matches!(out.code, 81 | GIT_CANNOT_RUN) {
+                return Err(self.hinted(
+                    crew,
+                    paths,
+                    op,
+                    WorkspaceError::Tool {
+                        id: id.to_string(),
+                        subcommand: "config".into(),
+                        args: probe_args(),
+                        stderr: out.stderr,
+                    },
+                    out.code == GIT_CANNOT_RUN,
+                ));
             }
             let sections = reader.finish().ok_or_else(|| WorkspaceError::Tool {
                 id: id.to_string(),
@@ -340,22 +479,29 @@ impl Runtime {
                 stderr: format!("unexpected output from the patch script: {}", out.stderr),
             })?;
             // the script's stderr is every section's: say which one failed
-            let failed = |args: Vec<&str>, what: String| {
+            let failed = |args: Vec<&str>, what: String, code: Option<i32>| {
                 let mut argv: Vec<&str> = CONFIG.to_vec();
                 argv.extend(args);
-                WorkspaceError::Tool {
-                    id: id.to_string(),
-                    subcommand: "diff".into(),
-                    args: argv.into_iter().map(str::to_string).collect(),
-                    stderr: format!(
-                        "{what} failed (stderr of the whole patch script follows): {}",
-                        out.stderr
-                    ),
-                }
+                self.hinted(
+                    crew,
+                    paths,
+                    op,
+                    WorkspaceError::Tool {
+                        id: id.to_string(),
+                        subcommand: "diff".into(),
+                        args: argv.into_iter().map(str::to_string).collect(),
+                        stderr: format!(
+                            "{what} failed (stderr of the whole patch script follows): {}",
+                            out.stderr
+                        ),
+                    },
+                    matches!(code, Some(126 | 127)),
+                )
             };
             let mut codes = sections.codes.into_iter();
             if let Some(split) = sections.combined {
-                if codes.next() != Some(0) {
+                let code = codes.next();
+                if code != Some(0) {
                     let mut args = Vec::new();
                     if mode == "paths" {
                         args.push("--literal-pathspecs");
@@ -367,7 +513,7 @@ impl Runtime {
                         args.push("--");
                         args.extend(pathspecs);
                     }
-                    return Err(failed(args, "the combined diff".into()));
+                    return Err(failed(args, "the combined diff".into(), code));
                 }
                 combined = split;
             }
@@ -379,6 +525,7 @@ impl Runtime {
                     return Err(failed(
                         args,
                         format!("the diff of untracked {path:?} (exit {code})"),
+                        Some(code),
                     ));
                 }
                 patches.push(patch);
@@ -635,6 +782,215 @@ pub fn shape_patch(raw: String) -> (String, bool, bool) {
     (raw[..end].to_string(), false, true)
 }
 
+/// The patch that stands in for an untracked path that is neither a
+/// regular file nor a symlink: a FIFO, a socket, a device, a directory
+/// (a nested repository is one), or a path one of whose directories is
+/// not one any more (`untracked_patch`).
+pub const SKIPPED_NOT_A_FILE: &str = "not a regular file, skipped\n";
+
+/// The most symlinks `untracked_patch` follows for one link's target: the
+/// kernel's own limit.
+const SYMLINK_HOPS: usize = 40;
+
+/// What one no-follow lookup found (`lookup`).
+#[derive(Debug, PartialEq, Eq)]
+enum Leaf {
+    Regular,
+    /// The link's target, as `readlinkat` gave it.
+    Symlink(Vec<u8>),
+    /// Nothing there, the last name or a directory before it.
+    Missing,
+    /// Anything else: a FIFO, a socket, a device, a directory.
+    Other,
+    /// A name on the way that is not a directory (a symlink included),
+    /// or a lookup that failed otherwise.
+    Blocked,
+}
+
+/// `names` looked up below the worktree's directory `root`, following no
+/// symlink: each directory on the way opened `O_PATH | O_NOFOLLOW |
+/// O_DIRECTORY` from the one before, the last name `statat`ed with
+/// `AT_SYMLINK_NOFOLLOW`, and a symlink there read with `readlinkat`. A
+/// directory swapped for a symlink after git listed the path is
+/// `Blocked`, never followed.
+fn lookup(root: &OwnedFd, names: &[&OsStr]) -> Leaf {
+    let Some((last, dirs)) = names.split_last() else {
+        return Leaf::Other;
+    };
+    let mut dir: Option<OwnedFd> = None;
+    for name in dirs {
+        let at = dir.as_ref().unwrap_or(root);
+        match openat(
+            at,
+            *name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => dir = Some(fd),
+            Err(e) if e == Errno::NOENT => return Leaf::Missing,
+            Err(_) => return Leaf::Blocked,
+        }
+    }
+    let at = dir.as_ref().unwrap_or(root);
+    let stat = match statat(at, *last, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(e) if e == Errno::NOENT => return Leaf::Missing,
+        Err(_) => return Leaf::Blocked,
+    };
+    match FileType::from_raw_mode(stat.st_mode) {
+        FileType::RegularFile => Leaf::Regular,
+        FileType::Symlink => match readlinkat(at, *last, Vec::new()) {
+            Ok(target) => Leaf::Symlink(target.into_bytes()),
+            Err(_) => Leaf::Blocked,
+        },
+        _ => Leaf::Other,
+    }
+}
+
+/// `rel`'s names, or `None` when it holds anything else (`..`, `.`, a
+/// root): git names untracked paths plainly, and a path that does not is
+/// refused rather than walked.
+fn plain_names(rel: &Path) -> Option<Vec<&OsStr>> {
+    rel.components()
+        .map(|c| match c {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether `--no-index` may be given the symlink at `names` whose target
+/// is `target`: only when it resolves, inside the worktree, to a regular
+/// file or to nothing, for which git prints the target text. git follows
+/// a link to a directory or a FIFO (and reads the FIFO, blocking until
+/// something writes to it), so anything else is not given to it, and
+/// neither is a target outside the worktree, which is never looked at.
+/// The resolution is lexical from the link's directory (whose names are
+/// real directories: `lookup` opened them) and each step a `lookup`, so
+/// a directory symlink on the way stops it. `root_path` is the worktree's
+/// canonical path, for an absolute target.
+fn link_is_safe(root: &OwnedFd, root_path: &Path, names: &[&OsStr], target: &[u8]) -> bool {
+    let mut dir: Vec<OsString> = names[..names.len().saturating_sub(1)]
+        .iter()
+        .map(|n| n.to_os_string())
+        .collect();
+    let mut target = target.to_vec();
+    for _ in 0..SYMLINK_HOPS {
+        let t = Path::new(OsStr::from_bytes(&target));
+        let path: Vec<OsString> = if t.is_absolute() {
+            let Ok(inside) = lexical(t).strip_prefix(root_path).map(Path::to_path_buf) else {
+                return false;
+            };
+            match plain_names(&inside) {
+                Some(n) => n.into_iter().map(OsStr::to_os_string).collect(),
+                None => return false,
+            }
+        } else {
+            let mut path = dir.clone();
+            for c in t.components() {
+                match c {
+                    Component::Normal(name) => path.push(name.to_os_string()),
+                    // above the worktree's root is outside it
+                    Component::ParentDir if path.pop().is_none() => return false,
+                    _ => {}
+                }
+            }
+            path
+        };
+        if path.is_empty() {
+            // the worktree's root: a directory
+            return false;
+        }
+        let refs: Vec<&OsStr> = path.iter().map(OsString::as_os_str).collect();
+        match lookup(root, &refs) {
+            Leaf::Regular | Leaf::Missing => return true,
+            Leaf::Symlink(next) => {
+                dir = path[..path.len() - 1].to_vec();
+                target = next;
+            }
+            Leaf::Other | Leaf::Blocked => return false,
+        }
+    }
+    false
+}
+
+/// What stands in for an untracked path's `--no-index` patch (#213), or
+/// `None` when the path may go to git: a regular file, a path that is not
+/// there any more (git reports it, as before), or a symlink that is safe
+/// to (`link_is_safe`). Another symlink, one out of the worktree included,
+/// gets the patch git would print for it, built here from the link's own
+/// target text (`symlink_patch`); the target is never touched. Anything
+/// else is `SKIPPED_NOT_A_FILE`. `root` is the worktree's directory and
+/// `root_path` its canonical path. A path changed between this and the
+/// patch start is the read's budget to bound.
+fn untracked_patch(root: &OwnedFd, root_path: &Path, rel: &str) -> Option<String> {
+    let Some(names) = plain_names(Path::new(rel)) else {
+        return Some(SKIPPED_NOT_A_FILE.to_string());
+    };
+    match lookup(root, &names) {
+        Leaf::Regular | Leaf::Missing => None,
+        Leaf::Symlink(target) => {
+            (!link_is_safe(root, root_path, &names, &target)).then(|| symlink_patch(rel, &target))
+        }
+        Leaf::Other | Leaf::Blocked => Some(SKIPPED_NOT_A_FILE.to_string()),
+    }
+}
+
+/// `prefix` and `path` as git's header lines print them: plain, or in
+/// double quotes with C escapes when `core.quotePath` (which `CONFIG`
+/// pins on) would quote it.
+fn git_quoted(prefix: &str, path: &str) -> String {
+    let needs = |b: u8| !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\';
+    if !path.bytes().any(needs) {
+        return format!("{prefix}{path}");
+    }
+    let mut out = String::from("\"");
+    out.push_str(prefix);
+    for b in path.bytes() {
+        match b {
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            0x0b => out.push_str("\\v"),
+            0x0c => out.push_str("\\f"),
+            b'\r' => out.push_str("\\r"),
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b if needs(b) => out.push_str(&format!("\\{b:03o}")),
+            b => out.push(char::from(b)),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The patch `git diff --no-index /dev/null <link>` prints for a new
+/// symlink: its mode and its target text as the one added line, without
+/// the `index` line (the target's blob id, which would take a SHA-1).
+pub fn symlink_patch(path: &str, target: &[u8]) -> String {
+    let target = String::from_utf8_lossy(target);
+    let lines: Vec<&str> = target.split_inclusive('\n').collect();
+    let mut out = format!(
+        "diff --git {} {}\nnew file mode 120000\n--- /dev/null\n+++ {}\n",
+        git_quoted("a/", path),
+        git_quoted("b/", path),
+        git_quoted("b/", path)
+    );
+    out.push_str(&match lines.len() {
+        1 => "@@ -0,0 +1 @@\n".to_string(),
+        n => format!("@@ -0,0 +1,{n} @@\n"),
+    });
+    for line in &lines {
+        out.push('+');
+        out.push_str(line);
+    }
+    if !target.ends_with('\n') {
+        out.push_str("\n\\ No newline at end of file\n");
+    }
+    out
+}
+
 /// One changed or untracked path as the fingerprint sees it: `(size,
 /// mtime, mtime_nsec)` from `symlink_metadata`, or `None` when the `stat`
 /// failed for any reason — the path vanished between the listing and the
@@ -797,7 +1153,8 @@ fn filter_key(probe: &str) -> Option<String> {
 /// nothing the caller passes is ever script text. The filter probe runs
 /// first, before any call that reads an object: a match prints the key and exits
 /// `VERSION_FILTER`; an exit 1 that printed anything (stderr is folded in)
-/// is a failure, as `is_gits_answer` would judge it. Then `merge-base`,
+/// is a failure, as `is_gits_answer` would judge it, and an exit 126 or 127
+/// is `GIT_CANNOT_RUN`. Then `merge-base`,
 /// printed with a NUL after it. Each git call fails with its own code
 /// (`version_stage`).
 macro_rules! listing_start {
@@ -808,6 +1165,7 @@ found=$("$@" config --local --includes --name-only --get-regexp "$keys" 2>&1)
 case $? in
 0) printf '%s' "$found"; exit 80 ;;
 1) if [ -n "$found" ]; then printf '%s\n' "$found" >&2; exit 81; fi ;;
+126|127) printf '%s\n' "$found" >&2; exit 85 ;;
 *) printf '%s\n' "$found" >&2; exit 81 ;;
 esac
 mb=$("$@" merge-base "$base" HEAD) || exit 83
@@ -869,7 +1227,8 @@ const DIFF_LISTING: &[&str] = &["--name-status", "-z", "--find-renames"];
 /// functions get their own `"$@"`, so the list itself never changes. The
 /// filter probe runs again first, in this start, so the window between
 /// the probe and the reads it guards is no wider than one start: a match
-/// exits `VERSION_FILTER`, a failed probe 81, the probe's output on
+/// exits `VERSION_FILTER`, a failed probe 81 (`GIT_CANNOT_RUN` when it
+/// exited 126 or 127), the probe's output on
 /// stderr (stdout is the sections). The
 /// script's own exit is `printf`'s: the codes are in the frames.
 const DIFF_PATCH_SCRIPT: &str = r#"mb=$1 keys=$2 mode=$3 nt=$4 nu=$5
@@ -883,6 +1242,7 @@ found=$(probe "$@")
 case $? in
 0) printf '%s\n' "$found" >&2; exit 80 ;;
 1) if [ -n "$found" ]; then printf '%s\n' "$found" >&2; exit 81; fi ;;
+126|127) printf '%s\n' "$found" >&2; exit 85 ;;
 *) printf '%s\n' "$found" >&2; exit 81 ;;
 esac
 combined() {
@@ -954,10 +1314,15 @@ const PATCH_ARGS_BUDGET: usize = 256 * 1024;
 /// `VERSION_SCRIPT`'s exit when the probe found a key (on stdout).
 const VERSION_FILTER: i32 = 80;
 
+/// Every script's exit when its first git call, the filter probe, exited
+/// 126 or 127: the shell could not execute git, or git could not load
+/// what it needs (#214). A failed probe otherwise exits 81.
+const GIT_CANNOT_RUN: i32 = 85;
+
 /// The git subcommand behind one of `VERSION_SCRIPT`'s failure exits.
 fn version_stage(code: i32) -> Option<&'static str> {
     match code {
-        81 => Some("config"),
+        81 | GIT_CANNOT_RUN => Some("config"),
         82 => Some("status"),
         83 => Some("merge-base"),
         84 => Some("diff"),
@@ -1143,12 +1508,14 @@ impl WorkspaceReader for Runtime {
     /// file the combined diff does not name as expected is diffed on its
     /// own, one more start each.
     fn diff(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceDiff, WorkspaceError> {
+        let op = ReadOp::diff();
         let id = agent.to_string();
         let (paths, crew) = self.sandboxed_workspace_of(agent)?;
         let listing = self.run_listing(
             &id,
             &crew,
             &paths,
+            op,
             (DIFF_LIST_SCRIPT, DIFF_LISTING),
             base_ref,
         )?;
@@ -1200,10 +1567,32 @@ impl WorkspaceReader for Runtime {
                 pathspecs.push(&f.path);
             }
         }
+        // an untracked FIFO (or a link to one) never reaches `--no-index`
+        // (#213); the worktree is walked from its own directory, and one
+        // that cannot be opened fails the read rather than go unchecked
+        let root_path = paths
+            .workspace
+            .canonicalize()
+            .map_err(|e| io_error(&paths.workspace, e))?;
+        let root = openat(
+            CWD,
+            &root_path,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| io_error(&root_path, e.into()))?;
+        let mut standing_in: BTreeMap<String, String> = BTreeMap::new();
         let kept_untracked: Vec<&str> = files
             .iter()
             .filter(|f| untracked.contains(&f.path))
             .map(|f| f.path.as_str())
+            .filter(|p| match untracked_patch(&root, &root_path, p) {
+                Some(patch) => {
+                    standing_in.insert((*p).to_string(), patch);
+                    false
+                }
+                None => true,
+            })
             .collect();
         let (mut sections, untracked_patches) = if mode == "none" && kept_untracked.is_empty() {
             (BTreeMap::new(), Vec::new())
@@ -1212,6 +1601,7 @@ impl WorkspaceReader for Runtime {
                 &id,
                 &crew,
                 &paths,
+                op,
                 &merge_base,
                 mode,
                 &pathspecs,
@@ -1224,7 +1614,9 @@ impl WorkspaceReader for Runtime {
             f.uncommitted = f.uncommitted
                 || dirty.contains(&f.path)
                 || f.old_path.as_deref().is_some_and(|o| dirty.contains(o));
-            let raw = if untracked.contains(&f.path) {
+            let raw = if let Some(patch) = standing_in.remove(&f.path) {
+                patch
+            } else if untracked.contains(&f.path) {
                 // in the order `kept_untracked` gave them
                 untracked_patches.next().unwrap_or_default()
             } else if let Some(section) = patch_header(f).and_then(|h| sections.remove(&h)) {
@@ -1240,7 +1632,7 @@ impl WorkspaceReader for Runtime {
                     args.push(old);
                 }
                 args.push(&f.path);
-                self.inspect_git(&id, &crew, &paths, &args)?
+                self.inspect_git(&id, &crew, &paths, op, &args)?
             };
             let (patch, binary, cut) = shape_patch(raw);
             f.patch = patch;
@@ -1346,12 +1738,14 @@ impl WorkspaceReader for Runtime {
     /// The filter probe, `merge-base`, one name-only diff against it and
     /// one `status`, in one sandbox start (`VERSION_SCRIPT`, #174).
     fn version(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceVersion, WorkspaceError> {
+        let op = ReadOp::version();
         let id = agent.to_string();
         let (paths, crew) = self.sandboxed_workspace_of(agent)?;
         let out = self.run_listing(
             &id,
             &crew,
             &paths,
+            op,
             (VERSION_SCRIPT, VERSION_LISTING),
             base_ref,
         )?;
@@ -1372,6 +1766,108 @@ impl WorkspaceReader for Runtime {
 mod tests {
     use super::*;
     use balerix_api::FileStatus;
+
+    /// #213: what may reach `--no-index`, judged inside the worktree
+    /// without following a link out of it.
+    #[test]
+    fn only_regular_files_and_safe_links_reach_no_index() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("file"), "x").unwrap();
+        let root_path = dir.path().join("ws");
+        std::fs::create_dir_all(root_path.join("sub")).unwrap();
+        let root_path = root_path.canonicalize().unwrap();
+        std::fs::write(root_path.join("file"), "x").unwrap();
+        std::fs::write(root_path.join("sub/inner"), "x").unwrap();
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(root_path.join("fifo"))
+            .status()
+            .unwrap();
+        assert!(mkfifo.success());
+        let link = |target: &Path, name: &str| symlink(target, root_path.join(name)).unwrap();
+        link(Path::new("file"), "to-file");
+        link(Path::new("sub/../to-file"), "chain");
+        link(&root_path.join("sub/inner"), "absolute-inside");
+        link(Path::new("nowhere"), "dangling");
+        link(Path::new("fifo"), "to-fifo");
+        link(Path::new("sub"), "to-dir");
+        link(Path::new("../outside/file"), "up-and-out");
+        link(&outside.join("file"), "absolute-out");
+        link(&outside, "out-dir");
+        link(Path::new("loop-b"), "loop-a");
+        link(Path::new("loop-a"), "loop-b");
+        link(Path::new("to-dir/inner"), "through-a-dir-link");
+        let root = openat(
+            CWD,
+            &root_path,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let patch = |rel: &str| untracked_patch(&root, &root_path, rel);
+
+        for keep in [
+            "file",
+            "sub/inner",
+            "to-file",
+            "chain",
+            "absolute-inside",
+            "dangling",
+            "vanished",
+            "gone/too",
+        ] {
+            assert_eq!(patch(keep), None, "{keep}");
+        }
+        for skipped in [
+            "fifo",
+            "sub",
+            "sub/",
+            // `..` is refused, never walked
+            "sub/../file",
+            // a directory link on the way is never followed
+            "out-dir/file",
+            "to-dir/inner",
+        ] {
+            assert_eq!(
+                patch(skipped).as_deref(),
+                Some(SKIPPED_NOT_A_FILE),
+                "{skipped}"
+            );
+        }
+        // the link's own text, as git would print it, the target untouched
+        for (name, target) in [
+            ("to-fifo", "fifo".to_string()),
+            ("to-dir", "sub".to_string()),
+            ("loop-a", "loop-b".to_string()),
+            ("up-and-out", "../outside/file".to_string()),
+            ("absolute-out", outside.join("file").display().to_string()),
+            ("out-dir", outside.display().to_string()),
+            ("through-a-dir-link", "to-dir/inner".to_string()),
+        ] {
+            assert_eq!(
+                patch(name),
+                Some(symlink_patch(name, target.as_bytes())),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symlink_patch_is_gits_and_quotes_as_git_does() {
+        assert_eq!(
+            symlink_patch("l", b"/home/x/.ssh/id_rsa"),
+            "diff --git a/l b/l\nnew file mode 120000\n--- /dev/null\n+++ b/l\n\
+             @@ -0,0 +1 @@\n+/home/x/.ssh/id_rsa\n\\ No newline at end of file\n"
+        );
+        assert_eq!(
+            symlink_patch("a\tb\u{e9}\"", b"t\nu"),
+            "diff --git \"a/a\\tb\\303\\251\\\"\" \"b/a\\tb\\303\\251\\\"\"\nnew file mode 120000\n\
+             --- /dev/null\n+++ \"b/a\\tb\\303\\251\\\"\"\n@@ -0,0 +1,2 @@\n+t\n+u\n\
+             \\ No newline at end of file\n"
+        );
+    }
 
     #[test]
     fn name_status_z_parses_statuses_and_rename_pairs() {

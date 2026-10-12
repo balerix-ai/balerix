@@ -685,7 +685,7 @@ fn resolve_links(path: &Path, links: u32) -> PathBuf {
 
 /// `..` and `.` folded away without touching the filesystem: for a link
 /// target joined onto its canonical directory.
-fn lexical(path: &Path) -> PathBuf {
+pub(crate) fn lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {
         match c {

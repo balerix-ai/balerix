@@ -174,6 +174,14 @@ pub enum WorkspaceError {
         args: Vec<String>,
         stderr: String,
     },
+    /// One sandbox start of a `diff` or `version` (`subcommand`) outlived
+    /// its deadline, `after`; everything it ran was ended (#213).
+    #[error("{id}: workspace {subcommand}: timed out after {after:?}")]
+    TimedOut {
+        id: String,
+        subcommand: String,
+        after: std::time::Duration,
+    },
     /// The repository's config names a clean/smudge/process filter, or a
     /// promisor remote; a diff would run a program, or fetch from
     /// elsewhere, as the daemon. Raised by `diff` and `version` alike, so

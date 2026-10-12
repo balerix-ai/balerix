@@ -42,6 +42,26 @@
   restart, and then the sidecar refuses to render the agent. Fix the
   Fleet's (or the Daemon's `spec.defaults`) `sandbox` block.
 
+- The workspace reader's `diff` and `version` now have a time budget
+  (#213): 6 s for a `version` and 25 s for a whole `diff`, both under
+  the plugin SDK's own request timeouts (10 s and 30 s). A read that runs
+  out ends its sandboxed git, and everything it started, and answers 504
+  `<agent>: workspace <diff|version>: timed out after <n>s`, where it
+  used to hold the request (and the review page's poll) until the
+  client gave up. In Kubernetes mode the same read answers 500
+  (`<agent>: git link: workspace <diff|version>: timed out after <n>s`),
+  and the daemon now waits 28 s for a sidecar's diff (15 s for
+  every other call, as before).
+- An untracked symlink that git would follow (to a FIFO, which it reads
+  and blocks on, or to a directory) or that points out of the worktree
+  is no longer given to git: its patch is the link's target text, as git
+  prints it for a new symlink, built without looking at the target. An
+  untracked directory, nested repository or other file that is not a
+  regular file shows as `not a regular file, skipped`. When git cannot
+  run under the daemon's git profile (it exits 126 or 127), `diff` and
+  `version` now name `sandbox.git_read` and both logs, as a removal
+  already did (#214).
+
 ## 0.2.4 - 2026-10-10
 
 ### Bug fixes

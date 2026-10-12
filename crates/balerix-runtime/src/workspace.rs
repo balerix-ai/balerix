@@ -2,6 +2,7 @@
 //! §4.2 step 1 before it).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use balerix_core::{MaterializeError, RepoRef};
 
@@ -404,6 +405,7 @@ fn sandboxed_cmd(
             "cannot create nono's home beside {}: {e}",
             agent.nono_home.display()
         ),
+        timed_out: None,
     })?;
     let cmd = Cmd::new(&tools.nono)
         .env_clear()
@@ -506,6 +508,8 @@ pub(crate) struct GitFailure {
     pub subcommand: String,
     pub args: Vec<String>,
     pub stderr: String,
+    /// The call's `deadline`, when it was ended by it.
+    pub timed_out: Option<Duration>,
 }
 
 /// One git call inside the agent's existing clone, run under the git
@@ -527,7 +531,10 @@ pub(crate) struct GitFailure {
 /// codes that count as success (0 included). A failure is reported as
 /// git's, with git's subcommand, not nono's. An accepted non-zero exit
 /// that printed anything on stderr is a failure too (`is_gits_answer`).
-/// `write_git_profile` must have run.
+/// With a `deadline`, the call's whole tree is ended once it passes
+/// (`Cmd::timeout`) and the failure says so (`timed_out`); the
+/// `ScratchHome` goes either way. `write_git_profile` must have run.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sandboxed_git(
     tools: &ToolPaths,
     policy: SocketPolicy,
@@ -536,11 +543,15 @@ pub(crate) fn sandboxed_git(
     args: &[&str],
     accepted: &[i32],
     log: GitLog,
+    deadline: Option<Duration>,
 ) -> Result<CmdOutput, GitFailure> {
     let (cmd, _home) = sandboxed_cmd(tools, policy, crew, agent, log)?;
-    let cmd = cmd
+    let mut cmd = cmd
         .args(git_command(tools, crew, agent))
         .args(args.iter().copied());
+    if let Some(d) = deadline {
+        cmd = cmd.timeout(d);
+    }
     // git's own: the first word that is neither an option nor a `-c` value
     let mut words = args.iter().copied();
     let mut subcommand = String::new();
@@ -556,12 +567,14 @@ pub(crate) fn sandboxed_git(
         subcommand: subcommand.clone(),
         args: f.args,
         stderr: f.stderr,
+        timed_out: f.timed_out,
     })?;
     if !is_gits_answer(&out) {
         return Err(GitFailure {
             subcommand,
             args: args.iter().map(|a| (*a).to_string()).collect(),
             stderr: out.stderr.clone(),
+            timed_out: None,
         });
     }
     Ok(out)
@@ -581,7 +594,8 @@ pub(crate) type StdoutSink<'a> = &'a mut dyn FnMut(&[u8]);
 /// a nono that fails exits with its own code, not one of the script's. A
 /// failure is reported with the subcommand `sh`. With a `sink`, stdout
 /// goes to it as it arrives (`Cmd::run_streaming`) instead of into the
-/// output. `write_git_profile` must have run.
+/// output. The start, and every process in it, is ended at `deadline`
+/// (`sandboxed_git`'s). `write_git_profile` must have run.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sandboxed_git_script(
     tools: &ToolPaths,
@@ -593,13 +607,15 @@ pub(crate) fn sandboxed_git_script(
     git_args: &[&str],
     accepted: &[i32],
     sink: Option<StdoutSink<'_>>,
+    deadline: Duration,
 ) -> Result<CmdOutput, GitFailure> {
     let (cmd, _home) = sandboxed_cmd(tools, policy, crew, agent, GitLog::ArgvOnly)?;
     let cmd = cmd
         .args(["/bin/sh", "-c", script, "sh"])
         .args(leading.iter().copied())
         .args(git_command(tools, crew, agent))
-        .args(git_args.iter().copied());
+        .args(git_args.iter().copied())
+        .timeout(deadline);
     match sink {
         Some(sink) => cmd.run_streaming(accepted, sink),
         None => cmd.run_with_exit_codes(accepted),
@@ -608,6 +624,72 @@ pub(crate) fn sandboxed_git_script(
         subcommand: "sh".into(),
         args: f.args,
         stderr: f.stderr,
+        timed_out: f.timed_out,
+    })
+}
+
+/// The most `sandbox_starts` waits for `/bin/true` on the clone step's
+/// path; the workspace reader passes what is left of its budget (#213).
+const START_CHECK_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Whether `/bin/true` runs under `agent`'s git profile: asked once a git
+/// call under it has failed in a way that says git could not run, to tell
+/// a git the profile cannot run (`git_read_hint`) from a sandbox that
+/// does not start at all. One that has not answered within `deadline`
+/// did not start.
+fn sandbox_starts(
+    tools: &ToolPaths,
+    policy: SocketPolicy,
+    agent: &AgentPaths,
+    deadline: Duration,
+) -> bool {
+    let mut args = sandbox_args(agent, policy, &tools.balerix);
+    args.push("/bin/true".into());
+    let Ok(home) = ScratchHome::new(agent) else {
+        return false;
+    };
+    Cmd::new(&tools.nono)
+        .env_clear()
+        .env("HOME", home.path().display().to_string())
+        .env("PATH", outer_path(tools))
+        .args(args)
+        .timeout(deadline)
+        .run()
+        .is_ok()
+}
+
+/// Where a failed git call under the git profile left its detail: the
+/// crew's `git.log` (git's stderr and exit status) and the agent's
+/// `nono-git.log` (nono's own).
+fn see_logs(crew: &CrewPaths, agent: &AgentPaths) -> String {
+    format!(
+        "see {} and {}",
+        crew.logs.join("git.log").display(),
+        agent.logs.join("nono-git.log").display()
+    )
+}
+
+/// The hint for a git that could not run under the git profile (#111,
+/// #214), typically one that loads its libraries from its own prefix:
+/// `Some` when the sandbox itself starts (`sandbox_starts`), naming
+/// `sandbox.git_read` and both logs; `None` when it does not, and the
+/// hint would point the wrong way. A prefix, not a line: the error
+/// displays its first line.
+pub(crate) fn git_read_hint(
+    tools: &ToolPaths,
+    policy: SocketPolicy,
+    crew: &CrewPaths,
+    agent: &AgentPaths,
+    deadline: Duration,
+) -> Option<String> {
+    sandbox_starts(tools, policy, agent, deadline).then(|| {
+        format!(
+            "git could not run under the git profile (the sandbox itself starts); if it \
+             loads libraries from outside {}, add that prefix to `sandbox.git_read` in the \
+             daemon's config.toml; {}",
+            system_prefixes(),
+            see_logs(crew, agent)
+        )
     })
 }
 
@@ -891,11 +973,9 @@ impl Workspace<'_> {
             self.git_read,
             self.socket_policy,
         )?;
-        let log = agent.logs.join("nono-git.log");
         self.agent_git(id, crew, agent, &["version"], &[0])
             .map(|_| ())
             .map_err(|e| match e {
-                // a prefix, not a line: the error displays the first line
                 MaterializeError::Tool {
                     id,
                     tool,
@@ -904,45 +984,27 @@ impl Workspace<'_> {
                     stderr,
                 } => {
                     // #111: a sandbox that runs `/bin/true` started; it is
-                    // git that could not run under it, typically a git
-                    // that loads its libraries from its own prefix
-                    let hint = if self.sandbox_starts(agent) {
-                        format!(
-                            "git could not run under the git profile (the sandbox itself \
-                             starts); if it loads libraries from outside {}, add that prefix \
-                             to `sandbox.git_read` in the daemon's config.toml",
-                            system_prefixes()
-                        )
-                    } else {
-                        "the sandbox did not start".to_string()
-                    };
+                    // git that could not run under it
+                    let hint = git_read_hint(
+                        self.tools,
+                        self.socket_policy,
+                        crew,
+                        agent,
+                        START_CHECK_DEADLINE,
+                    )
+                    .unwrap_or_else(|| {
+                        format!("the sandbox did not start; {}", see_logs(crew, agent))
+                    });
                     MaterializeError::Tool {
                         id,
                         tool,
                         subcommand,
                         args,
-                        stderr: format!("{hint}; see {}: {stderr}", log.display()),
+                        stderr: format!("{hint}: {stderr}"),
                     }
                 }
                 other => other,
             })
-    }
-
-    /// Whether `/bin/true` runs under the git profile: the canary's
-    /// second question, asked only once `git version` has failed.
-    fn sandbox_starts(&self, agent: &AgentPaths) -> bool {
-        let mut args = sandbox_args(agent, self.socket_policy, &self.tools.balerix);
-        args.push("/bin/true".into());
-        let Ok(home) = ScratchHome::new(agent) else {
-            return false;
-        };
-        Cmd::new(&self.tools.nono)
-            .env_clear()
-            .env("HOME", home.path().display().to_string())
-            .env("PATH", outer_path(self.tools))
-            .args(args)
-            .run()
-            .is_ok()
     }
 
     /// One git call inside the agent's existing clone, under the git
@@ -963,6 +1025,7 @@ impl Workspace<'_> {
             args,
             accepted,
             GitLog::Full,
+            None,
         )
         .map(|o| o.stdout)
         .map_err(|f| MaterializeError::Tool {

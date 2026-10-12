@@ -2,7 +2,6 @@
 //! body a review page or a GitHub review is mapped to, its limits, and the
 //! message `send_text` delivers.
 
-use balerix_api::check_path;
 use serde::Deserialize;
 
 /// The most comments one review may carry.
@@ -75,11 +74,33 @@ pub struct Review {
 
 /// Nothing downstream renders a NUL usefully: it is not valid in a ref, a
 /// path or a diff line, and it truncates wherever the message meets a C
-/// string on its way to the pane. `path` is not checked here — the shared
-/// `check_path` already refuses NUL, with its own reason.
+/// string on its way to the pane.
 fn no_nul(field: &str, value: &str) -> Result<(), String> {
     if value.contains('\0') {
         return Err(format!("{field}: contains NUL"));
+    }
+    Ok(())
+}
+
+/// A comment's `path`, in bytes: the workspace routes' own path limit.
+const MAX_PATH_BYTES: usize = 4096;
+
+/// A comment's `path` is only quoted in the message, never opened, so it
+/// is not held to the workspace routes' `check_path`: `a\b.txt` is a
+/// legal Linux name that shows up in the diff, and one comment on it
+/// must not refuse the whole review (#228). It is bounded and may not
+/// hold NUL, nor a control character but tab, which would break the
+/// message's one-header-line-per-comment layout.
+fn check_comment_path(field: &str, path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err(format!("{field}: empty"));
+    }
+    if path.len() > MAX_PATH_BYTES {
+        return Err(format!("{field}: longer than {MAX_PATH_BYTES} bytes"));
+    }
+    no_nul(field, path)?;
+    if path.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(format!("{field}: contains a control character"));
     }
     Ok(())
 }
@@ -106,11 +127,7 @@ pub fn validate(body: &Review) -> Result<(), String> {
     no_nul("summary", &body.summary)?;
     let mut bytes = body.summary.len();
     for (i, c) in body.comments.iter().enumerate() {
-        check_path(&c.path)
-            .map_err(|r| format!("comments[{i}].path: workspace: invalid path: {r}"))?;
-        if c.path.is_empty() {
-            return Err(format!("comments[{i}].path: empty"));
-        }
+        check_comment_path(&format!("comments[{i}].path"), &c.path)?;
         if c.body.trim().is_empty() {
             return Err(format!("comments[{i}].body: empty"));
         }
@@ -227,10 +244,14 @@ mod tests {
         b.summary = "just a summary".into();
         assert_eq!(validate(&b), Ok(()), "a summary alone is a review");
         let mut b = body();
-        b.comments[1].path = "../etc/passwd".into();
+        b.comments[1].path = String::new();
+        assert_eq!(validate(&b), Err("comments[1].path: empty".to_string()));
+        b.comments[1].path = "d/".repeat(2048) + "f";
         assert_eq!(
             validate(&b),
-            Err("comments[1].path: workspace: invalid path: \"..\" segment".to_string())
+            Err(format!(
+                "comments[1].path: longer than {MAX_PATH_BYTES} bytes"
+            ))
         );
         let mut b = body();
         b.comments[0].body = String::new();
@@ -307,13 +328,48 @@ mod tests {
             validate(&b),
             Err("comments[0].body: contains NUL".to_string())
         );
-        // `path` is the shared rule's job, and it refuses NUL already.
         let mut b = body();
         b.comments[0].path = "src/\0lib.rs".into();
         assert_eq!(
             validate(&b),
-            Err("comments[0].path: workspace: invalid path: contains NUL".to_string())
+            Err("comments[0].path: contains NUL".to_string())
         );
+    }
+
+    /// #228: a comment's path is quoted, never opened. A backslash, a
+    /// `..` or a leading `/` that the workspace routes refuse is fine here;
+    /// a line break or another control character is not. A tab breaks
+    /// nothing.
+    #[test]
+    fn a_comment_path_is_held_to_what_the_message_can_quote() {
+        for ok in ["a\\b.txt", "../x", "/abs", ".git/config", "tab\there"] {
+            let mut b = body();
+            b.comments[0].path = ok.into();
+            assert_eq!(validate(&b), Ok(()), "{ok:?}");
+        }
+        let mut b = body();
+        b.comments.truncate(1);
+        b.comments[0].path = "a\\b.txt".into();
+        let m = render_message(&b);
+        assert!(
+            m.contains("\na\\b.txt line 80 (old):\n> -    // TODO\n"),
+            "{m}"
+        );
+        for bad in [
+            "a\nOverall:",
+            "a\rb",
+            "a\u{1b}[31mb",
+            "a\u{7f}",
+            "a\u{85}b",
+        ] {
+            let mut b = body();
+            b.comments[1].path = bad.into();
+            assert_eq!(
+                validate(&b),
+                Err("comments[1].path: contains a control character".to_string()),
+                "{bad:?}"
+            );
+        }
     }
 
     /// The per-field caps leave the rendered message unbounded: 200

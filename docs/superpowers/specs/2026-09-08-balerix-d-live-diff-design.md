@@ -103,10 +103,13 @@ The body becomes `{ "phase", "events", "workspace" }`, where `workspace` is
 `{ "head", "fingerprint" }` from `Host::workspace_version`, or `null` when
 the call fails for any reason (no worktree, a refused filter, a transport
 failure — logged at debug, never an error status, since the column must
-keep flowing). The call is made on every poll; nothing is cached. It is
-bounded at 1.5 s (`VERSION_DEADLINE`, #18): past that the poll answers
-`workspace: null` and counts a version failure, so a slow daemon stalls the
-column no more than a failing one does.
+keep flowing). Nothing is cached: a poll starts a call, unless one for the
+same agent is still in flight, and then it waits on that call's answer
+(#185). Each poll's wait is bounded at 1.5 s (`VERSION_DEADLINE`, #18):
+past that the poll answers `workspace: null` and counts a version failure,
+so a slow daemon stalls the column no more than a failing one does. The
+timed-out call keeps running, for the polls after it, so a slow daemon has
+at most one `version` per agent to run at a time.
 
 ### 3.2 The page
 

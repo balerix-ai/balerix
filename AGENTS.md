@@ -593,7 +593,11 @@ credentials, hook input, or sandbox rules.
   of the fingerprint altogether (#19). A path whose `stat` fails for any
   reason hashes as `missing`.
   The web plugin's `events.json` waits 1.5 s for it, then answers
-  `workspace: null` and counts a `version_failures_total`.
+  `workspace: null` and counts a `version_failures_total`. The call goes
+  on and a later poll for the same agent waits on it instead of starting
+  another: one call in flight per agent (`routes::shared_version`, #185).
+  The daemon side has no deadline: a hung `version` holds its agent's
+  flight until it ends.
   The review page applies a changed diff automatically (3 s rate limit),
   but never while a comment box is open.
 - `web`'s event buffer is memory only: after a plugin restart the review

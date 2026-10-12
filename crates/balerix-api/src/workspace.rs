@@ -11,6 +11,14 @@ pub const WORKSPACE_FILE_LIMIT: u64 = 1 << 20;
 pub const WORKSPACE_PATCH_LIMIT: usize = 256 << 10;
 /// A diff lists at most this many files, in path order.
 pub const WORKSPACE_FILE_COUNT_LIMIT: usize = 500;
+/// A diff's `files`, serialized as JSON, take at most this many bytes.
+/// Past it, the file that crosses the limit has its patch cut at a line
+/// boundary (`truncated` on the file), and the list stops at the first
+/// file that does not fit even without a patch (`truncated` on the diff).
+pub const WORKSPACE_DIFF_LIMIT: usize = 8 << 20;
+/// A tree lists at most this many entries, the first by name. Nothing in
+/// the answer says that more were left out.
+pub const WORKSPACE_TREE_ENTRY_LIMIT: usize = 5000;
 
 /// The rule for `path` on the `file` and `tree` routes and for comment
 /// paths: relative, `/`-separated, at most 4096 bytes, no empty, `.` or
@@ -71,7 +79,8 @@ pub struct FileDiff {
     /// Unified diff for this one file, three lines of context, the
     /// `diff --git` header included.
     pub patch: String,
-    /// The patch was cut at `WORKSPACE_PATCH_LIMIT`.
+    /// The patch was cut at `WORKSPACE_PATCH_LIMIT`, or to keep the diff
+    /// within `WORKSPACE_DIFF_LIMIT`.
     #[serde(default)]
     pub truncated: bool,
 }
@@ -85,7 +94,8 @@ pub struct WorkspaceDiff {
     pub merge_base: String,
     pub head: String,
     pub files: Vec<FileDiff>,
-    /// The file list stopped at `WORKSPACE_FILE_COUNT_LIMIT`.
+    /// The file list stopped at `WORKSPACE_FILE_COUNT_LIMIT`, or at
+    /// `WORKSPACE_DIFF_LIMIT`.
     #[serde(default)]
     pub truncated: bool,
 }
@@ -218,6 +228,8 @@ mod tests {
         assert_eq!(WORKSPACE_FILE_LIMIT, 1 << 20);
         assert_eq!(WORKSPACE_PATCH_LIMIT, 256 << 10);
         assert_eq!(WORKSPACE_FILE_COUNT_LIMIT, 500);
+        assert_eq!(WORKSPACE_DIFF_LIMIT, 8 << 20);
+        assert_eq!(WORKSPACE_TREE_ENTRY_LIMIT, 5000);
         let v = WorkspaceVersion {
             head: "h".repeat(40),
             fingerprint: "f".repeat(64),

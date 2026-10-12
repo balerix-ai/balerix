@@ -19,6 +19,34 @@ pub const LINK_PROTOCOL: u32 = 1;
 /// The header carrying `LINK_PROTOCOL`.
 pub const LINK_PROTOCOL_HEADER: &str = "balerix-link-protocol";
 
+/// The largest message, and the largest frame, either end of the link
+/// accepts (both are set on the Daemon's upgrade and the sidecar's
+/// client; each frame is sent whole, never fragmented). A sidecar whose
+/// reply would be larger answers that request `Failed` instead, so the
+/// call fails and the link stays up.
+///
+/// The workspace caps keep every reply far below it. JSON escapes a
+/// control character as `\u00XX`, six bytes, so a string serializes to
+/// at most six times its length:
+///
+/// - a diff: its `files` are at most `WORKSPACE_DIFF_LIMIT` (8 MiB) as
+///   serialized; the rest is the envelope (about 150 bytes), two object
+///   ids, and the `base_ref` the Daemon sent (a ref of at most 4096
+///   bytes, 24 KiB escaped): under 8 MiB + 25 KiB;
+/// - a tree: `WORKSPACE_TREE_ENTRY_LIMIT` (5000) entries, each a name of
+///   at most 255 bytes (1530 escaped) and 57 bytes of
+///   `{"name":"","kind":"symlink","size":18446744073709551615},`, so
+///   5000 × 1587 = 7,935,000 bytes, plus a path of at most 4096 bytes
+///   (24 KiB escaped): under 7.6 MiB;
+/// - a file: `WORKSPACE_FILE_LIMIT` (1 MiB) bytes as a JSON array of at
+///   most four characters each (`255,`): 4 MiB;
+/// - a version or a runner's answer: well under 1 KiB.
+///
+/// The largest, a full diff, is under 8.1 MiB; 16 MiB is twice that.
+/// Daemon → sidecar requests are smaller still: a `send_text` is at most
+/// `MAX_SEND_TEXT` (256 KiB, 1.5 MiB escaped).
+pub const LINK_MAX_MESSAGE: usize = 16 << 20;
+
 /// Daemon → sidecar: one request. The reply carries the same `id`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,6 +157,13 @@ pub enum FailureKind {
     Runner,
 }
 
+/// The largest message, and the largest frame, either end of an attach
+/// socket accepts (set on the Daemon's upgrade and the sidecar's client).
+/// Terminal bytes travel in pieces no larger: the sidecar sends what one
+/// PTY read gives (8 KiB at most), and the Daemon cuts the viewer's input
+/// to this size.
+pub const ATTACH_MAX_MESSAGE: usize = 64 << 10;
+
 /// Sidecar → Daemon on every change: the agent's status as the sidecar's
 /// own planner keeps it, the pane's pid as tmux reports it (opaque to the
 /// Daemon, §6.3), and how many hooks the sidecar answered for a Daemon it
@@ -158,7 +193,73 @@ pub type AgentTokens = BTreeMap<String, String>;
 mod tests {
     use super::*;
     use crate::AgentPhase;
+    use crate::{
+        EntryKind, FileDiff, FileStatus, TreeEntry, WORKSPACE_DIFF_LIMIT, WORKSPACE_FILE_LIMIT,
+        WORKSPACE_TREE_ENTRY_LIMIT,
+    };
     use serde_json::json;
+
+    fn reply_len(result: LinkResult) -> usize {
+        serde_json::to_string(&SidecarFrame::Reply(LinkReply {
+            id: u64::MAX,
+            result,
+        }))
+        .unwrap()
+        .len()
+    }
+
+    /// `LINK_MAX_MESSAGE`'s arithmetic, on the worst reply each cap allows:
+    /// every string made of control characters, which JSON escapes to six
+    /// bytes each.
+    #[test]
+    fn the_largest_replies_the_workspace_caps_allow_fit_the_link() {
+        let worst = |n: usize| "\u{1}".repeat(n);
+        let tree = reply_len(LinkResult::Tree {
+            tree: WorkspaceTree {
+                path: worst(4096),
+                entries: (0..WORKSPACE_TREE_ENTRY_LIMIT)
+                    .map(|_| TreeEntry {
+                        name: worst(255),
+                        kind: EntryKind::Symlink,
+                        size: Some(u64::MAX),
+                    })
+                    .collect(),
+            },
+        });
+        assert!(tree < 7_960_000 + 24_600 + 100, "{tree}");
+        let bytes = reply_len(LinkResult::File {
+            bytes: vec![255; usize::try_from(WORKSPACE_FILE_LIMIT).unwrap()],
+        });
+        assert!(bytes <= (4 << 20) + 100, "{bytes}");
+        // a diff's `files` fill `WORKSPACE_DIFF_LIMIT`; the envelope is the
+        // rest
+        let file = FileDiff {
+            path: worst(4096),
+            old_path: Some(worst(4096)),
+            status: FileStatus::Typechange,
+            uncommitted: true,
+            binary: false,
+            patch: worst(100_000),
+            truncated: true,
+        };
+        let one = serde_json::to_string(&file).unwrap().len() + 1; // and a comma
+        let files: Vec<FileDiff> = std::iter::repeat_n(file, WORKSPACE_DIFF_LIMIT / one).collect();
+        let files_len = serde_json::to_string(&files).unwrap().len();
+        assert!(files_len <= WORKSPACE_DIFF_LIMIT, "{files_len}");
+        let diff = reply_len(LinkResult::Diff {
+            diff: WorkspaceDiff {
+                base_ref: worst(4096),
+                merge_base: "f".repeat(64),
+                head: "f".repeat(64),
+                files,
+                truncated: true,
+            },
+        });
+        assert!(diff - files_len < 25 << 10, "{}", diff - files_len);
+        for len in [tree, bytes, diff] {
+            assert!(len * 2 <= LINK_MAX_MESSAGE, "{len}: under half the limit");
+        }
+    }
 
     #[test]
     fn requests_are_tagged_by_kind_under_op() {

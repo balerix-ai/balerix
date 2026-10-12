@@ -569,13 +569,28 @@ the Daemon's Secret.
   id and a `result` tagged `kind`, or `status` with the agent's
   `AgentStatus`, the pane's pid and the hook-failure count). File bytes
   travel as a JSON array; the 1 MiB file cap keeps that small. Both
+  ends set a 16 MiB limit per message and per frame
+  (`LINK_MAX_MESSAGE`), twice the largest reply the workspace caps
+  allow (a diff's files are at most 8 MiB of JSON, a tree at most 5000
+  entries; the arithmetic is at the constant). A sidecar whose reply
+  would still be larger answers that request `failed` (`tool`, `the reply
+  is N bytes, over the link's limit of …`), so the call fails and the
+  link stays up (#229). Both
   sockets, the link and the attach socket, carry `balerix-link-protocol:
   1`, checked before the upgrade. An attach session is bound to the agent
   the `attach` request was sent to: another agent's socket is answered as
   an unknown session (close 1008). A call in flight when its link ends or
   is replaced fails `link down` at once. The sidecar drops a link that has
   been silent for three Daemon pings (90 s) and reconnects, and bounds its
-  connect at 10 s. Workspace and runner error text crosses the link
+  connect at 10 s. The Daemon likewise drops a link that has brought it
+  nothing, not even a pong, for three of its pings: the agent is then
+  link-down and calls to it fail at once rather than at their timeout
+  (#230). On both ends a send counts against the same deadline, so a
+  send blocked on a peer that stopped reading (a large reply on its way
+  to a lost node) cannot hold the link open past it (#231). A full-size
+  reply (about 8.1 MiB) must therefore arrive within what is left of
+  that window once the sidecar has read the request, at least a minute
+  after a diff's 25 s budget: roughly 140 KB/s. Workspace and runner error text crosses the link
   without the id prefix, which the Daemon adds back.
 
 ## 8. Storage

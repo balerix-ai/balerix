@@ -10,7 +10,7 @@ pub mod tls;
 
 pub use declared::DeclaredPlugins;
 pub use idle::{NoFiles, NoPool};
-pub use link::{ATTACH_WAIT, LINK_CALL_TIMEOUT, LinkError, LinkHub};
+pub use link::{ATTACH_WAIT, LINK_CALL_TIMEOUT, LinkError, LinkHub, PING_INTERVAL, SILENT_PINGS};
 pub use tls::{TlsServer, client_config, no_roots, serve_tls};
 
 /// `FleetRecord.owner` of a fleet the operator applied (§7.3).

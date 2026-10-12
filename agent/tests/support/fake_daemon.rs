@@ -13,7 +13,7 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::{get, post};
-use balerix_api::{LinkRequest, SidecarFrame};
+use balerix_api::{LINK_MAX_MESSAGE, LinkRequest, SidecarFrame};
 use futures_util::SinkExt;
 use tokio::sync::{mpsc, watch};
 
@@ -42,6 +42,10 @@ struct Fake {
 }
 
 async fn link_route(State(f): State<Fake>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    // the Daemon's limits (`kube/link.rs`)
+    let ws = ws
+        .max_message_size(LINK_MAX_MESSAGE)
+        .max_frame_size(LINK_MAX_MESSAGE);
     ws.on_upgrade(move |mut socket: WebSocket| async move {
         let (to_tx, mut to_rx) = mpsc::unbounded_channel::<LinkRequest>();
         let (from_tx, from_rx) = mpsc::unbounded_channel::<SidecarFrame>();

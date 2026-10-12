@@ -14,6 +14,7 @@ use balerix_api::{
 use balerix_core::{
     AgentId, AgentRunner, PassThrough, ProcessState, RunnerError, WorkspaceError, WorkspaceReader,
 };
+use balerix_server::kube::{PING_INTERVAL, SILENT_PINGS};
 use balerix_server::testing::Harness;
 use balerix_server::{Daemon, router, serve};
 use futures_util::{SinkExt, StreamExt};
@@ -311,4 +312,71 @@ async fn a_call_in_flight_fails_link_down_when_its_link_closes_or_is_replaced() 
         started.elapsed() < Duration::from_secs(5),
         "not the timeout path"
     );
+}
+
+/// A sidecar that answers pings stays linked however long it is quiet;
+/// one that stops reading (a node gone without a FIN, a frozen sidecar)
+/// is dropped after `SILENT_PINGS` intervals with nothing from it, and
+/// calls to it fail at once (#230).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sidecar_silent_for_three_pings_is_dropped() {
+    const PING: Duration = Duration::from_secs(1);
+    let h = Harness::kube_with_ping(Duration::from_secs(3600), PING);
+    let w = world(&h).await;
+    let name = "f".parse().unwrap();
+    w.daemon
+        .apply_kube(&name, spec(), tokens(), None)
+        .await
+        .unwrap();
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let token = w.daemon.hook_secret(&id).await.unwrap();
+    let hub = w.daemon.kube().unwrap().clone();
+
+    let ws = connect(w.port, &token, "1").await.unwrap();
+    wait_for(async || hub.linked(&id)).await;
+    // reading answers the Daemon's pings; told to stop, the sidecar keeps
+    // its socket open and reads nothing more
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let reader = tokio::spawn(async move {
+        let mut ws = ws;
+        let mut stopped = stopped;
+        loop {
+            tokio::select! {
+                _ = &mut stopped => return ws,
+                msg = ws.next() => assert!(matches!(msg, Some(Ok(_))), "{msg:?}"),
+            }
+        }
+    });
+    tokio::time::sleep(PING * (SILENT_PINGS * 2)).await;
+    assert!(hub.linked(&id), "a sidecar that answers pings stays linked");
+
+    stop.send(()).unwrap();
+    let _held = reader.await.unwrap();
+    let silent = Instant::now();
+    wait_for(async || !hub.linked(&id)).await;
+    let after = silent.elapsed();
+    assert!(
+        after >= PING * (SILENT_PINGS - 1),
+        "dropped after {after:?}, before the deadline"
+    );
+    let started = Instant::now();
+    let (hub2, id2) = (hub.clone(), id.clone());
+    let err = tokio::task::spawn_blocking(move || hub2.send_text(&id2, "hi", false))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        err,
+        RunnerError::Link {
+            id: "f/c/a".into(),
+            message: "link down".into(),
+        }
+    );
+    assert!(started.elapsed() < Duration::from_secs(1), "at once");
+}
+
+#[test]
+fn the_daemon_drops_a_link_after_three_silent_pings() {
+    assert_eq!(PING_INTERVAL, Duration::from_secs(30));
+    assert_eq!(SILENT_PINGS, 3);
 }

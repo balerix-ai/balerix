@@ -32,8 +32,8 @@ pub use credentials::CredentialBundle;
 pub use fleet::{CrewSpec, FleetSpec, GitAuth, GitIdentity, GitSettings};
 pub use hook::{HOOK_EVENTS, HookEvent};
 pub use link::{
-    AgentTokens, FailureKind, LINK_PROTOCOL, LINK_PROTOCOL_HEADER, LinkFailure, LinkOp, LinkReply,
-    LinkRequest, LinkResult, LinkStatus, SidecarFrame,
+    AgentTokens, FailureKind, LINK_MAX_MESSAGE, LINK_PROTOCOL, LINK_PROTOCOL_HEADER, LinkFailure,
+    LinkOp, LinkReply, LinkRequest, LinkResult, LinkStatus, SidecarFrame,
 };
 pub use plugin::{
     Capability, DeclaredPlugin, DeclaredPlugins, HelloRequest, HelloResponse, HookSubscriptions,
@@ -54,8 +54,9 @@ pub use status::{
     PluginActivation, SpecHash, Timestamp,
 };
 pub use workspace::{
-    EntryKind, FileDiff, FileStatus, TreeEntry, WORKSPACE_FILE_COUNT_LIMIT, WORKSPACE_FILE_LIMIT,
-    WORKSPACE_PATCH_LIMIT, WorkspaceDiff, WorkspaceTree, WorkspaceVersion, check_path,
+    EntryKind, FileDiff, FileStatus, TreeEntry, WORKSPACE_DIFF_LIMIT, WORKSPACE_FILE_COUNT_LIMIT,
+    WORKSPACE_FILE_LIMIT, WORKSPACE_PATCH_LIMIT, WORKSPACE_TREE_ENTRY_LIMIT, WorkspaceDiff,
+    WorkspaceTree, WorkspaceVersion, check_path,
 };
 
 #[cfg(test)]

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use balerix_api::{
-    FailureKind, LINK_PROTOCOL, LINK_PROTOCOL_HEADER, LinkFailure, LinkOp, LinkReply, LinkRequest,
-    LinkResult, LinkStatus, SidecarFrame,
+    FailureKind, LINK_MAX_MESSAGE, LINK_PROTOCOL, LINK_PROTOCOL_HEADER, LinkFailure, LinkOp,
+    LinkReply, LinkRequest, LinkResult, LinkStatus, SidecarFrame,
 };
 use balerix_core::{AgentId, AgentRunner, RunnerError, WorkspaceError, WorkspaceReader};
 use futures_util::{SinkExt, StreamExt};
@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
 };
@@ -81,16 +82,32 @@ pub fn ws_url(daemon_url: &str, path: &str) -> String {
     format!("{base}{path}")
 }
 
+/// A socket's limit on each message and frame, as the Daemon's upgrade
+/// sets it: `LINK_MAX_MESSAGE` for the link, `ATTACH_MAX_MESSAGE` for an
+/// attach socket. `None` keeps tungstenite's defaults.
+fn ws_config(max_message: Option<usize>) -> Option<WebSocketConfig> {
+    max_message.map(|max| {
+        WebSocketConfig::default()
+            .max_message_size(Some(max))
+            .max_frame_size(Some(max))
+    })
+}
+
 /// A socket to the Daemon at `path`, with the token and the protocol,
-/// within `CONNECT_TIMEOUT`.
-pub async fn connect(deps: &LinkDeps, path: &str) -> Result<Ws> {
+/// within `CONNECT_TIMEOUT`, accepting messages of up to `max_message`
+/// (`ATTACH_MAX_MESSAGE` for an attach socket).
+pub async fn connect(deps: &LinkDeps, path: &str, max_message: Option<usize>) -> Result<Ws> {
     let mut req = ws_url(&deps.daemon_url, path).into_client_request()?;
     req.headers_mut()
         .insert(AUTHORIZATION, format!("Bearer {}", deps.token).parse()?);
     req.headers_mut()
         .insert(LINK_PROTOCOL_HEADER, LINK_PROTOCOL.to_string().parse()?);
-    let connecting =
-        connect_async_tls_with_config(req, None, false, Some(Connector::Rustls(deps.tls.clone())));
+    let connecting = connect_async_tls_with_config(
+        req,
+        ws_config(max_message),
+        false,
+        Some(Connector::Rustls(deps.tls.clone())),
+    );
     let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
         .await
         .map_err(|_| anyhow::anyhow!("no answer within {} s", CONNECT_TIMEOUT.as_secs()))??;
@@ -107,7 +124,13 @@ pub async fn run(deps: Arc<LinkDeps>) {
 pub async fn run_with_idle(deps: Arc<LinkDeps>, idle: Duration) {
     let mut backoff = RECONNECT_MIN;
     loop {
-        match connect(&deps, &format!("/v1/agents/{}/link", deps.id)).await {
+        match connect(
+            &deps,
+            &format!("/v1/agents/{}/link", deps.id),
+            Some(LINK_MAX_MESSAGE),
+        )
+        .await
+        {
             Ok(ws) => {
                 tracing::info!("link up");
                 backoff = RECONNECT_MIN;
@@ -121,10 +144,58 @@ pub async fn run_with_idle(deps: Arc<LinkDeps>, idle: Duration) {
     }
 }
 
-async fn send(ws: &mut Ws, frame: &SidecarFrame) -> Result<()> {
-    ws.send(Message::Text(serde_json::to_string(frame)?.into()))
-        .await?;
+/// `frame` on the link, given up at `deadline`, the session's idle limit:
+/// a send blocked on a Daemon that stopped reading (a node lost while a
+/// large reply is on its way) must not keep the session from noticing,
+/// and the `select!` in `session` does not poll its deadline while one of
+/// its arms is sending (#231).
+async fn send(ws: &mut Ws, frame: &SidecarFrame, deadline: tokio::time::Instant) -> Result<()> {
+    let text = frame_text(frame)?;
+    send_message(ws, Message::Text(text.into()), deadline).await
+}
+
+async fn send_message(ws: &mut Ws, msg: Message, deadline: tokio::time::Instant) -> Result<()> {
+    tokio::time::timeout_at(deadline, ws.send(msg))
+        .await
+        .map_err(|_| anyhow::anyhow!("the Daemon took nothing before the idle limit"))??;
     Ok(())
+}
+
+/// `frame` as the text the link carries. A reply over `LINK_MAX_MESSAGE`
+/// goes as a failure of that request instead: the Daemon would drop the
+/// whole link on a message over its limit, failing every call in flight
+/// (#229). The workspace caps keep every reply far below it.
+fn frame_text(frame: &SidecarFrame) -> Result<String> {
+    let text = serde_json::to_string(frame)?;
+    if text.len() <= LINK_MAX_MESSAGE {
+        return Ok(text);
+    }
+    let SidecarFrame::Reply(reply) = frame else {
+        anyhow::bail!(
+            "a link frame of {} bytes, over the {LINK_MAX_MESSAGE}-byte limit",
+            text.len()
+        );
+    };
+    tracing::warn!(
+        id = reply.id,
+        bytes = text.len(),
+        "link: a reply over the limit"
+    );
+    let failed = SidecarFrame::Reply(LinkReply {
+        id: reply.id,
+        result: LinkResult::Failed {
+            // as a timeout crosses (#213): the plugin then reads the
+            // message, where an `io` failure is a fixed line
+            failure: LinkFailure {
+                reason: FailureKind::Tool,
+                message: format!(
+                    "the reply is {} bytes, over the link's limit of {LINK_MAX_MESSAGE}",
+                    text.len()
+                ),
+            },
+        },
+    });
+    Ok(serde_json::to_string(&failed)?)
 }
 
 async fn session(deps: Arc<LinkDeps>, mut ws: Ws, idle: Duration) {
@@ -133,33 +204,20 @@ async fn session(deps: Arc<LinkDeps>, mut ws: Ws, idle: Duration) {
     // the current status first, before any request is read: the Daemon
     // reconciles the stopped set on each connection's first status, and a
     // Daemon that restarted sees the agent at once
+    // reset by every frame the Daemon sends, its pings among them; what
+    // the sidecar sends proves nothing about the other end. Every send is
+    // bounded by it too.
+    let mut deadline = tokio::time::Instant::now() + idle;
     let current = status.borrow_and_update().clone();
-    if send(&mut ws, &SidecarFrame::Status(current)).await.is_err() {
+    if let Err(e) = send(&mut ws, &SidecarFrame::Status(current), deadline).await {
+        tracing::warn!("link: {e}");
         return;
     }
-    // reset by every frame the Daemon sends, its pings among them; what
-    // the sidecar sends proves nothing about the other end
-    let mut deadline = tokio::time::Instant::now() + idle;
     loop {
         tokio::select! {
-            () = tokio::time::sleep_until(deadline) => {
-                tracing::warn!("link: nothing from the Daemon in {} s", idle.as_secs());
-                return;
-            }
-            changed = status.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                let frame = SidecarFrame::Status(status.borrow_and_update().clone());
-                if send(&mut ws, &frame).await.is_err() {
-                    return;
-                }
-            }
-            Some(frame) = out_rx.recv() => {
-                if send(&mut ws, &frame).await.is_err() {
-                    return;
-                }
-            }
+            // a frame that is already here counts before the deadline
+            // is judged: a loaded host can be late to both
+            biased;
             msg = ws.next() => {
                 if matches!(msg, Some(Ok(_))) {
                     deadline = tokio::time::Instant::now() + idle;
@@ -179,12 +237,33 @@ async fn session(deps: Arc<LinkDeps>, mut ws: Ws, idle: Duration) {
                         Err(e) => tracing::warn!("link: not a request: {e}"),
                     },
                     Some(Ok(Message::Ping(p))) => {
-                        if ws.send(Message::Pong(p)).await.is_err() {
+                        if let Err(e) = send_message(&mut ws, Message::Pong(p), deadline).await {
+                            tracing::warn!("link: {e}");
                             return;
                         }
                     }
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
                     Some(Ok(_)) => {}
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                tracing::warn!("link: nothing from the Daemon in {} s", idle.as_secs());
+                return;
+            }
+            changed = status.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let frame = SidecarFrame::Status(status.borrow_and_update().clone());
+                if let Err(e) = send(&mut ws, &frame, deadline).await {
+                    tracing::warn!("link: {e}");
+                    return;
+                }
+            }
+            Some(frame) = out_rx.recv() => {
+                if let Err(e) = send(&mut ws, &frame, deadline).await {
+                    tracing::warn!("link: {e}");
+                    return;
                 }
             }
         }

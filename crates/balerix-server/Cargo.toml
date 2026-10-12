@@ -30,6 +30,8 @@ ureq = { workspace = true }
 reqwest = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+# `kube/pty.rs` splits an attach socket so its reads never wait on a send
+futures-util = { workspace = true }
 hyper-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 tracing = { workspace = true }

@@ -15,8 +15,9 @@ use axum::routing::get;
 use balerix_agent::link::{Control, LINK_IDLE, LinkDeps, run, run_with_idle};
 use balerix_agent::tls::client_config;
 use balerix_api::{
-    AgentPhase, AgentStatus, FailureKind, LinkOp, LinkRequest, LinkResult, LinkStatus,
-    SidecarFrame, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
+    AgentPhase, AgentStatus, EntryKind, FailureKind, FileDiff, FileStatus, LINK_MAX_MESSAGE,
+    LinkOp, LinkRequest, LinkResult, LinkStatus, SidecarFrame, TreeEntry, WorkspaceDiff,
+    WorkspaceTree, WorkspaceVersion,
 };
 use balerix_core::fakes::FakeRunner;
 use balerix_core::{AgentId, WorkspaceError, WorkspaceReader};
@@ -25,13 +26,34 @@ use tokio::sync::{mpsc, watch};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
-/// A reader of two paths: `f` is five bytes, anything else is absent;
-/// the other reads are never made here.
+/// A reader of two paths: `f` is five bytes, anything else is absent.
+/// Its diff is about `BIG_DIFF` of patches as JSON, within the link's
+/// limit but far more than the sockets' buffers hold.
 struct TwoFiles;
 
+const BIG_DIFF: usize = 10 << 20;
+
 impl WorkspaceReader for TwoFiles {
-    fn diff(&self, _: &AgentId, _: &str) -> Result<WorkspaceDiff, WorkspaceError> {
-        Err(WorkspaceError::NoSuchPath)
+    fn diff(&self, _: &AgentId, base_ref: &str) -> Result<WorkspaceDiff, WorkspaceError> {
+        // ten bytes a line as JSON (`\n` is escaped)
+        let patch = "+abcdefg\n".repeat((256 << 10) / 10);
+        Ok(WorkspaceDiff {
+            base_ref: base_ref.into(),
+            merge_base: String::new(),
+            head: String::new(),
+            files: (0..BIG_DIFF / patch.len())
+                .map(|i| FileDiff {
+                    path: format!("f{i}"),
+                    old_path: None,
+                    status: FileStatus::Added,
+                    uncommitted: true,
+                    binary: false,
+                    patch: patch.clone(),
+                    truncated: false,
+                })
+                .collect(),
+            truncated: false,
+        })
     }
     fn read_file(&self, _: &AgentId, path: &str) -> Result<Vec<u8>, WorkspaceError> {
         if path == "f" {
@@ -40,8 +62,22 @@ impl WorkspaceReader for TwoFiles {
             Err(WorkspaceError::NoSuchPath)
         }
     }
-    fn list_dir(&self, _: &AgentId, _: &str) -> Result<WorkspaceTree, WorkspaceError> {
-        Err(WorkspaceError::NoSuchPath)
+    /// `huge` is a listing larger than the link carries, as no capped
+    /// reader would answer.
+    fn list_dir(&self, _: &AgentId, path: &str) -> Result<WorkspaceTree, WorkspaceError> {
+        if path != "huge" {
+            return Err(WorkspaceError::NoSuchPath);
+        }
+        Ok(WorkspaceTree {
+            path: path.into(),
+            entries: (0..80_000)
+                .map(|i| TreeEntry {
+                    name: format!("{i:0>250}"),
+                    kind: EntryKind::File,
+                    size: Some(0),
+                })
+                .collect(),
+        })
     }
     fn version(&self, _: &AgentId, _: &str) -> Result<WorkspaceVersion, WorkspaceError> {
         Err(WorkspaceError::NoSuchPath)
@@ -275,6 +311,118 @@ async fn the_link_connects_answers_requests_and_reconnects() {
         SidecarFrame::Status(s) => assert_eq!(s.status.phase, AgentPhase::Ready),
         other => panic!("{other:?}"),
     }
+}
+
+/// A reply over the link's message limit fails its call; the link stays
+/// up and answers the next request (#229).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_over_the_link_limit_fails_the_call_not_the_link() {
+    let mut daemon = FakeDaemon::start(None).await;
+    let _side = start_sidecar_link(&format!("http://{}", daemon.addr));
+    let mut conn = tokio::time::timeout(Duration::from_secs(5), daemon.links.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    conn.to_sidecar
+        .send(LinkRequest {
+            id: 1,
+            op: LinkOp::WorkspaceTree {
+                path: "huge".into(),
+            },
+        })
+        .unwrap();
+    let (id, result) = tokio::time::timeout(Duration::from_secs(30), reply(&mut conn))
+        .await
+        .unwrap();
+    assert_eq!(id, 1);
+    let LinkResult::Failed { failure } = result else {
+        panic!("{result:?}");
+    };
+    assert_eq!(failure.reason, FailureKind::Tool);
+    assert!(
+        failure.message.starts_with("the reply is ")
+            && failure.message.ends_with(&format!(
+                "bytes, over the link's limit of {LINK_MAX_MESSAGE}"
+            )),
+        "{}",
+        failure.message
+    );
+    // the same connection answers the next request
+    conn.to_sidecar
+        .send(LinkRequest {
+            id: 2,
+            op: LinkOp::WorkspaceFile { path: "f".into() },
+        })
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), reply(&mut conn))
+            .await
+            .unwrap(),
+        (
+            2,
+            LinkResult::File {
+                bytes: b"hello".to_vec()
+            }
+        )
+    );
+    assert!(daemon.links.try_recv().is_err(), "no second link");
+}
+
+/// A Daemon that stops reading while the sidecar sends it a reply larger
+/// than the sockets hold: the send is given up at the idle limit and the
+/// sidecar reconnects, rather than waiting for TCP to give up (#231).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_blocked_on_a_daemon_that_stopped_reading_ends_at_the_idle_limit() {
+    // a small receive buffer, inherited by every accepted socket, so the
+    // reply cannot vanish into the kernel
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(16 << 10).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(16).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (conns, mut conns_rx) = mpsc::unbounded_channel::<Instant>();
+    let silent = Router::new().route(
+        "/v1/agents/{f}/{c}/{a}/link",
+        get(move |ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(move |mut socket: WebSocket| async move {
+                let _ = conns.send(Instant::now());
+                let req = LinkRequest {
+                    id: 1,
+                    op: LinkOp::WorkspaceDiff {
+                        base_ref: "origin/main".into(),
+                    },
+                };
+                let _ = socket
+                    .send(AxMsg::Text(serde_json::to_string(&req).unwrap().into()))
+                    .await;
+                // then nothing: no reads, no pings, the socket held open
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                drop(socket);
+            })
+        }),
+    );
+    tokio::spawn(axum::serve(listener, silent).into_future());
+    let reply = serde_json::to_string(&TwoFiles.diff(&"f/c/a".parse().unwrap(), "x").unwrap())
+        .unwrap()
+        .len();
+    assert!(
+        (8 << 20..LINK_MAX_MESSAGE).contains(&reply),
+        "{reply}: a reply the link carries"
+    );
+    let (deps, _side) = sidecar(&url);
+    let idle = Duration::from_secs(2);
+    tokio::spawn(run_with_idle(deps, idle));
+
+    let first = tokio::time::timeout(Duration::from_secs(5), conns_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // the idle limit (2 s) and the first back-off (1 s), with room
+    let second = tokio::time::timeout(Duration::from_secs(10), conns_rx.recv())
+        .await
+        .expect("the sidecar stayed in a send to a Daemon that stopped reading")
+        .unwrap();
+    assert!(second - first >= idle, "{:?}", second - first);
 }
 
 /// A Daemon whose node died: the socket stays open and nothing arrives,

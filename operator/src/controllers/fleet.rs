@@ -1,8 +1,10 @@
 //! The Fleet controller (Spec O §5.2, §21.2): resolve, mint the missing
 //! agent tokens, `PUT` the Daemon, then the children; a rejection lands
 //! nothing. The record it reads back is the status the Agents mirror. On
-//! deletion it waits for the Agents, downs the fleet on the Daemon and,
-//! for `retain: None`, runs one cleanup Job per crew.
+//! deletion it waits for the Agents, downs the fleet on the Daemon,
+//! for `retain: None` runs one cleanup Job per crew and, for a Fleet
+//! marked `balerix.ai/purge: "true"`, then purges its record on the Daemon
+//! (§25).
 
 use std::sync::Arc;
 
@@ -17,7 +19,7 @@ use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher;
 use kube::{Api, ResourceExt};
 
-use super::agent::PURGE_ANNOTATION;
+use super::agent::{PURGE_ANNOTATION, harvest_escape, purge_marked};
 use super::daemon::{authority_and_token, read_secret_string};
 use super::jobs::ensure_job;
 use super::{
@@ -354,9 +356,14 @@ async fn apply_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, Err
 async fn deleting(ctx: &Context, fleet: &Fleet, why: &Error) {
     let message = match why {
         Error::Waiting(m) => m.clone(),
-        // the one Daemon call of a cleanup
+        // the down; the purge's failure is `Error::Purge`
         Error::Daemon(e) => format!(
             "Fleet {}: Daemon {} did not take the down: {e}",
+            fleet.name_any(),
+            fleet.spec.daemon
+        ),
+        Error::Purge(e) => format!(
+            "Fleet {}: Daemon {} did not take the purge: {e}; it is retried, and removing the annotation {PURGE_ANNOTATION} lets the Fleet go with its record kept",
             fleet.name_any(),
             fleet.spec.daemon
         ),
@@ -400,16 +407,21 @@ async fn cleanup_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
         }
         let names: Vec<String> = remaining.iter().map(ResourceExt::name_any).collect();
         return Err(Error::Waiting(format!(
-            "Fleet {key}: {} agents still exist ({}); an Agent's harvest is skipped by the annotation {PURGE_ANNOTATION}=true on the Agent or the Fleet",
+            "Fleet {key}: {} agents still exist ({}); {}",
             remaining.len(),
-            names.join(", ")
+            names.join(", "),
+            harvest_escape()
         )));
     }
 
     // 2. down on the Daemon; a Daemon that is gone has nothing to down
+    let mut daemon_client = None;
     if let Some(daemon) = daemon_of(&ctx, &namespace, &fleet.spec.daemon).await? {
         match client_for(&ctx, &daemon).await {
-            Ok(client) => client.down(&name).await?,
+            Ok(client) => {
+                client.down(&name).await?;
+                daemon_client = Some(client);
+            }
             Err(Error::Missing(why)) => tracing::warn!(fleet = %key, "not downed: {why}"),
             Err(e) => return Err(e),
         }
@@ -453,6 +465,15 @@ async fn cleanup_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
         }
     }
 
+    // 4. marked: the record purged on the Daemon, last, so a failed
+    //    cleanup leaves it to read (§25). A record the Daemon no longer
+    //    has is purged already. With no Daemon object, or no authority
+    //    to reach it with, step 2 downed nothing and this purges nothing.
+    let purge = purge_marked(fleet.as_ref());
+    if purge && let Some(client) = &daemon_client {
+        client.purge(&name).await.map_err(Error::Purge)?;
+    }
+
     ctx.records
         .write()
         .unwrap_or_else(|e| e.into_inner())
@@ -469,6 +490,6 @@ async fn cleanup_fleet(fleet: Arc<Fleet>, ctx: Arc<Context>) -> Result<Action, E
     {
         list.retain(|f| f != &name);
     }
-    tracing::info!(fleet = %key, "removed");
+    tracing::info!(fleet = %key, purged = purge && daemon_client.is_some(), "removed");
     Ok(Action::await_change())
 }

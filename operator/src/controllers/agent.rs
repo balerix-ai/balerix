@@ -33,8 +33,27 @@ use crate::desired::fleet::HARVEST_FINALIZER;
 use crate::desired::jobs::{JobContext, harvest_job};
 use crate::desired::names;
 
-/// On an Agent or its Fleet: skip the harvest, as `--purge` does (§8.5).
+/// On an Agent: skip its harvest, as `--purge` does (§8.5). On a Fleet,
+/// read only while the Fleet is being deleted: skip every Agent's harvest
+/// and purge the fleet's record on the Daemon (§25, #135). A Fleet marked
+/// from the start still harvests the Agents dropped during its life. Only
+/// the value `"true"` counts.
 pub const PURGE_ANNOTATION: &str = "balerix.ai/purge";
+
+/// The escape a stuck harvest names, on the Agent and on its Fleet.
+pub fn harvest_escape() -> String {
+    format!(
+        "the annotation {PURGE_ANNOTATION}=true on the Agent skips its harvest; on the Fleet, while the Fleet is deleted, it skips every harvest and also purges the Fleet's record on the Daemon"
+    )
+}
+
+/// The object carries `balerix.ai/purge: "true"`.
+pub fn purge_marked(object: &impl ResourceExt) -> bool {
+    object
+        .annotations()
+        .get(PURGE_ANNOTATION)
+        .is_some_and(|v| v == "true")
+}
 
 pub async fn controller(ctx: Arc<Context>, watches: &kube::Client, namespace: Option<&str>) {
     let client = watches;
@@ -314,11 +333,11 @@ async fn deleting(ctx: &Context, agent: &Agent, condition: Cond) -> Error {
     Error::Waiting(message)
 }
 
-fn purged(agent: &Agent, fleet: Option<&Fleet>) -> bool {
-    let marked = |a: &std::collections::BTreeMap<String, String>| {
-        a.get(PURGE_ANNOTATION).is_some_and(|v| v == "true")
-    };
-    marked(agent.annotations()) || fleet.is_some_and(|f| marked(f.annotations()))
+/// The Agent's own mark, or its Fleet's once the Fleet is being deleted
+/// (§8.5, §25.3).
+fn harvest_skipped(agent: &Agent, fleet: Option<&Fleet>) -> bool {
+    purge_marked(agent)
+        || fleet.is_some_and(|f| f.metadata.deletion_timestamp.is_some() && purge_marked(f))
 }
 
 async fn cleanup_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Error> {
@@ -356,7 +375,7 @@ async fn cleanup_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, E
     let fleet_going_whole = fleet
         .as_ref()
         .is_some_and(|f| f.metadata.deletion_timestamp.is_some() && f.spec.retain == Retain::None);
-    if !purged(&agent, fleet.as_ref()) && !fleet_going_whole {
+    if !harvest_skipped(&agent, fleet.as_ref()) && !fleet_going_whole {
         let job_ctx = JobContext {
             namespace: &namespace,
             daemon: &agent.spec.daemon,
@@ -372,9 +391,7 @@ async fn cleanup_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, E
             Some((&agent.spec.fleet, &agent.spec.crew)),
         )
         .await?;
-        let purge = format!(
-            "the annotation {PURGE_ANNOTATION}=true on the Agent or its Fleet skips the harvest"
-        );
+        let purge = harvest_escape();
         match ensured.outcome {
             JobOutcome::Succeeded(message) => tracing::info!(agent = %name, "{message}"),
             // the namespace takes the claim with it; there is nowhere to harvest to

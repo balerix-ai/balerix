@@ -1191,7 +1191,7 @@ async fn a_crew_dropped_from_the_fleet_is_removed_and_its_agent_harvested() {
     assert_eq!(
         ready.message,
         format!(
-            "Agent {ns}/f-d-a: harvest Job f-d-a-harvest not finished; the annotation balerix.ai/purge=true on the Agent or its Fleet skips the harvest"
+            "Agent {ns}/f-d-a: harvest Job f-d-a-harvest not finished; the annotation balerix.ai/purge=true on the Agent skips its harvest; on the Fleet, while the Fleet is deleted, it skips every harvest and also purges the Fleet's record on the Daemon"
         )
     );
     finish_job(
@@ -1570,6 +1570,255 @@ async fn fleet_deletion_with_retain_none_downs_the_daemon_and_runs_the_cleanup_j
         fleets.get_opt("f").await.unwrap().is_none().then_some(())
     })
     .await;
+    // O-16: unmarked, a plain down, which keeps the record
+    assert!(
+        stub.delete_queries().iter().all(|(_, q)| !q.purge),
+        "{:?}",
+        stub.delete_queries()
+    );
+    operator.abort();
+}
+
+/// A Fleet of one crew of one agent, annotated `balerix.ai/purge` with
+/// `purge` (§25); its agent's pod made, then the Fleet deleted.
+async fn delete_annotated_fleet(
+    client: &kube::Client,
+    ns: &str,
+    retain: &str,
+    purge: &str,
+) -> Api<Fleet> {
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), ns);
+    let mut fleet = Fleet::new("f", fleet_spec("default", &[("c", &["a"])], retain));
+    fleet.metadata.annotations = Some(
+        [("balerix.ai/purge".to_string(), purge.to_string())]
+            .into_iter()
+            .collect(),
+    );
+    fleets.create(&PostParams::default(), &fleet).await.unwrap();
+    crew_ready(client, ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    wait_for("the pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    fleets.delete("f", &DeleteParams::default()).await.unwrap();
+    reap_pod(client, ns, "f-c-a", Duration::from_secs(60)).await;
+    fleets
+}
+
+/// §25 (#135): a marked Fleet is downed, its crews cleaned up, and only
+/// then purged on the Daemon, forced as the down is; the finalizer goes
+/// after the purge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purge_marked_fleet_is_purged_after_its_down_and_cleanup_job() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("purgemarked").await;
+    let client = env.client.clone();
+    let fleets = delete_annotated_fleet(&client, &ns, "None", "true").await;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    wait_for("the cleanup Job", Duration::from_secs(60), || async {
+        jobs.get_opt("f-c-remove").await.unwrap()
+    })
+    .await;
+    let purged = || async {
+        stub.delete_queries()
+            .iter()
+            .any(|(f, q)| f == "f" && q.purge)
+            .then_some(())
+    };
+    // downed, and not purged while the cleanup runs
+    assert!(
+        stub.delete_queries()
+            .iter()
+            .any(|(f, q)| f == "f" && q.force && !q.purge),
+        "{:?}",
+        stub.delete_queries()
+    );
+    hold_for(
+        "a purge before the cleanup finished",
+        Duration::from_secs(3),
+        purged,
+    )
+    .await;
+    assert!(fleets.get_opt("f").await.unwrap().is_some());
+    finish_job(&client, &ns, "f-c-remove", true, Some("removed")).await;
+    wait_for("the Fleet gone", Duration::from_secs(60), || async {
+        fleets.get_opt("f").await.unwrap().is_none().then_some(())
+    })
+    .await;
+    let queries = stub.delete_queries();
+    let first_purge = queries.iter().position(|(_, q)| q.purge).expect("a purge");
+    assert!(
+        queries[..first_purge].iter().all(|(_, q)| !q.purge) && first_purge > 0,
+        "the down comes first: {queries:?}"
+    );
+    let (fleet, purge) = queries.last().unwrap();
+    assert_eq!(fleet, "f");
+    assert!(
+        purge.purge && purge.force && !purge.keep_repos && !purge.keep_sessions,
+        "{purge:?}"
+    );
+    operator.abort();
+}
+
+/// §25: a value other than `"true"` is no mark: the deletion is a plain
+/// down (O-16), with no purge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fleet_not_marked_true_is_downed_and_not_purged() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("purgeunmarked").await;
+    let client = env.client.clone();
+    let fleets = delete_annotated_fleet(&client, &ns, "None", "yes").await;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    wait_for("the cleanup Job", Duration::from_secs(60), || async {
+        jobs.get_opt("f-c-remove").await.unwrap()
+    })
+    .await;
+    finish_job(&client, &ns, "f-c-remove", true, Some("removed")).await;
+    wait_for("the Fleet gone", Duration::from_secs(60), || async {
+        fleets.get_opt("f").await.unwrap().is_none().then_some(())
+    })
+    .await;
+    let queries = stub.delete_queries();
+    assert!(
+        !queries.is_empty() && queries.iter().all(|(f, q)| f == "f" && q.force && !q.purge),
+        "{queries:?}"
+    );
+    operator.abort();
+}
+
+/// §25: a purge the Daemon fails says so on the Fleet and holds it; a
+/// Daemon with no record left (404) is purged already, and the finalizer
+/// goes. `retain: Branches` with the mark runs no cleanup Job and no
+/// harvest: the crew cache is kept, and only the record goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_purge_is_retried_and_a_404_lets_the_fleet_go() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("purge404").await;
+    // every purge fails until the test says otherwise
+    stub.answer_purges(&[axum::http::StatusCode::INTERNAL_SERVER_ERROR]);
+    let client = env.client.clone();
+    let fleets = delete_annotated_fleet(&client, &ns, "Branches", "true").await;
+    let ready = wait_for(
+        "Deleting with the purge's failure",
+        Duration::from_secs(60),
+        || async {
+            let s = fleets.get_opt("f").await.unwrap()?.status?;
+            let c = condition(&s.conditions, "Ready").clone();
+            (c.reason == "Deleting" && c.message.contains("did not take the purge")).then_some(c)
+        },
+    )
+    .await;
+    assert_eq!(ready.status, "False");
+    assert_eq!(
+        ready.message,
+        "Fleet f: Daemon default did not take the purge: the Daemon answered 500: no purge of f (500 Internal Server Error); it is retried, and removing the annotation balerix.ai/purge lets the Fleet go with its record kept"
+    );
+    assert!(fleets.get_opt("f").await.unwrap().is_some());
+    stub.answer_purges(&[axum::http::StatusCode::NOT_FOUND]);
+    wait_for("the Fleet gone", Duration::from_secs(60), || async {
+        fleets.get_opt("f").await.unwrap().is_none().then_some(())
+    })
+    .await;
+    let purges = stub
+        .delete_queries()
+        .iter()
+        .filter(|(_, q)| q.purge)
+        .count();
+    assert!(purges >= 2, "{:?}", stub.delete_queries());
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    assert!(jobs.get_opt("f-c-remove").await.unwrap().is_none());
+    assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_none());
+    operator.abort();
+}
+
+/// §25.3: a Fleet marked from the start ("purge on delete", as a GitOps
+/// manifest carries it) still harvests an Agent dropped during its life;
+/// only its deletion skips the harvests, and then purges its record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fleet_marked_from_the_start_harvests_until_it_is_deleted() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, stub, _clock, operator) = world("purgelive").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    let mut fleet = Fleet::new(
+        "f",
+        fleet_spec("default", &[("c", &["a", "b"])], "Branches"),
+    );
+    fleet.metadata.annotations = Some(
+        [("balerix.ai/purge".to_string(), "true".to_string())]
+            .into_iter()
+            .collect(),
+    );
+    fleets.create(&PostParams::default(), &fleet).await.unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    for pod in ["f-c-a", "f-c-b"] {
+        wait_for("the pods", Duration::from_secs(60), || async {
+            pods.get_opt(pod).await.unwrap()
+        })
+        .await;
+    }
+
+    // b dropped from the live, marked Fleet: harvested all the same
+    fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(
+                serde_json::json!({ "spec": { "crews": { "c": { "agents": { "b": null } } } } }),
+            ),
+        )
+        .await
+        .unwrap();
+    reap_pod(&client, &ns, "f-c-b", Duration::from_secs(60)).await;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    wait_for("b's harvest Job", Duration::from_secs(60), || async {
+        jobs.get_opt("f-c-b-harvest").await.unwrap()
+    })
+    .await;
+    finish_job(&client, &ns, "f-c-b-harvest", true, Some("harvested b")).await;
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    wait_for("Agent f-c-b gone", Duration::from_secs(60), || async {
+        agents
+            .get_opt("f-c-b")
+            .await
+            .unwrap()
+            .is_none()
+            .then_some(())
+    })
+    .await;
+    reap_claim(&client, &ns, "f-c-b", Duration::from_secs(60)).await;
+    assert!(
+        stub.delete_queries().is_empty(),
+        "{:?}",
+        stub.delete_queries()
+    );
+
+    // the Fleet deleted: a's harvest skipped, the record purged
+    fleets.delete("f", &DeleteParams::default()).await.unwrap();
+    reap_pod(&client, &ns, "f-c-a", Duration::from_secs(60)).await;
+    wait_for("the Fleet gone", Duration::from_secs(60), || async {
+        fleets.get_opt("f").await.unwrap().is_none().then_some(())
+    })
+    .await;
+    assert!(jobs.get_opt("f-c-a-harvest").await.unwrap().is_none());
+    assert!(jobs.get_opt("f-c-remove").await.unwrap().is_none());
+    let queries = stub.delete_queries();
+    assert!(
+        queries
+            .last()
+            .is_some_and(|(f, q)| f == "f" && q.purge && q.force),
+        "{queries:?}"
+    );
     operator.abort();
 }
 
@@ -2132,7 +2381,7 @@ async fn a_failed_harvest_keeps_the_agent_until_it_is_purged() {
     assert_eq!(ready.status, "False");
     assert_eq!(
         ready.message,
-        "Job f-c-b-harvest failed: harvest: f/c/b: the clone has uncommitted work; the annotation balerix.ai/purge=true on the Agent or its Fleet skips the harvest"
+        "Job f-c-b-harvest failed: harvest: f/c/b: the clone has uncommitted work; the annotation balerix.ai/purge=true on the Agent skips its harvest; on the Fleet, while the Fleet is deleted, it skips every harvest and also purges the Fleet's record on the Daemon"
     );
     hold_for(
         "the Agent gone after a failed harvest",

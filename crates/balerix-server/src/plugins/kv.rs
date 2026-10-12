@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use balerix_api::check_kv_key;
 use balerix_core::AgentName;
@@ -15,16 +16,34 @@ use crate::vault::Vault;
 
 const PLAIN: u8 = b'p';
 const SEALED: u8 = b's';
-
 pub struct PluginKv {
     state_root: PathBuf,
     vault: Vault,
+    /// Directories come and go under this lock (#223). `put` and `list`
+    /// hold it shared, so puts still run side by side; `delete`, whose
+    /// prune removes directories, and `put`'s healing of an empty one
+    /// hold it exclusive. A prune can therefore never remove the
+    /// directory a put has just made and is about to write into, and a
+    /// list never reads a directory that vanishes under it.
+    tree: RwLock<()>,
 }
 
 impl PluginKv {
     /// `state_root` is `$XDG_STATE_HOME/balerix/plugins`.
     pub fn new(state_root: PathBuf, vault: Vault) -> Self {
-        Self { state_root, vault }
+        Self {
+            state_root,
+            vault,
+            tree: RwLock::new(()),
+        }
+    }
+
+    fn shared(&self) -> RwLockReadGuard<'_, ()> {
+        self.tree.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn exclusive(&self) -> RwLockWriteGuard<'_, ()> {
+        self.tree.write().unwrap_or_else(|e| e.into_inner())
     }
 
     fn dir(&self, name: &AgentName) -> PathBuf {
@@ -123,7 +142,25 @@ impl PluginKv {
             out.push(PLAIN);
             out.extend_from_slice(bytes);
         }
-        write_private(&path, &out).map_err(|e| {
+        let mut result = {
+            let _tree = self.shared();
+            write_private(&path, &out)
+        };
+        // A key that is an empty directory (one an older daemon's delete
+        // left, or a prune cut short) is healed (#223): `remove_dir` takes
+        // only an empty one, then the write goes again once. A directory
+        // that holds keys stays a conflict.
+        if matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::IsADirectory) {
+            let healed = {
+                let _tree = self.exclusive();
+                fs::remove_dir(&path).is_ok()
+            };
+            if healed {
+                let _tree = self.shared();
+                result = write_private(&path, &out);
+            }
+        }
+        result.map_err(|e| {
             if self.put_collides(name, key, &e) {
                 PluginError::KvConflict(key.to_string())
             } else {
@@ -135,10 +172,46 @@ impl PluginKv {
     /// `Ok(false)` when there was nothing to delete.
     pub fn delete(&self, name: &AgentName, key: &str) -> Result<bool, PluginError> {
         let path = self.path(name, key)?;
+        let _tree = self.exclusive();
         match fs::remove_file(&path) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                self.prune(name, &path);
+                Ok(true)
+            }
             Err(e) if Self::absent(&e) => Ok(false),
             Err(e) => Err(Self::io(&path, e)),
+        }
+    }
+
+    /// Removes the directories `key`'s delete left empty, deepest first,
+    /// up to but not including the plugin's `kv/` root (#223): a
+    /// directory left behind would make a later `put` of its own name a
+    /// conflict, and nothing in the API could clear it. Runs under the
+    /// exclusive `tree` lock; still best effort: a directory that is not
+    /// empty (it holds another key, or a stale temp file) or is already
+    /// gone stops it.
+    fn prune(&self, name: &AgentName, path: &Path) {
+        let root = self.dir(name);
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if d == root || !d.starts_with(&root) {
+                return;
+            }
+            match fs::remove_dir(d) {
+                Ok(()) => dir = d.parent(),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(plugin = %name, dir = %d.display(), "kv: could not prune an empty directory: {e}");
+                    return;
+                }
+            }
         }
     }
 
@@ -147,6 +220,7 @@ impl PluginKv {
     pub fn list(&self, name: &AgentName, prefix: &str) -> Result<Vec<String>, PluginError> {
         let dir = self.dir(name);
         let mut keys = Vec::new();
+        let _tree = self.shared();
         if dir.exists() {
             Self::walk(&dir, &dir, &mut keys)?;
         }
@@ -155,8 +229,17 @@ impl PluginKv {
         Ok(keys)
     }
 
+    /// A subdirectory gone between being seen and being read held no
+    /// keys, so it lists as empty (#223). The `tree` lock keeps the
+    /// daemon's own prunes out of a walk; this keeps one removed by
+    /// anything else from failing the list. The root is never pruned.
     fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), PluginError> {
-        for entry in fs::read_dir(dir).map_err(|e| Self::io(dir, e))? {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if dir != root && e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Self::io(dir, e)),
+        };
+        for entry in entries {
             let entry = entry.map_err(|e| Self::io(dir, e))?;
             let path = entry.path();
             let file_name = entry.file_name().to_string_lossy().to_string();
@@ -325,6 +408,140 @@ mod tests {
             .unwrap()
             .count();
         assert_eq!(left, 1, "no temp file left on disk");
+    }
+
+    /// #223: deleting `a/b` prunes the `a/` it leaves empty, so `a` is a
+    /// key again; pruning stops below `kv/` and at a directory still
+    /// holding another key.
+    #[test]
+    fn a_delete_prunes_the_directories_it_empties_so_a_put_at_the_prefix_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = kv(dir.path(), 1);
+        let root = dir.path().join("plugins/flow/kv");
+        store.put(&flow(), "a/b", b"v", false).unwrap();
+        assert!(store.delete(&flow(), "a/b").unwrap());
+        assert!(!root.join("a").exists(), "a/ pruned");
+        assert!(root.is_dir(), "kv/ itself stays");
+        assert!(store.list(&flow(), "").unwrap().is_empty());
+        store.put(&flow(), "a", b"w", false).unwrap();
+        assert_eq!(store.list(&flow(), "").unwrap(), vec!["a".to_string()]);
+        assert_eq!(store.get(&flow(), "a").unwrap().as_deref(), Some(&b"w"[..]));
+
+        // only the emptied levels go
+        store.put(&flow(), "x/y/z", b"1", false).unwrap();
+        store.put(&flow(), "x/k", b"2", false).unwrap();
+        assert!(store.delete(&flow(), "x/y/z").unwrap());
+        assert!(!root.join("x/y").exists(), "x/y/ pruned");
+        assert!(root.join("x").is_dir(), "x/ still holds x/k");
+        assert_eq!(
+            store.list(&flow(), "").unwrap(),
+            vec!["a".to_string(), "x/k".to_string()]
+        );
+        store.put(&flow(), "x/y", b"3", false).unwrap();
+        assert!(store.delete(&flow(), "x/k").unwrap());
+        assert!(store.delete(&flow(), "x/y").unwrap());
+        assert!(store.delete(&flow(), "a").unwrap());
+        assert!(store.list(&flow(), "").unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "all pruned");
+    }
+
+    /// #223: a key left as an empty directory (by a daemon before the
+    /// prune, or a prune cut short) is healed by the next put of it; a
+    /// directory still holding a key is not.
+    #[test]
+    fn a_put_replaces_an_empty_directory_at_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = kv(dir.path(), 1);
+        let root = dir.path().join("plugins/flow/kv");
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        let e = store.put(&flow(), "a", b"v", false).unwrap_err();
+        assert!(
+            matches!(e, PluginError::KvConflict(_)),
+            "a/ holds b/: {e:?}"
+        );
+        store.put(&flow(), "a/b", b"v", false).unwrap();
+        assert_eq!(
+            store.get(&flow(), "a/b").unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
+        assert_eq!(store.list(&flow(), "").unwrap(), vec!["a/b".to_string()]);
+        std::fs::create_dir_all(root.join("c")).unwrap();
+        store.put(&flow(), "c", b"w", false).unwrap();
+        assert_eq!(store.get(&flow(), "c").unwrap().as_deref(), Some(&b"w"[..]));
+        assert_eq!(
+            store.list(&flow(), "").unwrap(),
+            vec!["a/b".to_string(), "c".to_string()]
+        );
+    }
+
+    /// #223: a list racing deletes that prune directories never fails:
+    /// a directory gone between being seen and being read lists as empty.
+    #[test]
+    fn a_list_racing_prunes_never_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(kv(dir.path(), 1));
+        store.put(&flow(), "keep", b"v", false).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let workers: Vec<_> = (0..4u8)
+            .map(|i| {
+                let (store, stop) = (store.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let key = format!("d{i}/e/f/k");
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        store.put(&flow(), &key, b"v", false)?;
+                        store.delete(&flow(), &key)?;
+                    }
+                    Ok::<_, PluginError>(())
+                })
+            })
+            .collect();
+        for _ in 0..2000 {
+            let keys = store.list(&flow(), "").unwrap();
+            assert!(keys.contains(&"keep".to_string()), "{keys:?}");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap().unwrap();
+        }
+        assert_eq!(store.list(&flow(), "").unwrap(), vec!["keep".to_string()]);
+    }
+
+    /// Puts and deletes racing in one directory: every put succeeds (a
+    /// prune that took its directory away is retried) and every key whose
+    /// last operation was a put is still there.
+    #[test]
+    fn puts_racing_deletes_in_one_directory_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(kv(dir.path(), 1));
+        for round in 0..50 {
+            let workers: Vec<_> = (0..8u8)
+                .map(|i| {
+                    let store = store.clone();
+                    std::thread::spawn(move || {
+                        let key = format!("d/e/k{i}");
+                        for _ in 0..10 {
+                            store.put(&flow(), &key, b"v", false)?;
+                            store.delete(&flow(), &key)?;
+                        }
+                        if i % 2 == 0 {
+                            store.put(&flow(), &key, b"v", false)?;
+                        }
+                        Ok::<_, PluginError>(())
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join()
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+            }
+            let want: Vec<String> = (0..8).step_by(2).map(|i| format!("d/e/k{i}")).collect();
+            assert_eq!(store.list(&flow(), "").unwrap(), want, "round {round}");
+            for k in &want {
+                assert!(store.delete(&flow(), k).unwrap());
+            }
+        }
+        assert!(!dir.path().join("plugins/flow/kv/d").exists());
     }
 
     #[test]

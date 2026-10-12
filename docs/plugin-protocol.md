@@ -156,7 +156,8 @@ reverse proxy in front of the daemon must keep encoded slashes. `PUT` and
 `GET` bodies are raw bytes, content-type `application/octet-stream`;
 `?secret=true` on `PUT` stores the value through the daemon's vault.
 `?prefix=` on the list route filters returned `keys` by prefix
-(`kv-list.json`).
+(`kv-list.json`). Keys with `/` form a tree: `a` cannot be stored beside
+`a/b` (the 409 above), and deleting the last key under `a/` frees `a` again.
 
 **Streams** (plugins spec §18.4). `fleets/watch` sends the current list
 as its first frame and the whole list again after every change (fleet

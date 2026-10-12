@@ -5,6 +5,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) fn ensure_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)
@@ -27,8 +28,13 @@ pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
 /// mode is fixed up after the fact. `set_permissions` is still applied
 /// afterwards: `mode()` only governs permissions at creation time, and an
 /// umask can only remove bits, so a restrictive umask (e.g. `0o077`) could
-/// otherwise leave the file narrower than the caller asked for. A stale
-/// temp file from a crashed run is removed first.
+/// otherwise leave the file narrower than the caller asked for.
+///
+/// The temp name is `.{name}.tmp-{pid}-{n}`, `n` a process-wide counter, so
+/// two threads writing one path never share a temp file (#21): a shared
+/// name let one call unlink the other's in-flight file, or fail
+/// `create_new` with `AlreadyExists`. The temp file is removed when the
+/// write or rename fails, so a failed call leaves nothing behind.
 pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let dir = path
         .parent()
@@ -38,18 +44,27 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
         .file_name()
         .ok_or_else(|| io::Error::other("path has no file name"))?
         .to_string_lossy();
-    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.tmp-{}-{n}", std::process::id()));
+    // only a dead process with this pid can have left this name; without
+    // the removal its leftover would fail `create_new` below
     let _ = fs::remove_file(&tmp);
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(mode)
         .open(&tmp)?;
-    f.write_all(contents)?;
-    f.sync_all()?;
-    drop(f);
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
-    fs::rename(&tmp, path)
+    let written = (|| {
+        f.write_all(contents)?;
+        f.sync_all()?;
+        drop(f);
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+        fs::rename(&tmp, path)
+    })();
+    written.inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 #[cfg(test)]
@@ -92,13 +107,40 @@ mod tests {
     }
 
     #[test]
-    fn removes_a_stale_temp_file_from_a_crashed_run() {
+    fn concurrent_writes_of_one_path_all_succeed_and_leave_no_temp_file() {
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 200;
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("f");
-        let tmp = dir.path().join(format!(".f.tmp-{}", std::process::id()));
-        fs::write(&tmp, b"junk from a crashed run").unwrap();
-        write_atomic(&p, b"fresh", 0o600).unwrap();
-        assert_eq!(fs::read_to_string(&p).unwrap(), "fresh");
-        assert!(!tmp.exists(), "stale temp file should be gone");
+        let barrier = std::sync::Barrier::new(THREADS);
+        let contents: Vec<String> = (0..THREADS).map(|t| format!("writer {t}")).collect();
+        std::thread::scope(|s| {
+            for c in &contents {
+                let (p, barrier) = (&p, &barrier);
+                s.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..ROUNDS {
+                        write_atomic(p, c.as_bytes(), 0o600).unwrap();
+                    }
+                });
+            }
+        });
+        assert!(contents.contains(&fs::read_to_string(&p).unwrap()));
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, ["f"], "no temp file left");
+    }
+
+    #[test]
+    fn a_failed_rename_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("d");
+        fs::create_dir(&p).unwrap();
+        fs::write(p.join("x"), b"").unwrap();
+        // a file cannot replace a non-empty directory
+        write_atomic(&p, b"x", 0o600).unwrap_err();
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

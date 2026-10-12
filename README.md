@@ -139,7 +139,10 @@ back as comments.
 - On the first start after the upgrade every running agent restarts once: its
   spec hash changed with the block.
 - A stored fleet named `balerix` is ignored, with an error in the daemon log —
-  the name is now reserved for the plugin fleet.
+  the name is now reserved for the plugin fleet. Neither `apply` nor `down`
+  accepts the name, so the error repeats on every start until you delete the
+  record, `$XDG_STATE_HOME/balerix/fleets/balerix/fleet.json`, and the
+  `secrets.enc` beside it.
 
 ### Upgrading to Spec B phase 2a
 - `status` gains a `PLUGINS` column and `plugin list` an `ACTIVE` column.

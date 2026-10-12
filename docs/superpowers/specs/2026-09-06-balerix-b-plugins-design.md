@@ -31,7 +31,7 @@ the corrections and the reasons.
 | PB-7 | **Fleet-level activation.** The fleet YAML's `plugins:` block (replacing the reserved `flow: {}`) carries per-agent plugin config, merged like every other map, still resolved client-side. | Per-agent behaviour (`flow` states) needs the three-level merge; the daemon must never merge settings layers itself (architecture spec §5). |
 | PB-8 | **State is daemon-provided**: a namespaced KV with an opt-in vault path for secrets, plus a scratch directory for bulk data. | Plugins stay restartable processes; secrets have a vault path; recordings and the like do not go through an API. |
 | PB-9 | **Attach is runner-neutral**: the daemon exposes a PTY stream for an agent over the protocol; tmux implements it today. | `web` never learns the tmux socket; Docker/Pod runners implement the same stream later. |
-| PB-10 | **Transport is JSON over HTTP/1.1 on loopback, WebSockets for streams**; no gRPC. | Reuses `axum`, `ureq`, the proven `open_port` grant and the per-launch secret pattern. `tonic`/`prost`/`protoc` would be added for typed bidi streams WebSockets already give. |
+| PB-10 | **Transport is JSON over HTTP/1.1 on loopback, WebSockets for streams**; no gRPC. | Reuses `axum`, `ureq`, the proven `open_port` grant and the hook-secret pattern (a per-plugin token minted on add, §4.1). `tonic`/`prost`/`protoc` would be added for typed bidi streams WebSockets already give. |
 | PB-11 | **Per-plugin capabilities (`needs`)** gate every host route; a call outside the manifest's list is 403. | Least privilege for a trusted-but-sandboxed process; makes a plugin's reach reviewable from its manifest. |
 | PB-12 | **Interceptors fail open**, individually, inside a chain budget of 1.5 s within the existing 2 s hook timeout. | Continues the recorded fail-open posture: a plugin outage degrades a fleet, it never wedges an agent. |
 | PB-13 | The **DSL "plugin for plugins" is named, not designed**. | No use case yet (YAGNI, as the architecture spec's "later" list). |
@@ -254,7 +254,7 @@ plugins/<name>/
   home/            HOME, XDG_CONFIG_HOME…, TMPDIR=home/tmp (0700)
   nono/            nono's own $HOME (its state root), as for agents
   kv/  scratch/    §4.1
-  (no mise.toml copy — the package's own is used in place, see §15)
+  mise.toml        (no copy — the package's own is used in place, see §15)
   nono-profile.json  0600; carries BALERIX_PLUGIN_TOKEN
   launch.sh        cd <package>; exec nono run --profile … -- mise run <start>
   logs/

@@ -178,7 +178,11 @@ patch, truncated }` with `status` one of `added`, `modified`, `deleted`,
 `renamed`, `copied`, `typechange`; untracked files are `added` and
 `uncommitted`; a patch is unified with three lines of context, empty for a
 binary, cut at 256 KiB (`truncated`), and the list stops at 500 files
-(top-level `truncated`). An untracked symlink is shown as git shows a
+(top-level `truncated`). The whole `files` list is at most 8 MiB as
+JSON: the entries come first (the list stops, top-level `truncated`, at
+the first that does not fit), then the patches in path order, the one
+that crosses the limit cut at a line and those after it empty (each
+`truncated`). An untracked symlink is shown as git shows a
 new one, its target text the one added line, but one that git would
 follow (to a FIFO or a directory) or that leaves the worktree is never
 given to git: its patch is built from the link alone, without the
@@ -188,7 +192,8 @@ a regular file, skipped`. `file` answers the bytes of one regular file, 404
 `no such path`, 400 `not a regular file` (a symlink is never followed),
 413 `file larger than 1 MiB`. `tree` lists one directory (`{ name, kind:
 file|dir|symlink|other, size }`, sorted, `.git` never listed, never
-recursive); the empty path is the root. `path` is relative, `/`-separated,
+recursive), at most 5000 entries, the first by name (nothing in the
+answer says when more were left out); the empty path is the root. `path` is relative, `/`-separated,
 at most 4096 bytes, with no empty, `.` or `..` segment, no `\`, no NUL and
 no `.git` segment, else 400 `workspace: invalid path: <reason>`. Two 404
 texts: `no workspace for agent <id>` (no worktree) and `no such path`.

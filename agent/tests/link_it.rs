@@ -15,8 +15,9 @@ use axum::routing::get;
 use balerix_agent::link::{Control, LINK_IDLE, LinkDeps, run, run_with_idle};
 use balerix_agent::tls::client_config;
 use balerix_api::{
-    AgentPhase, AgentStatus, FailureKind, LinkOp, LinkRequest, LinkResult, LinkStatus,
-    SidecarFrame, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
+    AgentPhase, AgentStatus, EntryKind, FailureKind, LINK_MAX_MESSAGE, LinkOp, LinkRequest,
+    LinkResult, LinkStatus, SidecarFrame, TreeEntry, WorkspaceDiff, WorkspaceTree,
+    WorkspaceVersion,
 };
 use balerix_core::fakes::FakeRunner;
 use balerix_core::{AgentId, WorkspaceError, WorkspaceReader};
@@ -40,8 +41,22 @@ impl WorkspaceReader for TwoFiles {
             Err(WorkspaceError::NoSuchPath)
         }
     }
-    fn list_dir(&self, _: &AgentId, _: &str) -> Result<WorkspaceTree, WorkspaceError> {
-        Err(WorkspaceError::NoSuchPath)
+    /// `huge` is a listing larger than the link carries, as no capped
+    /// reader would answer.
+    fn list_dir(&self, _: &AgentId, path: &str) -> Result<WorkspaceTree, WorkspaceError> {
+        if path != "huge" {
+            return Err(WorkspaceError::NoSuchPath);
+        }
+        Ok(WorkspaceTree {
+            path: path.into(),
+            entries: (0..80_000)
+                .map(|i| TreeEntry {
+                    name: format!("{i:0>250}"),
+                    kind: EntryKind::File,
+                    size: Some(0),
+                })
+                .collect(),
+        })
     }
     fn version(&self, _: &AgentId, _: &str) -> Result<WorkspaceVersion, WorkspaceError> {
         Err(WorkspaceError::NoSuchPath)
@@ -275,6 +290,61 @@ async fn the_link_connects_answers_requests_and_reconnects() {
         SidecarFrame::Status(s) => assert_eq!(s.status.phase, AgentPhase::Ready),
         other => panic!("{other:?}"),
     }
+}
+
+/// A reply over the link's message limit fails its call; the link stays
+/// up and answers the next request (#229).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_over_the_link_limit_fails_the_call_not_the_link() {
+    let mut daemon = FakeDaemon::start(None).await;
+    let _side = start_sidecar_link(&format!("http://{}", daemon.addr));
+    let mut conn = tokio::time::timeout(Duration::from_secs(5), daemon.links.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    conn.to_sidecar
+        .send(LinkRequest {
+            id: 1,
+            op: LinkOp::WorkspaceTree {
+                path: "huge".into(),
+            },
+        })
+        .unwrap();
+    let (id, result) = tokio::time::timeout(Duration::from_secs(30), reply(&mut conn))
+        .await
+        .unwrap();
+    assert_eq!(id, 1);
+    let LinkResult::Failed { failure } = result else {
+        panic!("{result:?}");
+    };
+    assert_eq!(failure.reason, FailureKind::Tool);
+    assert!(
+        failure.message.starts_with("the reply is ")
+            && failure.message.ends_with(&format!(
+                "bytes, over the link's limit of {LINK_MAX_MESSAGE}"
+            )),
+        "{}",
+        failure.message
+    );
+    // the same connection answers the next request
+    conn.to_sidecar
+        .send(LinkRequest {
+            id: 2,
+            op: LinkOp::WorkspaceFile { path: "f".into() },
+        })
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), reply(&mut conn))
+            .await
+            .unwrap(),
+        (
+            2,
+            LinkResult::File {
+                bytes: b"hello".to_vec()
+            }
+        )
+    );
+    assert!(daemon.links.try_recv().is_err(), "no second link");
 }
 
 /// A Daemon whose node died: the socket stays open and nothing arrives,

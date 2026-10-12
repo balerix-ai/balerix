@@ -17,8 +17,9 @@ use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
 use balerix_api::{
-    EntryKind, FileDiff, FileStatus, TreeEntry, WORKSPACE_FILE_COUNT_LIMIT, WORKSPACE_FILE_LIMIT,
-    WORKSPACE_PATCH_LIMIT, WorkspaceDiff, WorkspaceTree, WorkspaceVersion, check_path,
+    EntryKind, FileDiff, FileStatus, TreeEntry, WORKSPACE_DIFF_LIMIT, WORKSPACE_FILE_COUNT_LIMIT,
+    WORKSPACE_FILE_LIMIT, WORKSPACE_PATCH_LIMIT, WORKSPACE_TREE_ENTRY_LIMIT, WorkspaceDiff,
+    WorkspaceTree, WorkspaceVersion, check_path,
 };
 use balerix_core::{AgentId, MaterializeError, WorkspaceError, WorkspaceReader};
 
@@ -780,6 +781,76 @@ pub fn shape_patch(raw: String) -> (String, bool, bool) {
         .rposition(|b| *b == b'\n')
         .map_or(0, |i| i + 1);
     (raw[..end].to_string(), false, true)
+}
+
+/// Bytes `s` takes inside a JSON string, as serde_json writes it: `"`,
+/// `\\` and the short escapes take two, any other control character six
+/// (`\u00XX`), everything else its UTF-8 length.
+fn json_escaped_len(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            c if u32::from(c) < 0x20 => 6,
+            c => c.len_utf8(),
+        })
+        .sum()
+}
+
+/// `file` as JSON with an empty patch, in bytes, with a comma for its
+/// place in the list.
+fn bare_json_len(file: &mut FileDiff) -> usize {
+    let patch = std::mem::take(&mut file.patch);
+    let n = serde_json::to_vec(&*file).map_or(usize::MAX, |v| v.len());
+    file.patch = patch;
+    n.saturating_add(1)
+}
+
+/// Holds a diff's `files` within `WORKSPACE_DIFF_LIMIT` as serialized.
+/// The entries come first: the list stops at the first file whose entry,
+/// with an empty patch, does not fit. What is left is shared among the
+/// patches in path order: the first patch that does not fit keeps the
+/// whole lines that do, and every patch after it is empty (each
+/// `truncated`). `true` when the list was cut. Keeps
+/// every reply well under the link's message limit
+/// (`balerix_api::LINK_MAX_MESSAGE`).
+pub fn fit_diff(files: &mut Vec<FileDiff>) -> bool {
+    let mut used: usize = 2; // `[]`
+    let mut keep = files.len();
+    for (i, f) in files.iter_mut().enumerate() {
+        let bare = bare_json_len(f);
+        if used.saturating_add(bare) > WORKSPACE_DIFF_LIMIT {
+            keep = i;
+            break;
+        }
+        used += bare;
+    }
+    let cut = keep < files.len();
+    files.truncate(keep);
+    let mut room = WORKSPACE_DIFF_LIMIT - used;
+    for f in files.iter_mut() {
+        if f.patch.is_empty() {
+            continue;
+        }
+        let whole = json_escaped_len(&f.patch);
+        if whole <= room {
+            room -= whole;
+            continue;
+        }
+        let mut end = 0;
+        for line in f.patch.split_inclusive('\n') {
+            let n = json_escaped_len(line);
+            if n > room {
+                break;
+            }
+            room -= n;
+            end += line.len();
+        }
+        f.patch.truncate(end);
+        f.truncated = true;
+        // the patches after the cut one are empty, small or not
+        room = 0;
+    }
+    cut
 }
 
 /// The patch that stands in for an untracked path that is neither a
@@ -1639,12 +1710,13 @@ impl WorkspaceReader for Runtime {
             f.binary = binary;
             f.truncated = cut;
         }
+        let cut = fit_diff(&mut files);
         Ok(WorkspaceDiff {
             base_ref: base_ref.to_string(),
             merge_base,
             head,
             files,
-            truncated,
+            truncated: truncated || cut,
         })
     }
 
@@ -1705,13 +1777,24 @@ impl WorkspaceReader for Runtime {
             return Err(WorkspaceError::NotADirectory);
         }
         confine(&ws, &full)?;
-        let mut entries = Vec::new();
+        // The first `WORKSPACE_TREE_ENTRY_LIMIT` by name, held as they are
+        // read, so a huge directory costs no more than the limit. Keyed by
+        // the raw name too: two names may read alike once made lossy.
+        let mut kept: BTreeMap<(String, std::ffi::OsString), std::fs::DirEntry> = BTreeMap::new();
         for entry in std::fs::read_dir(&full).map_err(|e| io_error(&full, e))? {
             let entry = entry.map_err(|e| io_error(&full, e))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name == ".git" {
+            let raw = entry.file_name();
+            if raw == ".git" {
                 continue;
             }
+            let name = raw.to_string_lossy().into_owned();
+            kept.insert((name, raw), entry);
+            if kept.len() > WORKSPACE_TREE_ENTRY_LIMIT {
+                kept.pop_last();
+            }
+        }
+        let mut entries = Vec::with_capacity(kept.len());
+        for ((name, _), entry) in kept {
             // `DirEntry::metadata` does not follow symlinks.
             let m = entry.metadata().map_err(|e| io_error(&entry.path(), e))?;
             let kind = if m.is_file() {
@@ -1729,7 +1812,6 @@ impl WorkspaceReader for Runtime {
                 size: m.is_file().then_some(m.len()),
             });
         }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(WorkspaceTree {
             path: path.to_string(),
             entries,
@@ -1920,6 +2002,81 @@ mod tests {
         );
         assert_eq!(parse_status("# branch.oid (initial)\0").head, None);
         assert_eq!(parse_status(""), Status::default());
+    }
+
+    #[test]
+    fn the_escaped_length_is_what_serde_json_writes() {
+        for s in [
+            "",
+            "plain",
+            "a\"b\\c",
+            "\n\r\t\u{8}\u{c}",
+            "\u{0}\u{1f}\u{7f}",
+            "ü€😀",
+        ] {
+            assert_eq!(
+                json_escaped_len(s),
+                serde_json::to_string(s).unwrap().len() - 2,
+                "{s:?}"
+            );
+        }
+    }
+
+    fn patched(path: &str, patch: &str) -> FileDiff {
+        FileDiff {
+            path: path.into(),
+            old_path: None,
+            status: FileStatus::Added,
+            uncommitted: true,
+            binary: false,
+            patch: patch.into(),
+            truncated: false,
+        }
+    }
+
+    /// The file list stays within `WORKSPACE_DIFF_LIMIT` as serialized:
+    /// the file that crosses it keeps whole lines of its patch, and the
+    /// list stops where not even an empty patch fits.
+    #[test]
+    fn a_diff_is_held_within_its_byte_limit() {
+        // 250 KiB patches of control characters: 1.5 MiB each, escaped
+        let line = format!("+{}\n", "\u{1}".repeat(1023));
+        let patch = line.repeat(250);
+        let mut files: Vec<FileDiff> = (0..20)
+            .map(|i| patched(&format!("f{i:03}"), &patch))
+            .collect();
+        assert!(
+            !fit_diff(&mut files),
+            "every entry fits; only patches are cut"
+        );
+        assert_eq!(files.len(), 20);
+        let len = serde_json::to_vec(&files).unwrap().len();
+        assert!(len <= WORKSPACE_DIFF_LIMIT, "{len}");
+        let (whole, cut): (Vec<&FileDiff>, Vec<&FileDiff>) =
+            files.iter().partition(|f| !f.truncated);
+        assert_eq!(whole.len(), 5, "8 MiB holds five whole 1.5 MiB patches");
+        assert!(whole.iter().all(|f| f.patch == patch));
+        assert_eq!(whole[4].path, "f004", "the first by path");
+        // the sixth keeps the whole lines that fit; the rest are empty
+        assert!(!cut[0].patch.is_empty() && cut[0].patch.len() < patch.len());
+        assert!(cut[0].patch.ends_with('\n') && patch.starts_with(&cut[0].patch));
+        assert!(cut[1..].iter().all(|f| f.patch.is_empty()));
+
+        // entries alone over the limit: the list stops
+        let long = "\u{1}".repeat(4000);
+        let mut files: Vec<FileDiff> = (0..WORKSPACE_FILE_COUNT_LIMIT)
+            .map(|i| patched(&format!("{long}{i:03}"), ""))
+            .collect();
+        assert!(fit_diff(&mut files));
+        assert!(files.len() < WORKSPACE_FILE_COUNT_LIMIT);
+        let len = serde_json::to_vec(&files).unwrap().len();
+        assert!(len <= WORKSPACE_DIFF_LIMIT, "{len}");
+
+        // a small diff is untouched
+        let mut files = vec![patched("a", "+x\n"), patched("b", "+y\n")];
+        let before = files.clone();
+        assert!(!fit_diff(&mut files));
+        assert_eq!(files, before);
     }
 
     #[test]

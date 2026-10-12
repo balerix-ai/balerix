@@ -69,6 +69,20 @@
   reports `agent processes still running after stop`. Nothing to do: the
   upgraded daemon restarts every running plugin on its first pass, and
   that restart's stop is the last one without the wrapper.
+- A workspace `diff` is now at most 8 MiB as JSON (its `files`), and a
+  `tree` at most 5000 entries (#229), in both modes. Past 8 MiB the
+  entries come first: the list stops, with the diff's `truncated` set,
+  at the first file that does not fit even without a patch; the patches
+  then fill what is left in path order, the one that crosses the limit
+  cut at a line and those after it empty, each with its file's
+  `truncated` set (the review page shows `patch truncated`). A `tree`
+  answers the first 5000 entries by name and nothing in it says that
+  more were left out. A diff under 8 MiB, and a directory of up to 5000
+  entries, answer as before. In Kubernetes mode the link carries
+  messages of up to 16 MiB, and a sidecar reply that would still be
+  larger fails that call with a 500 (`<agent>: git link: the reply is
+  <n> bytes, over the link's limit of 16777216`) where it used to drop
+  the link.
 
 ## 0.2.4 - 2026-10-10
 

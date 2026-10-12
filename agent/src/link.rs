@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use balerix_api::{
-    FailureKind, LINK_PROTOCOL, LINK_PROTOCOL_HEADER, LinkFailure, LinkOp, LinkReply, LinkRequest,
-    LinkResult, LinkStatus, SidecarFrame,
+    FailureKind, LINK_MAX_MESSAGE, LINK_PROTOCOL, LINK_PROTOCOL_HEADER, LinkFailure, LinkOp,
+    LinkReply, LinkRequest, LinkResult, LinkStatus, SidecarFrame,
 };
 use balerix_core::{AgentId, AgentRunner, RunnerError, WorkspaceError, WorkspaceReader};
 use futures_util::{SinkExt, StreamExt};
@@ -83,7 +83,8 @@ pub fn ws_url(daemon_url: &str, path: &str) -> String {
 }
 
 /// A socket's limit on each message and frame, as the Daemon's upgrade
-/// sets it; `None` keeps tungstenite's defaults.
+/// sets it: `LINK_MAX_MESSAGE` for the link, `ATTACH_MAX_MESSAGE` for an
+/// attach socket. `None` keeps tungstenite's defaults.
 fn ws_config(max_message: Option<usize>) -> Option<WebSocketConfig> {
     max_message.map(|max| {
         WebSocketConfig::default()
@@ -123,7 +124,13 @@ pub async fn run(deps: Arc<LinkDeps>) {
 pub async fn run_with_idle(deps: Arc<LinkDeps>, idle: Duration) {
     let mut backoff = RECONNECT_MIN;
     loop {
-        match connect(&deps, &format!("/v1/agents/{}/link", deps.id), None).await {
+        match connect(
+            &deps,
+            &format!("/v1/agents/{}/link", deps.id),
+            Some(LINK_MAX_MESSAGE),
+        )
+        .await
+        {
             Ok(ws) => {
                 tracing::info!("link up");
                 backoff = RECONNECT_MIN;
@@ -138,9 +145,45 @@ pub async fn run_with_idle(deps: Arc<LinkDeps>, idle: Duration) {
 }
 
 async fn send(ws: &mut Ws, frame: &SidecarFrame) -> Result<()> {
-    ws.send(Message::Text(serde_json::to_string(frame)?.into()))
-        .await?;
+    ws.send(Message::Text(frame_text(frame)?.into())).await?;
     Ok(())
+}
+
+/// `frame` as the text the link carries. A reply over `LINK_MAX_MESSAGE`
+/// goes as a failure of that request instead: the Daemon would drop the
+/// whole link on a message over its limit, failing every call in flight
+/// (#229). The workspace caps keep every reply far below it.
+fn frame_text(frame: &SidecarFrame) -> Result<String> {
+    let text = serde_json::to_string(frame)?;
+    if text.len() <= LINK_MAX_MESSAGE {
+        return Ok(text);
+    }
+    let SidecarFrame::Reply(reply) = frame else {
+        anyhow::bail!(
+            "a link frame of {} bytes, over the {LINK_MAX_MESSAGE}-byte limit",
+            text.len()
+        );
+    };
+    tracing::warn!(
+        id = reply.id,
+        bytes = text.len(),
+        "link: a reply over the limit"
+    );
+    let failed = SidecarFrame::Reply(LinkReply {
+        id: reply.id,
+        result: LinkResult::Failed {
+            // as a timeout crosses (#213): the plugin then reads the
+            // message, where an `io` failure is a fixed line
+            failure: LinkFailure {
+                reason: FailureKind::Tool,
+                message: format!(
+                    "the reply is {} bytes, over the link's limit of {LINK_MAX_MESSAGE}",
+                    text.len()
+                ),
+            },
+        },
+    });
+    Ok(serde_json::to_string(&failed)?)
 }
 
 async fn session(deps: Arc<LinkDeps>, mut ws: Ws, idle: Duration) {

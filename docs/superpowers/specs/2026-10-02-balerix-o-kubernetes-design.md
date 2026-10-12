@@ -569,6 +569,13 @@ the Daemon's Secret.
   id and a `result` tagged `kind`, or `status` with the agent's
   `AgentStatus`, the pane's pid and the hook-failure count). File bytes
   travel as a JSON array; the 1 MiB file cap keeps that small. Both
+  ends set a 16 MiB limit per message and per frame
+  (`LINK_MAX_MESSAGE`), twice the largest reply the workspace caps
+  allow (a diff's files are at most 8 MiB of JSON, a tree at most 5000
+  entries; the arithmetic is at the constant). A sidecar whose reply
+  would still be larger answers that request `failed` (`tool`, `the reply
+  is N bytes, over the link's limit of …`), so the call fails and the
+  link stays up (#229). Both
   sockets, the link and the attach socket, carry `balerix-link-protocol:
   1`, checked before the upgrade. An attach session is bound to the agent
   the `attach` request was sent to: another agent's socket is answered as

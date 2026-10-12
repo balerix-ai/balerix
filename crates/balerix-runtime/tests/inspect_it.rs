@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-use balerix_api::{EntryKind, FileStatus, WORKSPACE_FILE_LIMIT};
+use balerix_api::{EntryKind, FileStatus, WORKSPACE_FILE_LIMIT, WORKSPACE_TREE_ENTRY_LIMIT};
 use balerix_core::{AgentId, RepoRef, WorkspaceError, WorkspaceReader};
 use balerix_runtime::inspect::{DIFF_BUDGET, SKIPPED_NOT_A_FILE, VERSION_BUDGET, symlink_patch};
 use balerix_runtime::{Runtime, SocketPolicy, Workspace};
@@ -261,6 +261,20 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         Err(WorkspaceError::NotADirectory)
     );
     assert_eq!(rt.list_dir(&id, "nope"), Err(WorkspaceError::NoSuchPath));
+    // a directory past the entry cap lists the first entries by name
+    let many = w.join("many");
+    std::fs::create_dir(&many).unwrap();
+    for i in 0..WORKSPACE_TREE_ENTRY_LIMIT + 3 {
+        std::fs::write(many.join(format!("f{i:05}")), b"").unwrap();
+    }
+    let listed = rt.list_dir(&id, "many").unwrap();
+    assert_eq!(listed.entries.len(), WORKSPACE_TREE_ENTRY_LIMIT);
+    let expected: Vec<String> = (0..WORKSPACE_TREE_ENTRY_LIMIT)
+        .map(|i| format!("f{i:05}"))
+        .collect();
+    let got: Vec<&str> = listed.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(got, expected);
+    std::fs::remove_dir_all(&many).unwrap();
 
     // repo config an agent could write must not run a program here
     let marker = root.join("fsmonitor-ran");

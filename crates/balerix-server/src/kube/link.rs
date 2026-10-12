@@ -20,8 +20,9 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use balerix_api::{
-    FailureKind, LINK_PROTOCOL, LINK_PROTOCOL_HEADER, LinkFailure, LinkOp, LinkRequest, LinkResult,
-    LinkStatus, SidecarFrame, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
+    FailureKind, LINK_MAX_MESSAGE, LINK_PROTOCOL, LINK_PROTOCOL_HEADER, LinkFailure, LinkOp,
+    LinkRequest, LinkResult, LinkStatus, SidecarFrame, WorkspaceDiff, WorkspaceTree,
+    WorkspaceVersion,
 };
 use balerix_core::{
     AgentId, AgentRunner, CrewRef, FleetName, LaunchPlan, ObservedState, ProcessState, PtyStream,
@@ -554,7 +555,11 @@ pub(crate) async fn link(
         Err(refusal) => return *refusal,
     };
     let daemon = state.daemon.clone();
-    ws.on_upgrade(move |socket| hub.serve(daemon, id, socket))
+    // The sidecar's limits too (`agent/src/link.rs`): a reply it would
+    // send over them fails that call instead (#229)
+    ws.max_message_size(LINK_MAX_MESSAGE)
+        .max_frame_size(LINK_MAX_MESSAGE)
+        .on_upgrade(move |socket| hub.serve(daemon, id, socket))
 }
 
 /// `GET /v1/agents/{fleet}/{crew}/{agent}/link/attach/{session}`: the

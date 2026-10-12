@@ -1,6 +1,8 @@
 //! `/v1/plugin-host/*` beyond `hello` (plugins spec §4.1): the plugin's
 //! bearer identifies it, the manifest's `needs` gates every route.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection};
 use axum::extract::ws::WebSocketUpgrade;
@@ -441,56 +443,263 @@ async fn delete_key(
 }
 
 /// The metrics prefix rule (plugins spec §9): every family name in the
-/// body starts with `balerix_plugin_<name>_`. Comment lines are checked
-/// through their `# TYPE`/`# HELP` family, sample lines through the name
-/// before `{` or the first space.
-pub fn families_ok(body: &str, plugin: &str) -> bool {
-    let prefix = format!("balerix_plugin_{plugin}_");
-    body.lines().all(|line| {
-        let line = line.trim();
-        if line.is_empty() {
-            return true;
-        }
-        let family = if let Some(rest) = line.strip_prefix('#') {
-            let mut words = rest.split_whitespace();
-            match words.next() {
-                Some("TYPE" | "HELP") => match words.next() {
-                    Some(f) => f,
-                    None => return false,
-                },
-                _ => return true,
+/// body starts with `balerix_plugin_<name>_`, each `-` of the plugin's
+/// name written `_` as the SDK's `Metrics::family` writes it, and is a
+/// valid Prometheus name (#224): one invalid name would make a strict
+/// parser reject the daemon's whole `/metrics`. Comment lines are
+/// checked through their `# TYPE`/`# HELP` family, sample lines through
+/// the name before `{` or the first space.
+///
+/// `Some` with the body's collision keys (`collision_keys`) when it
+/// passes, for `/metrics` to check against the names already merged;
+/// `None` when it breaks the rule.
+pub fn families_ok(body: &str, plugin: &str) -> Option<BTreeSet<String>> {
+    let prefix = format!("balerix_plugin_{}_", plugin.replace('-', "_"));
+    let mut keys = BTreeSet::new();
+    for line in body.lines() {
+        match line_name(line) {
+            LineName::Skip => {}
+            LineName::Malformed => return None,
+            LineName::Name(n) if n.starts_with(&prefix) && is_metric_name(n) => {
+                keys.extend(collision_keys(n));
             }
-        } else {
-            line.split(|c: char| c == '{' || c.is_whitespace())
-                .next()
-                .unwrap_or("")
+            LineName::Name(_) => return None,
+        }
+    }
+    Some(keys)
+}
+
+/// Plugin scrapes merged into the daemon's `/metrics`, in order (#224):
+/// every name merged so far and who owns it. The daemon's own families
+/// sit under `balerix_plugin_` too, and with `-` written `_` plugin `a`'s
+/// `b_x` and plugin `a-b`'s `x` are the same name, so a scrape sharing a
+/// name with what is already merged is dropped whole: the exposition
+/// never repeats a family.
+pub struct MetricsMerge {
+    seen: BTreeMap<String, String>,
+}
+
+/// Why `MetricsMerge::admit` dropped a scrape.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Dropped {
+    /// It broke the prefix rule (`families_ok`).
+    Rule,
+    /// `name` is already `owner`'s (a plugin, or `the daemon`).
+    Collides { name: String, owner: String },
+}
+
+impl MetricsMerge {
+    /// Seeded with the daemon's own families, sampled yet or not.
+    pub fn new<'a>(own: impl IntoIterator<Item = &'a String>) -> Self {
+        let seen = own
+            .into_iter()
+            .flat_map(|f| collision_keys(f))
+            .map(|k| (k, "the daemon".to_string()))
+            .collect();
+        Self { seen }
+    }
+
+    /// `Ok` when `text` may be appended: its names are now `plugin`'s.
+    pub fn admit(&mut self, plugin: &str, text: &str) -> Result<(), Dropped> {
+        let keys = families_ok(text, plugin).ok_or(Dropped::Rule)?;
+        // the longest shared key: the full name rather than its stem
+        if let Some((name, owner)) = keys
+            .iter()
+            .filter_map(|k| self.seen.get_key_value(k))
+            .max_by_key(|(k, _)| k.len())
+        {
+            return Err(Dropped::Collides {
+                name: name.clone(),
+                owner: owner.clone(),
+            });
+        }
+        self.seen
+            .extend(keys.into_iter().map(|k| (k, plugin.to_string())));
+        Ok(())
+    }
+}
+
+/// The suffixes a family's samples carry: a histogram's `x` is sampled
+/// as `x_bucket`, `x_sum` and `x_count`, a summary's as `x_sum` and
+/// `x_count`, and an OpenMetrics counter `x` as `x_total` and
+/// `x_created`.
+const SAMPLE_SUFFIXES: [&str; 5] = ["_bucket", "_sum", "_count", "_total", "_created"];
+
+/// A name and, when it ends in a sample suffix, its stem: two names
+/// collide when they are equal or one is the other plus a suffix (a
+/// family `x` and another's `x_count`), and both cases share a key.
+/// Conservative: `x_sum` and `x_count` from different owners collide too.
+fn collision_keys(name: &str) -> impl Iterator<Item = String> + '_ {
+    let stem = SAMPLE_SUFFIXES
+        .iter()
+        .find_map(|s| name.strip_suffix(s))
+        .filter(|stem| !stem.is_empty());
+    std::iter::once(name.to_string()).chain(stem.map(str::to_string))
+}
+
+enum LineName<'a> {
+    Skip,
+    Malformed,
+    Name(&'a str),
+}
+
+fn line_name(line: &str) -> LineName<'_> {
+    let line = line.trim();
+    if line.is_empty() {
+        return LineName::Skip;
+    }
+    if let Some(rest) = line.strip_prefix('#') {
+        let mut words = rest.split_whitespace();
+        return match words.next() {
+            Some("TYPE" | "HELP") => words.next().map_or(LineName::Malformed, LineName::Name),
+            _ => LineName::Skip,
         };
-        family.starts_with(&prefix)
-    })
+    }
+    LineName::Name(
+        line.split(|c: char| c == '{' || c.is_whitespace())
+            .next()
+            .unwrap_or(""),
+    )
+}
+
+/// Prometheus's metric name grammar, `[a-zA-Z_:][a-zA-Z0-9_:]*`.
+fn is_metric_name(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b == b':')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn ok_(body: &str, plugin: &str) -> bool {
+        families_ok(body, plugin).is_some()
+    }
+
     #[test]
     fn a_body_passes_only_if_every_family_carries_the_plugin_prefix() {
         let ok = "# HELP balerix_plugin_flow_state Current state\n# TYPE balerix_plugin_flow_state gauge\nbalerix_plugin_flow_state{agent=\"a\"} 1\n\nbalerix_plugin_flow_transitions_total{from=\"a\",to=\"b\"} 2\n";
-        assert!(families_ok(ok, "flow"));
-        assert!(!families_ok(ok, "web"), "another plugin's prefix");
-        assert!(!families_ok(
+        assert!(ok_(ok, "flow"));
+        assert!(!ok_(ok, "web"), "another plugin's prefix");
+        assert!(!ok_(
             "balerix_plugin_flow_x 1\nprocess_cpu_seconds_total 3\n",
             "flow"
         ));
         assert!(
-            !families_ok("balerix_agents{fleet=\"f\"} 1\n", "flow"),
+            !ok_("balerix_agents{fleet=\"f\"} 1\n", "flow"),
             "daemon families cannot be spoofed"
         );
-        assert!(families_ok("", "flow"), "empty is fine");
-        assert!(families_ok("# just a comment\n", "flow"));
+        assert!(ok_("", "flow"), "empty is fine");
+        assert!(ok_("# just a comment\n", "flow"));
         assert!(
-            !families_ok("balerix_plugin_flow 1\n", "flow"),
+            !ok_("balerix_plugin_flow 1\n", "flow"),
             "the prefix needs the trailing underscore"
         );
+    }
+
+    /// #224: a hyphenated plugin's prefix is the SDK's, `-` written `_`,
+    /// and every family must be a valid Prometheus name.
+    #[test]
+    fn a_hyphenated_plugin_uses_the_underscored_prefix_and_names_must_be_valid() {
+        let ok = "# HELP balerix_plugin_my_plugin_up Up\n# TYPE balerix_plugin_my_plugin_up gauge\nbalerix_plugin_my_plugin_up 1\nbalerix_plugin_my_plugin_calls_total{route=\"x\"} 2\n";
+        assert!(ok_(ok, "my-plugin"));
+        assert!(
+            !ok_("balerix_plugin_my-plugin_up 1\n", "my-plugin"),
+            "the raw name is not a valid family name"
+        );
+        for bad in [
+            "balerix_plugin_flow_a-b 1\n",
+            "# TYPE balerix_plugin_flow_a.b gauge\n",
+            "balerix_plugin_flow_é 1\n",
+            "balerix_plugin_flow_x/y{a=\"b\"} 1\n",
+        ] {
+            assert!(!ok_(bad, "flow"), "{bad:?}");
+        }
+        assert!(ok_("balerix_plugin_flow_a:b_9 1\n", "flow"));
+        assert!(is_metric_name("_x") && is_metric_name(":x") && is_metric_name("x"));
+        assert!(!is_metric_name("") && !is_metric_name("9x") && !is_metric_name("x-y"));
+    }
+
+    /// #224: a passing body's keys are its names plus each sample
+    /// suffix's stem, so a family and another owner's `_count` or
+    /// `_total` of it share a key.
+    #[test]
+    fn collision_keys_cover_names_and_their_sample_stems() {
+        let keys = families_ok(
+            "# TYPE balerix_plugin_a_b_x counter\nbalerix_plugin_a_b_x_total 1\nbalerix_plugin_a_h_bucket{le=\"1\"} 1\n",
+            "a",
+        )
+        .unwrap();
+        let want: BTreeSet<String> = [
+            "balerix_plugin_a_b_x",
+            "balerix_plugin_a_b_x_total",
+            "balerix_plugin_a_h",
+            "balerix_plugin_a_h_bucket",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(keys, want);
+
+        assert_eq!(collision_keys("_total").collect::<Vec<_>>(), vec!["_total"]);
+    }
+
+    fn flow_like(plugin: &str, short: &str) -> String {
+        let m = balerix_plugin_sdk::Metrics::new(plugin);
+        m.int_counter(short, "x").unwrap().inc();
+        m.render().unwrap()
+    }
+
+    /// #224: a plugin cannot claim a daemon family, sampled or not: a
+    /// plugin `events` registering `total` is `balerix_plugin_events_total`.
+    #[test]
+    fn a_plugin_scrape_naming_a_daemon_family_is_dropped() {
+        let daemon = crate::metrics::Metrics::new().unwrap();
+        assert!(
+            !daemon.encode().contains("balerix_plugin_events_total"),
+            "not sampled yet, so only `families` names it"
+        );
+        let mut merge = MetricsMerge::new(daemon.families());
+        assert_eq!(
+            merge.admit("events", &flow_like("events", "total")),
+            Err(Dropped::Collides {
+                name: "balerix_plugin_events_total".into(),
+                owner: "the daemon".into()
+            })
+        );
+        // a histogram's sample names: `intercept`'s `duration_seconds_count`
+        assert_eq!(
+            merge.admit(
+                "intercept",
+                &flow_like("intercept", "duration_seconds_count")
+            ),
+            Err(Dropped::Collides {
+                name: "balerix_plugin_intercept_duration_seconds".into(),
+                owner: "the daemon".into()
+            })
+        );
+        assert_eq!(merge.admit("events", &flow_like("events", "mine")), Ok(()));
+        assert_eq!(merge.admit("web", "process_cpu 1\n"), Err(Dropped::Rule));
+    }
+
+    /// #224: plugin `a`'s `b_x` and plugin `a-b`'s `x` are one name; the
+    /// first in order keeps it and the other's scrape is dropped whole.
+    #[test]
+    fn a_and_a_hyphen_b_cannot_both_have_a_b_x() {
+        let mut merge = MetricsMerge::new(&[]);
+        assert_eq!(merge.admit("a", &flow_like("a", "b_x")), Ok(()));
+        let ab = flow_like("a-b", "x");
+        assert!(ab.contains("balerix_plugin_a_b_x 1"), "{ab}");
+        assert_eq!(
+            merge.admit("a-b", &ab),
+            Err(Dropped::Collides {
+                name: "balerix_plugin_a_b_x".into(),
+                owner: "a".into()
+            })
+        );
+        assert_eq!(merge.admit("a-b", &flow_like("a-b", "y")), Ok(()));
+        assert_eq!(merge.admit("a", &flow_like("a", "c")), Ok(()));
     }
 }

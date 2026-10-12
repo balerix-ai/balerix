@@ -321,13 +321,23 @@ through unchanged and the chain continues (fail-open).
 degraded. Never causes a restart.
 
 **`metrics`**: Prometheus text. Every family name — `# TYPE`/`# HELP` lines
-and samples alike — must start with `balerix_plugin_<name>_`
-(`metrics.json`'s `balerix_plugin_flow_state`); the daemon drops a body
-that breaks this rule instead of re-exposing it. The Rust SDK's
+and samples alike — must start with `balerix_plugin_<name>_`, where
+`<name>` is the plugin's name with each `-` written `_` (a family name
+cannot contain `-`: `my-plugin`'s prefix is `balerix_plugin_my_plugin_`;
+`metrics.json`'s `balerix_plugin_flow_state`), and must match
+Prometheus's `[a-zA-Z_:][a-zA-Z0-9_:]*`; the daemon drops a body
+that breaks either rule instead of re-exposing it. It also drops, whole,
+a body that uses a name the daemon's own families (several are
+`balerix_plugin_<word>_…`: `events`, `intercept`, `actions`, `metrics`,
+`proxy`) or an earlier plugin in the list already use, a name and its
+`_bucket`, `_sum`, `_count`, `_total` and `_created` forms counting as
+one: plugin `a`'s `b_x` and plugin `a-b`'s `x` are both
+`balerix_plugin_a_b_x`, and only the first is kept. The Rust SDK's
 `balerix_plugin_sdk::Metrics` registers every family under that prefix and
 `Plugin::metrics` returns it for the router to render, so an SDK plugin
-cannot break the rule; a plugin in another language formats the text
-itself and must apply the prefix.
+cannot break the prefix rule (a clash is still possible: pick short names
+that are not another plugin's or the daemon's); a plugin in another
+language formats the text itself and must apply the prefix.
 
 ### 4.1 Routes
 

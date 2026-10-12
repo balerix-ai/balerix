@@ -1,5 +1,6 @@
 //! A Prometheus registry that prefixes every family with
-//! `balerix_plugin_<name>_` (plugins spec §9, §17.4): the daemon drops a
+//! `balerix_plugin_<name>_`, every `-` in the name written `_` (plugins
+//! spec §9, §17.4): the daemon drops a
 //! whole scrape when one family lacks the prefix, and a hand-formatted
 //! body is how a plugin author trips that rule. Register through this
 //! type and the rule cannot be broken.
@@ -38,9 +39,15 @@ impl Metrics {
     }
 
     /// The full family name for a short one: `state` →
-    /// `balerix_plugin_flow_state`.
+    /// `balerix_plugin_flow_state`. A plugin name may contain `-`, which
+    /// a Prometheus family name may not, so it becomes `_` (#224):
+    /// `my-plugin`'s `state` is `balerix_plugin_my_plugin_state`. The
+    /// daemon expects the same mapping.
     pub fn family(&self, short: &str) -> String {
-        format!("balerix_plugin_{}_{short}", self.plugin_name)
+        format!(
+            "balerix_plugin_{}_{short}",
+            self.plugin_name.replace('-', "_")
+        )
     }
 
     fn opts(&self, short: &str, help: &str) -> Result<Opts, SdkError> {
@@ -158,6 +165,23 @@ mod tests {
         assert_eq!(err.to_string(), "metrics: family name is empty");
         let err = m.int_gauge("Bad-Name", "x").unwrap_err();
         assert!(err.to_string().starts_with("metrics: "), "{err}");
+    }
+
+    /// #224: a plugin name may contain `-` and a family name may not.
+    #[test]
+    fn a_hyphenated_plugin_name_registers_under_an_underscored_prefix() {
+        let m = Metrics::new("my-plugin");
+        assert_eq!(m.plugin_name(), "my-plugin", "the name itself is kept");
+        assert_eq!(m.family("state"), "balerix_plugin_my_plugin_state");
+        m.int_gauge("up", "1 while serving").unwrap().set(1);
+        m.int_counter_vec("calls_total", "calls", &["route"])
+            .unwrap()
+            .with_label_values(&["x"])
+            .inc();
+        let text = m.render().unwrap();
+        assert!(text.contains("# TYPE balerix_plugin_my_plugin_up gauge\n"));
+        assert!(text.contains("balerix_plugin_my_plugin_up 1\n"));
+        assert!(text.contains("balerix_plugin_my_plugin_calls_total{route=\"x\"} 1\n"));
     }
 
     #[test]

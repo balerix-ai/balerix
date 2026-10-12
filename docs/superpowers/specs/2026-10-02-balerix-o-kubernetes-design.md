@@ -1539,7 +1539,12 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
 - **The attempt count is one annotation on the owner,** `balerix.ai/attempts`,
   a JSON object from Job name to count (`{"f-c-sync": 2}`), since a Fleet
   owns its pool Job and, while deleting, one cleanup Job per crew. An entry
-  is removed when the Job succeeds or its input changes. The delay is
+  is removed when the Job succeeds or its input changes. A write changes
+  only its Job's entry, computing the new count from the owner it reads
+  again: it patches with the `resourceVersion` it read and, on a
+  conflict, reads and writes again, giving up after five attempts. One reconcile
+  can fail and retry several Jobs of one owner from one stale snapshot
+  (#236). The delay is
   `30 × 2^(n−1)` seconds for attempt `n`, capped at 600, measured from the
   failed Job's `Failed` condition's transition time, else its creation time.
 - **The Fleet's agents are re-reconciled through a Fleet watch.** The Agent

@@ -2163,6 +2163,64 @@ async fn the_crew_lock_lets_one_of_two_racing_jobs_start() {
     );
 }
 
+/// #236: two Jobs of one owner fail and come due in one reconcile, each
+/// `ensure_job` given the same snapshot of the owner: each Job's count
+/// advances, and an entry the snapshot does not have is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_jobs_of_one_owner_failing_at_once_each_advance_their_attempt() {
+    use balerix_operator::controllers::jobs::{ATTEMPTS_ANNOTATION, ensure_job};
+    use balerix_operator::desired::common::JobOutcome;
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, mut ctx, owner) = job_rule("attempts").await;
+    // every failure is past its delay (at most 10 min)
+    ctx.run.clock = std::sync::Arc::new(|| k8s_openapi::jiff::Timestamp::now().as_second() + 3600);
+    let owners: Api<ConfigMap> = Api::namespaced(env.client.clone(), &ns);
+    let attempts = || async {
+        let o = owners.get("owner").await.unwrap();
+        let value = o.metadata.annotations.unwrap_or_default()[ATTEMPTS_ANNOTATION].clone();
+        serde_json::from_str::<std::collections::BTreeMap<String, u32>>(&value).unwrap()
+    };
+    let names = ["f-c1-sync", "f-c2-sync"];
+    let job = |name: &str| crew_job(&ns, name, "i");
+    let mut snapshot = owner;
+    for round in 2..=3u32 {
+        for name in names {
+            let made = ensure_job(&ctx, &snapshot, job(name), None).await.unwrap();
+            assert_eq!(made.outcome, JobOutcome::Running);
+            finish_job(&env.client, &ns, name, false, Some("boom")).await;
+        }
+        if round == 2 {
+            // written since the snapshot, by an earlier reconcile
+            owners
+                .patch(
+                    "owner",
+                    &PatchParams::default(),
+                    &Patch::Merge(serde_json::json!({ "metadata": { "annotations": {
+                        ATTEMPTS_ANNOTATION: "{\"f-pool\":3}"
+                    } } })),
+                )
+                .await
+                .unwrap();
+        }
+        // one reconcile: both failed Jobs retried from the same snapshot
+        for name in names {
+            let retried = ensure_job(&ctx, &snapshot, job(name), None).await.unwrap();
+            assert!(
+                matches!(retried.outcome, JobOutcome::Failed(_)),
+                "{name}: {:?}",
+                retried.outcome
+            );
+        }
+        let now = attempts().await;
+        assert_eq!(now.get("f-c1-sync"), Some(&round), "{now:?}");
+        assert_eq!(now.get("f-c2-sync"), Some(&round), "{now:?}");
+        assert_eq!(now.get("f-pool"), Some(&3), "{now:?}");
+        snapshot = owners.get("owner").await.unwrap();
+    }
+}
+
 /// A pod of crew `f/c` with `extra` labels; nothing runs it. A
 /// `finalizer` keeps it, deleting, until the test takes it off.
 fn crew_pod(ns: &str, name: &str, extra: &[(&str, &str)], finalizer: Option<&str>) -> Pod {

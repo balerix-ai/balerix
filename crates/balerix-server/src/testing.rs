@@ -129,8 +129,17 @@ impl Harness {
     /// the link hub and `Ports.kube` is set, so actors mirror and plan
     /// nothing. The fake materializer stays: nothing calls it.
     pub fn kube(resync: Duration) -> Self {
+        Self::kube_with_hub(resync, LinkHub::new())
+    }
+
+    /// `kube`, its links pinged every `ping` and dropped after
+    /// `SILENT_PINGS` of them with nothing from the sidecar.
+    pub fn kube_with_ping(resync: Duration, ping: Duration) -> Self {
+        Self::kube_with_hub(resync, LinkHub::with_ping(ping))
+    }
+
+    fn kube_with_hub(resync: Duration, hub: Arc<LinkHub>) -> Self {
         let mut h = Self::new(resync);
-        let hub = LinkHub::new();
         let ports = Ports {
             runner: hub.clone(),
             workspace: hub.clone(),

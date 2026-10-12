@@ -44,8 +44,17 @@ pub const DIFF_LINK_TIMEOUT: Duration = Duration::from_secs(28);
 /// How long `attach` waits for the sidecar's second socket once it has
 /// answered `Attach`.
 pub const ATTACH_WAIT: Duration = Duration::from_secs(5);
-/// Reaps a sidecar that vanished without a close frame (as `watch.rs`).
-const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the Daemon pings each link. The sidecar answers with a pong,
+/// so a healthy link never goes quiet for long; the sidecar drops a link
+/// that brings it nothing for three of these (`LINK_IDLE` in
+/// `agent/src/link.rs`).
+pub const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// How many ping intervals may pass with nothing from the sidecar, not
+/// even a pong, before the Daemon drops its link (#230): a node gone
+/// without a FIN, or a sidecar frozen, would otherwise stay linked until
+/// TCP gives up, its status the last one mirrored and every call waiting
+/// out its timeout.
+pub const SILENT_PINGS: u32 = 3;
 
 type Pending = Arc<Mutex<HashMap<u64, SyncSender<LinkResult>>>>;
 
@@ -60,8 +69,9 @@ struct Conn {
     last: Option<LinkStatus>,
 }
 
-#[derive(Default)]
 pub struct LinkHub {
+    /// `PING_INTERVAL`, but for the tests.
+    ping: Duration,
     conns: Mutex<HashMap<AgentId, Conn>>,
     epochs: AtomicU64,
     /// `attach` calls waiting for their second socket, by session name,
@@ -85,9 +95,30 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+impl Default for LinkHub {
+    fn default() -> Self {
+        Self {
+            ping: PING_INTERVAL,
+            conns: Mutex::default(),
+            epochs: AtomicU64::default(),
+            attach_waiting: Mutex::default(),
+        }
+    }
+}
+
 impl LinkHub {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// A hub that pings every `ping` and drops a link silent for
+    /// `SILENT_PINGS` of them: the tests' short clock.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_ping(ping: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            ping,
+            ..Self::default()
+        })
     }
 
     pub fn linked(&self, agent: &AgentId) -> bool {
@@ -185,51 +216,82 @@ impl LinkHub {
         let pending: Pending = Arc::default();
         let epoch = self.register(&agent, tx, pending.clone());
         tracing::info!(agent = %agent, "sidecar linked");
-        let mut ping = tokio::time::interval(PING_INTERVAL);
+        let mut ping = tokio::time::interval(self.ping);
+        // a late tick is a late ping, not a burst of them
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ping.tick().await; // the first tick is immediate
+        // Moved on by every frame the sidecar sends, its pongs among
+        // them; what the Daemon sends proves nothing about the other end.
+        // A send is bounded by it too: one blocked on a peer that stopped
+        // reading would otherwise keep the deadline from being checked.
+        let silent = self.ping * SILENT_PINGS;
+        let mut deadline = tokio::time::Instant::now() + silent;
         // the actor reconciles the stopped set on this link's first status
         let mut first = true;
         loop {
             tokio::select! {
+                // a frame that is already here counts before the
+                // deadline is judged: a loaded host can be late to both
+                biased;
+                msg = socket.recv() => {
+                    if matches!(msg, Some(Ok(_))) {
+                        deadline = tokio::time::Instant::now() + silent;
+                    }
+                    match msg {
+                        Some(Ok(Message::Text(text))) => match serde_json::from_str::<SidecarFrame>(text.as_str()) {
+                            Ok(SidecarFrame::Status(status)) => {
+                                self.note_status(&agent, epoch, &status);
+                                // a wait on the fleet actor is not the
+                                // sidecar's silence: the socket goes unread
+                                let waited = tokio::time::Instant::now();
+                                daemon.link_status(&agent, status, first).await;
+                                deadline += waited.elapsed();
+                                first = false;
+                            }
+                            Ok(SidecarFrame::Reply(reply)) => {
+                                if let Some(tx) = lock(&pending).remove(&reply.id) {
+                                    // the caller may have timed out and gone
+                                    let _ = tx.try_send(reply.result);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(agent = %agent, "link: not a sidecar frame: {e}");
+                                let close = socket.send(Message::Close(Some(CloseFrame {
+                                    code: crate::attach::CLOSE_UNSUPPORTED,
+                                    reason: "expected a sidecar frame".into(),
+                                })));
+                                let _ = tokio::time::timeout_at(deadline, close).await;
+                                break;
+                            }
+                        },
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(_)) => {}
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    tracing::warn!(
+                        agent = %agent,
+                        "link: nothing from the sidecar in {} s, dropping it",
+                        silent.as_secs()
+                    );
+                    break;
+                }
                 req = rx.recv() => match req {
                     Some(req) => {
                         let Ok(json) = serde_json::to_string(&req) else { break };
-                        if socket.send(Message::Text(json.into())).await.is_err() {
+                        let sent = tokio::time::timeout_at(deadline, socket.send(Message::Text(json.into())));
+                        if !matches!(sent.await, Ok(Ok(()))) {
                             break;
                         }
                     }
                     None => break,
                 },
                 _ = ping.tick() => {
-                    if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                    let sent = tokio::time::timeout_at(deadline, socket.send(Message::Ping(Bytes::new())));
+                    if !matches!(sent.await, Ok(Ok(()))) {
                         break;
                     }
                 }
-                msg = socket.recv() => match msg {
-                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<SidecarFrame>(text.as_str()) {
-                        Ok(SidecarFrame::Status(status)) => {
-                            self.note_status(&agent, epoch, &status);
-                            daemon.link_status(&agent, status, first).await;
-                            first = false;
-                        }
-                        Ok(SidecarFrame::Reply(reply)) => {
-                            if let Some(tx) = lock(&pending).remove(&reply.id) {
-                                // the caller may have timed out and gone
-                                let _ = tx.try_send(reply.result);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(agent = %agent, "link: not a sidecar frame: {e}");
-                            let _ = socket.send(Message::Close(Some(CloseFrame {
-                                code: crate::attach::CLOSE_UNSUPPORTED,
-                                reason: "expected a sidecar frame".into(),
-                            }))).await;
-                            break;
-                        }
-                    },
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                    Some(Ok(_)) => {}
-                },
             }
         }
         self.unregister(&agent, epoch);

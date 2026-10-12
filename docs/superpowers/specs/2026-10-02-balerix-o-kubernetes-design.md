@@ -582,7 +582,10 @@ the Daemon's Secret.
   an unknown session (close 1008). A call in flight when its link ends or
   is replaced fails `link down` at once. The sidecar drops a link that has
   been silent for three Daemon pings (90 s) and reconnects, and bounds its
-  connect at 10 s. Workspace and runner error text crosses the link
+  connect at 10 s. The Daemon likewise drops a link that has brought it
+  nothing, not even a pong, for three of its pings: the agent is then
+  link-down and calls to it fail at once rather than at their timeout
+  (#230); its sends count against the same deadline. Workspace and runner error text crosses the link
   without the id prefix, which the Daemon adds back.
 
 ## 8. Storage

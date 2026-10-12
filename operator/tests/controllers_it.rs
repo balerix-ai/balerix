@@ -1353,6 +1353,118 @@ async fn a_changed_spec_hash_replaces_the_pod_and_keeps_the_claim() {
     operator.abort();
 }
 
+/// §11, #234: the kubelet's node-pressure eviction leaves the pod object
+/// in phase `Failed`; its specHash still matches, and it is replaced on
+/// the same claim all the same. Pods evicted young wait before their
+/// replacement, longer for each in a row, and each replacement is a
+/// `PodReplaced` Event on the Agent.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_evicted_pod_is_replaced_on_the_same_claim_backing_off() {
+    use balerix_operator::desired::agent::{POD_BACKOFF_ANNOTATION, PodBackoff};
+    use k8s_openapi::api::events::v1::Event;
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, clock, operator) = world("evicted").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let events: Api<Event> = Api::namespaced(client.clone(), &ns);
+    let mut pod = wait_for("the pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+    let claim = claims.get("f-c-a").await.unwrap();
+
+    for (streak, delay) in [(1u32, 10u64), (2, 20)] {
+        let uid = pod.metadata.uid.clone().unwrap();
+        pods.patch_status(
+            "f-c-a",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "status": {
+                "phase": "Failed", "reason": "Evicted",
+                "message": "The node was low on resource: memory."
+            } })),
+        )
+        .await
+        .unwrap();
+        // the pod lived seconds: its replacement waits, longer each time
+        let backoff = wait_for(
+            "the back-off on the Agent",
+            Duration::from_secs(60),
+            || async {
+                let a = agents.get("f-c-a").await.unwrap();
+                let b: PodBackoff =
+                    serde_json::from_str(a.metadata.annotations?.get(POD_BACKOFF_ANNOTATION)?)
+                        .ok()?;
+                (b.pod == uid).then_some(b)
+            },
+        )
+        .await;
+        assert_eq!((backoff.streak, backoff.delay), (streak, delay));
+        hold_for("the ended pod waits", Duration::from_secs(3), || async {
+            let p = pods.get_opt("f-c-a").await.unwrap();
+            (p?.metadata.uid.as_deref() != Some(uid.as_str())).then_some(())
+        })
+        .await;
+
+        clock.advance(delay as i64);
+        reap_pod_uid(&client, &ns, "f-c-a", &uid, Duration::from_secs(60)).await;
+        let next = wait_for("the new pod", Duration::from_secs(60), || async {
+            let p = pods.get_opt("f-c-a").await.unwrap()?;
+            (p.metadata.uid.as_deref() != Some(uid.as_str())).then_some(p)
+        })
+        .await;
+        assert_eq!(
+            next.metadata.annotations.as_ref().unwrap()["balerix.ai/spec-hash"],
+            pod.metadata.annotations.as_ref().unwrap()["balerix.ai/spec-hash"]
+        );
+        pod = next;
+    }
+    assert_eq!(
+        claims.get("f-c-a").await.unwrap().metadata.uid,
+        claim.metadata.uid
+    );
+    // the recorder folds a repeat within its cache's lifetime into the
+    // first Event's `series`, keeping the first note
+    let event = wait_for(
+        "a PodReplaced Event on the Agent, counted twice",
+        Duration::from_secs(30),
+        || async {
+            events
+                .list(&Default::default())
+                .await
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|e| {
+                    e.reason.as_deref() == Some("PodReplaced")
+                        && e.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some("f-c-a")
+                        && e.series.as_ref().is_some_and(|s| s.count == 2)
+                })
+        },
+    )
+    .await;
+    assert_eq!(event.type_.as_deref(), Some("Warning"));
+    assert_eq!(
+        event.note.as_deref(),
+        Some(
+            "pod f-c-a ended in phase Failed (Evicted: The node was low on resource: memory.); replaced on the same claim after a 10 s back-off (1 in a row ended within 300 s of creation)"
+        )
+    );
+    operator.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_crew_lock_holds_the_harvest_while_a_sync_runs() {
     if envtest().await.is_none() {

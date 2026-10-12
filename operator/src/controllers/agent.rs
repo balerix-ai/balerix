@@ -293,7 +293,8 @@ async fn apply_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Err
     apply(&ctx.client, &objects.bundle).await?;
     apply(&ctx.client, &objects.policy).await?;
 
-    // the Pod: created when absent, replaced when its specHash differs (§5.4)
+    // the Pod: created when absent, replaced when its specHash differs
+    // (§5.4) or it has ended, as an evicted pod has (§11, #234)
     let mut again = period;
     let pod = match pods.get_opt(&name).await? {
         None => match pods.create(&PostParams::default(), &objects.pod).await {
@@ -303,6 +304,10 @@ async fn apply_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Err
         },
         Some(pod) if pod.metadata.deletion_timestamp.is_some() => {
             again = std::time::Duration::from_secs(2);
+            Some(pod)
+        }
+        Some(pod) if crate::desired::agent::finished_phase(&pod).is_some() => {
+            again = replace_ended(&ctx, &agent, &pods, &pod).await?;
             Some(pod)
         }
         Some(pod) if pod.annotations().get(SPEC_HASH_ANNOTATION) != Some(&agent.spec.spec_hash) => {
@@ -318,6 +323,88 @@ async fn apply_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Err
     patch_status(&ctx.client, agent.as_ref(), &status).await?;
     reconciled(&ctx, agent.as_ref());
     Ok(Action::requeue(again))
+}
+
+/// An ended pod (§11, #234) deleted, so the next reconcile makes it again
+/// on the same claim; when to look again. Pods that keep ending young (a
+/// kubelet that refuses them at admission, a node that keeps evicting
+/// them) wait `replace_delay`, kept on the Agent per pod, before the
+/// delete. Each delete is a `PodReplaced` Warning Event on the Agent.
+async fn replace_ended(
+    ctx: &Context,
+    agent: &Agent,
+    pods: &Api<Pod>,
+    pod: &Pod,
+) -> Result<std::time::Duration, Error> {
+    use crate::desired::agent::{
+        POD_BACKOFF_ANNOTATION, finished_phase, next_backoff, pod_backoff, pod_lifetime,
+    };
+    use crate::desired::common::DesiredError;
+    use kube::api::{Patch, PatchParams, Preconditions};
+    let namespace = agent.namespace().unwrap_or_default();
+    let name = agent.name_any();
+    let now = ctx.now();
+    let uid = pod.metadata.uid.clone().unwrap_or_default();
+    let backoff = match pod_backoff(agent) {
+        Some(b) if b.pod == uid => b,
+        previous => {
+            let b = next_backoff(previous.as_ref(), &uid, pod_lifetime(pod, now), now);
+            let value = serde_json::to_string(&b).map_err(DesiredError::from)?;
+            Api::<Agent>::namespaced(ctx.client.clone(), &namespace)
+                .patch(
+                    &name,
+                    &PatchParams::default(),
+                    &Patch::Merge(serde_json::json!({ "metadata": { "annotations": {
+                        POD_BACKOFF_ANNOTATION: value
+                    } } })),
+                )
+                .await?;
+            b
+        }
+    };
+    if now < backoff.until {
+        tracing::info!(agent = %name, streak = backoff.streak, "the pod ended: replacing it in {} s", backoff.until - now);
+        return Ok(std::time::Duration::from_secs((backoff.until - now) as u64));
+    }
+    let params = DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(uid),
+            resource_version: None,
+        }),
+        ..DeleteParams::default()
+    };
+    match pods.delete(&name, &params).await {
+        Ok(_) => {}
+        // gone, or already another pod: nothing of this one to replace
+        Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => {}
+        Err(e) => return Err(e.into()),
+    }
+    let status = pod.status.as_ref();
+    let phase = finished_phase(pod).unwrap_or_default();
+    let why = [
+        status.and_then(|s| s.reason.as_deref()),
+        status.and_then(|s| s.message.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(": ");
+    let mut note = format!("pod {name} ended in phase {phase}");
+    if !why.is_empty() {
+        note.push_str(&format!(" ({why})"));
+    }
+    note.push_str("; replaced on the same claim");
+    if backoff.streak > 0 {
+        note.push_str(&format!(
+            " after a {} s back-off ({} in a row ended within {} s of creation)",
+            backoff.delay,
+            backoff.streak,
+            crate::desired::agent::SHORT_LIVED_SECS
+        ));
+    }
+    tracing::info!(agent = %name, "{note}");
+    ctx.warn(agent, "PodReplaced", note).await;
+    Ok(std::time::Duration::from_secs(2))
 }
 
 /// A deletion that waits: the condition written (or the failure to write

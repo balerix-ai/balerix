@@ -8,7 +8,7 @@ use balerix_api::{AgentBundle, AgentSettings, CredentialBundle, GitSettings, Run
 use k8s_openapi::api::core::v1::{ContainerStatus, PersistentVolumeClaim, Pod, Secret};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::common::{
@@ -264,10 +264,134 @@ fn termination_message(sidecar: &ContainerStatus) -> Option<String> {
 
 const PULL_FAILURES: [&str; 3] = ["ImagePullBackOff", "ErrImagePull", "InvalidImageName"];
 
+/// The pod's phase when it is `Failed` or `Succeeded`: the kubelet ran it
+/// to an end and never starts it again, so the controller replaces it on
+/// the same claim (§11, #234). An eviction, a graceful node shutdown or a
+/// refused admission leaves `Failed`; `Succeeded` only when every
+/// container exited 0 as the pod ended.
+pub fn finished_phase(pod: &Pod) -> Option<&str> {
+    pod.status
+        .as_ref()?
+        .phase
+        .as_deref()
+        .filter(|p| matches!(*p, "Failed" | "Succeeded"))
+}
+
+/// On the Agent: the back-off for replacing its ended pods (#234), as
+/// JSON (`PodBackoff`).
+pub const POD_BACKOFF_ANNOTATION: &str = "balerix.ai/pod-backoff";
+
+/// A pod that ended sooner than this after its creation counts toward
+/// the back-off; one that lived longer starts the count again.
+pub const SHORT_LIVED_SECS: i64 = 300;
+
+/// The decision for one ended pod: made once, when the controller first
+/// sees it ended, and kept on the Agent so a restarted operator, or the
+/// next reconcile, keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodBackoff {
+    /// The ended pod's uid.
+    pub pod: String,
+    /// Consecutive pods that ended short-lived, this one included.
+    pub streak: u32,
+    /// Seconds from the decision to the replacement.
+    pub delay: u64,
+    /// Unix seconds: the pod is replaced from then on.
+    pub until: i64,
+}
+
+/// The Agent's back-off, when it has a readable one.
+pub fn pod_backoff(agent: &Agent) -> Option<PodBackoff> {
+    agent
+        .metadata
+        .annotations
+        .as_ref()?
+        .get(POD_BACKOFF_ANNOTATION)
+        .and_then(|v| serde_json::from_str(v).ok())
+}
+
+/// No wait for a pod that lived; 10 s for the first short-lived one,
+/// doubling per short-lived pod in a row, at most 5 min.
+pub fn replace_delay(streak: u32) -> u64 {
+    match streak {
+        0 => 0,
+        n => (10u64 << (n - 1).min(5)).min(300),
+    }
+}
+
+/// How long the pod lived: from its creation to its containers' last
+/// finish, or to `now` when no container says when it finished (a pod
+/// refused at admission ran none).
+pub fn pod_lifetime(pod: &Pod, now: i64) -> i64 {
+    let created = pod
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .map_or(now, |t| t.0.as_second());
+    let finished = pod
+        .status
+        .as_ref()
+        .into_iter()
+        .flat_map(|s| {
+            s.init_container_statuses
+                .iter()
+                .flatten()
+                .chain(s.container_statuses.iter().flatten())
+        })
+        .filter_map(|c| c.state.as_ref()?.terminated.as_ref()?.finished_at.as_ref())
+        .map(|t| t.0.as_second())
+        .max()
+        .unwrap_or(now);
+    (finished - created).max(0)
+}
+
+/// The back-off for pod `uid`, which lived `lived` seconds, seen ended at
+/// `now`, after `previous`.
+pub fn next_backoff(previous: Option<&PodBackoff>, uid: &str, lived: i64, now: i64) -> PodBackoff {
+    let streak = if lived < SHORT_LIVED_SECS {
+        previous.map_or(0, |p| p.streak) + 1
+    } else {
+        0
+    };
+    let delay = replace_delay(streak);
+    PodBackoff {
+        pod: uid.to_string(),
+        streak,
+        delay,
+        until: now + delay as i64,
+    }
+}
+
 fn scheduled(pod: Option<&Pod>) -> Cond {
     let Some(status) = pod.and_then(|p| p.status.as_ref()) else {
         return Cond::no("Scheduled", "PodMissing", "");
     };
+    if let Some(phase) = pod.and_then(finished_phase) {
+        // the kubelet's reason (`Evicted`, `Terminated`, …) when it is one
+        // the API takes as a condition reason
+        let reason = status
+            .reason
+            .as_deref()
+            .filter(|r| {
+                r.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && r.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            .unwrap_or(if phase == "Failed" {
+                "PodFailed"
+            } else {
+                "PodSucceeded"
+            });
+        let said = status
+            .message
+            .as_deref()
+            .map(|m| format!(": {m}"))
+            .unwrap_or_default();
+        return Cond::no(
+            "Scheduled",
+            reason,
+            &format!("the pod ended in phase {phase}{said}; it is replaced on the same claim"),
+        );
+    }
     let placed = status
         .conditions
         .iter()
@@ -607,6 +731,109 @@ mod tests {
         assert_eq!(
             cond(&s, "Scheduled"),
             ("False", "ImagePullBackOff", "Back-off pulling image")
+        );
+    }
+
+    /// §11, #234: an evicted or shut-down pod is not left `Pending`.
+    #[test]
+    fn a_pod_that_ended_is_not_scheduled_and_says_it_is_replaced() {
+        let a = agent(json!({ "type": "pod" }));
+        let evicted = pod(json!({
+            "phase": "Failed", "reason": "Evicted",
+            "message": "The node was low on resource: memory.",
+            "conditions": [{ "type": "PodScheduled", "status": "True" }]
+        }));
+        assert_eq!(finished_phase(&evicted), Some("Failed"));
+        let s = agent_status(&a, Some(&evicted), None, &at(1));
+        assert_eq!(
+            cond(&s, "Scheduled"),
+            (
+                "False",
+                "Evicted",
+                "the pod ended in phase Failed: The node was low on resource: memory.; it is replaced on the same claim"
+            )
+        );
+        assert_eq!(cond(&s, "Ready").0, "False");
+
+        // no reason, or one the API would refuse: the phase names it
+        let ended = pod(json!({ "phase": "Succeeded", "reason": "not a reason" }));
+        let s = agent_status(&a, Some(&ended), None, &at(1));
+        assert_eq!(
+            cond(&s, "Scheduled"),
+            (
+                "False",
+                "PodSucceeded",
+                "the pod ended in phase Succeeded; it is replaced on the same claim"
+            )
+        );
+        let running = pod(json!({ "phase": "Running" }));
+        assert_eq!(finished_phase(&running), None);
+        assert_eq!(finished_phase(&pod(json!({}))), None);
+    }
+
+    #[test]
+    fn short_lived_pods_in_a_row_double_the_wait_and_a_pod_that_lived_resets_it() {
+        assert_eq!(
+            (0..8).map(replace_delay).collect::<Vec<_>>(),
+            [0, 10, 20, 40, 80, 160, 300, 300]
+        );
+        let first = next_backoff(None, "u1", 3, 1_000);
+        assert_eq!(
+            first,
+            PodBackoff {
+                pod: "u1".into(),
+                streak: 1,
+                delay: 10,
+                until: 1_010
+            }
+        );
+        let second = next_backoff(Some(&first), "u2", 20, 1_100);
+        assert_eq!((second.streak, second.delay, second.until), (2, 20, 1_120));
+        // a pod that lived 5 min or more: replaced at once, the count restarts
+        let lived = next_backoff(Some(&second), "u3", SHORT_LIVED_SECS, 9_000);
+        assert_eq!((lived.streak, lived.delay, lived.until), (0, 0, 9_000));
+        assert_eq!(next_backoff(Some(&lived), "u4", 1, 9_500).streak, 1);
+    }
+
+    #[test]
+    fn a_pods_lifetime_ends_at_its_last_container_finish_else_now() {
+        let mut p = pod(json!({
+            "phase": "Failed",
+            "containerStatuses": [
+                { "name": "claude", "ready": false, "restartCount": 0, "image": "i", "imageID": "",
+                  "state": { "terminated": { "exitCode": 137, "finishedAt": "1970-01-01T00:01:40Z" } } }
+            ],
+            "initContainerStatuses": [sidecar(false,
+                json!({ "terminated": { "exitCode": 0, "finishedAt": "1970-01-01T00:02:00Z" } }), json!({}))]
+        }));
+        p.metadata.creation_timestamp = Some(at(60));
+        assert_eq!(pod_lifetime(&p, 10_000), 60);
+        p.status = None;
+        assert_eq!(pod_lifetime(&p, 90), 30);
+        // no creation time: nothing to measure
+        p.metadata.creation_timestamp = None;
+        assert_eq!(pod_lifetime(&p, 90), 0);
+    }
+
+    #[test]
+    fn the_backoff_is_read_from_the_agent_annotation() {
+        let mut a = agent(json!({ "type": "pod" }));
+        assert_eq!(pod_backoff(&a), None);
+        a.metadata.annotations = Some(
+            [(
+                POD_BACKOFF_ANNOTATION.to_string(),
+                r#"{"pod":"u","streak":2,"delay":20,"until":5}"#.to_string(),
+            )]
+            .into(),
+        );
+        assert_eq!(
+            pod_backoff(&a),
+            Some(PodBackoff {
+                pod: "u".into(),
+                streak: 2,
+                delay: 20,
+                until: 5
+            })
         );
     }
 

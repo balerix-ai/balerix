@@ -362,6 +362,10 @@ Every `hello` re-sends `activate` for every row the daemon holds for that
 plugin — pending, active and **rejected** alike, since re-offering a
 rejected pair is how it recovers — so a restarted plugin gets its
 activations back without the daemon persisting anything about them. The
+daemon answers `hello` first and sends those `activate`s after it, one at a
+time, so a plugin must be serving its routes before it says `hello`; a
+`hello` that arrives while they are still being sent makes the daemon
+offer every row once more when they are done. The
 answer to each is the pair's new state: a pair rejected before can become
 active, and one active before can be rejected. An `up` or `update` also
 re-offers every pair whose row is not `active`, even when its config did

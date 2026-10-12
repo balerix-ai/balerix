@@ -98,6 +98,11 @@ pub struct Daemon {
     /// fleet. Every other fleet runs on its own lock — an apply waits for
     /// the actor's pass, and one fleet's pass must not hold up the rest.
     applying: std::sync::Mutex<BTreeMap<FleetName, Arc<tokio::sync::Mutex<()>>>>,
+    /// Re-activation is single-flight per plugin (#222): a plugin in this
+    /// map has a run in progress, and `true` means another `hello` or
+    /// health transition asked for one meanwhile, so the run goes round
+    /// once more when it ends rather than two runs interleaving.
+    reactivating: std::sync::Mutex<BTreeMap<AgentName, bool>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -274,6 +279,7 @@ impl Daemon {
             sessions: Sessions::new(),
             changes,
             applying: std::sync::Mutex::new(BTreeMap::new()),
+            reactivating: std::sync::Mutex::new(BTreeMap::new()),
         });
         tokio::spawn(Self::forget_purged(Arc::downgrade(&daemon), purged));
         tokio::spawn(Self::health_loop(Arc::downgrade(&daemon)));
@@ -301,8 +307,10 @@ impl Daemon {
                     tracing::warn!(plugin = %name, "health check failed: {e}");
                 }
                 if d.health(&name, result) {
-                    self.reactivate(&name).await;
                     self.bump();
+                    if self.claim_reactivation(&name) {
+                        self.run_reactivation(&name).await;
+                    }
                 }
             }
             return;
@@ -669,7 +677,7 @@ impl Daemon {
     /// Kubernetes mode the list entry's — and is otherwise the plugin's
     /// `SessionStart`.
     pub async fn plugin_hello(
-        &self,
+        self: &Arc<Self>,
         name: &AgentName,
         token: &str,
         req: HelloRequest,
@@ -689,9 +697,93 @@ impl Daemon {
             }
         };
         self.handler.on_hello(name);
-        self.reactivate(name).await;
         self.bump();
+        // Answered before re-activation (#222): one `activate` per active
+        // pair, each up to `CALL_TIMEOUT`, can outlast the SDK's hello
+        // timeout, and a plugin whose hello times out exits and says hello
+        // again: a crash loop with every activation succeeding.
+        if self.claim_reactivation(name) {
+            let d = self.clone();
+            let name = name.clone();
+            tokio::spawn(async move { d.run_reactivation(&name).await });
+        }
         Ok(response)
+    }
+
+    /// Re-activation is single-flight per plugin. `true`: the caller now
+    /// owns the run and must call `run_reactivation`. `false`: a run is in
+    /// progress and has been asked to go round once more when it ends; its
+    /// next pass offers every row again, so a plugin that restarted
+    /// (another `hello`) mid-run still gets them all.
+    fn claim_reactivation(&self, name: &AgentName) -> bool {
+        let mut map = self.reactivating.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(again) = map.get_mut(name) {
+            *again = true;
+            return false;
+        }
+        map.insert(name.clone(), false);
+        true
+    }
+
+    /// `reactivate` for a claimed plugin, again for as long as another
+    /// claim arrived during the pass. Failures are the rows' states and
+    /// the log, as in `reactivate`; nothing is returned.
+    async fn run_reactivation(&self, name: &AgentName) {
+        /// Takes the plugin out of the map if the run unwinds, so a
+        /// panicking `activate` cannot leave its re-activation stuck. A
+        /// claim that set `again` during the panicking pass is lost with
+        /// it: that plugin's rows wait for its next `hello`.
+        struct Unwinding<'a> {
+            map: &'a std::sync::Mutex<BTreeMap<AgentName, bool>>,
+            name: &'a AgentName,
+            armed: bool,
+        }
+        impl Drop for Unwinding<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.map
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(self.name);
+                }
+            }
+        }
+        let mut unwinding = Unwinding {
+            map: &self.reactivating,
+            name,
+            armed: true,
+        };
+        loop {
+            let superseded = self.reactivate(name).await;
+            self.bump();
+            // Deciding to stop and leaving the map are one step under the
+            // lock: a claim made after it starts a run of its own.
+            let mut map = self.reactivating.lock().unwrap_or_else(|e| e.into_inner());
+            if superseded || map.get(name).copied() == Some(true) {
+                map.insert(name.clone(), false);
+                continue;
+            }
+            map.remove(name);
+            unwinding.armed = false;
+            return;
+        }
+    }
+
+    /// Tests: no re-activation of `name` is claimed or running.
+    #[cfg(test)]
+    pub(crate) async fn reactivation_settled(&self, name: &AgentName) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while self
+                .reactivating
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(name)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("re-activation settles");
     }
 
     /// Restart recovery (§16.2): the plugin knows nothing about the
@@ -708,11 +800,19 @@ impl Daemon {
     /// row's current config is offered again — `activate` replaces in
     /// place, so this converges — and a row the apply removed is
     /// deactivated, at most `REACTIVATE_TRIES` offers per row.
-    async fn reactivate(&self, name: &AgentName) {
+    ///
+    /// `true` when a newer `hello` superseded the pass: it stopped before
+    /// the next row rather than offer the rest to the address it started
+    /// with, and the caller goes round again with the new one.
+    async fn reactivate(&self, name: &AgentName) -> bool {
+        let generation = self.registry.hello_generation(name);
         let Some(addr) = self.registry.ready_addr(name) else {
-            return;
+            return false;
         };
         for (agent, _) in self.registry.rows_for_plugin(name) {
+            if self.registry.hello_generation(name) != generation {
+                return true;
+            }
             let mut offered = false;
             for _ in 0..REACTIVATE_TRIES {
                 let Some(row) = self.registry.row(&agent, name) else {
@@ -746,6 +846,7 @@ impl Daemon {
                 tracing::warn!(plugin = %name, agent = %agent, "row kept changing during re-activation; the next hello offers it again");
             }
         }
+        false
     }
 
     /// `CallFailure::Status` carries the plugin's own error verbatim; every
@@ -1747,6 +1848,7 @@ mod tests {
             )
             .await
             .unwrap();
+        w.daemon.reactivation_settled(&name).await;
     }
 
     /// The plugin agent's own `hello` reaches the actor behind its first
@@ -3311,6 +3413,7 @@ mod tests {
             )
             .await
             .unwrap();
+            d.reactivation_settled(&flow).await;
         })
     }
 
@@ -3521,5 +3624,148 @@ mod tests {
         assert!(removals.0.lock().unwrap().is_empty());
         daemon.declare_plugins(list(&["web"])).await.unwrap();
         assert_eq!(*removals.0.lock().unwrap(), vec!["flow".to_string()]);
+    }
+
+    /// A plugin whose every `activate` takes `delay`; it counts the calls
+    /// and the most it ever had in flight at once.
+    #[derive(Clone, Default)]
+    struct Slow {
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        most: Arc<std::sync::atomic::AtomicUsize>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn slow_plugin(delay: Duration) -> (Slow, String) {
+        use axum::extract::State;
+        use axum::routing::{get, post};
+        use std::sync::atomic::Ordering::SeqCst;
+        let slow = Slow::default();
+        let app = axum::Router::new()
+            .route(
+                "/v1/activate",
+                post(move |State(s): State<Slow>| async move {
+                    let now = s.in_flight.fetch_add(1, SeqCst) + 1;
+                    s.most.fetch_max(now, SeqCst);
+                    tokio::time::sleep(delay).await;
+                    s.in_flight.fetch_sub(1, SeqCst);
+                    s.calls.fetch_add(1, SeqCst);
+                    axum::Json(json!({}))
+                }),
+            )
+            .route("/v1/health", get(|| async { axum::Json(json!({})) }))
+            .with_state(slow.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (slow, listen)
+    }
+
+    async fn three_pending_pairs(w: &World) -> Vec<AgentId> {
+        let name: FleetName = "f".parse().unwrap();
+        w.daemon
+            .apply(
+                &name,
+                spec(&[
+                    ("a", &[("flow", json!({ "v": 1 }))]),
+                    ("b", &[("flow", json!({ "v": 2 }))]),
+                    ("c", &[("flow", json!({ "v": 3 }))]),
+                ]),
+                Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        ["f/c/a", "f/c/b", "f/c/c"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect()
+    }
+
+    fn all_active(w: &World, agents: &[AgentId]) -> bool {
+        let flow: AgentName = "flow".parse().unwrap();
+        agents.iter().all(|a| {
+            w.daemon
+                .registry()
+                .row(a, &flow)
+                .is_some_and(|r| r.activation.state == ActivationState::Active)
+        })
+    }
+
+    async fn say_hello(w: &World, listen: &str) -> Duration {
+        let flow: AgentName = "flow".parse().unwrap();
+        let token = w.daemon.hook_secret(&plugin_id(&flow)).await.unwrap();
+        let started = Instant::now();
+        w.daemon
+            .plugin_hello(
+                &flow,
+                &token,
+                HelloRequest {
+                    name: "flow".into(),
+                    version: "0.1.0".into(),
+                    protocol: balerix_api::PLUGIN_PROTOCOL,
+                    listen: listen.into(),
+                    manifest: None,
+                    revision: None,
+                },
+            )
+            .await
+            .unwrap();
+        started.elapsed()
+    }
+
+    /// #222: `hello` answers before re-activation. Three pairs whose
+    /// `activate` takes 4 s each kept it 12 s, past the SDK's 10 s hello
+    /// timeout, and the plugin crash-looped; now it answers at once and
+    /// every pair is activated behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hello_answers_before_a_slow_reactivation_and_every_pair_follows() {
+        let w = world().await;
+        let agents = three_pending_pairs(&w).await;
+        let (slow, listen) = slow_plugin(Duration::from_secs(4)).await;
+        let took = say_hello(&w, &listen).await;
+        assert!(took < Duration::from_secs(2), "hello took {took:?}");
+        assert!(!all_active(&w, &agents), "re-activation is still running");
+        w.daemon
+            .reactivation_settled(&"flow".parse().unwrap())
+            .await;
+        assert!(all_active(&w, &agents));
+        assert_eq!(slow.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// #222: re-activation is single-flight per plugin. A second hello
+    /// during a run does not start a second one beside it: the run stops
+    /// offering the old hello's address and goes round once more, so the
+    /// plugin never has two `activate`s in flight and every pair is
+    /// offered again after the later hello.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hellos_close_together_never_interleave_reactivations() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let w = world().await;
+        let agents = three_pending_pairs(&w).await;
+        let (slow, listen) = slow_plugin(Duration::from_secs(1)).await;
+        say_hello(&w, &listen).await;
+        eventually("the first run's activate is in flight", || {
+            slow.in_flight.load(SeqCst) == 1
+        })
+        .await;
+        say_hello(&w, &listen).await;
+        say_hello(&w, &listen).await;
+        w.daemon
+            .reactivation_settled(&"flow".parse().unwrap())
+            .await;
+        assert!(all_active(&w, &agents));
+        assert_eq!(slow.most.load(SeqCst), 1, "never two activates at once");
+        assert_eq!(
+            slow.calls.load(SeqCst),
+            4,
+            "the first pass stops after the activate in flight when the \
+             later hellos supersede it, then one whole pass for both"
+        );
+        // a hello once it has settled starts a run of its own
+        say_hello(&w, &listen).await;
+        w.daemon
+            .reactivation_settled(&"flow".parse().unwrap())
+            .await;
+        assert_eq!(slow.calls.load(SeqCst), 7);
     }
 }

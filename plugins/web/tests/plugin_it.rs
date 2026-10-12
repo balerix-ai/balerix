@@ -378,6 +378,46 @@ async fn observed_events_feed_the_activity_column_of_enabled_agents() {
     );
 }
 
+/// #225: a re-activation makes the log again, with `seq` from 1; the
+/// `epoch` in `events.json` is what tells an open page.
+#[tokio::test]
+async fn a_reactivated_agent_gets_a_new_epoch_and_seq_from_one() {
+    let (_fake, _, h, _watch) = world().await;
+    h.activate(ALICE, json!({})).await.unwrap();
+    let poll = |after: u64| {
+        let h = &h;
+        async move {
+            let (status, _, body) = h
+                .get_route(
+                    &format!("/agents/e2e/c/alice/events.json?after={after}"),
+                    "/v1/plugins/web",
+                )
+                .await;
+            assert_eq!(status, 200);
+            serde_json::from_slice::<Value>(&body).unwrap()
+        }
+    };
+    h.observe(vec![
+        event(ALICE, "Stop", json!({})),
+        event(ALICE, "Stop", json!({})),
+    ])
+    .await;
+    let before = poll(0).await;
+    let epoch = before["epoch"].as_str().unwrap().to_string();
+    assert_eq!(epoch.len(), 16, "{before}");
+    assert_eq!(before["events"].as_array().unwrap().len(), 2);
+    h.deactivate(ALICE).await;
+    h.activate(ALICE, json!({})).await.unwrap();
+    h.observe(vec![event(ALICE, "Stop", json!({}))]).await;
+    let after = poll(2).await;
+    assert_ne!(after["epoch"], epoch.as_str(), "{after}");
+    assert!(
+        after["events"].as_array().unwrap().is_empty(),
+        "seq 1 again, under what the page has seen: {after}"
+    );
+    assert_eq!(poll(0).await["events"][0]["seq"], 1);
+}
+
 fn sample_diff() -> balerix_api::WorkspaceDiff {
     use balerix_api::{FileDiff, FileStatus, WorkspaceDiff};
     WorkspaceDiff {

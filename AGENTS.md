@@ -647,6 +647,9 @@ credentials, hook input, or sandbox rules.
   but never while a comment box is open.
 - `web`'s event buffer is memory only: after a plugin restart the review
   page's column is empty until new events arrive (no observer catch-up).
+  Each agent's log carries a random `epoch` in `events.json`, new after a
+  restart or a `deactivate`; an open page that sees it change clears its
+  column and reads again from seq 0 (#225).
 - The matrix plugin's `matrix-sdk` state and crypto store lives in the
   plugin's `scratch/`, so `plugin remove --purge` discards the device keys:
   the bot rejoins as a new device and previously encrypted history stops

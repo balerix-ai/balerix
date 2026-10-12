@@ -52,6 +52,12 @@ pub struct Entry {
 /// The `events.json` body (Spec D §3.1 adds `workspace`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Events {
+    /// Names this agent's log: made afresh, with `seq` starting again from
+    /// 1, when the agent is activated after a `deactivate` or the plugin
+    /// restarts. A page that sees it change drops what it shows and asks
+    /// for everything again (#225). Empty when the agent has no log.
+    #[serde(default)]
+    pub epoch: String,
     pub phase: AgentPhase,
     pub events: Vec<Entry>,
     /// The worktree's version, `None` when the daemon refused or failed.
@@ -59,10 +65,32 @@ pub struct Events {
     pub workspace: Option<WorkspaceVersion>,
 }
 
-#[derive(Default)]
 struct EventLog {
+    epoch: String,
     next_seq: u64,
     entries: VecDeque<Entry>,
+}
+
+impl Default for EventLog {
+    fn default() -> Self {
+        Self {
+            epoch: new_epoch(),
+            next_seq: 0,
+            entries: VecDeque::new(),
+        }
+    }
+}
+
+/// 64 random bits in hex, without a new dependency: std seeds each
+/// thread's `RandomState` keys from the OS and moves them on for every
+/// `RandomState::new`, so two logs, in one process or two, get unrelated
+/// values. Only inequality matters: a page compares the epoch it saw.
+fn new_epoch() -> String {
+    use std::hash::BuildHasher;
+    format!(
+        "{:016x}",
+        std::hash::RandomState::new().hash_one(std::process::id())
+    )
 }
 
 /// Seconds since the epoch, for the synthetic entries the plugin itself
@@ -197,6 +225,8 @@ impl Cache {
         let mut i = self.lock();
         if enabled {
             i.enabled.insert(agent.to_string());
+            // the log, and its epoch, from the first activation on
+            i.events.entry(agent.to_string()).or_default();
         } else {
             i.enabled.remove(agent);
         }
@@ -263,9 +293,8 @@ impl Cache {
     /// The entries with `seq > after`, oldest first, and the agent's phase.
     pub fn events_after(&self, agent: &str, after: u64) -> Events {
         let i = self.lock();
-        let events = i
-            .events
-            .get(agent)
+        let log = i.events.get(agent);
+        let events = log
             .map(|log| {
                 log.entries
                     .iter()
@@ -275,6 +304,7 @@ impl Cache {
             })
             .unwrap_or_default();
         Events {
+            epoch: log.map(|log| log.epoch.clone()).unwrap_or_default(),
             phase: phase_in(&i.fleets, agent),
             events,
             workspace: None,
@@ -443,6 +473,43 @@ mod tests {
             c.events_after("f/c/a", 0).events.is_empty(),
             "deactivate drops the buffer"
         );
+    }
+
+    /// #225: `deactivate` drops the log and the next activation starts
+    /// `seq` from 1 again, below what an open page has seen; the epoch is
+    /// how the page tells. It holds for one log and differs for the next.
+    #[test]
+    fn a_log_made_again_has_a_new_epoch() {
+        use serde_json::json;
+        let c = Cache::new();
+        assert_eq!(c.events_after("f/c/a", 0).epoch, "", "no log, no epoch");
+        c.set_enabled("f/c/a", true);
+        let first = c.events_after("f/c/a", 0).epoch;
+        assert_eq!(first.len(), 16, "{first}");
+        for i in 1..=5 {
+            c.push_event("f/c/a", Timestamp(i), "Stop", "t".into(), json!({}));
+        }
+        assert_eq!(c.events_after("f/c/a", 3).epoch, first, "steady per log");
+        c.set_enabled("f/c/a", false);
+        c.set_enabled("f/c/a", true);
+        assert_eq!(
+            c.events_after("f/c/a", 0).epoch,
+            first,
+            "hidden and shown again: the same log"
+        );
+        c.remove("f/c/a");
+        c.set_enabled("f/c/a", true);
+        let again = c.events_after("f/c/a", 0);
+        assert_ne!(again.epoch, first);
+        assert!(again.events.is_empty());
+        assert_eq!(
+            c.push_event("f/c/a", Timestamp(9), "Stop", "t".into(), json!({})),
+            Some(1),
+            "seq starts again under the new epoch"
+        );
+        let other = Cache::new();
+        other.set_enabled("f/c/a", true);
+        assert_ne!(other.events_after("f/c/a", 0).epoch, again.epoch);
     }
 
     #[test]

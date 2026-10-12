@@ -465,18 +465,37 @@ async function loadDiff(fp) {{
   catch (e) {{ banner.style.color = "#b00"; banner.textContent = "diff: " + e.message; }}
 }}
 
+// One review at a time: the button is off while a POST is out, so a second
+// click cannot submit it twice (#225). A comment whose edit box is open is
+// not sent: it stays in the draft for the next review, with its edit. What
+// was sent is what success clears: a comment saved or edited while the POST
+// was out stays, and so does a summary changed meanwhile.
+let sending = false;
 async function send() {{
+  if (sending) return;
   const banner = document.getElementById("banner"); banner.textContent = "";
-  const comments = draft.comments.map((c) => ({{ path: c.path, side: c.side, line: c.line, text: c.text, body: c.body }}));
-  const body = {{ head: diff ? diff.head : "", base_ref: diff ? diff.base_ref : "", summary: draft.summary, comments }};
+  const sent = draft.comments.filter((c) => !c.editing).map((c) => [c, c.body]);
+  const open = draft.comments.length - sent.length;
+  const summary = draft.summary;
+  const comments = sent.map(([c]) => ({{ path: c.path, side: c.side, line: c.line, text: c.text, body: c.body }}));
+  const body = {{ head: diff ? diff.head : "", base_ref: diff ? diff.base_ref : "", summary, comments }};
+  const button = document.getElementById("send");
+  sending = true; button.disabled = true;
   try {{
     const r = await fetch(prefix + "/agents/" + id + "/review", {{ method: "POST", headers: {{ "content-type": "application/json" }}, body: JSON.stringify(body) }});
-    if (r.ok) {{ draft.comments = []; draft.summary = ""; save(); render(); banner.style.color = "#080"; banner.textContent = "review sent"; }}
+    if (r.ok) {{
+      const done = new Set(sent.filter(([c, b]) => c.body === b).map(([c]) => c));
+      draft.comments = draft.comments.filter((c) => !done.has(c));
+      if (draft.summary === summary) draft.summary = "";
+      save(); render(); banner.style.color = "#080";
+      banner.textContent = "review sent" + (open ? " (" + open + " comment" + (open === 1 ? "" : "s") + " being edited kept for the next one)" : "");
+    }}
     else {{ banner.style.color = "#b00"; banner.textContent = "send failed: " + (await r.text()); }}
   }} catch (e) {{ banner.style.color = "#b00"; banner.textContent = "send failed: " + e; }}
+  finally {{ sending = false; button.disabled = false; }}
 }}
 
-let lastSeq = 0, unread = 0, fetching = false;
+let unread = 0, fetching = false;
 const side = document.getElementById("side");
 function renderEvent(e) {{
   const row = el("div", "ev" + (e.name === "review_sent" ? " divider" : ""));
@@ -490,22 +509,40 @@ function renderEvent(e) {{
   row.appendChild(pre); row.onclick = () => {{ pre.hidden = !pre.hidden; }};
   return row;
 }}
+async function fetchEvents(after) {{
+  return await (await fetch(prefix + "/agents/" + id + "/events.json?after=" + after)).json();
+}}
 // The activity column's half of a poll: new events and the phase. Returns
 // the poll's body (its `workspace` is the version, or null when the daemon
 // refused, failed or was slower than the plugin's deadline), or null when
-// the poll itself failed.
+// the poll itself failed or another was still out (#225: one at a time, as
+// the interval does not wait for a slow one). A changed `epoch` is a log
+// made again, its `seq` restarted (a re-activation, a plugin restart): the
+// column is cleared and read again from the start.
+let lastSeq = 0, epoch = null, polling = false;
 async function pollEvents() {{
+  if (polling) return null;
+  polling = true;
   try {{
-    const r = await (await fetch(prefix + "/agents/" + id + "/events.json?after=" + lastSeq)).json();
-    document.getElementById("phase").textContent = r.phase;
+    let r = await fetchEvents(lastSeq);
     const box = document.getElementById("events");
+    if (epoch !== null && r.epoch !== epoch) {{
+      lastSeq = 0; unread = 0;
+      const none = document.getElementById("no-events"); none.hidden = false;
+      box.replaceChildren(none);
+      r = await fetchEvents(0);
+    }}
+    epoch = r.epoch;
+    document.getElementById("phase").textContent = r.phase;
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
-    for (const e of r.events) {{ box.appendChild(renderEvent(e)); lastSeq = e.seq; if (side.classList.contains("collapsed")) unread++; }}
+    const fresh = r.events.filter((e) => e.seq > lastSeq);
+    for (const e of fresh) {{ box.appendChild(renderEvent(e)); lastSeq = e.seq; if (side.classList.contains("collapsed")) unread++; }}
     if (lastSeq > 0) document.getElementById("no-events").hidden = true;
     document.getElementById("unread").textContent = unread ? "(" + unread + " new)" : "";
-    if (r.events.length && atBottom) box.scrollTop = box.scrollHeight;
+    if (fresh.length && atBottom) box.scrollTop = box.scrollHeight;
     return r;
   }} catch (e) {{ console.warn("events", e); return null; }}
+  finally {{ polling = false; }}
 }}
 // The diff column's half: a new fingerprint fetches the diff once and parks
 // it until maybeApply lets it through — unless a reload applied that
@@ -1145,11 +1182,10 @@ mod tests {
         false
     }
 
-    /// Spec D PD-4 run as the page runs it (#20): the script is sliced out
-    /// of `review_html` itself — `anchorOf`, `parsePatch` and
-    /// `anchorComments` — and the four cases run under `node`, fed on stdin.
-    #[test]
-    fn anchor_comments_keeps_reanchors_or_stales_under_node() {
+    /// Runs `script` under `node` on stdin and asserts it exits 0 having
+    /// printed `marker`; returns at once when node is missing and the test
+    /// may skip (`require_or_skip`).
+    fn run_under_node(script: &str, marker: &str) {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let node = Command::new("node")
@@ -1159,6 +1195,65 @@ mod tests {
         if !require_or_skip("node", node) {
             return;
         }
+        let mut child = Command::new("node")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("node starts");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(script.as_bytes())
+            .expect("the script reaches node");
+        let out = child.wait_with_output().expect("node finishes");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(marker),
+            "node failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The review page's whole script, for `run_under_node`.
+    fn page_script() -> String {
+        let page = review_html("", "f/c/a");
+        let start = page.find("<script>\n").expect("the script") + "<script>\n".len();
+        let end = page.rfind("</script>").expect("its end");
+        page[start..end].to_string()
+    }
+
+    /// A stub DOM for `page_script`: elements keep their children, and
+    /// `.file` elements stack 100 px apart. `fetch` is the test's own,
+    /// defined after this and before the page's script (its load polls).
+    const DOM_STUBS: &str = r#"
+const assert = require("node:assert");
+class El {
+  constructor(tag) { this.tag = tag; this.children = []; this.dataset = {}; this.style = {}; this.className = ""; this.textContent = ""; this.value = ""; this.hidden = false; this.disabled = false; this.scrollTop = 0; this.scrollHeight = 0; this.clientHeight = 0; this.classList = { add() {}, remove() {}, toggle() {}, contains() { return false; } }; }
+  appendChild(c) { this.children.push(c); return c; }
+  append(...cs) { for (const c of cs) this.children.push(c); }
+  replaceChildren(...cs) { this.children = cs; }
+  // layout: the files stack 100 px apart, in order
+  querySelectorAll(sel) { assert.strictEqual(sel, ".file"); const out = this.children.filter((c) => c instanceof El && c.className === "file"); out.forEach((f, i) => { f.offsetTop = i * 100; }); return out; }
+}
+const els = {};
+globalThis.document = { getElementById: (k) => (els[k] = els[k] || new El(k)), createElement: (t) => new El(t) };
+globalThis.localStorage = { getItem: () => null, setItem: () => {} };
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+const settle = async () => { for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r)); };
+const json = (v) => ({ ok: true, json: async () => v, text: async () => JSON.stringify(v) });
+// every text under an element, depth first
+const texts = (e, out = []) => { if (e.textContent) out.push(e.textContent); for (const c of e.children || []) if (c instanceof El) texts(c, out); return out; };
+"#;
+
+    /// Spec D PD-4 run as the page runs it (#20): the script is sliced out
+    /// of `review_html` itself — `anchorOf`, `parsePatch` and
+    /// `anchorComments` — and the four cases run under `node`, fed on stdin.
+    #[test]
+    fn anchor_comments_keeps_reanchors_or_stales_under_node() {
         let page = review_html("", "f/c/a");
         let start = page.find("const anchorOf").expect("anchorOf in the page");
         let func = page
@@ -1182,26 +1277,7 @@ assert.strictEqual(several.line, 9, "a stale comment keeps its line");
 console.log("anchor cases ok");
 "#;
         let script = format!("{}\n{cases}", &page[start..end]);
-        let mut child = Command::new("node")
-            .arg("-")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("node starts");
-        child
-            .stdin
-            .take()
-            .expect("stdin")
-            .write_all(script.as_bytes())
-            .expect("the script reaches node");
-        let out = child.wait_with_output().expect("node finishes");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("anchor cases ok"),
-            "node failed:\n{stdout}\n{}\nscript:\n{script}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        run_under_node(&script, "anchor cases ok");
     }
 
     /// The review page's whole script under `node` with a stub DOM and a
@@ -1210,42 +1286,14 @@ console.log("anchor cases ok");
     /// a poll's fetch that a reload overtook parks nothing.
     #[test]
     fn the_review_page_keeps_its_place_and_its_fingerprints_under_node() {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-        let node = Command::new("node")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if !require_or_skip("node", node) {
-            return;
-        }
-        let page = review_html("", "f/c/a");
-        let start = page.find("<script>\n").expect("the script") + "<script>\n".len();
-        let end = page.rfind("</script>").expect("its end");
-        let stubs = r#"
-const assert = require("node:assert");
-class El {
-  constructor(tag) { this.tag = tag; this.children = []; this.dataset = {}; this.style = {}; this.className = ""; this.textContent = ""; this.value = ""; this.hidden = false; this.scrollTop = 0; this.scrollHeight = 0; this.clientHeight = 0; this.classList = { add() {}, remove() {}, toggle() {}, contains() { return false; } }; }
-  appendChild(c) { this.children.push(c); return c; }
-  append(...cs) { for (const c of cs) this.children.push(c); }
-  replaceChildren() { this.children = []; }
-  // layout: the files stack 100 px apart, in order
-  querySelectorAll(sel) { assert.strictEqual(sel, ".file"); const out = this.children.filter((c) => c instanceof El && c.className === "file"); out.forEach((f, i) => { f.offsetTop = i * 100; }); return out; }
-}
-const els = {};
-globalThis.document = { getElementById: (k) => (els[k] = els[k] || new El(k)), createElement: (t) => new El(t) };
-globalThis.localStorage = { getItem: () => null, setItem: () => {} };
-globalThis.setInterval = () => 0;
-globalThis.setTimeout = () => 0;
+        let fetches = r#"
 // fetch: events.json answers `version` (null until set); diff.json waits on `diffs`
 let version = null; const diffs = []; const fetched = [];
-const json = (v) => ({ ok: true, json: async () => v, text: async () => JSON.stringify(v) });
 globalThis.fetch = async (url) => {
   fetched.push(url);
   if (url.includes("/events.json")) return json({ phase: "ready", events: [], workspace: version && { head: "h", fingerprint: version } });
   return await new Promise((resolve) => diffs.push((d) => resolve(json(d))));
 };
-const settle = async () => { for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r)); };
 const file = (path) => ({ path, status: "modified", patch: "@@ -1 +1 @@\n-a\n+b\n" });
 const diffOf = (...paths) => ({ base_ref: "origin/main", head: "h", truncated: false, files: paths.map(file) });
 "#;
@@ -1289,27 +1337,127 @@ const diffOf = (...paths) => ({ base_ref: "origin/main", head: "h", truncated: f
   console.log("page cases ok");
 })().catch((e) => { console.error(e); process.exit(1); });
 "#;
-        let script = format!("{stubs}\n{}\n{cases}", &page[start..end]);
-        let mut child = Command::new("node")
-            .arg("-")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("node starts");
-        child
-            .stdin
-            .take()
-            .expect("stdin")
-            .write_all(script.as_bytes())
-            .expect("the script reaches node");
-        let out = child.wait_with_output().expect("node finishes");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("page cases ok"),
-            "node failed:\n{stdout}\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let script = format!("{DOM_STUBS}\n{fetches}\n{}\n{cases}", page_script());
+        run_under_node(&script, "page cases ok");
+    }
+
+    /// #225 under `node`: overlapping polls render each event once; a
+    /// changed epoch clears the column and reads it again from seq 0; Send
+    /// is one POST at a time and success clears only what it sent.
+    #[test]
+    fn the_review_page_polls_once_at_a_time_and_sends_once_under_node() {
+        let fetches = r#"
+// events.json and the POST wait on `out`, answered by the test; diff.json is empty at once
+const out = []; const posts = []; const fetched = [];
+globalThis.fetch = async (url, opts) => {
+  fetched.push(url);
+  if (url.includes("/diff.json")) return json({ base_ref: "origin/main", head: "h", truncated: false, files: [] });
+  if (opts && opts.method === "POST") posts.push(JSON.parse(opts.body));
+  // `out.shift()(v)` answers 200 with `v`; `.raw(response)` answers that; `.fail(e)` throws
+  return await new Promise((resolve, reject) => { const f = (v) => resolve(json(v)); f.raw = resolve; f.fail = reject; out.push(f); });
+};
+const ev = (seq, summary) => ({ seq, at: seq, name: "Notification", summary: summary || "n" + seq, payload: {} });
+const rows = () => document.getElementById("events").children.filter((c) => c.className && c.className.startsWith("ev")).map((r) => texts(r).join(" "));
+"#;
+        let cases = r#"
+(async () => {
+  await settle();
+  assert.strictEqual(out.length, 1, "the load's poll is out");
+  // the interval ticks while it is out: no second request
+  assert.strictEqual(await pollEvents(), null, "skipped while one is in flight");
+  const tick = poll(); await settle();
+  assert.strictEqual(out.length, 1, fetched.join("\n"));
+  out.shift()({ epoch: "A", phase: "ready", workspace: null, events: [ev(1), ev(2)] });
+  await tick; await settle();
+  assert.deepStrictEqual(rows().length, 2);
+
+  // an event at or below lastSeq is dropped, whatever the server sends
+  const p = poll(); await settle();
+  assert.ok(fetched[fetched.length - 1].endsWith("events.json?after=2"), fetched.join("\n"));
+  out.shift()({ epoch: "A", phase: "ready", workspace: null, events: [ev(2), ev(3)] });
+  await p;
+  assert.strictEqual(rows().length, 3, rows().join("\n"));
+  assert.strictEqual(lastSeq, 3);
+
+  // a re-activation: the log is new and its seq starts again below 3
+  const q = poll(); await settle();
+  out.shift()({ epoch: "B", phase: "ready", workspace: null, events: [] });
+  await settle();
+  assert.ok(fetched[fetched.length - 1].endsWith("events.json?after=0"), "read again from the start: " + fetched.join("\n"));
+  out.shift()({ epoch: "B", phase: "ready", workspace: null, events: [ev(1, "fresh")] });
+  await q;
+  assert.deepStrictEqual(rows().length, 1, rows().join("\n"));
+  assert.ok(rows()[0].includes("fresh"), rows()[0]);
+  assert.strictEqual(lastSeq, 1);
+  assert.strictEqual(document.getElementById("no-events").hidden, true);
+
+  // Send twice before the first answers: one POST, the button off meanwhile
+  const button = document.getElementById("send");
+  const c1 = { path: "a.rs", side: "new", line: 1, text: "+x", body: "one" };
+  const c2 = { path: "a.rs", side: "new", line: 2, text: "+y", body: "two" };
+  draft.comments = [c1, c2]; draft.summary = "please fix";
+  const s1 = send(); const s2 = send(); await settle();
+  assert.strictEqual(posts.length, 1, "one review");
+  assert.strictEqual(button.disabled, true);
+  // meanwhile: a comment saved, one edited, the summary changed
+  const c3 = { path: "a.rs", side: "new", line: 3, text: "+z", body: "three" };
+  draft.comments.push(c3); c2.body = "two, edited";
+  draft.summary = "please fix, and test";
+  out.shift()({});
+  await s1; await s2;
+  assert.strictEqual(button.disabled, false);
+  assert.deepStrictEqual(posts[0].comments.map((c) => c.body), ["one", "two"]);
+  assert.deepStrictEqual(draft.comments, [c2, c3], "only what was sent, unchanged, is cleared");
+  assert.strictEqual(draft.summary, "please fix, and test", "a changed summary stays");
+
+  // an unchanged summary is cleared; a failed send keeps everything
+  draft.comments = [c3]; draft.summary = "again";
+  const s3 = send(); await settle();
+  out.shift()({});
+  await s3;
+  assert.deepStrictEqual(draft.comments, []);
+  assert.strictEqual(draft.summary, "");
+
+  // a comment whose edit box is open is not sent, and is kept with its edit
+  // (on lines of the diff: a stale comment's box is closed by render)
+  diff = { base_ref: "origin/main", head: "h", truncated: false, files: [{ path: "a.rs", status: "modified", patch: "@@ -3,0 +4,2 @@\n+w\n+v\n" }] };
+  const banner = document.getElementById("banner");
+  const c4 = { path: "a.rs", side: "new", line: 4, text: "+w", body: "four", editing: true, typing: "four, better" };
+  const c5 = { path: "a.rs", side: "new", line: 5, text: "+v", body: "five" };
+  draft.comments = [c4, c5];
+  posts.length = 0;
+  const s4 = send(); await settle();
+  assert.deepStrictEqual(posts[0].comments.map((c) => c.body), ["five"], "the open one stays out");
+  out.shift()({});
+  await s4;
+  assert.deepStrictEqual(draft.comments, [c4]);
+  assert.strictEqual(c4.typing, "four, better");
+  assert.ok(banner.textContent.startsWith("review sent (1 comment being edited kept"), banner.textContent);
+
+  // failures keep the whole draft and give the button back
+  delete c4.editing; delete c4.typing;
+  draft.comments = [c4, c5]; draft.summary = "keep";
+  const s5 = send(); await settle();
+  assert.strictEqual(button.disabled, true);
+  out.shift().raw({ ok: false, json: async () => ({}), text: async () => "f/c/a: no window" });
+  await s5;
+  assert.strictEqual(button.disabled, false);
+  assert.strictEqual(banner.textContent, "send failed: f/c/a: no window");
+  assert.deepStrictEqual(draft.comments, [c4, c5]);
+  assert.strictEqual(draft.summary, "keep");
+  const s6 = send(); await settle();
+  out.shift().fail(new Error("network down"));
+  await s6;
+  assert.strictEqual(button.disabled, false);
+  assert.strictEqual(banner.textContent, "send failed: Error: network down");
+  assert.deepStrictEqual(draft.comments, [c4, c5]);
+  assert.strictEqual(draft.summary, "keep");
+  assert.strictEqual(posts.length, 3);
+  console.log("race cases ok");
+})().catch((e) => { console.error(e); process.exit(1); });
+"#;
+        let script = format!("{DOM_STUBS}\n{fetches}\n{}\n{cases}", page_script());
+        run_under_node(&script, "race cases ok");
     }
 
     #[test]

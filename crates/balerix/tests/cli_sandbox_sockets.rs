@@ -373,6 +373,26 @@ fn deny_policy_the_daemons_sandboxed_git_runs_behind_the_wrapper() {
     git(&paths.workspace, &["commit", "-q", "-m", "agent work"]);
     let sha = git(&paths.workspace, &["rev-parse", "HEAD"]);
 
+    // the workspace reader's scripts too, the patches streamed (#186)
+    std::fs::write(paths.workspace.join("untracked.txt"), "new\n").unwrap();
+    let rt = balerix_runtime::Runtime::new(layout.clone(), tools.clone())
+        .with_socket_policy(SocketPolicy::Deny);
+    use balerix_core::WorkspaceReader;
+    let d = rt.diff(&id, "origin/main").unwrap();
+    let patches: Vec<(&str, bool)> = d
+        .files
+        .iter()
+        .map(|f| {
+            (
+                f.path.as_str(),
+                f.patch.contains("+unpushed") || f.patch.contains("+new"),
+            )
+        })
+        .collect();
+    assert_eq!(patches, [("untracked.txt", true), ("work.txt", true)]);
+    rt.version(&id, "origin/main").unwrap();
+    std::fs::remove_file(paths.workspace.join("untracked.txt")).unwrap();
+
     ws.harvest_and_remove("f/c/a", &crew, &paths).unwrap();
 
     assert_eq!(
@@ -387,4 +407,9 @@ fn deny_policy_the_daemons_sandboxed_git_runs_behind_the_wrapper() {
             .any(|l| l.contains(" version") && l.contains(&wrapped)),
         "the canary did not run behind the wrapper: {log}"
     );
+    let scripts = log
+        .lines()
+        .filter(|l| l.contains("/bin/sh -c") && l.contains(&wrapped))
+        .count();
+    assert_eq!(scripts, 3, "diff's two scripts and version's: {log}");
 }

@@ -46,7 +46,8 @@ pub(crate) fn scrub_git_env(mut cmd: Cmd) -> Cmd {
 /// profile's `set_vars`, and `scrub_git_env`) closes that from git 2.45.1
 /// (and the patched maintenance releases from 2.39.4); the git profile's
 /// blocked network is what holds on any git, and the refusal by key
-/// (`check_clone_config`, `refuse_filters`) is the operator's message
+/// (`check_clone_config`, the workspace reader's filter probe) is the
+/// operator's message
 /// (#67).
 pub(crate) const PROMISOR_KEYS: &str = r"^(extensions\.partialclone|remote\..*\.promisor)$";
 
@@ -403,7 +404,6 @@ fn sandboxed_cmd(
             "cannot create nono's home beside {}: {e}",
             agent.nono_home.display()
         ),
-        unanswered: None,
     })?;
     let cmd = Cmd::new(&tools.nono)
         .env_clear()
@@ -500,14 +500,12 @@ pub(crate) enum GitLog {
 /// A failed `sandboxed_git`, reported as git's: git's subcommand (its
 /// first argument past the options), and the argv nono ran, or git's own
 /// arguments when the call exited with an accepted non-zero code but
-/// printed on stderr (`is_gits_answer`). That last case keeps the output
-/// in `unanswered`, for a caller to whom such an exit is harmless.
+/// printed on stderr (`is_gits_answer`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitFailure {
     pub subcommand: String,
     pub args: Vec<String>,
     pub stderr: String,
-    pub unanswered: Option<Box<CmdOutput>>,
 }
 
 /// One git call inside the agent's existing clone, run under the git
@@ -539,81 +537,6 @@ pub(crate) fn sandboxed_git(
     accepted: &[i32],
     log: GitLog,
 ) -> Result<CmdOutput, GitFailure> {
-    run_sandboxed_git(tools, policy, crew, agent, args, accepted, log, None)
-}
-
-/// `sandboxed_git` with stdout handed to `sink` as it arrives instead of
-/// collected (`Cmd::run_streaming`): exit 0 only, logged without stdout.
-pub(crate) fn sandboxed_git_streaming(
-    tools: &ToolPaths,
-    policy: SocketPolicy,
-    crew: &CrewPaths,
-    agent: &AgentPaths,
-    args: &[&str],
-    sink: &mut dyn FnMut(&[u8]),
-) -> Result<CmdOutput, GitFailure> {
-    run_sandboxed_git(
-        tools,
-        policy,
-        crew,
-        agent,
-        args,
-        &[0],
-        GitLog::ArgvOnly,
-        Some(sink),
-    )
-}
-
-/// Several git calls in one sandbox start (#174): `script`, a fixed
-/// constant, runs as `/bin/sh -c <script> sh <leading…> <git…>` under the
-/// git profile (`/bin` is one of its system prefixes), where `<git…>` is
-/// git with `sandboxed_git`'s options and then `git_args`, so the script
-/// runs each call as `"$@" <subcommand> …` after shifting `leading` off.
-/// Every value reaches the script as an argument, never as script text.
-/// Logged as one argv-only `git.log` entry. `accepted` are the script's
-/// exit codes, which the caller interprets: no `is_gits_answer` here, since
-/// a nono that fails exits with its own code, not one of the script's. A
-/// failure is reported with the subcommand `sh`. `write_git_profile` must
-/// have run.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn sandboxed_git_script(
-    tools: &ToolPaths,
-    policy: SocketPolicy,
-    crew: &CrewPaths,
-    agent: &AgentPaths,
-    script: &'static str,
-    leading: &[&str],
-    git_args: &[&str],
-    accepted: &[i32],
-) -> Result<CmdOutput, GitFailure> {
-    let (cmd, _home) = sandboxed_cmd(tools, policy, crew, agent, GitLog::ArgvOnly)?;
-    cmd.args(["/bin/sh", "-c", script, "sh"])
-        .args(leading.iter().copied())
-        .args(git_command(tools, crew, agent))
-        .args(git_args.iter().copied())
-        .run_with_exit_codes(accepted)
-        .map_err(|f| GitFailure {
-            subcommand: "sh".into(),
-            args: f.args,
-            stderr: f.stderr,
-            unanswered: None,
-        })
-}
-
-/// Where a streamed call's stdout goes, chunk by chunk.
-type StdoutSink<'a> = &'a mut dyn FnMut(&[u8]);
-
-#[allow(clippy::too_many_arguments)]
-fn run_sandboxed_git(
-    tools: &ToolPaths,
-    policy: SocketPolicy,
-    crew: &CrewPaths,
-    agent: &AgentPaths,
-    args: &[&str],
-    accepted: &[i32],
-    log: GitLog,
-    sink: Option<StdoutSink<'_>>,
-) -> Result<CmdOutput, GitFailure> {
     let (cmd, _home) = sandboxed_cmd(tools, policy, crew, agent, log)?;
     let cmd = cmd
         .args(git_command(tools, crew, agent))
@@ -629,25 +552,63 @@ fn run_sandboxed_git(
             break;
         }
     }
-    let out = match sink {
-        Some(sink) => cmd.run_streaming(accepted, sink),
-        None => cmd.run_with_exit_codes(accepted),
-    }
-    .map_err(|f| GitFailure {
+    let out = cmd.run_with_exit_codes(accepted).map_err(|f| GitFailure {
         subcommand: subcommand.clone(),
         args: f.args,
         stderr: f.stderr,
-        unanswered: None,
     })?;
     if !is_gits_answer(&out) {
         return Err(GitFailure {
             subcommand,
             args: args.iter().map(|a| (*a).to_string()).collect(),
             stderr: out.stderr.clone(),
-            unanswered: Some(Box::new(out)),
         });
     }
     Ok(out)
+}
+
+/// Where a streamed call's stdout goes, chunk by chunk.
+pub(crate) type StdoutSink<'a> = &'a mut dyn FnMut(&[u8]);
+
+/// Several git calls in one sandbox start (#174): `script`, a fixed
+/// constant, runs as `/bin/sh -c <script> sh <leading…> <git…>` under the
+/// git profile (`/bin` is one of its system prefixes), where `<git…>` is
+/// git with `sandboxed_git`'s options and then `git_args`, so the script
+/// runs each call as `"$@" <subcommand> …` after shifting `leading` off.
+/// Every value reaches the script as an argument, never as script text.
+/// Logged as one argv-only `git.log` entry. `accepted` are the script's
+/// exit codes, which the caller interprets: no `is_gits_answer` here, since
+/// a nono that fails exits with its own code, not one of the script's. A
+/// failure is reported with the subcommand `sh`. With a `sink`, stdout
+/// goes to it as it arrives (`Cmd::run_streaming`) instead of into the
+/// output. `write_git_profile` must have run.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sandboxed_git_script(
+    tools: &ToolPaths,
+    policy: SocketPolicy,
+    crew: &CrewPaths,
+    agent: &AgentPaths,
+    script: &'static str,
+    leading: &[&str],
+    git_args: &[&str],
+    accepted: &[i32],
+    sink: Option<StdoutSink<'_>>,
+) -> Result<CmdOutput, GitFailure> {
+    let (cmd, _home) = sandboxed_cmd(tools, policy, crew, agent, GitLog::ArgvOnly)?;
+    let cmd = cmd
+        .args(["/bin/sh", "-c", script, "sh"])
+        .args(leading.iter().copied())
+        .args(git_command(tools, crew, agent))
+        .args(git_args.iter().copied());
+    match sink {
+        Some(sink) => cmd.run_streaming(accepted, sink),
+        None => cmd.run_with_exit_codes(accepted),
+    }
+    .map_err(|f| GitFailure {
+        subcommand: "sh".into(),
+        args: f.args,
+        stderr: f.stderr,
+    })
 }
 
 pub struct Workspace<'a> {
@@ -870,7 +831,7 @@ impl Workspace<'_> {
     /// closes the same route on a git that honours it (2.45.1, or a
     /// patched maintenance release from 2.39.4) and stays as the second
     /// layer. The probe is `config --local --includes` through
-    /// `agent_git`, the workspace reader's `refuse_filters` probe: it
+    /// `agent_git`, the workspace reader's filter probe (`PROBE`): it
     /// reads no object, so it is safe to run before its own verdict, and
     /// it follows `include.path` and `includeIf` exactly as git would in
     /// that repository, which a read of the file alone would not. Runs

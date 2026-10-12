@@ -276,9 +276,16 @@ credentials, hook input, or sandbox rules.
   four git commands run in one `/bin/sh` under the profile,
   `workspace::sandboxed_git_script`; the script is a constant and every
   value, git's path and the base ref included, is a positional argument)
-  and its `diff` one combined `git diff -U3` split per file
-  (`split_patch`), plus one `--no-index` per untracked file; keep it that
-  way. Tests that run git in an existing
+  and its `diff` two (#186): a listing script (the probe, `merge-base`,
+  `--name-status`, `status`; `DIFF_LIST_SCRIPT`) and a patch script
+  (`DIFF_PATCH_SCRIPT`: the filter probe again, so it guards the reads
+  in its own start, then one combined `git diff -U3` split per file by
+  `PatchSplitter`, and one `--no-index` per untracked file, its paths
+  positional arguments, each section followed by a `\0<exit code>\n`
+  frame that `SectionReader` reads as it streams); only a file the
+  combined diff cannot name (a quoted or ambiguous header) costs a start
+  of its own, and untracked paths past 256 KiB of arguments a further
+  patch start; keep it that way. Tests that run git in an existing
   clone need Landlock and gate on `support::landlock_works`. Go through
   `Workspace::prepare_sandbox` before the first sandboxed call: it writes
   the profile, then runs one `git version` that must exit 0. The yes/no
@@ -694,7 +701,7 @@ credentials, hook input, or sandbox rules.
   `status`/`diff` fetch foreign objects into the clone as the daemon, and
   run `remote.<x>.uploadpack`: `check_clone_config` (before the first
   object-reading call on a branch change and before a harvest; the
-  marker's reuse path makes no git call) and the reader's `refuse_filters`
+  marker's reuse path makes no git call) and the reader's filter probe
   refuse those keys, read with `config --local --includes` so includes
   count as git counts them. `scrub_git_env` sets `GIT_NO_LAZY_FETCH=1` on
   every git call as the second layer; git honours it from 2.45.1 (and

@@ -621,9 +621,9 @@ fn the_reader_runs_git_under_the_git_profile() {
     let calls: Vec<&str> = log.lines().filter(|l| l.starts_with("$ ")).collect();
     assert_eq!(
         calls.len(),
-        7,
-        "diff: the filter probe, status, merge-base, name-status, one combined \
-         patch, one --no-index; version: one script (#108, #174): {log}"
+        3,
+        "diff: the listing script and the patch script; version: one script \
+         (#108, #174, #186): {log}"
     );
     for line in &calls {
         assert!(
@@ -896,12 +896,11 @@ fn a_truncated_diff_still_patches_every_file_it_keeps() {
     );
     let log = std::fs::read_to_string(&log_path).unwrap();
     let calls: Vec<&str> = log.lines().filter(|l| l.starts_with("$ ")).collect();
-    assert_eq!(calls.len(), 5, "no per-file diff: {log}");
-    assert!(
-        calls[4].contains(" --literal-pathspecs diff "),
-        "{}",
-        calls[4]
-    );
+    assert_eq!(calls.len(), 2, "no per-file diff: {log}");
+    // the kept files are the combined diff's pathspecs, the cut ones not
+    let last = d.files.last().unwrap().path.clone();
+    assert!(log.contains(&format!(" {last} ")), "{log}");
+    assert!(!log.contains(" f0504 "), "{log}");
 }
 
 /// What the agent's clone may hold that would mislead the split of the one
@@ -924,24 +923,18 @@ fn the_combined_diff_holds_up_against_what_the_clone_can_do() {
     let w = &paths.workspace;
     let rt = Runtime::new(layout.clone(), tools.clone());
     let log_path = crew.logs.join("git.log");
-    let diff_calls = |log: &str| {
-        log.lines()
-            .filter(|l| l.starts_with("$ ") && l.contains(" diff "))
-            .count()
-    };
+    // sandbox starts: the listing and the patch scripts (#186), then one
+    // per file the combined diff could not name
+    let diff_calls = |log: &str| log.lines().filter(|l| l.starts_with("$ ")).count();
 
     // mnemonic and custom prefixes in the clone's config: still one
-    // combined diff (and one --no-index for the untracked file)
+    // combined diff, no file diffed on its own
     git(w, &["config", "diff.mnemonicPrefix", "true"]);
     git(w, &["config", "diff.srcPrefix", "x/"]);
     std::fs::write(&log_path, "").unwrap();
     let d = rt.diff(&id, "origin/main").unwrap();
     let log = std::fs::read_to_string(&log_path).unwrap();
-    assert_eq!(
-        diff_calls(&log),
-        3,
-        "name-status, combined, --no-index: {log}"
-    );
+    assert_eq!(diff_calls(&log), 2, "the listing and the patches: {log}");
     assert!(
         d.files[0]
             .patch
@@ -1002,9 +995,10 @@ fn the_combined_diff_holds_up_against_what_the_clone_can_do() {
     std::fs::write(&log_path, "").unwrap();
     let d = rt.diff(&id, "origin/main").unwrap();
     let log = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        diff_calls(&log) <= 5,
-        "one combined diff; per-file only for notes.txt and the ambiguous renames: {log}"
+    assert_eq!(
+        diff_calls(&log),
+        4,
+        "the two scripts; per-file only for the ambiguous renames: {log}"
     );
     assert!(!log.contains(" -- big"), "{log}");
     for name in ["big1", "big2", "big3"] {
@@ -1029,4 +1023,227 @@ fn the_combined_diff_holds_up_against_what_the_clone_can_do() {
             .unwrap();
         assert_eq!(f.patch, own[..=line_end], "{name}");
     }
+}
+
+/// Plain git's `--no-index` diff of an untracked file against
+/// `/dev/null`, which exits 1 when it printed a diff.
+fn no_index(dir: &Path, path: &str) -> String {
+    let out = Command::new("git")
+        .args([
+            "diff",
+            "--no-color",
+            "--no-index",
+            "-U3",
+            "--",
+            "/dev/null",
+            path,
+        ])
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// #186: a diff is two sandbox starts whatever it holds — the listing
+/// (filter probe, status, merge-base, name-status) and the patches (one
+/// combined diff and one `--no-index` per untracked file) — and gives
+/// what git gives file by file: renames, binaries, untracked files with
+/// awkward names, an untracked symlink to a directory.
+#[test]
+fn diff_is_two_sandboxed_calls() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("inspect-diff-twice");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (id, layout) = clone_with_changes(&root, &tools);
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let w = &paths.workspace;
+    let log_path = crew.logs.join("git.log");
+    let rt = Runtime::new(layout.clone(), tools.clone());
+    let starts = || {
+        std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("$ "))
+            .count()
+    };
+
+    // 50 files: 40 committed edits, a rename, a binary, two added, an
+    // uncommitted edit (LICENSE), and untracked: notes.txt, three awkward
+    // names and a symlink to a directory
+    for i in 0..40 {
+        std::fs::write(w.join(format!("f{i:02}")), format!("{i}\n")).unwrap();
+    }
+    std::fs::write(w.join("moved-from"), "a\nb\nc\nd\n").unwrap();
+    // LICENSE and notes.txt stay as `clone_with_changes` left them
+    git(w, &["add", "f*", "moved-from"]);
+    git(w, &["commit", "-q", "-m", "base files"]);
+    git(
+        &root,
+        &[
+            "-C",
+            &w.display().to_string(),
+            "push",
+            "-q",
+            "origin",
+            "HEAD:main",
+        ],
+    );
+    git(w, &["fetch", "-q", "origin"]);
+    for i in 0..40 {
+        std::fs::write(w.join(format!("f{i:02}")), format!("{i}\nedited\n")).unwrap();
+    }
+    git(w, &["mv", "moved-from", "moved-to"]);
+    std::fs::write(w.join("img.bin"), [0u8, 1, 2, 255, 0, 7]).unwrap();
+    std::fs::write(w.join("added"), "new\n").unwrap();
+    git(w, &["add", "f*", "img.bin", "added"]);
+    git(w, &["commit", "-q", "-m", "edits"]);
+    for name in ["a b.txt", "-dash", "quote\"d"] {
+        std::fs::write(w.join(name), format!("{name}\n")).unwrap();
+    }
+    std::fs::create_dir(w.join("dir")).unwrap();
+    std::fs::write(w.join("dir/inner"), "x\n").unwrap();
+    git(w, &["add", "dir"]);
+    git(w, &["commit", "-q", "-m", "dir"]);
+    std::os::unix::fs::symlink("dir", w.join("to-dir")).unwrap();
+
+    rt.version(&id, "origin/main").unwrap(); // writes the profile
+    std::fs::write(&log_path, "").unwrap();
+    let d = rt.diff(&id, "origin/main").unwrap();
+    assert_eq!(
+        starts(),
+        2,
+        "{}",
+        std::fs::read_to_string(&log_path).unwrap()
+    );
+    assert_eq!(
+        d.files.len(),
+        50,
+        "{:?}",
+        d.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+    for f in &d.files {
+        let expected = match f.path.as_str() {
+            "img.bin" => {
+                assert!(f.binary && f.status == FileStatus::Added, "{f:?}");
+                String::new()
+            }
+            // git cannot read it as a file; the patch is empty, as before
+            "to-dir" => {
+                assert!(f.uncommitted && f.status == FileStatus::Added, "{f:?}");
+                String::new()
+            }
+            "notes.txt" | "a b.txt" | "-dash" | "quote\"d" => {
+                assert!(f.uncommitted && f.status == FileStatus::Added, "{f:?}");
+                no_index(w, &f.path)
+            }
+            path => {
+                let mut args = vec![
+                    "diff",
+                    "--no-color",
+                    "-U3",
+                    "--find-renames",
+                    &d.merge_base,
+                    "--",
+                ];
+                if let Some(old) = &f.old_path {
+                    args.push(old);
+                }
+                args.push(path);
+                git(w, &args)
+            }
+        };
+        assert_eq!(f.patch, expected, "{}", f.path);
+        assert!(!f.truncated, "{}", f.path);
+    }
+    let moved = d.files.iter().find(|f| f.path == "moved-to").unwrap();
+    assert_eq!(
+        (moved.status, moved.old_path.as_deref()),
+        (FileStatus::Renamed, Some("moved-from"))
+    );
+    assert!(
+        moved.patch.contains("rename from moved-from"),
+        "{}",
+        moved.patch
+    );
+    let license = d.files.iter().find(|f| f.path == "LICENSE").unwrap();
+    assert!(license.uncommitted && license.patch.contains("+edited"));
+
+    // only untracked files: the listing and one more start
+    git(w, &["reset", "-q", "--hard", "origin/main"]);
+    std::fs::write(w.join("solo"), "s\n").unwrap();
+    std::fs::write(&log_path, "").unwrap();
+    let d = rt.diff(&id, "origin/main").unwrap();
+    assert_eq!(starts(), 2);
+    let names: Vec<&str> = d.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "-dash",
+            "a b.txt",
+            "notes.txt",
+            "quote\"d",
+            "solo",
+            "to-dir"
+        ]
+    );
+    assert_eq!(d.files[4].patch, no_index(w, "solo"));
+
+    // untracked paths too long for one start's arguments: one more start
+    // per 256 KiB of paths, the same patches
+    let deep = w.join(format!("{0}/{0}/{0}", "d".repeat(250)));
+    std::fs::create_dir_all(&deep).unwrap();
+    for i in 0..300 {
+        std::fs::write(deep.join(format!("{i:03}{}", "x".repeat(240))), "deep\n").unwrap();
+    }
+    std::fs::write(&log_path, "").unwrap();
+    let d = rt.diff(&id, "origin/main").unwrap();
+    assert_eq!(starts(), 3, "300 paths of ~1000 bytes: two patch starts");
+    assert_eq!(d.files.len(), 306);
+    for f in d.files.iter().filter(|f| f.path.starts_with("ddd")) {
+        assert_eq!(f.patch, no_index(w, &f.path), "{}", f.path);
+    }
+    std::fs::remove_dir_all(w.join("d".repeat(250))).unwrap();
+
+    // nothing to diff: the listing alone
+    for name in names {
+        std::fs::remove_file(w.join(name)).unwrap();
+    }
+    std::fs::write(&log_path, "").unwrap();
+    assert!(rt.diff(&id, "origin/main").unwrap().files.is_empty());
+    assert_eq!(starts(), 1);
+
+    // a refusal is the listing's start alone, and runs no filter
+    std::fs::write(w.join("README"), "hi\nchanged\n").unwrap();
+    let marker = root.join("filter-ran");
+    let hook = root.join("filter.sh");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch {}\ncat\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(w.join(".gitattributes"), "README filter=pwn\n").unwrap();
+    git(
+        w,
+        &["config", "filter.pwn.clean", &hook.display().to_string()],
+    );
+    std::fs::write(&log_path, "").unwrap();
+    assert_eq!(
+        rt.diff(&id, "origin/main"),
+        Err(WorkspaceError::Filter {
+            key: "filter.pwn.clean".into()
+        })
+    );
+    assert!(!marker.exists(), "the filter ran under diff");
+    assert_eq!(starts(), 1);
 }

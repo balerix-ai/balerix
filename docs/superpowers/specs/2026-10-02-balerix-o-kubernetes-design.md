@@ -168,6 +168,14 @@ spec:
 - Conditions: `Resolved` (the resolver's message, config path first),
   `Accepted` (plugin activations), `Ready` (every agent `Ready`).
 - A Fleet carries the finalizer `balerix.ai/fleet`.
+- `spec.daemon` is immutable: a CEL rule (`self == oldSelf`) in the
+  definition refuses an update that changes it (#235). Moving a Fleet to
+  another Daemon means deleting it, which downs it on the old Daemon and
+  runs its cleanup, and creating it again naming the new one. A move in
+  place would leave the agent pods on the old Daemon's shared claim,
+  authority and URL, and the fleet's record on the old Daemon. The field
+  is required and has no default, so every stored Fleet has it and the
+  rule applies to all of them.
 
 ### 4.3 Crew (generated)
 

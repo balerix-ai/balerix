@@ -951,6 +951,68 @@ async fn a_fleet_with_a_refused_sandbox_key_is_not_resolved() {
     operator.abort();
 }
 
+/// #235: the definition's CEL rule refuses a change of `spec.daemon`;
+/// other changes, and an update that leaves it as it is, pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fleets_daemon_cannot_be_changed() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let env = envtest().await.unwrap();
+    let ns = namespace(&env.client, "immutable").await;
+    let fleets: Api<Fleet> = Api::namespaced(env.client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+
+    let moved = fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": { "daemon": "other" } })),
+        )
+        .await;
+    match moved {
+        Err(kube::Error::Api(e)) => {
+            assert_eq!(e.code, 422, "{e:?}");
+            assert!(
+                e.message.contains("spec.daemon is immutable"),
+                "{}",
+                e.message
+            );
+        }
+        other => panic!("the move was not refused: {other:?}"),
+    }
+    assert_eq!(fleets.get("f").await.unwrap().spec.daemon, "default");
+
+    // the rest of the spec still changes, with the daemon restated or not
+    fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": { "daemon": "default", "retain": "None" } })),
+        )
+        .await
+        .unwrap();
+    let f = fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(
+                serde_json::json!({ "spec": { "crews": { "c": { "agents": { "b": {} } } } } }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.spec.daemon, "default");
+    assert_eq!(f.spec.retain, balerix_operator::api::Retain::None);
+    assert!(f.spec.crews["c"].agents.contains_key("b"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn watch_namespaces_ignores_another_namespace() {
     if envtest().await.is_none() {

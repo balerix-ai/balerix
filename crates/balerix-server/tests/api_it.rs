@@ -455,3 +455,52 @@ async fn an_inexact_tool_version_is_a_400_naming_its_path() {
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
 }
+
+/// #187: the admin `POST` and `PUT` hold every agent's `sandbox` block to
+/// the fleet allowlist, so no API client can hand nono a key past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_sandbox_key_is_a_400_naming_its_path() {
+    let h = Harness::new(Duration::from_secs(3600));
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let daemon = h.daemon(Arc::new(PassThrough), plugin_dir.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(listener, router(daemon.clone()), async {
+        let _ = stop_rx.await;
+    }));
+    let api = Api::new(format!("http://127.0.0.1:{port}"), "admin-tok");
+
+    let mut s = spec(&["a"]);
+    s.crews
+        .get_mut("c")
+        .unwrap()
+        .agents
+        .get_mut("a")
+        .unwrap()
+        .sandbox = json!({ "network": { "custom_credentials": { "x": { "credential_key": "file:///etc/shadow" } } } });
+    let req = json!(FleetRequest {
+        spec: s,
+        credentials: Default::default(),
+        agent_tokens: None,
+        managed_by: None,
+    });
+    let api = Arc::new(api);
+    for (method, path) in [("POST", "/v1/fleets"), ("PUT", "/v1/fleets/f")] {
+        let (api, req) = (api.clone(), req.clone());
+        let (st, v) = tokio::task::spawn_blocking(move || api.admin(method, path, Some(&req)))
+            .await
+            .unwrap();
+        assert_eq!(st, 400, "{method}: {v}");
+        let e: ErrorBody = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            e.error,
+            "crews.c.agents.a.sandbox.network.custom_credentials: not accepted in a \
+             fleet's sandbox block"
+        );
+        assert!(daemon.get(&"f".parse().unwrap()).await.is_none());
+    }
+
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+}

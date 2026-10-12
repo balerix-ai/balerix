@@ -271,19 +271,22 @@ impl Runtime {
         let env = plugin_env(plugin, &paths, &self.layout, &host.url, &host.secret)?;
         // before anything is written from the manifest's block (#2)
         let layout = &self.layout;
-        check_plugin_sandbox(
-            &id,
-            &plugin.manifest.sandbox,
-            &[
-                ("state", &layout.state_root),
-                ("data", &layout.data_root),
-                ("config", &layout.config_root),
-            ],
-            PluginGrants {
-                read_only: &[plugin.package.clone(), layout.mise_data_dir()],
-                read_write: &[paths.home.clone(), paths.scratch.clone()],
-            },
-        )?;
+        self.with_socket_dirs(|sockets| {
+            check_plugin_sandbox(
+                &id,
+                &plugin.manifest.sandbox,
+                &[
+                    ("state", &layout.state_root),
+                    ("data", &layout.data_root),
+                    ("config", &layout.config_root),
+                ],
+                sockets,
+                PluginGrants {
+                    read_only: &[plugin.package.clone(), layout.mise_data_dir()],
+                    read_write: &[paths.home.clone(), paths.scratch.clone()],
+                },
+            )
+        })?;
         // the policy last, over the merged manifest block, so nothing
         // the block carries can re-set what it pins
         let profile = apply_to_profile(

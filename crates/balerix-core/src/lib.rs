@@ -9,6 +9,7 @@ pub mod plugin;
 pub mod ports;
 pub mod reconcile;
 pub mod repo;
+pub mod sandbox;
 pub mod store;
 pub mod version;
 
@@ -28,5 +29,6 @@ pub use ports::{
 };
 pub use reconcile::{Plan, ReconcilePolicy, Step};
 pub use repo::{RepoError, RepoRef};
+pub use sandbox::{Access, BlockGrant, SandboxPolicy, SandboxRefusal, check_sandbox_block};
 pub use store::{Desired, FleetRecord, FleetSecrets, FleetStore, StoreError};
 pub use version::{exact_version_message, is_exact_version};

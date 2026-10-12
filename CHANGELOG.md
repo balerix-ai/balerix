@@ -1,5 +1,47 @@
 # Changelog
 
+### Upgrading
+
+- A fleet's `sandbox` block (fleet, crew and agent `defaults`, a plugin
+  entry's `fleetDefaults`, and a Fleet's or Daemon's `defaults` in
+  Kubernetes) is now an allowlist, like a plugin manifest's (#187):
+  `filesystem` (`read`, `allow`, `write`, their `_file` forms, `deny` and
+  the `unix_socket*` lists), `network` without `credentials`,
+  `custom_credentials` or `tls_intercept`, `security.ipc_mode`, and those
+  inside `platform_overrides.<os>`. Refused, naming the path:
+  - every other key (`extends`, `command_policies`, `hooks`,
+    `session_hooks`, `bypass_protection`, `process_info_mode`,
+    `capability_elevation`, `linux`, …), and `environment`, `meta` and
+    `security.signal_mode` (balerix-owned; until now refused only when
+    the agent was rendered);
+  - `security.ipc_mode: full` (only `shared_memory_only` is accepted)
+    and `network.allow_domain` entries that are objects (endpoint rules);
+  - a path with `~`, `$`, `..` or a glob, or under `/proc` or `/dev/fd`;
+  - at render, a grant under balerix's state, data or config root
+    outside the agent's own `home/` and `workspace/` (or, for reading,
+    its tool pools, `mise.toml` and its crew's object cache), or one that
+    contains a root (your home directory, `/`);
+  - a grant naming balerix's tmux socket directory
+    (`<$TMUX_TMPDIR or /tmp>/tmux-<uid>`; in a pod the run directory),
+    anything under it, or anything containing it (`/tmp`).
+
+  The same `ipc_mode`, `allow_domain`, `/proc` and tmux socket rules now
+  apply to a plugin manifest's block, whose key and path rules are also
+  checked at `plugin install`.
+
+  `balerix up` refuses such a file on the client, naming the layer; the
+  daemon's `POST`/`PUT` answer 400 with the path. A stored fleet that now
+  fails is not converted any more: the daemon logs `pass failed …
+  invalid stored spec: <path>: …` on every pass, `balerix status` stays
+  as it was, and the agents keep running under their old profile with
+  nothing supervising them (no restarts, no spec changes; stopping or
+  starting one agent does nothing). `balerix down` still works. Fix the
+  fleet's `sandbox` block and re-apply it, or `down` it. In Kubernetes
+  mode the Fleet goes `Resolved=False` (`InvalidFleet`, naming the path)
+  and its status stops updating; its pods keep running until they
+  restart, and then the sidecar refuses to render the agent. Fix the
+  Fleet's (or the Daemon's `spec.defaults`) `sandbox` block.
+
 ## 0.2.4 - 2026-10-10
 
 ### Bug fixes

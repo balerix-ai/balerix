@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::ConfigError;
 use crate::file::FleetFile;
 use crate::merge::merge_layers;
-use crate::validate::{tools_layer, validate_agent};
+use crate::validate::{sandbox_layer, tools_layer, validate_agent};
 
 /// Inputs to resolution that do not come from the file itself.
 #[derive(Debug, Clone, Default)]
@@ -26,6 +26,10 @@ pub struct ResolveOptions {
     /// (Spec M §12.1): a settings layer between the host settings and the
     /// file's `defaults`, never subject to `restricted`.
     pub operator_layer: Option<Value>,
+    /// What an error in `operator_layer` names it: `fleetDefaults` when
+    /// unset (one machine's `plugins.yaml`); the operator names a Daemon's
+    /// `spec.defaults`.
+    pub operator_layer_name: Option<String>,
     /// Spec M §12.1: refuse `restricted::REFUSED_KEYS` at each of the
     /// file's layers. Set for a plugin-applied file, never for `up`.
     pub restricted: bool,
@@ -59,7 +63,12 @@ pub fn resolve(file: &FleetFile, opts: &ResolveOptions) -> Result<FleetSpec, Con
         json!({ "claude": { "settings": s } })
     });
     if let Some(layer) = &opts.operator_layer {
-        expect_mapping("fleetDefaults", layer)?;
+        let name = opts
+            .operator_layer_name
+            .as_deref()
+            .unwrap_or("fleetDefaults");
+        expect_mapping(name, layer)?;
+        sandbox_layer(name, layer)?;
     }
     let check = |path: &str, layer: &Value| -> Result<(), ConfigError> {
         if opts.restricted {
@@ -70,6 +79,7 @@ pub fn resolve(file: &FleetFile, opts: &ResolveOptions) -> Result<FleetSpec, Con
     };
     expect_mapping("defaults", &file.defaults)?;
     check("defaults", &file.defaults)?;
+    sandbox_layer("defaults", &file.defaults)?;
     let fleet_tools = tools_layer("defaults", &file.defaults)?;
 
     let mut crews = BTreeMap::new();
@@ -77,6 +87,7 @@ pub fn resolve(file: &FleetFile, opts: &ResolveOptions) -> Result<FleetSpec, Con
         let crew_path = format!("crews.{crew_name}");
         expect_mapping(&format!("{crew_path}.defaults"), &crew.defaults)?;
         check(&format!("{crew_path}.defaults"), &crew.defaults)?;
+        sandbox_layer(&format!("{crew_path}.defaults"), &crew.defaults)?;
         let crew_tools = tools_layer(&format!("{crew_path}.defaults"), &crew.defaults)?;
 
         let mut agents = BTreeMap::new();
@@ -84,6 +95,7 @@ pub fn resolve(file: &FleetFile, opts: &ResolveOptions) -> Result<FleetSpec, Con
             let agent_path = format!("{crew_path}.agents.{agent_name}");
             expect_mapping(&agent_path, layer)?;
             check(&agent_path, layer)?;
+            sandbox_layer(&agent_path, layer)?;
             let merged = merge_layers(host_layer.iter().chain(opts.operator_layer.iter()).chain([
                 &file.defaults,
                 &crew.defaults,
@@ -418,6 +430,87 @@ crews:
             .to_string();
         assert!(e.starts_with("defaults.tools.node:"), "got {e}");
         assert!(e.contains("expected a version string"), "got {e}");
+    }
+
+    /// #187: each layer's `sandbox` block is held to the fleet allowlist
+    /// before merging, so the message names the layer that set the key.
+    #[test]
+    fn a_refused_sandbox_key_is_named_at_its_layer() {
+        let at = |layer: &str, block: &str| {
+            let yaml = match layer {
+                "defaults" => format!(
+                    "apiVersion: balerix/v1\nkind: Fleet\nname: f\ndefaults:\n  sandbox: {block}\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a: {{}}\n"
+                ),
+                "crew" => format!(
+                    "apiVersion: balerix/v1\nkind: Fleet\nname: f\ncrews:\n  c:\n    repo: o/r\n    defaults:\n      sandbox: {block}\n    agents:\n      a: {{}}\n"
+                ),
+                _ => format!(
+                    "apiVersion: balerix/v1\nkind: Fleet\nname: f\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a:\n        sandbox: {block}\n"
+                ),
+            };
+            resolve(&file(&yaml), &opts())
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(
+            at("defaults", "{ extends: default }").unwrap_err(),
+            "defaults.sandbox.extends: not accepted in a fleet's sandbox block"
+        );
+        assert_eq!(
+            at("crew", "{ network: { credentials: [github] } }").unwrap_err(),
+            "crews.c.defaults.sandbox.network.credentials: not accepted in a fleet's sandbox block"
+        );
+        assert_eq!(
+            at("agent", "{ filesystem: { allow: [\"/srv/*\"] } }").unwrap_err(),
+            "crews.c.agents.a.sandbox.filesystem.allow[0]: /srv/*: glob patterns \
+             (`*`, `?`, `[`, `{`) are not accepted; name a literal path"
+        );
+        assert_eq!(
+            at("crew", "[1]").unwrap_err(),
+            "crews.c.defaults.sandbox: expected a mapping"
+        );
+        // a null deletes what a lower layer set: nothing to check
+        at("crew", "{ extends: null, network: { block: null } }").unwrap();
+        at("agent", "null").unwrap();
+        at(
+            "defaults",
+            "{ network: { block: false }, filesystem: { allow: [/srv/repo.git] } }",
+        )
+        .unwrap();
+    }
+
+    /// #187 review: the operator's layer is checked as itself, so its
+    /// error does not name an agent of the file.
+    #[test]
+    fn a_refused_sandbox_key_in_the_operator_layer_names_that_layer() {
+        let layer = json!({ "sandbox": { "hooks": {} } });
+        let e = resolve(
+            &file(BASE),
+            &ResolveOptions {
+                operator_layer: Some(layer.clone()),
+                ..opts()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            e,
+            "fleetDefaults.sandbox.hooks: not accepted in a fleet's sandbox block"
+        );
+        let e = resolve(
+            &file(BASE),
+            &ResolveOptions {
+                operator_layer: Some(layer),
+                operator_layer_name: Some("Daemon default spec.defaults".into()),
+                ..opts()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.starts_with("Daemon default spec.defaults.sandbox.hooks: "),
+            "{e}"
+        );
     }
 
     fn restricted() -> ResolveOptions {

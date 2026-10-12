@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::fleet::{Crew, Fleet};
 use crate::name::{AgentId, AgentName, validate_name};
 use crate::repo::RepoRef;
+use crate::sandbox::{SandboxPolicy, check_sandbox_block};
 use crate::version::{exact_version_message, is_exact_version};
 
 /// The daemon's own fleet: every plugin is an agent of its `plugins` crew.
@@ -150,6 +151,15 @@ fn path_prefix(path: &str) -> String {
 /// package's `mise.toml`.
 pub fn validate_manifest(m: &PluginManifest, mise_toml: &str) -> Result<(), ManifestError> {
     validate_manifest_fields(m)?;
+    // #2, #187: what one machine's nono profile may take from the block;
+    // the runtime adds the root check at every render. Not in
+    // `validate_manifest_fields`: a pod has no nono profile.
+    check_sandbox_block(SandboxPolicy::Plugin, &m.sandbox).map_err(|r| {
+        ManifestError::Manifest {
+            path: r.path_under("sandbox"),
+            message: r.message,
+        }
+    })?;
     validate_mise_toml(mise_toml, &m.start)
 }
 
@@ -435,6 +445,21 @@ mod tests {
             (
                 Box::new(|m| m.sandbox = json!([1])),
                 "balerix-plugin.yaml: sandbox: expected a mapping",
+            ),
+            // #187: the allowlist and the literal-path rule, at install
+            (
+                Box::new(|m| m.sandbox = json!({ "extends": "default" })),
+                "balerix-plugin.yaml: sandbox.extends: not accepted in a plugin's sandbox block",
+            ),
+            (
+                Box::new(|m| m.sandbox = json!({ "filesystem": { "unix_socket": ["/run/x"] } })),
+                "balerix-plugin.yaml: sandbox.filesystem.unix_socket: not accepted in a \
+                 plugin's sandbox block",
+            ),
+            (
+                Box::new(|m| m.sandbox = json!({ "filesystem": { "read": ["/opt/*"] } })),
+                "balerix-plugin.yaml: sandbox.filesystem.read[0]: /opt/*: glob patterns \
+                 (`*`, `?`, `[`, `{`) are not accepted; name a literal path",
             ),
         ];
         for (mutate, expected) in cases {

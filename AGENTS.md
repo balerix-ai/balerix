@@ -410,14 +410,28 @@ credentials, hook input, or sandbox rules.
   `balerix-plugin.yaml` into the plugin's digest, so editing either and
   running `plugin sync` reinstalls (#4). Tarballs and URLs need `sha256` and
   unpack read-only under `$XDG_DATA_HOME/balerix/plugins/<name>/<digest12>/`.
-- A plugin manifest's `sandbox` block is an allowlist, unlike a fleet's
-  (`sandbox::check_plugin_sandbox`, #2): `filesystem` (the six grant lists
-  and `deny`), `network` minus its credential keys,
-  `security.ipc_mode`, and those inside `platform_overrides.<os>`. Paths are
-  absolute and literal (no `~`, `$`, `..`, globs), and no grant may reach the
-  state, data or config root outside the plugin's own grants. Anything else
-  fails the render with `sandbox.<key path>: not accepted`. Widening the list
-  means checking what the key lets nono's supervisor do outside the sandbox.
+- A plugin manifest's and a fleet's `sandbox` blocks are allowlists, one
+  checker with two policies (`balerix_core::sandbox::check_sandbox_block`,
+  #2, #187): `filesystem` (the six grant lists and `deny`; a fleet's also
+  the six `unix_socket*` lists), `network` minus its credential keys and
+  with `allow_domain` strings only, `security.ipc_mode` as
+  `shared_memory_only` only, and those inside `platform_overrides.<os>`;
+  `environment`, `meta` and `security.signal_mode` are refused as
+  balerix-owned (and again by `check_conflicts` at render). Paths are
+  absolute and literal (no `~`, `$`, `..`, globs, nothing under `/proc` or
+  `/dev/fd`). That half needs no
+  filesystem and runs at install (`validate_manifest`), in each layer of a
+  fleet file (`balerix_config`, naming the layer) and in `Fleet::try_from`
+  (the admin `POST`/`PUT`, every pass over a stored record, the operator's
+  `resolve_fleet`). The other half, no grant reaching the state, data or
+  config root outside the plugin's or agent's own grants, is the runtime's
+  (`sandbox::check_plugin_sandbox`, `check_fleet_sandbox`) and runs on
+  every render, before `render_profile`; it also holds every grant off
+  `Runtime::socket_dirs` (tmux's socket directory for the daemon's
+  `TMUX_TMPDIR`, which `serve` passes in; a pod's run directory) in
+  both directions. A refusal reads `<path>: not
+  accepted in a plugin's (fleet's) sandbox block`. Widening a list means
+  checking what the key lets nono's supervisor do outside the sandbox.
 - The daemon runs `mise trust` + `mise install` on the package's own
   `mise.toml` with `MISE_STATE_DIR` under the plugin's home; the sandbox uses
   the same dir, so if `mise run` says the config is untrusted, the two

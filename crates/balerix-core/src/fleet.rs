@@ -7,6 +7,7 @@ use balerix_api::{AgentSettings, CrewSpec, FleetSpec, GitSettings};
 
 use crate::name::{AgentName, CrewName, FleetName, NameError};
 use crate::repo::{RepoError, RepoRef};
+use crate::sandbox::{SandboxPolicy, check_sandbox_block};
 use crate::version::{exact_version_message, is_exact_version};
 
 /// A validated fleet.
@@ -55,6 +56,10 @@ pub enum FleetError {
         tool: String,
         version: String,
     },
+    /// #187: an agent's `sandbox` block outside the fleet allowlist
+    /// (`sandbox::check_sandbox_block`); `path` names the entry.
+    #[error("{path}: {message}")]
+    Sandbox { path: String, message: String },
 }
 
 /// Refuses the first tool in `tools` whose version is not exact; `path`
@@ -136,6 +141,13 @@ fn convert_crew(path: &str, crew: CrewSpec) -> Result<Crew, FleetError> {
             })?;
         }
         check_tools(&format!("{agent_path}.tools"), &settings.tools)?;
+        let sandbox_path = format!("{agent_path}.sandbox");
+        check_sandbox_block(SandboxPolicy::Fleet, &settings.sandbox).map_err(|r| {
+            FleetError::Sandbox {
+                path: r.path_under(&sandbox_path),
+                message: r.message,
+            }
+        })?;
         agents.insert(agent_name, settings);
     }
     Ok(Crew {
@@ -390,6 +402,73 @@ mod tests {
         let agent = s.crews.get_mut("c").unwrap().agents.get_mut("a").unwrap();
         agent.tools.insert("ripgrep".into(), "14.1.1".into());
         assert!(Fleet::try_from(s).is_ok());
+    }
+
+    fn with_sandbox(block: serde_json::Value) -> FleetSpec {
+        let mut s = spec("f", "c", "acme/x", "main", &["a"]);
+        s.crews
+            .get_mut("c")
+            .unwrap()
+            .agents
+            .get_mut("a")
+            .unwrap()
+            .sandbox = block;
+        s
+    }
+
+    /// #187: the admin `POST`/`PUT` and every pass over a stored record
+    /// hold an agent's `sandbox` block to the fleet allowlist, naming the
+    /// path.
+    #[test]
+    fn a_refused_sandbox_key_reports_its_path() {
+        for (block, expected) in [
+            (
+                serde_json::json!({ "extends": "default" }),
+                "crews.c.agents.a.sandbox.extends: not accepted in a fleet's sandbox block",
+            ),
+            (
+                serde_json::json!({ "network": { "custom_credentials": {} } }),
+                "crews.c.agents.a.sandbox.network.custom_credentials: not accepted in a \
+                 fleet's sandbox block",
+            ),
+            (
+                serde_json::json!({ "platform_overrides": { "linux": { "hooks": {} } } }),
+                "crews.c.agents.a.sandbox.platform_overrides.linux.hooks: not accepted in a \
+                 fleet's sandbox block",
+            ),
+            (
+                serde_json::json!({ "filesystem": { "allow": ["/home/*/.local"] } }),
+                "crews.c.agents.a.sandbox.filesystem.allow[0]: /home/*/.local: glob patterns \
+                 (`*`, `?`, `[`, `{`) are not accepted; name a literal path",
+            ),
+            (
+                serde_json::json!({ "filesystem": { "read": [7] } }),
+                "crews.c.agents.a.sandbox.filesystem.read[0]: expected a path string or \
+                 { path, when }",
+            ),
+            (
+                serde_json::json!([1]),
+                "crews.c.agents.a.sandbox: expected a mapping",
+            ),
+        ] {
+            let e = Fleet::try_from(with_sandbox(block)).unwrap_err();
+            assert!(matches!(e, FleetError::Sandbox { .. }), "{e:?}");
+            assert_eq!(e.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn an_allowed_sandbox_block_converts() {
+        for block in [
+            serde_json::json!({}),
+            serde_json::json!({ "network": { "block": false } }),
+            serde_json::json!({
+                "filesystem": { "allow": ["/srv/repo.git"], "unix_socket": ["/run/pg.sock"] },
+                "platform_overrides": { "linux": { "filesystem": { "read": ["/opt/x"] } } }
+            }),
+        ] {
+            Fleet::try_from(with_sandbox(block)).unwrap();
+        }
     }
 
     #[test]

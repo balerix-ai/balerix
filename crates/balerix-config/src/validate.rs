@@ -2,7 +2,7 @@
 //! repos are validated by `balerix_core::Fleet`; this covers everything else.
 
 use balerix_api::AgentSettings;
-use balerix_core::{exact_version_message, is_exact_version};
+use balerix_core::{SandboxPolicy, check_sandbox_block, exact_version_message, is_exact_version};
 use serde_json::Value;
 
 use crate::ConfigError;
@@ -93,6 +93,25 @@ pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), Config
         }
     }
     Ok(())
+}
+
+/// The `sandbox` block of one settings layer (#187), held to the fleet
+/// allowlist (`balerix_core::check_sandbox_block`) before merging, so a
+/// refusal names the layer that set the key; `Fleet::try_from` checks the
+/// merged block again. Absent or null is nothing; a `null` inside is the
+/// file's delete marker and is dropped first. `path` is the layer's config
+/// path, e.g. `defaults` or `crews.web.agents.bob`.
+pub(crate) fn sandbox_layer(path: &str, layer: &Value) -> Result<(), ConfigError> {
+    let block = match layer.get("sandbox") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(block) => crate::merge::strip_nulls(block),
+    };
+    check_sandbox_block(SandboxPolicy::Fleet, &block)
+        .map(|_| ())
+        .map_err(|r| ConfigError::Invalid {
+            path: r.path_under(&format!("{path}.sandbox")),
+            message: r.message,
+        })
 }
 
 /// The `tools` table of one settings layer, as the pool for that level

@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use balerix_core::{AgentId, MaterializeError};
+use balerix_core::{
+    Access, AgentId, BlockGrant, MaterializeError, SandboxPolicy, check_sandbox_block,
+};
 use serde_json::{Value, json};
 
 use crate::fsutil::write_atomic;
@@ -443,7 +445,8 @@ fn check_linux(
 }
 
 /// balerix's own trees, named for the error message: the state, data and
-/// config roots (`StateLayout`).
+/// config roots (`StateLayout`), or the directories holding balerix's tmux
+/// socket (`Runtime::socket_dirs`).
 pub type Roots<'a> = [(&'a str, &'a Path)];
 
 /// The grants balerix already gives a plugin under its roots, by access:
@@ -457,209 +460,186 @@ pub struct PluginGrants<'a> {
     pub read_write: &'a [PathBuf],
 }
 
-/// What a plugin's `sandbox` block may set (#2). Everything else nono
-/// accepts reaches past the filesystem rules below: `extends`,
-/// `groups`, `packs`, `command_policies` (with its own `fs_read`),
-/// `workdir`, `hooks` and `session_hooks` (run outside the sandbox),
-/// credential capture and injection, raw Seatbelt rules, AF_UNIX socket
-/// grants, process inspection and capability elevation (nono 0.79.0's
-/// profile schema). The top level takes `filesystem`, `network`,
-/// `security` and `platform_overrides`; each patch the first three.
-/// `platform_overrides` names nono knows.
-const PLUGIN_OSES: &[&str] = &["linux", "macos", "windows"];
-/// Grant lists, checked against the roots, and `deny`, which grants
-/// nothing (checked as a literal path only). Not `bypass_protection`: on
-/// macOS it lifts nono's `deny_credentials` for `~/.ssh` and `~/.aws`.
-const PLUGIN_FS_KEYS: &[&str] = &[
-    "read",
-    "read_file",
-    "allow",
-    "allow_file",
-    "write",
-    "write_file",
-    "deny",
-];
-/// Ports, domains and proxies; never credentials (`credentials`,
-/// `custom_credentials` make nono's supervisor read a secret — a
-/// `file://` or `env://` one included — and hand it to an upstream the
-/// manifest names) nor TLS interception.
-const PLUGIN_NETWORK_KEYS: &[&str] = &[
-    "block",
-    "allow_http2",
-    "network_profile",
-    "allow_domain",
-    "deny_domain",
-    "open_port",
-    "open_port_range",
-    "connect_port",
-    "listen_port",
-    "listen_port_range",
-    "no_proxy",
-    "upstream_proxy",
-    "upstream_bypass",
-];
-/// `signal_mode` is refused by `check_conflicts` (#118); the rest of
-/// `security` would widen the sandbox at runtime (`process_info_mode`
-/// reads other processes, among them other plugins' tokens in their
-/// environment; `capability_elevation` with `approval_backends` lets a
-/// webhook grant paths) or degrade it (`wsl2_proxy_policy`).
-const PLUGIN_SECURITY_KEYS: &[&str] = &["ipc_mode", "signal_mode"];
-
-/// A plugin manifest's `sandbox` block (#2): only the keys above, and no
-/// filesystem grant that reaches balerix's own state, data or config —
-/// the daemon's token and vault, the fleet store, other plugins' trees
-/// and KV, every agent. Every path entry (top level and in
-/// `platform_overrides.<os>`) must be an absolute, literal path: no `~`,
-/// no `$`, no `..` and no glob (`*`, `?`, `[`, `{`), since nono would
-/// expand what balerix compares. A grant must not overlap a root in
-/// either direction, so `/` or the home holding the roots is refused as
-/// well, unless it lies inside a grant balerix already gives the plugin
+/// A plugin manifest's `sandbox` block (#2): the keys
+/// `balerix_core::check_sandbox_block` allows a plugin, and no filesystem
+/// grant that reaches balerix's own state, data or config — the daemon's
+/// token and vault, the fleet store, other plugins' trees and KV, every
+/// agent — unless it lies inside a grant balerix already gives the plugin
 /// at that level (`grants`). The plugin's own `plugins/<name>/` is not
-/// one: `kv/` is reached through the API only. Both the path as written
-/// and as resolved (the longest existing prefix canonicalised, a
-/// dangling link followed) are compared, so a symlink into a root is
-/// caught; an entry is let through only if its resolved path is inside a
-/// resolved grant. Run on every render, so a symlink planted since the
-/// last one is seen; one planted between the render and nono's start
-/// (Landlock follows it then) is not, a gap the install-time trust in
-/// the package already covers. `security.signal_mode`, `environment` and `meta` are
-/// left to `check_conflicts`, which refuses them with their own messages.
+/// one: `kv/` is reached through the API only. Nor may a grant name
+/// balerix's tmux socket directory (`sockets`) or anything beneath or
+/// above it. See `check_roots`.
 pub fn check_plugin_sandbox(
     id: &AgentId,
     user: &Value,
     roots: &Roots<'_>,
+    sockets: &Roots<'_>,
     grants: PluginGrants<'_>,
+) -> Result<(), MaterializeError> {
+    check_roots(
+        id,
+        user,
+        SandboxPolicy::Plugin,
+        roots,
+        sockets,
+        grants.read_only,
+        grants.read_write,
+    )
+}
+
+/// A fleet's `sandbox` block, as resolved for one agent (#187): the keys
+/// `balerix_core::check_sandbox_block` allows a fleet (`Fleet::try_from`
+/// refused the rest already; checked again here because a render must
+/// never trust its input), and no grant, `unix_socket*` lists included,
+/// that reaches balerix's own roots — the daemon's token and vault, other
+/// agents' trees, plugins — outside the agent's own grants (`grants`,
+/// from `balerix_grants`: `allow` at any level, `read` for reading), and
+/// none that names balerix's tmux socket directory or, in a pod, its run
+/// directory (`sockets`), or anything beneath or above it. Runs just
+/// before `render_profile`, on every render. See `check_roots`.
+pub fn check_fleet_sandbox(
+    id: &AgentId,
+    user: &Value,
+    roots: &Roots<'_>,
+    sockets: &Roots<'_>,
+    grants: &Grants,
+) -> Result<(), MaterializeError> {
+    check_roots(
+        id,
+        user,
+        SandboxPolicy::Fleet,
+        roots,
+        sockets,
+        &grants.read,
+        &grants.allow,
+    )
+}
+
+/// The shared half of both checks. A grant must not overlap a root in
+/// either direction, so `/` or the home holding the roots is refused as
+/// well, unless it lies inside a grant balerix already gives at that
+/// level: `read_write` for any entry, `read_only` for a `read` or
+/// `read_file` one. Both the path as written and as resolved (the longest
+/// existing prefix canonicalised, a dangling link followed) are compared,
+/// so a symlink into a root is caught; an entry is let through only if
+/// its resolved path is inside a resolved grant. Run on every render, so
+/// a symlink planted since the last one is seen; one planted between the
+/// render and nono's start (Landlock follows it then) is not
+/// (docs/THREAT-MODEL.md). The `sockets` directories are held off in
+/// both directions with no exemption, whatever the list: the base
+/// profile grants nothing under `/tmp`, so a grant of `/tmp` itself would
+/// be the only way there. A block that is not a mapping passes here: the
+/// manifest and `Fleet::try_from` refused it before.
+fn check_roots(
+    id: &AgentId,
+    user: &Value,
+    policy: SandboxPolicy,
+    roots: &Roots<'_>,
+    sockets: &Roots<'_>,
+    read_only: &[PathBuf],
+    read_write: &[PathBuf],
 ) -> Result<(), MaterializeError> {
     let conflict = |path: String, message: String| MaterializeError::SandboxConflict {
         id: id.to_string(),
         path,
         message,
     };
-    let Value::Object(u) = user else {
+    if !user.is_object() {
         return Ok(());
+    }
+    let entries = check_sandbox_block(policy, user).map_err(|r| conflict(r.at, r.message))?;
+    let both = |rs: &Roots<'_>| -> Vec<(String, [PathBuf; 2])> {
+        rs.iter()
+            .map(|(what, p)| (what.to_string(), [p.to_path_buf(), resolve_existing(p)]))
+            .collect()
     };
-    let roots: Vec<(&str, [PathBuf; 2])> = roots
-        .iter()
-        .map(|(what, p)| (*what, [p.to_path_buf(), resolve_existing(p)]))
-        .collect();
+    let roots = both(roots);
+    let sockets = both(sockets);
     let resolve = |ps: &[PathBuf]| ps.iter().map(|p| resolve_existing(p)).collect::<Vec<_>>();
-    let read_only = resolve(grants.read_only);
-    let read_write = resolve(grants.read_write);
-    let ctx = PluginCheck {
+    let ctx = RootCheck {
+        policy,
         roots: &roots,
-        read_only: &read_only,
-        read_write: &read_write,
+        sockets: &sockets,
+        read_only: &resolve(read_only),
+        read_write: &resolve(read_write),
     };
-    ctx.block(u, "", true).map_err(|(at, m)| conflict(at, m))
+    for entry in &entries {
+        ctx.grant(entry)
+            .map_err(|m| conflict(entry.at.clone(), m))?;
+    }
+    Ok(())
 }
 
-struct PluginCheck<'a> {
-    roots: &'a [(&'a str, [PathBuf; 2])],
+struct RootCheck<'a> {
+    policy: SandboxPolicy,
+    roots: &'a [(String, [PathBuf; 2])],
+    sockets: &'a [(String, [PathBuf; 2])],
     read_only: &'a [PathBuf],
     read_write: &'a [PathBuf],
 }
 
-type Refusal = (String, String);
-
-fn not_accepted(at: String) -> Refusal {
-    (at, "not accepted in a plugin's sandbox block".into())
-}
-
-fn object<'v>(v: &'v Value, at: &str) -> Result<&'v serde_json::Map<String, Value>, Refusal> {
-    v.as_object()
-        .ok_or_else(|| (at.to_string(), "expected an object".into()))
-}
-
-impl PluginCheck<'_> {
-    /// The top level (`top`) or one `platform_overrides.<os>` patch.
-    fn block(
-        &self,
-        u: &serde_json::Map<String, Value>,
-        prefix: &str,
-        top: bool,
-    ) -> Result<(), Refusal> {
-        for (key, value) in u {
-            let at = format!("{prefix}{key}");
-            match key.as_str() {
-                // `check_conflicts`' to refuse, with its own message
-                "environment" | "meta" if top => {}
-                "filesystem" => self.filesystem(object(value, &at)?, &at)?,
-                "network" => {
-                    for k in object(value, &at)?.keys() {
-                        if !PLUGIN_NETWORK_KEYS.contains(&k.as_str()) {
-                            return Err(not_accepted(format!("{at}.{k}")));
-                        }
-                    }
-                }
-                "security" => {
-                    for k in object(value, &at)?.keys() {
-                        if !PLUGIN_SECURITY_KEYS.contains(&k.as_str()) {
-                            return Err(not_accepted(format!("{at}.{k}")));
-                        }
-                    }
-                }
-                "platform_overrides" if top => {
-                    for (os, patch) in object(value, &at)? {
-                        let os_at = format!("{at}.{os}");
-                        if !PLUGIN_OSES.contains(&os.as_str()) {
-                            return Err(not_accepted(os_at));
-                        }
-                        self.block(object(patch, &os_at)?, &format!("{os_at}."), false)?;
-                    }
-                }
-                _ => return Err(not_accepted(at)),
-            }
-        }
-        Ok(())
-    }
-
-    fn filesystem(&self, fs: &serde_json::Map<String, Value>, at: &str) -> Result<(), Refusal> {
-        for (key, entries) in fs {
-            let list_at = format!("{at}.{key}");
-            if !PLUGIN_FS_KEYS.contains(&key.as_str()) {
-                return Err(not_accepted(list_at));
-            }
-            let Value::Array(items) = entries else {
-                return Err((list_at, "expected an array".into()));
-            };
-            for (i, item) in items.iter().enumerate() {
-                let entry_at = format!("{list_at}[{i}]");
-                let raw = entry_text(item).ok_or_else(|| {
-                    (
-                        entry_at.clone(),
-                        "expected a path string or { path, when }".to_string(),
-                    )
-                })?;
-                let path = literal_path(raw).map_err(|m| (entry_at.clone(), m))?;
-                if let Some(level) = level(key) {
-                    self.grant(raw, &path, level).map_err(|m| (entry_at, m))?;
-                }
-            }
-        }
-        Ok(())
-    }
-
+impl RootCheck<'_> {
     /// One grant against the roots; the message on refusal.
-    fn grant(&self, raw: &str, path: &Path, level: &str) -> Result<(), String> {
-        let resolved = resolve_existing(path);
-        let forms = [path.to_path_buf(), resolved.clone()];
+    fn grant(&self, entry: &BlockGrant) -> Result<(), String> {
+        let raw = &entry.raw;
+        let resolved = resolve_existing(&entry.path);
+        // the literal entry was checked in core; where a link leads is not
+        if balerix_core::sandbox::REFUSED_PREFIXES
+            .iter()
+            .any(|p| resolved.starts_with(p))
+        {
+            return Err(format!(
+                "{raw} leads to {}; paths under /proc and /dev/fd are not accepted",
+                resolved.display()
+            ));
+        }
+        let forms = [entry.path.clone(), resolved.clone()];
         let inside = |gs: &[PathBuf]| gs.iter().any(|g| resolved.starts_with(g));
-        let granted = inside(self.read_write) || (level == "read" && inside(self.read_only));
+        let granted =
+            inside(self.read_write) || (entry.access == Access::Read && inside(self.read_only));
+        let hint = match self.policy {
+            SandboxPolicy::Plugin => {
+                "a plugin may name only paths in its home/ or scratch/ there, or read \
+                 its package or the mise pool"
+            }
+            SandboxPolicy::Fleet => {
+                "an agent may name only paths in its home/ or workspace/ there, or read \
+                 its tool pools, its mise.toml or its crew's object cache"
+            }
+        };
         for (what, root_forms) in self.roots {
             for root in root_forms {
-                for entry in &forms {
-                    if root.starts_with(entry) {
+                for form in &forms {
+                    if root.starts_with(form) {
                         return Err(format!(
                             "{raw} covers balerix's {what} root {}",
                             root.display()
                         ));
                     }
-                    if entry.starts_with(root) && !granted {
+                    if form.starts_with(root) && !granted {
                         return Err(format!(
-                            "{raw} is inside balerix's {what} root {}; a plugin may name \
-                             only paths in its home/ or scratch/ there, or read its \
-                             package or the mise pool",
+                            "{raw} is inside balerix's {what} root {}; {hint}",
                             root.display()
+                        ));
+                    }
+                }
+            }
+        }
+        for (what, dir_forms) in self.sockets {
+            for dir in dir_forms {
+                for form in &forms {
+                    if form.starts_with(dir) {
+                        return Err(format!(
+                            "{raw} is inside balerix's {what} {}; sandbox grants may not \
+                             name it",
+                            dir.display()
+                        ));
+                    }
+                    if dir.starts_with(form) {
+                        return Err(format!(
+                            "{raw} covers balerix's {what} {}; sandbox grants may not \
+                             name it",
+                            dir.display()
                         ));
                     }
                 }
@@ -667,44 +647,6 @@ impl PluginCheck<'_> {
         }
         Ok(())
     }
-}
-
-/// The path of a nono `ConditionalPath`: a string, or an object with a
-/// string `path` and at most a `when` beside it. Anything else is refused
-/// here rather than left to nono's validation.
-fn entry_text(v: &Value) -> Option<&str> {
-    match v {
-        Value::String(s) => Some(s),
-        Value::Object(m) if m.keys().all(|k| k == "path" || k == "when") => {
-            m.get("path").and_then(Value::as_str)
-        }
-        _ => None,
-    }
-}
-
-/// An entry nono will not expand: absolute, no `~`, `$`, `..` or glob.
-fn literal_path(raw: &str) -> Result<PathBuf, String> {
-    if raw.starts_with('~') {
-        return Err(format!("{raw}: `~` is not expanded; name an absolute path"));
-    }
-    if raw.contains('$') {
-        return Err(format!(
-            "{raw}: variables are not expanded; name an absolute path"
-        ));
-    }
-    if raw.contains(['*', '?', '[', '{']) {
-        return Err(format!(
-            "{raw}: glob patterns (`*`, `?`, `[`, `{{`) are not accepted; name a literal path"
-        ));
-    }
-    let path = Path::new(raw);
-    if !path.is_absolute() {
-        return Err(format!("{raw}: must be an absolute path"));
-    }
-    if path.components().any(|c| c == Component::ParentDir) {
-        return Err(format!("{raw}: must not contain `..`"));
-    }
-    Ok(path.to_path_buf())
 }
 
 /// `path` with its longest existing prefix canonicalised and the rest
@@ -1407,10 +1349,12 @@ mod tests {
             ];
             let read_only = [self.inside[0].clone(), self.inside[3].clone()];
             let read_write = [self.inside[1].clone(), self.inside[2].clone()];
+            let tmux = self.top.join("tmp/tmux-1000");
             check_plugin_sandbox(
                 &id,
                 &user,
                 &roots,
+                &[("tmux socket directory", &tmux)],
                 PluginGrants {
                     read_only: &read_only,
                     read_write: &read_write,
@@ -1711,11 +1655,18 @@ mod tests {
             r.refused(json!({ "network": [] }))
                 .ends_with("sandbox.network: expected an object")
         );
-        // `check_conflicts` keeps its own messages for these
-        r.check(
-            json!({ "environment": {}, "meta": {}, "security": { "signal_mode": "allow_all" } }),
-        )
-        .unwrap();
+        // balerix's own keys, refused with `check_conflicts`' messages
+        assert_eq!(
+            r.refused(json!({ "environment": {} })),
+            "balerix/plugins/web: sandbox.environment: balerix-owned; set variables through \
+             `env` instead"
+        );
+        assert!(
+            r.refused(json!({ "security": { "signal_mode": "allow_all" } }))
+                .ends_with(
+                    "sandbox.security.signal_mode: balerix-owned; agents stay signal-isolated"
+                )
+        );
     }
 
     #[test]
@@ -1739,7 +1690,7 @@ mod tests {
             "listen_port": [8081], "listen_port_range": [[9100, 9110]],
             "no_proxy": [".internal"], "upstream_proxy": "proxy:3128", "upstream_bypass": ["*.corp"],
         });
-        let security = json!({ "ipc_mode": "full" });
+        let security = json!({ "ipc_mode": "shared_memory_only" });
         r.check(json!({
             "filesystem": fs, "network": network, "security": security,
             "platform_overrides": {
@@ -1798,5 +1749,360 @@ mod tests {
         }
         r.check(json!({ "filesystem": { "deny": [{ "path": "/x", "when": ["linux"] }] } }))
             .unwrap();
+    }
+
+    /// A real tree for an agent's fleet block (#187): the three roots,
+    /// the agent's own grants under them, a sibling agent and the crew
+    /// cache beside it.
+    struct AgentTree {
+        _dir: tempfile::TempDir,
+        top: PathBuf,
+        layout: StateLayout,
+        paths: AgentPaths,
+        crew: CrewPaths,
+        grants: Grants,
+    }
+
+    impl AgentTree {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let top = std::fs::canonicalize(dir.path()).unwrap();
+            let layout = StateLayout::xdg(top.join("state"), top.join("data"), top.join("config"));
+            let id: AgentId = "f/c/a".parse().unwrap();
+            let paths = layout.agent(&id);
+            let crew = layout.crew(&id.crew_ref());
+            let sibling = layout.agent(&"f/c/b".parse().unwrap());
+            for d in [
+                &paths.home,
+                &paths.workspace,
+                &sibling.home,
+                &crew.cache_objects(),
+                &layout.server_dir(),
+                &layout.config_root,
+            ] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            for pool in layout.agent_pools(&id) {
+                std::fs::create_dir_all(pool).unwrap();
+            }
+            let grants = balerix_grants(
+                &id,
+                &paths,
+                &crew,
+                &layout,
+                Path::new("/opt/balerix"),
+                Path::new("/opt/mise"),
+            );
+            Self {
+                _dir: dir,
+                top,
+                layout,
+                paths,
+                crew,
+                grants,
+            }
+        }
+
+        fn check(&self, user: Value) -> Result<(), MaterializeError> {
+            let l = &self.layout;
+            let tmux = self.top.join("tmp/tmux-1000");
+            check_fleet_sandbox(
+                &"f/c/a".parse().unwrap(),
+                &user,
+                &[
+                    ("state", &l.state_root),
+                    ("data", &l.data_root),
+                    ("config", &l.config_root),
+                ],
+                &[("tmux socket directory", &tmux)],
+                &self.grants,
+            )
+        }
+
+        fn refused(&self, user: Value) -> String {
+            let e = self.check(user).unwrap_err();
+            assert!(
+                matches!(e, MaterializeError::SandboxConflict { .. }),
+                "{e:?}"
+            );
+            e.to_string()
+                .replace(&self.top.display().to_string(), "<top>")
+        }
+    }
+
+    #[test]
+    fn a_fleet_block_cannot_grant_balerixs_own_roots() {
+        let t = AgentTree::new();
+        assert_eq!(
+            t.refused(read(t.layout.server_dir().join("token"))),
+            "f/c/a: sandbox.filesystem.read[0]: <top>/state/server/token is inside \
+             balerix's state root <top>/state; an agent may name only paths in its home/ \
+             or workspace/ there, or read its tool pools, its mise.toml or its crew's \
+             object cache"
+        );
+        let sibling = t.layout.agent(&"f/c/b".parse().unwrap());
+        for (block, root) in [
+            (read(&sibling.home), "state"),
+            (
+                json!({ "filesystem": { "allow": [sibling.workspace] } }),
+                "state",
+            ),
+            // the crew's repo beyond its objects, and its pool for writing
+            (read(&t.crew.repo), "state"),
+            (
+                json!({ "filesystem": { "allow": [t.crew.mise_pool()] } }),
+                "state",
+            ),
+            (read(t.layout.plugins_data_dir()), "data"),
+            (read(t.layout.config_root.join("config.toml")), "config"),
+            (
+                json!({ "filesystem": { "write_file": [t.layout.fleets_dir().join("f.json")] } }),
+                "state",
+            ),
+        ] {
+            let e = t.refused(block.clone());
+            assert!(
+                e.contains(&format!("is inside balerix's {root} root")),
+                "{block}: {e}"
+            );
+        }
+        // an ancestor of a root reaches it too
+        assert_eq!(
+            t.refused(json!({ "filesystem": { "allow": ["/"] } })),
+            "f/c/a: sandbox.filesystem.allow[0]: / covers balerix's state root <top>/state"
+        );
+        assert!(
+            t.refused(read(&t.top))
+                .contains("covers balerix's state root")
+        );
+    }
+
+    #[test]
+    fn a_fleet_blocks_socket_grants_and_overrides_are_root_checked() {
+        let t = AgentTree::new();
+        let server = t.layout.server_dir().display().to_string();
+        for key in balerix_core::sandbox::UNIX_SOCKET_KEYS {
+            let e = t.refused(json!({ "filesystem": { *key: ["/run/ok.sock", server] } }));
+            assert!(
+                e.contains(&format!("sandbox.filesystem.{key}[1]: ")) && e.contains("is inside"),
+                "{e}"
+            );
+        }
+        let e = t.refused(json!({
+            "platform_overrides": { "linux": { "filesystem": { "read": [{ "path": server }] } } }
+        }));
+        assert!(
+            e.starts_with("f/c/a: sandbox.platform_overrides.linux.filesystem.read[0]: "),
+            "{e}"
+        );
+        // a socket in the agent's own tree, or outside the roots, passes;
+        // `deny` grants nothing and is not root-checked
+        t.check(json!({ "filesystem": {
+            "unix_socket": [t.paths.home.join("s.sock")],
+            "unix_socket_subtree_bind": ["/run/pg"],
+            "deny": [server],
+        } }))
+        .unwrap();
+        // a socket in a read-only grant is not the agent's to bind
+        let e = t.refused(
+            json!({ "filesystem": { "unix_socket_bind": [t.crew.cache_objects().join("s")] } }),
+        );
+        assert!(e.contains("is inside balerix's state root"), "{e}");
+    }
+
+    #[test]
+    fn a_symlink_from_a_fleet_block_into_a_root_is_refused_by_where_it_leads() {
+        let t = AgentTree::new();
+        let outside = t.top.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = outside.join("link");
+        std::os::unix::fs::symlink(t.layout.server_dir(), &link).unwrap();
+        assert!(
+            t.refused(read(&link))
+                .contains("inside balerix's state root")
+        );
+        assert!(
+            t.refused(read(link.join("token")))
+                .contains("inside balerix's state root")
+        );
+        // planted in the agent's own workspace, pointing at a sibling
+        let sibling = t.layout.agent(&"f/c/b".parse().unwrap());
+        let planted = t.paths.workspace.join("b");
+        std::os::unix::fs::symlink(&sibling.home, &planted).unwrap();
+        assert!(
+            t.refused(json!({ "filesystem": { "allow": [planted] } }))
+                .contains("inside balerix's state root"),
+            "inside a grant as written, not as resolved"
+        );
+        // a root reached through a symlinked ancestor of it
+        let alias = t.top.join("alias");
+        std::os::unix::fs::symlink(&t.top, &alias).unwrap();
+        assert!(
+            t.refused(read(alias.join("state")))
+                .contains("covers balerix's state root")
+        );
+    }
+
+    #[test]
+    fn a_fleet_blocks_own_grants_and_unrelated_paths_pass() {
+        let t = AgentTree::new();
+        for p in [&t.paths.home, &t.paths.workspace] {
+            for key in ["read", "allow", "write", "allow_file"] {
+                t.check(json!({ "filesystem": { key: [p.join("sub")] } }))
+                    .unwrap();
+            }
+        }
+        for p in t
+            .layout
+            .agent_pools(&"f/c/a".parse().unwrap())
+            .into_iter()
+            .chain([t.paths.mise_toml.clone(), t.crew.cache_objects()])
+        {
+            t.check(json!({ "filesystem": { "read": [p], "read_file": [p.join("x")] } }))
+                .unwrap();
+        }
+        // what the repository's own tests and examples use
+        t.check(json!({ "network": { "block": false } })).unwrap();
+        t.check(json!({ "filesystem": { "allow": ["/srv/scratch/repo.git"] } }))
+            .unwrap();
+        t.check(json!({})).unwrap();
+    }
+
+    #[test]
+    fn keys_outside_the_fleet_allowlist_are_refused_by_path() {
+        let t = AgentTree::new();
+        for (block, at) in [
+            (json!({ "extends": "default" }), "extends"),
+            (json!({ "command_policies": {} }), "command_policies"),
+            (json!({ "hooks": {} }), "hooks"),
+            (json!({ "session_hooks": {} }), "session_hooks"),
+            (
+                json!({ "network": { "credentials": ["github"] } }),
+                "network.credentials",
+            ),
+            (
+                json!({ "network": { "custom_credentials": {} } }),
+                "network.custom_credentials",
+            ),
+            (
+                json!({ "network": { "tls_intercept": {} } }),
+                "network.tls_intercept",
+            ),
+            (
+                json!({ "filesystem": { "bypass_protection": ["/x"] } }),
+                "filesystem.bypass_protection",
+            ),
+            (
+                json!({ "security": { "process_info_mode": "allow_all" } }),
+                "security.process_info_mode",
+            ),
+            (
+                json!({ "security": { "capability_elevation": true } }),
+                "security.capability_elevation",
+            ),
+            (
+                json!({ "platform_overrides": { "linux": { "extends": "x" } } }),
+                "platform_overrides.linux.extends",
+            ),
+            (
+                json!({ "platform_overrides": { "macos": { "network": { "tls_intercept": {} } } } }),
+                "platform_overrides.macos.network.tls_intercept",
+            ),
+        ] {
+            assert_eq!(
+                t.refused(block),
+                format!("f/c/a: sandbox.{at}: not accepted in a fleet's sandbox block")
+            );
+        }
+        let e = t.refused(json!({ "filesystem": { "read": ["/opt/*"] } }));
+        assert!(e.contains("glob patterns"), "{e}");
+        // balerix's own keys, refused with `check_conflicts`' messages
+        assert_eq!(
+            t.refused(json!({ "meta": {} })),
+            "f/c/a: sandbox.meta: balerix-owned"
+        );
+        assert_eq!(
+            t.refused(json!({ "security": { "ipc_mode": "full" } })),
+            "f/c/a: sandbox.security.ipc_mode: only \"shared_memory_only\" is accepted"
+        );
+    }
+
+    /// #187 review: sandbox grants may not name balerix's tmux socket
+    /// directory, anything beneath it or anything holding it, in any list
+    /// and either kind of block (the base profile grants nothing under
+    /// `/tmp`, so a grant of `/tmp` itself is refused too).
+    #[test]
+    fn grants_may_not_name_the_tmux_socket_directory() {
+        let t = AgentTree::new();
+        let r = Reserved::new();
+        let tmux = t.top.join("tmp/tmux-1000");
+        let ptmux = r.top.join("tmp/tmux-1000");
+        for key in [
+            "read",
+            "allow",
+            "write_file",
+            "unix_socket",
+            "unix_socket_subtree_bind",
+        ] {
+            for (entry, how) in [
+                (tmux.join("balerix-x"), "is inside"),
+                (tmux.clone(), "is inside"),
+                (t.top.join("tmp"), "covers"),
+            ] {
+                let e = t.refused(json!({ "filesystem": { key: [entry] } }));
+                assert!(
+                    e.contains(&format!("{how} balerix's tmux socket directory <top>/tmp/tmux-1000; sandbox grants may not name it")),
+                    "{key}: {e}"
+                );
+            }
+        }
+        for key in ["read", "allow_file"] {
+            let e = r.refused(json!({ "filesystem": { key: [ptmux.join("balerix-x")] } }));
+            assert!(
+                e.contains("is inside balerix's tmux socket directory"),
+                "{e}"
+            );
+            let e = r.refused(json!({ "filesystem": { key: [r.top.join("tmp")] } }));
+            assert!(e.contains("covers balerix's tmux socket directory"), "{e}");
+        }
+        // through a symlink
+        std::fs::create_dir_all(&tmux).unwrap();
+        std::fs::create_dir_all(t.top.join("outside")).unwrap();
+        let link = t.top.join("outside/sockets");
+        std::os::unix::fs::symlink(&tmux, &link).unwrap();
+        let e = t.refused(json!({ "filesystem": { "unix_socket_subtree": [link] } }));
+        assert!(
+            e.contains("is inside balerix's tmux socket directory"),
+            "{e}"
+        );
+        // a sibling is fine
+        t.check(json!({ "filesystem": { "read": [t.top.join("tmp/other")] } }))
+            .unwrap();
+    }
+
+    /// A link to `/proc` (or `/dev/fd`) is refused by where it leads.
+    #[test]
+    fn a_symlink_into_proc_is_refused_by_where_it_leads() {
+        let t = AgentTree::new();
+        let r = Reserved::new();
+        for (top, root) in [(&t.top, "outside"), (&r.top, "outside")] {
+            std::fs::create_dir_all(top.join(root)).unwrap();
+            std::os::unix::fs::symlink("/proc/1/root", top.join(root).join("p")).unwrap();
+            std::os::unix::fs::symlink("/dev/fd", top.join(root).join("fd")).unwrap();
+        }
+        for (link, rest) in [("p", ""), ("p", "/etc"), ("fd", "")] {
+            let e = t.refused(json!({ "filesystem": { "read": [format!("{}{rest}", t.top.join("outside").join(link).display())] } }));
+            assert!(
+                e.contains("; paths under /proc and /dev/fd are not accepted"),
+                "{e}"
+            );
+            assert!(e.contains(" leads to /proc/"), "{e}");
+            let e =
+                r.refused(json!({ "filesystem": { "allow": [r.top.join("outside").join(link)] } }));
+            assert!(
+                e.contains("; paths under /proc and /dev/fd are not accepted"),
+                "{e}"
+            );
+        }
     }
 }

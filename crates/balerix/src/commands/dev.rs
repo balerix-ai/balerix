@@ -63,7 +63,10 @@ pub fn materialize_command(args: &MaterializeArgs) -> Result<String> {
         out_root.join("data"),
         real.config_root,
     );
-    let rt = Runtime::new(layout.clone(), tools);
+    // what `serve` passes, so the preview holds the same grants off
+    // the daemon's tmux socket directory (#187)
+    let rt = Runtime::new(layout.clone(), tools)
+        .with_tmux_tmpdir(std::env::var_os("TMUX_TMPDIR").map(std::path::PathBuf::from));
 
     let paths = layout.agent(&agent.id);
     std::fs::create_dir_all(&paths.workspace)?;

@@ -37,8 +37,8 @@ pub use plugin::{
 pub use quote::sh_quote;
 pub use sandbox::{
     Grants, PluginGrants, Roots, SIGNAL_SCOPING_ABI, SelfTestError, balerix_grants,
-    check_conflicts, check_plugin_sandbox, host_landlock_abi, landlock_abi, merge_profile,
-    render_git_profile, render_profile, sandbox_self_test, signal_scoping_warning,
+    check_conflicts, check_fleet_sandbox, check_plugin_sandbox, host_landlock_abi, landlock_abi,
+    merge_profile, render_git_profile, render_profile, sandbox_self_test, signal_scoping_warning,
     validate_profile, validate_profile_at, write_git_profile, write_profile, write_profile_at,
 };
 pub use socket_policy::{

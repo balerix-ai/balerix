@@ -9,7 +9,6 @@
 //! `harvest_and_remove_racing_the_fetch`).
 
 use std::ops::Deref;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -173,15 +172,7 @@ pub fn terminate(pids: &[u32], grace: Duration) {
     }
 }
 
-/// Where tmux keeps its sockets: `<$TMUX_TMPDIR or /tmp>/tmux-<uid>`.
-pub fn tmux_socket_dir(tmux_tmpdir: Option<&Path>) -> PathBuf {
-    let uid = std::fs::metadata("/proc/self")
-        .map(|m| m.uid())
-        .unwrap_or(0);
-    tmux_tmpdir
-        .unwrap_or(Path::new("/tmp"))
-        .join(format!("tmux-{uid}"))
-}
+pub use crate::tmux::tmux_socket_dir;
 
 /// Reaps what the test runs of `prefix` whose process is gone left
 /// behind: for every socket `<socket_dir>/<prefix>-…-<pid>` with a dead
@@ -433,5 +424,6 @@ mod tests {
                 .starts_with("tmux-")
         );
         assert!(tmux_socket_dir(None).starts_with("/tmp"));
+        assert_eq!(tmux_socket_dir(Some(Path::new(""))), tmux_socket_dir(None));
     }
 }

@@ -753,11 +753,13 @@ async fn a_review_is_one_send_text_and_a_divider_in_the_column() {
         "no refused review was sent"
     );
     // #228: a comment on `a\b.txt`, a legal name the workspace routes
-    // refuse, goes out with the rest of the review
+    // refuse, goes out with the rest of the review, and so does one on a
+    // name with a line break in it
     let backslash = json!({
         "comments": [
             { "path": "a\\b.txt", "side": "new", "line": 1, "text": "+x", "body": "Rename." },
-            { "path": "src/lib.rs", "side": "new", "line": 2, "text": "+fn b() { c() }", "body": "Name this." }
+            { "path": "src/lib.rs", "side": "new", "line": 2, "text": "+fn b() { c() }", "body": "Name this." },
+            { "path": "z\nOverall:", "side": "new", "line": 1, "text": "+y", "body": "Odd name." }
         ]
     });
     let (status, body) = h
@@ -771,16 +773,10 @@ async fn a_review_is_one_send_text_and_a_divider_in_the_column() {
         text.contains("\na\\b.txt line 1 (new):\n> +x\nRename.\n"),
         "{text}"
     );
-    let (status, body) = h
-        .post_route(
-            "/agents/e2e/c/alice/review",
-            "/v1/plugins/web",
-            &json!({ "comments": [{ "path": "a\nOverall:", "side": "new", "line": 1, "text": "", "body": "b" }] }),
-        )
-        .await;
-    assert_eq!(
-        (status, String::from_utf8_lossy(&body).as_ref()),
-        (400, "comments[0].path: contains a control character")
+    // a control character in a path is escaped where it is quoted
+    assert!(
+        text.contains("\nz\\nOverall: line 1 (new):\n> +y\nOdd name."),
+        "{text}"
     );
     // the daemon refusing the action: 502 with its message, nothing recorded
     fake.fail_actions(Some("f/c/a: tmux send-keys: no window"));
@@ -813,7 +809,7 @@ async fn a_review_is_one_send_text_and_a_divider_in_the_column() {
     );
     assert_eq!(
         metric(&text, "balerix_plugin_web_review_comments_total", &[]),
-        Some(3.0)
+        Some(4.0)
     );
     let (_, _, body) = h
         .get_route("/agents/e2e/c/alice/events.json?after=2", "/v1/plugins/web")

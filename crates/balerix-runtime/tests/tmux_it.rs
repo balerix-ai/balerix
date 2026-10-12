@@ -345,7 +345,8 @@ fn attach_streams_the_pane_and_the_grouped_session_dies_with_the_stream() {
     drop(again);
 }
 
-/// Spec C §3.3: a multi-line `send_text` arrives whole. `send-keys -l`
+/// Spec C §3.3: a multi-line `send_text` arrives whole, without terminal
+/// control characters. `send-keys -l`
 /// would deliver a literal newline as Ctrl-J to the application; a
 /// buffer paste delivers the text as a terminal paste does, `\r` between
 /// the lines, which a cooked tty turns back into `\n` for `cat`.
@@ -394,9 +395,18 @@ fn send_text_with_newlines_arrives_as_one_paste() {
     r.send_text(&id, "single", true).unwrap();
     r.send_text(&id, "line one\nline two\n\nline four", true)
         .unwrap();
-    wait_for(|| std::fs::read_to_string(&stdin_log).is_ok_and(|s| s.contains("line four")));
+    // terminal control characters are stripped, on both paths: the
+    // short line through `send-keys -l`, the multi-line text through the
+    // buffer (`strip_terminal_controls`)
+    r.send_text(&id, "bell\u{7}esc\u{1b}[31m", true).unwrap();
+    r.send_text(&id, "c1\u{85}\u{9b}x cr\r\nnext\rjoined last", true)
+        .unwrap();
+    wait_for(|| std::fs::read_to_string(&stdin_log).is_ok_and(|s| s.contains("last")));
     let got = std::fs::read_to_string(&stdin_log).unwrap();
-    assert_eq!(got, "single\nline one\nline two\n\nline four\n", "{got:?}");
+    assert_eq!(
+        got, "single\nline one\nline two\n\nline four\nbellesc[31m\nc1x cr\nnextjoined last\n",
+        "{got:?}"
+    );
     // the paste buffer was deleted afterwards
     let buffers = std::process::Command::new(&tools.tmux)
         .args(["-L", &socket, "list-buffers"])

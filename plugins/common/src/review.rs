@@ -88,9 +88,9 @@ const MAX_PATH_BYTES: usize = 4096;
 /// A comment's `path` is only quoted in the message, never opened, so it
 /// is not held to the workspace routes' `check_path`: `a\b.txt` is a
 /// legal Linux name that shows up in the diff, and one comment on it
-/// must not refuse the whole review (#228). It is bounded and may not
-/// hold NUL, nor a control character but tab, which would break the
-/// message's one-header-line-per-comment layout.
+/// must not refuse the whole review (#228). It is bounded and may not hold
+/// NUL, like every other field; a control character in it is escaped where
+/// the message quotes it (`quoted_path`), not refused.
 fn check_comment_path(field: &str, path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err(format!("{field}: empty"));
@@ -98,11 +98,26 @@ fn check_comment_path(field: &str, path: &str) -> Result<(), String> {
     if path.len() > MAX_PATH_BYTES {
         return Err(format!("{field}: longer than {MAX_PATH_BYTES} bytes"));
     }
-    no_nul(field, path)?;
-    if path.chars().any(|c| c.is_control() && c != '\t') {
-        return Err(format!("{field}: contains a control character"));
+    no_nul(field, path)
+}
+
+/// A comment's path as the message quotes it: every control character
+/// but tab escaped the way Rust's `escape_debug` writes it (`\n`,
+/// `\u{1b}`), so a name holding a line break stays on its comment's
+/// header line. Anything else, a backslash included, is left as it is.
+fn quoted_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if !path.chars().any(|c| c.is_control() && c != '\t') {
+        return std::borrow::Cow::Borrowed(path);
     }
-    Ok(())
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        if c.is_control() && c != '\t' {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// The 400 text, field path first, or `Ok` for a sendable review. Every
@@ -173,7 +188,7 @@ pub fn render_message(body: &Review) -> String {
     for c in comments {
         out.push_str(&format!(
             "\n{} line {} ({}):\n> {}\n{}\n",
-            c.path,
+            quoted_path(&c.path),
             c.line,
             c.side,
             c.text,
@@ -337,25 +352,17 @@ mod tests {
     }
 
     /// #228: a comment's path is quoted, never opened. A backslash, a
-    /// `..` or a leading `/` that the workspace routes refuse is fine here;
-    /// a line break or another control character is not. A tab breaks
-    /// nothing.
+    /// `..` or a leading `/` that the workspace routes refuse is fine here,
+    /// and so is a control character: it is escaped in the message, so
+    /// one odd name never refuses the whole review.
     #[test]
-    fn a_comment_path_is_held_to_what_the_message_can_quote() {
-        for ok in ["a\\b.txt", "../x", "/abs", ".git/config", "tab\there"] {
-            let mut b = body();
-            b.comments[0].path = ok.into();
-            assert_eq!(validate(&b), Ok(()), "{ok:?}");
-        }
-        let mut b = body();
-        b.comments.truncate(1);
-        b.comments[0].path = "a\\b.txt".into();
-        let m = render_message(&b);
-        assert!(
-            m.contains("\na\\b.txt line 80 (old):\n> -    // TODO\n"),
-            "{m}"
-        );
-        for bad in [
+    fn a_comment_path_is_quoted_with_its_control_characters_escaped() {
+        for ok in [
+            "a\\b.txt",
+            "../x",
+            "/abs",
+            ".git/config",
+            "tab\there",
             "a\nOverall:",
             "a\rb",
             "a\u{1b}[31mb",
@@ -363,13 +370,31 @@ mod tests {
             "a\u{85}b",
         ] {
             let mut b = body();
-            b.comments[1].path = bad.into();
-            assert_eq!(
-                validate(&b),
-                Err("comments[1].path: contains a control character".to_string()),
-                "{bad:?}"
-            );
+            b.comments[0].path = ok.into();
+            assert_eq!(validate(&b), Ok(()), "{ok:?}");
         }
+        let quoted = |path: &str| {
+            let mut b = body();
+            b.comments.truncate(1);
+            b.comments[0].path = path.into();
+            b.summary.clear();
+            render_message(&b)
+        };
+        let m = quoted("a\\b.txt");
+        assert!(
+            m.contains("\na\\b.txt line 80 (old):\n> -    // TODO\n"),
+            "{m}"
+        );
+        let m = quoted("a\nOverall:\r\u{1b}[31m\u{7f}\u{85}\tz");
+        assert!(
+            m.contains("\na\\nOverall:\\r\\u{1b}[31m\\u{7f}\\u{85}\tz line 80 (old):\n"),
+            "{m}"
+        );
+        assert!(
+            !m.contains("\nOverall:"),
+            "the path stays on its header line: {m}"
+        );
+        assert_eq!(quoted_path("plain/path"), "plain/path");
     }
 
     /// The per-field caps leave the rendered message unbounded: 200

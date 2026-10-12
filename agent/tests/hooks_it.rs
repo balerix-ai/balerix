@@ -243,27 +243,32 @@ async fn a_daemon_that_is_down_or_slow_fails_open_inside_the_budget() {
 
 /// One budget covers the whole forward: a Daemon that sends its headers
 /// inside the budget and then stalls the body is answered `200 {}` inside one budget.
+///
+/// Timed on the fake Daemon's side, from the request reaching it to the
+/// sidecar closing the connection when the budget drops the forward, so
+/// neither the test client nor the sidecar's inbound work counts (#157).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_daemon_that_stalls_the_body_fails_open_inside_one_budget() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // headers late in the budget, so a second budget would show
+    const HEADERS_AT: Duration = Duration::from_secs(2);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let daemon = format!("http://{}", listener.local_addr().unwrap());
+    let (held, held_rx) = tokio::sync::oneshot::channel::<Duration>();
     tokio::spawn(async move {
-        loop {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf).await;
-                // headers late in the budget, so a second budget would show
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                sock.write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{",
-                )
-                .await
-                .unwrap();
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            });
-        }
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await;
+        let t_req = Instant::now();
+        tokio::time::sleep(HEADERS_AT).await;
+        sock.write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{",
+        )
+        .await
+        .unwrap();
+        // the body never comes; the forward ends when the sidecar closes
+        while matches!(sock.read(&mut buf).await, Ok(n) if n > 0) {}
+        let _ = held.send(t_req.elapsed());
     });
     let (base, failures, _) = sidecar(&daemon).await;
     let start = Instant::now();
@@ -275,8 +280,11 @@ async fn a_daemon_that_stalls_the_body_fails_open_inside_one_budget() {
     )
     .await;
     assert_eq!((status, text.as_str()), (200, "{}"));
+    let held = held_rx.await.unwrap();
+    assert!(held < FORWARD_BUDGET + HEADERS_AT / 2, "{held:?}");
+    // a hang guard only, below the sidecar client's own 10 s timeout
     assert!(
-        start.elapsed() < FORWARD_BUDGET + Duration::from_millis(500),
+        start.elapsed() < Duration::from_secs(9),
         "{:?}",
         start.elapsed()
     );

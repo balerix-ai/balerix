@@ -186,6 +186,19 @@ async fn sync_starts_the_plugin_and_lists_it() {
         .await
         .unwrap();
     }
+    // The fakes log those calls before the actor publishes the pass's
+    // status, and the host lists Pending until it does (#182): wait for
+    // the phase, as `ready` does, before reading it over HTTP.
+    {
+        let d = fx.daemon.clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while d.plugin_host().unwrap().list().await[0].phase != AgentPhase::Starting {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the plugin reaches Starting");
+    }
     let (s, rows) = fx.api.call("GET", "/v1/plugins", ADMIN, None);
     assert_eq!(s, 200);
     assert_eq!(rows[0]["name"], "hello");

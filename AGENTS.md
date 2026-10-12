@@ -592,6 +592,10 @@ credentials, hook input, or sandbox rules.
   `fake-claude` records a paste line by line; the real `claude` is expected
   to arrive as one message — verify with `mise run verify-claude`
   (Spec C §8, pending).
+  `TmuxRunner::send_text` strips terminal control characters from the
+  text first (`strip_terminal_controls`: C0 but `\n` and `\t`, DEL, C1;
+  `\r\n` becomes `\n`, a lone `\r` goes). Local tmux and the Kubernetes
+  sidecar both send through it.
 - Workspace git calls (`balerix-runtime/src/inspect.rs`) run under the git
   profile (`GIT_OPTIONAL_LOCKS=0` and the rest in its `set_vars`), with
   `-c core.fsmonitor=false -c core.hooksPath=<empty>`
@@ -647,6 +651,9 @@ credentials, hook input, or sandbox rules.
   but never while a comment box is open.
 - `web`'s event buffer is memory only: after a plugin restart the review
   page's column is empty until new events arrive (no observer catch-up).
+  Each agent's log carries a random `epoch` in `events.json`, new after a
+  restart or a `deactivate`; an open page that sees it change clears its
+  column and reads again from seq 0 (#225).
 - The matrix plugin's `matrix-sdk` state and crypto store lives in the
   plugin's `scratch/`, so `plugin remove --purge` discards the device keys:
   the bot rejoins as a new device and previously encrypted history stops

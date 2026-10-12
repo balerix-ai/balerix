@@ -1040,6 +1040,51 @@ fn the_combined_diff_holds_up_against_what_the_clone_can_do() {
     }
 }
 
+/// #226: a clone that sets `diff.suppressBlankEmpty` still gets a blank
+/// context line as ` `, so the review page's line numbers hold.
+#[test]
+fn a_blank_context_line_keeps_its_space_whatever_the_clone_sets() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("inspect-blank");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (id, layout) = clone_with_changes(&root, &tools);
+    let w = &layout.agent(&id).workspace;
+    std::fs::write(w.join("blank"), "a\n\nb\nc\n").unwrap();
+    git(w, &["add", "blank"]);
+    git(w, &["commit", "-q", "-m", "blank"]);
+    git(
+        &root,
+        &[
+            "-C",
+            &w.display().to_string(),
+            "push",
+            "-q",
+            "origin",
+            "HEAD:main",
+        ],
+    );
+    git(w, &["fetch", "-q", "origin"]);
+    std::fs::write(w.join("blank"), "a\n\nb\nC\n").unwrap();
+    git(w, &["config", "diff.suppressBlankEmpty", "true"]);
+    assert!(
+        git(w, &["diff", "--no-color", "--", "blank"]).contains("\n a\n\n b\n"),
+        "the clone's own git drops the space"
+    );
+    let rt = Runtime::new(layout.clone(), tools.clone());
+    let d = rt.diff(&id, "origin/main").unwrap();
+    let f = d.files.iter().find(|f| f.path == "blank").unwrap();
+    assert!(
+        f.patch.ends_with("@@ -1,4 +1,4 @@\n a\n \n b\n-c\n+C\n"),
+        "{}",
+        f.patch
+    );
+}
+
 /// Plain git's `--no-index` diff of an untracked file against
 /// `/dev/null`, which exits 1 when it printed a diff.
 fn no_index(dir: &Path, path: &str) -> String {

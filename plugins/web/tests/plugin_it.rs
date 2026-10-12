@@ -319,6 +319,68 @@ async fn the_bridge_relays_bytes_and_resizes_to_the_daemon_attach() {
     assert_eq!(fake.attaches().len(), 1);
 }
 
+/// #227: a daemon that takes the attach connection and never answers the
+/// handshake no longer holds the bridge: after the SDK's 10 s the browser
+/// gets 1011 with the reason, and no terminal was counted open.
+#[tokio::test]
+async fn an_attach_the_daemon_never_answers_closes_the_browser_with_1011() {
+    let stuck = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stuck_addr = stuck.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = stuck.accept().await {
+            held.push(socket);
+        }
+    });
+    let fake = FakeHost::start("tok", json!({}), vec![]).await;
+    let env = fake.env("web", std::path::Path::new("/s"));
+    let daemon = Env {
+        api_url: format!("http://{stuck_addr}"),
+        ..env.clone()
+    };
+    let plugin = WebPlugin::new(Host::new(daemon).unwrap()).unwrap();
+    let h = Harness::start(&env, plugin).await;
+    h.activate(ALICE, json!({})).await.unwrap();
+    let mut req = format!("ws://{}/v1/routes/agents/e2e/c/alice/ws", h.listen())
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", env.token).parse().unwrap(),
+    );
+    let (mut ws, _) = connect_async(req).await.unwrap();
+    let started = std::time::Instant::now();
+    let close = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(f))) => return f,
+                Some(Ok(_)) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the bridge gave up within 20 s")
+    .expect("with a frame");
+    assert!(
+        started.elapsed() >= Duration::from_secs(9),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(u16::from(close.code), 1011);
+    assert!(
+        close.reason.starts_with(
+            "attach: daemon: agents/e2e/c/alice/attach: no WebSocket handshake within 10s"
+        ),
+        "{}",
+        close.reason
+    );
+    assert_eq!(
+        metric(&h.metrics().await, "balerix_plugin_web_terminals_open", &[]),
+        Some(0.0)
+    );
+}
+
 #[tokio::test]
 async fn observed_events_feed_the_activity_column_of_enabled_agents() {
     let (fake, _, h, _watch) = world().await;
@@ -376,6 +438,46 @@ async fn observed_events_feed_the_activity_column_of_enabled_agents() {
         metric(&text, "balerix_plugin_web_events_buffered_total", &[]),
         Some(3.0)
     );
+}
+
+/// #225: a re-activation makes the log again, with `seq` from 1; the
+/// `epoch` in `events.json` is what tells an open page.
+#[tokio::test]
+async fn a_reactivated_agent_gets_a_new_epoch_and_seq_from_one() {
+    let (_fake, _, h, _watch) = world().await;
+    h.activate(ALICE, json!({})).await.unwrap();
+    let poll = |after: u64| {
+        let h = &h;
+        async move {
+            let (status, _, body) = h
+                .get_route(
+                    &format!("/agents/e2e/c/alice/events.json?after={after}"),
+                    "/v1/plugins/web",
+                )
+                .await;
+            assert_eq!(status, 200);
+            serde_json::from_slice::<Value>(&body).unwrap()
+        }
+    };
+    h.observe(vec![
+        event(ALICE, "Stop", json!({})),
+        event(ALICE, "Stop", json!({})),
+    ])
+    .await;
+    let before = poll(0).await;
+    let epoch = before["epoch"].as_str().unwrap().to_string();
+    assert_eq!(epoch.len(), 16, "{before}");
+    assert_eq!(before["events"].as_array().unwrap().len(), 2);
+    h.deactivate(ALICE).await;
+    h.activate(ALICE, json!({})).await.unwrap();
+    h.observe(vec![event(ALICE, "Stop", json!({}))]).await;
+    let after = poll(2).await;
+    assert_ne!(after["epoch"], epoch.as_str(), "{after}");
+    assert!(
+        after["events"].as_array().unwrap().is_empty(),
+        "seq 1 again, under what the page has seen: {after}"
+    );
+    assert_eq!(poll(0).await["events"][0]["seq"], 1);
 }
 
 fn sample_diff() -> balerix_api::WorkspaceDiff {
@@ -650,6 +752,32 @@ async fn a_review_is_one_send_text_and_a_divider_in_the_column() {
         1,
         "no refused review was sent"
     );
+    // #228: a comment on `a\b.txt`, a legal name the workspace routes
+    // refuse, goes out with the rest of the review, and so does one on a
+    // name with a line break in it
+    let backslash = json!({
+        "comments": [
+            { "path": "a\\b.txt", "side": "new", "line": 1, "text": "+x", "body": "Rename." },
+            { "path": "src/lib.rs", "side": "new", "line": 2, "text": "+fn b() { c() }", "body": "Name this." },
+            { "path": "z\nOverall:", "side": "new", "line": 1, "text": "+y", "body": "Odd name." }
+        ]
+    });
+    let (status, body) = h
+        .post_route("/agents/e2e/c/alice/review", "/v1/plugins/web", &backslash)
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let Some(PluginAction::SendText { text, .. }) = fake.actions_for(ALICE).last().cloned() else {
+        panic!("a send_text")
+    };
+    assert!(
+        text.contains("\na\\b.txt line 1 (new):\n> +x\nRename.\n"),
+        "{text}"
+    );
+    // a control character in a path is escaped where it is quoted
+    assert!(
+        text.contains("\nz\\nOverall: line 1 (new):\n> +y\nOdd name."),
+        "{text}"
+    );
     // the daemon refusing the action: 502 with its message, nothing recorded
     fake.fail_actions(Some("f/c/a: tmux send-keys: no window"));
     let (status, body) = h
@@ -669,7 +797,7 @@ async fn a_review_is_one_send_text_and_a_divider_in_the_column() {
             "balerix_plugin_web_reviews_total",
             &[("outcome", "sent")]
         ),
-        Some(1.0)
+        Some(2.0)
     );
     assert_eq!(
         metric(
@@ -681,10 +809,10 @@ async fn a_review_is_one_send_text_and_a_divider_in_the_column() {
     );
     assert_eq!(
         metric(&text, "balerix_plugin_web_review_comments_total", &[]),
-        Some(1.0)
+        Some(4.0)
     );
     let (_, _, body) = h
-        .get_route("/agents/e2e/c/alice/events.json?after=1", "/v1/plugins/web")
+        .get_route("/agents/e2e/c/alice/events.json?after=2", "/v1/plugins/web")
         .await;
     let v: Value = serde_json::from_slice(&body).unwrap();
     assert!(

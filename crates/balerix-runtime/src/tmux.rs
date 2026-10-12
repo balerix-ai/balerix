@@ -42,6 +42,26 @@ pub const ATTACH_SESSION_PREFIX: &str = "balerix-attach-";
 const ATTACH_TERM: &str = "xterm-256color";
 static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
 static SEND_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Strips terminal control characters from text sent to an agent: every
+/// C0 control but `\n` and `\t`, DEL, and every C1 control are removed;
+/// `\r\n` becomes `\n` and a lone `\r` is dropped. The text is otherwise
+/// unchanged. Stripping, not refusing, so a review or a reply that happens
+/// to carry one still arrives. Every `send_text` goes through here
+/// (`TmuxRunner::send_text`, which the Kubernetes sidecar runs as well).
+pub fn strip_terminal_controls(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(
+        text.chars()
+            .filter(|&c| !c.is_control() || c == '\n' || c == '\t')
+            .collect(),
+    )
+}
 /// Above this many bytes a single line is pasted through a buffer like a
 /// multi-line text: tmux refuses a command whose argv exceeds ~16 KiB
 /// (`command too long`), and `send-keys -l` carries the text as argv.
@@ -802,12 +822,15 @@ impl AgentRunner for TmuxRunner {
     /// Spec C §4.4 allows a review of 64 KiB. Buffer names are unique per
     /// process so two concurrent sends cannot swap texts; on a failed
     /// paste (the target window gone, say) the buffer is deleted before
-    /// the error is returned, so failures do not leak buffers.
+    /// the error is returned, so failures do not leak buffers. The text is
+    /// passed through `strip_terminal_controls` first.
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
         let lock = self.send_lock(agent);
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         let id = agent.to_string();
         let target = Self::window_target(agent);
+        let text = strip_terminal_controls(text);
+        let text = text.as_ref();
         if text.contains('\n') || text.len() > SEND_KEYS_LIMIT {
             let buffer = format!(
                 "balerix-send-{}-{}",
@@ -989,6 +1012,27 @@ pub fn tmux_socket_dir(tmux_tmpdir: Option<&Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_controls_are_stripped_from_sent_text() {
+        assert!(matches!(
+            strip_terminal_controls("plain\ttext\nok"),
+            std::borrow::Cow::Borrowed("plain\ttext\nok")
+        ));
+        assert_eq!(
+            strip_terminal_controls("a\u{1b}[31mb\u{7}c\u{85}d\u{9b}e\u{7f}f\u{0}g"),
+            "a[31mbcdefg"
+        );
+        assert_eq!(
+            strip_terminal_controls("one\r\ntwo\rthree\n"),
+            "one\ntwothree\n"
+        );
+        assert_eq!(
+            strip_terminal_controls("ä € \u{a0}"),
+            "ä € \u{a0}",
+            "not controls"
+        );
+    }
 
     /// `cmd()` and `attach` build every client's leading argv from
     /// `socket_args`: a pod runner always carries `-S <path> -u -N`, the

@@ -168,6 +168,14 @@ spec:
 - Conditions: `Resolved` (the resolver's message, config path first),
   `Accepted` (plugin activations), `Ready` (every agent `Ready`).
 - A Fleet carries the finalizer `balerix.ai/fleet`.
+- `spec.daemon` is immutable: a CEL rule (`self == oldSelf`) in the
+  definition refuses an update that changes it (#235). Moving a Fleet to
+  another Daemon means deleting it, which downs it on the old Daemon and
+  runs its cleanup, and creating it again naming the new one. A move in
+  place would leave the agent pods on the old Daemon's shared claim,
+  authority and URL, and the fleet's record on the old Daemon. The field
+  is required and has no default, so every stored Fleet has it and the
+  rule applies to all of them.
 
 ### 4.3 Crew (generated)
 
@@ -719,7 +727,7 @@ bundle) is in the sidecar container only.
 | Daemon down | Hooks pass; sidecars and plugins reconnect; the operator sets `DaemonUnavailable` and retries. After a restart the Daemon reloads its records from the state claim and the operator re-sends fleets and the plugin list. |
 | Sync Job fails | `CacheReady=False` or `ToolsReady=False` with the message; the crew's agents wait; retried with back-off. |
 | Node lacks Landlock | The sidecar's sandbox self-test (§6.2) fails: nono exits 1 and runs nothing, as observed with the Landlock syscalls answering `ENOSYS` (§19.2); the Agent is `Materialized=False`, reason `SandboxUnavailable`. |
-| Pod evicted or node drained | Recreated on the same claim; Claude resumes. |
+| Pod evicted or node drained | Recreated on the same claim; Claude resumes. A pod the kubelet ended and kept is deleted and recreated like a pod with a stale `specHash`. A node-pressure eviction, a graceful node shutdown or a refused admission leaves it `Failed` (reason `Evicted`, `Terminated`, `OutOfcpu`, …); `Succeeded` is rarer, when every container exited 0 as the pod ended. A pod that ended within 5 min of its creation is replaced after a back-off: 10 s, doubling per such pod in a row, at most 5 min; one that lived longer is replaced at once and restarts the count. The count is the Agent's annotation `balerix.ai/pod-backoff`. Each replacement is a `PodReplaced` Warning Event on the Agent. Until the replacement the Agent is `Scheduled=False` with the pod's reason (#234). |
 | Harvest fails | The finalizer blocks with a condition; the purge annotation skips it. |
 | Shared class is not ReadWriteMany | The Daemon is `StorageReady=False`; nothing starts. |
 | A plugin rejects an agent's config | The Fleet is `Accepted=False` with the config path; no pod changes. |
@@ -1531,7 +1539,12 @@ What 3b's plan decided beyond §21.1–§21.5, as built.
 - **The attempt count is one annotation on the owner,** `balerix.ai/attempts`,
   a JSON object from Job name to count (`{"f-c-sync": 2}`), since a Fleet
   owns its pool Job and, while deleting, one cleanup Job per crew. An entry
-  is removed when the Job succeeds or its input changes. The delay is
+  is removed when the Job succeeds or its input changes. A write changes
+  only its Job's entry, computing the new count from the owner it reads
+  again: it patches with the `resourceVersion` it read and, on a
+  conflict, reads and writes again, giving up after five attempts. One reconcile
+  can fail and retry several Jobs of one owner from one stale snapshot
+  (#236). The delay is
   `30 × 2^(n−1)` seconds for attempt `n`, capped at 600, measured from the
   failed Job's `Failed` condition's transition time, else its creation time.
 - **The Fleet's agents are re-reconciled through a Fleet watch.** The Agent

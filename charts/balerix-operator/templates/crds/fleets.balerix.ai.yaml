@@ -61,7 +61,13 @@ spec:
                 default: {}
                 type: object
               daemon:
+                description: |-
+                  The Daemon the fleet runs on. Immutable: to move the Fleet to
+                  another Daemon, delete it and create it again.
                 type: string
+                x-kubernetes-validations:
+                - message: 'spec.daemon is immutable: delete the Fleet and create it again to move it to another Daemon'
+                  rule: self == oldSelf
               defaults:
                 default: {}
                 type: object

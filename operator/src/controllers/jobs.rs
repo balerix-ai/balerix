@@ -169,11 +169,21 @@ fn stuck(holders: &[Holder], now: i64, after: Duration) -> Option<&Holder> {
         .min_by_key(|h| h.deleting_since)
 }
 
-async fn set_attempts<K>(
+/// Changes Job `job`'s entry in the owner's attempts map (`None` is no
+/// entry) by `change`, applied to the entry as the API server has it now,
+/// and leaves every other entry alone; the entry written. The caller's
+/// owner is a snapshot from before this reconcile, and one reconcile can
+/// ensure several Jobs of one owner (a Fleet's cleanup, one per crew): a
+/// whole map written from that snapshot would drop the entry the call
+/// before wrote (#236). So the owner is read again, and the patch carries
+/// the `resourceVersion` it read: a write that races another is refused
+/// (409) and made again on the newer owner, at most five times.
+async fn set_attempt<K>(
     ctx: &Context,
     owner: &K,
-    attempts: &BTreeMap<String, u32>,
-) -> Result<(), Error>
+    job: &str,
+    change: impl Fn(Option<u32>) -> Option<u32>,
+) -> Result<Option<u32>, Error>
 where
     K: Resource<Scope = k8s_openapi::NamespaceResourceScope>
         + Clone
@@ -183,17 +193,38 @@ where
 {
     let namespace = owner.namespace().unwrap_or_default();
     let api: Api<K> = Api::namespaced(ctx.client.clone(), &namespace);
-    let value =
-        serde_json::to_string(attempts).map_err(crate::desired::common::DesiredError::from)?;
-    api.patch(
-        &owner.name_any(),
-        &PatchParams::default(),
-        &Patch::Merge(
-            serde_json::json!({ "metadata": { "annotations": { ATTEMPTS_ANNOTATION: value } } }),
-        ),
-    )
-    .await?;
-    Ok(())
+    let name = owner.name_any();
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let current = api.get(&name).await?;
+        let mut attempts = attempts_of(&current);
+        let before = attempts.get(job).copied();
+        let after = change(before);
+        if before == after {
+            return Ok(after);
+        }
+        match after {
+            Some(n) => attempts.insert(job.to_string(), n),
+            None => attempts.remove(job),
+        };
+        let value =
+            serde_json::to_string(&attempts).map_err(crate::desired::common::DesiredError::from)?;
+        let patch = serde_json::json!({ "metadata": {
+            "resourceVersion": current.meta().resource_version,
+            "annotations": { ATTEMPTS_ANNOTATION: value },
+        } });
+        match api
+            .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+            .await
+        {
+            Ok(_) => return Ok(after),
+            Err(kube::Error::Api(e)) if e.code == 409 && tries < 5 => {
+                tracing::debug!(owner = %name, job, "attempts: the owner changed; again");
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// A Job's pods, by the Job's uid and not `job-name`: a deleted Job's
@@ -277,7 +308,6 @@ where
     }
     let job_pods = pods_of(&pods, existing.as_ref()).await?;
     let outcome = job_outcome(existing.as_ref(), &job_pods, &wanted);
-    let mut attempts = attempts_of(owner);
     match &outcome {
         JobOutcome::Absent => {
             // the crew's lock across the check and the create (§5.3), kept
@@ -328,7 +358,7 @@ where
                     if let Some((fleet, crew)) = crew_lock {
                         ctx.crew_unlocked(&format!("{namespace}/{fleet}/{crew}"));
                     }
-                    tracing::info!(job = %name, attempt = attempts.get(&name).copied().unwrap_or(1), "created");
+                    tracing::info!(job = %name, attempt = attempts_of(owner).get(&name).copied().unwrap_or(1), "created");
                     Ok(Ensured::new(JobOutcome::Running, soon))
                 }
                 Created::Raced => Ok(Ensured::new(JobOutcome::Running, soon)),
@@ -338,21 +368,24 @@ where
             // foreground: the Job stays, deleting, until its pods are gone,
             // so a running predecessor keeps the crew busy (§5.3)
             jobs.delete(&name, &DeleteParams::foreground()).await?;
-            if attempts.remove(&name).is_some() {
-                set_attempts(ctx, owner, &attempts).await?;
-            }
+            set_attempt(ctx, owner, &name, |_| None).await?;
             tracing::info!(job = %name, "stale: replaced");
             Ok(Ensured::new(outcome, Duration::from_secs(2)))
         }
         JobOutcome::Running => Ok(Ensured::new(outcome, soon)),
         JobOutcome::Succeeded(_) => {
-            if attempts.remove(&name).is_some() {
-                set_attempts(ctx, owner, &attempts).await?;
+            // the snapshot decides whether to look: a Succeeded Job is
+            // seen every period, and an entry the snapshot missed is seen
+            // the next time
+            if attempts_of(owner).contains_key(&name) {
+                set_attempt(ctx, owner, &name, |_| None).await?;
             }
             Ok(Ensured::new(outcome, ctx.run.period))
         }
         JobOutcome::Failed(message) => {
-            let attempt = attempts.get(&name).copied().unwrap_or(1);
+            // the delay from the snapshot; the count written from the
+            // owner as it is now
+            let attempt = attempts_of(owner).get(&name).copied().unwrap_or(1);
             let now = ctx.now();
             let due = failed_at(
                 existing
@@ -363,9 +396,8 @@ where
                 + delay(attempt).as_secs() as i64;
             if now >= due {
                 jobs.delete(&name, &DeleteParams::background()).await?;
-                attempts.insert(name.clone(), attempt + 1);
-                set_attempts(ctx, owner, &attempts).await?;
-                tracing::warn!(job = %name, attempt = attempt + 1, "failed: {message}; retrying");
+                let next = set_attempt(ctx, owner, &name, |n| Some(n.unwrap_or(1) + 1)).await?;
+                tracing::warn!(job = %name, attempt = ?next, "failed: {message}; retrying");
                 return Ok(Ensured::new(outcome, Duration::from_secs(2)));
             }
             Ok(Ensured::new(

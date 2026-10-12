@@ -951,6 +951,68 @@ async fn a_fleet_with_a_refused_sandbox_key_is_not_resolved() {
     operator.abort();
 }
 
+/// #235: the definition's CEL rule refuses a change of `spec.daemon`;
+/// other changes, and an update that leaves it as it is, pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fleets_daemon_cannot_be_changed() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let env = envtest().await.unwrap();
+    let ns = namespace(&env.client, "immutable").await;
+    let fleets: Api<Fleet> = Api::namespaced(env.client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+
+    let moved = fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": { "daemon": "other" } })),
+        )
+        .await;
+    match moved {
+        Err(kube::Error::Api(e)) => {
+            assert_eq!(e.code, 422, "{e:?}");
+            assert!(
+                e.message.contains("spec.daemon is immutable"),
+                "{}",
+                e.message
+            );
+        }
+        other => panic!("the move was not refused: {other:?}"),
+    }
+    assert_eq!(fleets.get("f").await.unwrap().spec.daemon, "default");
+
+    // the rest of the spec still changes, with the daemon restated or not
+    fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": { "daemon": "default", "retain": "None" } })),
+        )
+        .await
+        .unwrap();
+    let f = fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(
+                serde_json::json!({ "spec": { "crews": { "c": { "agents": { "b": {} } } } } }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.spec.daemon, "default");
+    assert_eq!(f.spec.retain, balerix_operator::api::Retain::None);
+    assert!(f.spec.crews["c"].agents.contains_key("b"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn watch_namespaces_ignores_another_namespace() {
     if envtest().await.is_none() {
@@ -1349,6 +1411,118 @@ async fn a_changed_spec_hash_replaces_the_pod_and_keeps_the_claim() {
             .metadata
             .uid,
         claim.metadata.uid
+    );
+    operator.abort();
+}
+
+/// §11, #234: the kubelet's node-pressure eviction leaves the pod object
+/// in phase `Failed`; its specHash still matches, and it is replaced on
+/// the same claim all the same. Pods evicted young wait before their
+/// replacement, longer for each in a row, and each replacement is a
+/// `PodReplaced` Event on the Agent.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_evicted_pod_is_replaced_on_the_same_claim_backing_off() {
+    use balerix_operator::desired::agent::{POD_BACKOFF_ANNOTATION, PodBackoff};
+    use k8s_openapi::api::events::v1::Event;
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, _stub, clock, operator) = world("evicted").await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let events: Api<Event> = Api::namespaced(client.clone(), &ns);
+    let mut pod = wait_for("the pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+    let claim = claims.get("f-c-a").await.unwrap();
+
+    for (streak, delay) in [(1u32, 10u64), (2, 20)] {
+        let uid = pod.metadata.uid.clone().unwrap();
+        pods.patch_status(
+            "f-c-a",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "status": {
+                "phase": "Failed", "reason": "Evicted",
+                "message": "The node was low on resource: memory."
+            } })),
+        )
+        .await
+        .unwrap();
+        // the pod lived seconds: its replacement waits, longer each time
+        let backoff = wait_for(
+            "the back-off on the Agent",
+            Duration::from_secs(60),
+            || async {
+                let a = agents.get("f-c-a").await.unwrap();
+                let b: PodBackoff =
+                    serde_json::from_str(a.metadata.annotations?.get(POD_BACKOFF_ANNOTATION)?)
+                        .ok()?;
+                (b.pod == uid).then_some(b)
+            },
+        )
+        .await;
+        assert_eq!((backoff.streak, backoff.delay), (streak, delay));
+        hold_for("the ended pod waits", Duration::from_secs(3), || async {
+            let p = pods.get_opt("f-c-a").await.unwrap();
+            (p?.metadata.uid.as_deref() != Some(uid.as_str())).then_some(())
+        })
+        .await;
+
+        clock.advance(delay as i64);
+        reap_pod_uid(&client, &ns, "f-c-a", &uid, Duration::from_secs(60)).await;
+        let next = wait_for("the new pod", Duration::from_secs(60), || async {
+            let p = pods.get_opt("f-c-a").await.unwrap()?;
+            (p.metadata.uid.as_deref() != Some(uid.as_str())).then_some(p)
+        })
+        .await;
+        assert_eq!(
+            next.metadata.annotations.as_ref().unwrap()["balerix.ai/spec-hash"],
+            pod.metadata.annotations.as_ref().unwrap()["balerix.ai/spec-hash"]
+        );
+        pod = next;
+    }
+    assert_eq!(
+        claims.get("f-c-a").await.unwrap().metadata.uid,
+        claim.metadata.uid
+    );
+    // the recorder folds a repeat within its cache's lifetime into the
+    // first Event's `series`, keeping the first note
+    let event = wait_for(
+        "a PodReplaced Event on the Agent, counted twice",
+        Duration::from_secs(30),
+        || async {
+            events
+                .list(&Default::default())
+                .await
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|e| {
+                    e.reason.as_deref() == Some("PodReplaced")
+                        && e.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some("f-c-a")
+                        && e.series.as_ref().is_some_and(|s| s.count == 2)
+                })
+        },
+    )
+    .await;
+    assert_eq!(event.type_.as_deref(), Some("Warning"));
+    assert_eq!(
+        event.note.as_deref(),
+        Some(
+            "pod f-c-a ended in phase Failed (Evicted: The node was low on resource: memory.); replaced on the same claim after a 10 s back-off (1 in a row ended within 300 s of creation)"
+        )
     );
     operator.abort();
 }
@@ -1987,6 +2161,64 @@ async fn the_crew_lock_lets_one_of_two_racing_jobs_start() {
         jobs.list(&Default::default()).await.unwrap().items.len(),
         20
     );
+}
+
+/// #236: two Jobs of one owner fail and come due in one reconcile, each
+/// `ensure_job` given the same snapshot of the owner: each Job's count
+/// advances, and an entry the snapshot does not have is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_jobs_of_one_owner_failing_at_once_each_advance_their_attempt() {
+    use balerix_operator::controllers::jobs::{ATTEMPTS_ANNOTATION, ensure_job};
+    use balerix_operator::desired::common::JobOutcome;
+    if envtest().await.is_none() {
+        return;
+    }
+    let (env, ns, mut ctx, owner) = job_rule("attempts").await;
+    // every failure is past its delay (at most 10 min)
+    ctx.run.clock = std::sync::Arc::new(|| k8s_openapi::jiff::Timestamp::now().as_second() + 3600);
+    let owners: Api<ConfigMap> = Api::namespaced(env.client.clone(), &ns);
+    let attempts = || async {
+        let o = owners.get("owner").await.unwrap();
+        let value = o.metadata.annotations.unwrap_or_default()[ATTEMPTS_ANNOTATION].clone();
+        serde_json::from_str::<std::collections::BTreeMap<String, u32>>(&value).unwrap()
+    };
+    let names = ["f-c1-sync", "f-c2-sync"];
+    let job = |name: &str| crew_job(&ns, name, "i");
+    let mut snapshot = owner;
+    for round in 2..=3u32 {
+        for name in names {
+            let made = ensure_job(&ctx, &snapshot, job(name), None).await.unwrap();
+            assert_eq!(made.outcome, JobOutcome::Running);
+            finish_job(&env.client, &ns, name, false, Some("boom")).await;
+        }
+        if round == 2 {
+            // written since the snapshot, by an earlier reconcile
+            owners
+                .patch(
+                    "owner",
+                    &PatchParams::default(),
+                    &Patch::Merge(serde_json::json!({ "metadata": { "annotations": {
+                        ATTEMPTS_ANNOTATION: "{\"f-pool\":3}"
+                    } } })),
+                )
+                .await
+                .unwrap();
+        }
+        // one reconcile: both failed Jobs retried from the same snapshot
+        for name in names {
+            let retried = ensure_job(&ctx, &snapshot, job(name), None).await.unwrap();
+            assert!(
+                matches!(retried.outcome, JobOutcome::Failed(_)),
+                "{name}: {:?}",
+                retried.outcome
+            );
+        }
+        let now = attempts().await;
+        assert_eq!(now.get("f-c1-sync"), Some(&round), "{now:?}");
+        assert_eq!(now.get("f-c2-sync"), Some(&round), "{now:?}");
+        assert_eq!(now.get("f-pool"), Some(&3), "{now:?}");
+        snapshot = owners.get("owner").await.unwrap();
+    }
 }
 
 /// A pod of crew `f/c` with `extra` labels; nothing runs it. A

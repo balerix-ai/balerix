@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
-use kube::CustomResource;
+use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,7 +10,7 @@ use super::common::{empty_object, open_object};
 
 /// The fleet file, with `name` as `metadata.name`, `daemon` naming the
 /// Daemon and `runner` a pod (Spec O §4.2).
-#[derive(CustomResource, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, Debug, Clone, PartialEq, Serialize, Deserialize, KubeSchema)]
 #[kube(
     group = "balerix.ai",
     version = "v1alpha1",
@@ -23,6 +23,9 @@ use super::common::{empty_object, open_object};
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FleetSpec {
+    /// The Daemon the fleet runs on. Immutable: to move the Fleet to
+    /// another Daemon, delete it and create it again.
+    #[x_kube(validation = Rule::new("self == oldSelf").message("spec.daemon is immutable: delete the Fleet and create it again to move it to another Daemon"))]
     pub daemon: String,
     #[serde(default)]
     pub retain: Retain,

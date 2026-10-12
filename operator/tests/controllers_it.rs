@@ -135,10 +135,14 @@ async fn a_daemon_gets_its_objects_and_a_renewal_rolls_the_pod() {
         .get("balerix-default")
         .await
         .unwrap();
-    Api::<NetworkPolicy>::namespaced(client.clone(), &ns)
-        .get("balerix-default")
-        .await
-        .unwrap();
+    // the reconcile applies the NetworkPolicy after the StatefulSet (#215)
+    wait_for("the NetworkPolicy", Duration::from_secs(60), || async {
+        Api::<NetworkPolicy>::namespaced(client.clone(), &ns)
+            .get_opt("balerix-default")
+            .await
+            .unwrap()
+    })
+    .await;
     // the reconcile applies the StatefulSet before it creates the pool Job
     let pool_jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
     wait_for("the pool Job", Duration::from_secs(60), || async {

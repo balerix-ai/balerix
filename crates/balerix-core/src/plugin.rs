@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::fleet::{Crew, Fleet};
 use crate::name::{AgentId, AgentName, validate_name};
 use crate::repo::RepoRef;
-use crate::version::is_exact_version;
+use crate::version::{exact_version_message, is_exact_version};
 
 /// The daemon's own fleet: every plugin is an agent of its `plugins` crew.
 /// User fleets may not take this name (checked at the API and client-side;
@@ -247,7 +247,7 @@ fn validate_mise_toml(text: &str, start: &str) -> Result<(), ManifestError> {
             if !is_exact_version(&version) {
                 return Err(ManifestError::MiseToml {
                     path: format!("tools.{k}"),
-                    message: format!("expected an exact version, got {version:?}"),
+                    message: exact_version_message(k, &version),
                 });
             }
         }
@@ -458,7 +458,8 @@ mod tests {
             )
             .unwrap_err()
             .to_string(),
-            "mise.toml: tools.ttyd: expected an exact version, got \"latest\""
+            "mise.toml: tools.ttyd: expected an exact version, got \"latest\" \
+             (try: mise latest ttyd@latest)"
         );
         assert_eq!(
             validate_manifest(&manifest("web"), "[tools]\n")

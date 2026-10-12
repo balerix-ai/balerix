@@ -19,7 +19,8 @@ use balerix_core::{AgentId, MaterializeError, WorkspaceError, WorkspaceReader};
 use crate::layout::{AgentPaths, CrewPaths};
 use crate::materializer::Runtime;
 use crate::sandbox::write_git_profile;
-use crate::workspace::{GitLog, sandboxed_git, sandboxed_git_script, sandboxed_git_streaming};
+use crate::tools::CmdOutput;
+use crate::workspace::{GitLog, StdoutSink, sandboxed_git, sandboxed_git_script};
 
 /// Command-line config beats every config file: whatever an agent wrote
 /// into its clone's `.git/config`, no program runs from it here (the rest
@@ -136,77 +137,254 @@ impl Runtime {
     /// 256 KiB each, and full-output logging would grow `git.log` by the
     /// whole diff on every fetch. `CONFIG` goes first; the profile's
     /// `set_vars` and `sandboxed_git`'s `-c` pairs are the rest of the
-    /// hardening.
+    /// hardening. Only for the rare file the combined diff cannot name;
+    /// the rest is two scripts (`DIFF_LIST_SCRIPT`, `DIFF_PATCH_SCRIPT`).
     fn inspect_git(
         &self,
         id: &str,
         crew: &CrewPaths,
         paths: &AgentPaths,
         args: &[&str],
-        accepted: &[i32],
-    ) -> Result<String, WorkspaceError> {
-        self.inspect_git_answer(id, crew, paths, args, accepted, false)
-    }
-
-    /// `inspect_git` for a call whose stdout goes to `sink` as it arrives
-    /// (the combined diff); exit 0 only.
-    fn inspect_git_streaming(
-        &self,
-        id: &str,
-        crew: &CrewPaths,
-        paths: &AgentPaths,
-        args: &[&str],
-        sink: &mut dyn FnMut(&[u8]),
-    ) -> Result<(), WorkspaceError> {
-        let mut argv: Vec<&str> = CONFIG.to_vec();
-        argv.extend(args);
-        sandboxed_git_streaming(&self.tools, self.socket_policy, crew, paths, &argv, sink)
-            .map(|_| ())
-            .map_err(|f| WorkspaceError::Tool {
-                id: id.to_string(),
-                subcommand: f.subcommand,
-                args: f.args,
-                stderr: f.stderr,
-            })
-    }
-
-    /// `inspect_git`; with `lenient`, an accepted exit that printed on
-    /// stderr is still the answer. Only for the `--no-index` diff of an
-    /// untracked file: git exits 1 with `error: Could not access
-    /// '<link>/null'` for a symlink to a directory, which used to be an
-    /// empty patch, and should not fail the whole diff. A nono that fails
-    /// there, after the calls before it ran, costs one empty patch.
-    fn inspect_git_answer(
-        &self,
-        id: &str,
-        crew: &CrewPaths,
-        paths: &AgentPaths,
-        args: &[&str],
-        accepted: &[i32],
-        lenient: bool,
     ) -> Result<String, WorkspaceError> {
         let mut argv: Vec<&str> = CONFIG.to_vec();
         argv.extend(args);
-        match sandboxed_git(
+        sandboxed_git(
             &self.tools,
             self.socket_policy,
             crew,
             paths,
             &argv,
-            accepted,
+            &[0],
             GitLog::ArgvOnly,
-        ) {
-            Ok(out) => Ok(out.stdout),
-            Err(f) if lenient && f.unanswered.is_some() => {
-                Ok(f.unanswered.map(|o| o.stdout).unwrap_or_default())
-            }
-            Err(f) => Err(WorkspaceError::Tool {
+        )
+        .map(|out| out.stdout)
+        .map_err(|f| WorkspaceError::Tool {
+            id: id.to_string(),
+            subcommand: f.subcommand,
+            args: f.args,
+            stderr: f.stderr,
+        })
+    }
+
+    /// One of the reader's scripts in one sandbox start
+    /// (`workspace::sandboxed_git_script`), git's options `CONFIG`'s; a
+    /// failure of the start itself is reported as `sh`'s.
+    #[allow(clippy::too_many_arguments)]
+    fn inspect_script(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        paths: &AgentPaths,
+        script: &'static str,
+        leading: &[&str],
+        accepted: &[i32],
+        sink: Option<StdoutSink<'_>>,
+    ) -> Result<CmdOutput, WorkspaceError> {
+        sandboxed_git_script(
+            &self.tools,
+            self.socket_policy,
+            crew,
+            paths,
+            script,
+            leading,
+            CONFIG,
+            accepted,
+            sink,
+        )
+        .map_err(|f| WorkspaceError::Tool {
+            id: id.to_string(),
+            subcommand: f.subcommand,
+            args: f.args,
+            stderr: f.stderr,
+        })
+    }
+
+    /// A listing script (`VERSION_SCRIPT` with `VERSION_LISTING`,
+    /// `DIFF_LIST_SCRIPT` with `DIFF_LISTING`) against `base_ref`: its
+    /// stdout, or the refusal or the failed stage reported as that git
+    /// call on its own would have been. The caller parses the stdout
+    /// (`parse_listing`; `unexpected_listing` when it does not parse).
+    fn run_listing(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        paths: &AgentPaths,
+        (script, listing): (&'static str, &[&str]),
+        base_ref: &str,
+    ) -> Result<String, WorkspaceError> {
+        let out = self.inspect_script(
+            id,
+            crew,
+            paths,
+            script,
+            &[base_ref, FILTER_KEYS],
+            &[0, VERSION_FILTER, 81, 82, 83, 84],
+            None,
+        )?;
+        let tool_error =
+            |subcommand: &str, args: Vec<String>, stderr: String| WorkspaceError::Tool {
                 id: id.to_string(),
-                subcommand: f.subcommand,
-                args: f.args,
-                stderr: f.stderr,
-            }),
+                subcommand: subcommand.to_string(),
+                args,
+                stderr,
+            };
+        // each stage's own git arguments, as `inspect_git` reports them
+        let stage_args = |stage: &str| -> Vec<String> {
+            let mut args: Vec<&str> = CONFIG.to_vec();
+            let merge_base = out.stdout.split('\0').next().unwrap_or_default();
+            match stage {
+                "config" => args.extend(PROBE.iter().chain([&FILTER_KEYS])),
+                "merge-base" => args.extend(["merge-base", base_ref, "HEAD"]),
+                "diff" => {
+                    args.push("diff");
+                    args.extend(DIFF_FLAGS);
+                    args.extend(listing);
+                    args.push(merge_base);
+                }
+                _ => args.extend(STATUS),
+            }
+            args.into_iter().map(str::to_string).collect()
+        };
+        if out.code == VERSION_FILTER {
+            return Err(match filter_key(&out.stdout) {
+                Some(key) => WorkspaceError::Filter { key },
+                None => tool_error("config", stage_args("config"), out.stdout.clone()),
+            });
         }
+        if let Some(stage) = version_stage(out.code) {
+            return Err(tool_error(stage, stage_args(stage), out.stderr));
+        }
+        Ok(out.stdout)
+    }
+
+    /// `DIFF_PATCH_SCRIPT` over `untracked` (and the combined diff, when
+    /// `mode` is not `none`), in as many starts as `PATCH_ARGS_BUDGET`
+    /// needs (one, unless the paths are very long): the combined diff's
+    /// sections and each untracked file's raw patch, in order. A combined
+    /// diff that fails, or a `--no-index` that exits other than 0 or 1
+    /// (1 is "they differ", and also what git answers, with a message,
+    /// for a path it cannot read as a file, such as a symlink to a
+    /// directory: an empty patch, as before), fails the read as that git
+    /// call would have.
+    #[allow(clippy::too_many_arguments)]
+    fn run_patches(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        paths: &AgentPaths,
+        merge_base: &str,
+        mode: &str,
+        pathspecs: &[&str],
+        untracked: &[&str],
+    ) -> Result<(BTreeMap<String, String>, Vec<String>), WorkspaceError> {
+        // the first start carries the pathspecs too: they count against
+        // its budget, so the untracked paths after them may start later
+        let used = pathspecs.iter().map(|p| p.len() + 1).sum();
+        let mut batches = batches(untracked, PATCH_ARGS_BUDGET, used);
+        if mode != "none" && batches.is_empty() {
+            batches.push(&[]);
+        }
+        let mut combined = BTreeMap::new();
+        let mut patches = Vec::with_capacity(untracked.len());
+        for (n, batch) in batches.into_iter().enumerate() {
+            let (mode, pathspecs) = if n == 0 {
+                (mode, pathspecs)
+            } else {
+                ("none", &[][..])
+            };
+            let (nt, nu) = (pathspecs.len().to_string(), batch.len().to_string());
+            let mut leading: Vec<&str> = vec![merge_base, FILTER_KEYS, mode, &nt, &nu];
+            leading.extend(pathspecs);
+            leading.extend(batch);
+            let mut reader = SectionReader::new(mode != "none", batch.len());
+            let out = self.inspect_script(
+                id,
+                crew,
+                paths,
+                DIFF_PATCH_SCRIPT,
+                &leading,
+                &[0, VERSION_FILTER, 81],
+                Some(&mut |chunk| reader.feed(chunk)),
+            )?;
+            let probe_args = || -> Vec<String> {
+                CONFIG
+                    .iter()
+                    .chain(PROBE)
+                    .chain([&FILTER_KEYS])
+                    .map(|a| (*a).to_string())
+                    .collect()
+            };
+            if out.code == VERSION_FILTER {
+                return Err(match filter_key(&out.stderr) {
+                    Some(key) => WorkspaceError::Filter { key },
+                    None => WorkspaceError::Tool {
+                        id: id.to_string(),
+                        subcommand: "config".into(),
+                        args: probe_args(),
+                        stderr: out.stderr,
+                    },
+                });
+            }
+            if out.code == 81 {
+                return Err(WorkspaceError::Tool {
+                    id: id.to_string(),
+                    subcommand: "config".into(),
+                    args: probe_args(),
+                    stderr: out.stderr,
+                });
+            }
+            let sections = reader.finish().ok_or_else(|| WorkspaceError::Tool {
+                id: id.to_string(),
+                subcommand: "sh".into(),
+                args: Vec::new(),
+                stderr: format!("unexpected output from the patch script: {}", out.stderr),
+            })?;
+            // the script's stderr is every section's: say which one failed
+            let failed = |args: Vec<&str>, what: String| {
+                let mut argv: Vec<&str> = CONFIG.to_vec();
+                argv.extend(args);
+                WorkspaceError::Tool {
+                    id: id.to_string(),
+                    subcommand: "diff".into(),
+                    args: argv.into_iter().map(str::to_string).collect(),
+                    stderr: format!(
+                        "{what} failed (stderr of the whole patch script follows): {}",
+                        out.stderr
+                    ),
+                }
+            };
+            let mut codes = sections.codes.into_iter();
+            if let Some(split) = sections.combined {
+                if codes.next() != Some(0) {
+                    let mut args = Vec::new();
+                    if mode == "paths" {
+                        args.push("--literal-pathspecs");
+                    }
+                    args.push("diff");
+                    args.extend(DIFF_FLAGS);
+                    args.extend(["-U3", "--find-renames", merge_base]);
+                    if mode == "paths" {
+                        args.push("--");
+                        args.extend(pathspecs);
+                    }
+                    return Err(failed(args, "the combined diff".into()));
+                }
+                combined = split;
+            }
+            for (patch, (code, path)) in sections.untracked.into_iter().zip(codes.zip(batch)) {
+                if !matches!(code, 0 | 1) {
+                    let mut args = vec!["diff"];
+                    args.extend(DIFF_FLAGS);
+                    args.extend(["--no-index", "-U3", "--", "/dev/null", path]);
+                    return Err(failed(
+                        args,
+                        format!("the diff of untracked {path:?} (exit {code})"),
+                    ));
+                }
+                patches.push(patch);
+            }
+        }
+        Ok((combined, patches))
     }
 }
 
@@ -580,31 +758,8 @@ fn confine(workspace: &Path, full: &Path) -> Result<(), WorkspaceError> {
     }
 }
 
-/// The `FILTER_KEYS` probe, first on every git-running read: `Filter` when
-/// the repository config names a program git would run.
-#[allow(clippy::type_complexity)]
-fn refuse_filters(
-    id: &str,
-    git: &dyn Fn(&[&str], &[i32]) -> Result<String, WorkspaceError>,
-) -> Result<(), WorkspaceError> {
-    let mut args = PROBE.to_vec();
-    args.push(FILTER_KEYS);
-    let filters = git(&args, &[0, 1])?;
-    match filter_key(&filters) {
-        Some(key) => Err(WorkspaceError::Filter { key }),
-        None if filters.trim().is_empty() => Ok(()),
-        // git exited 0, so something matched, but no line is a key
-        None => Err(WorkspaceError::Tool {
-            id: id.to_string(),
-            subcommand: "config".into(),
-            args: args.iter().map(|a| (*a).to_string()).collect(),
-            stderr: filters,
-        }),
-    }
-}
-
-/// The `FILTER_KEYS` probe, before the regex: `refuse_filters` and
-/// `VERSION_SCRIPT` both run exactly this.
+/// The `FILTER_KEYS` probe, before the regex: the listing scripts
+/// (`listing_start`) run exactly this, first on every git-running read.
 const PROBE: &[&str] = &[
     "config",
     "--local",
@@ -637,19 +792,17 @@ fn filter_key(probe: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `version`'s four git calls as one sandbox start (#174;
-/// `workspace::sandboxed_git_script`). `$1` is the base ref, `$2`
-/// `FILTER_KEYS`, and the rest git with its options, so nothing the caller
-/// passes is ever script text. The filter probe runs first, as in
-/// `refuse_filters`: a match prints the key and exits `VERSION_FILTER`; an
-/// exit 1 that printed anything (stderr is folded in) is a failure, as
-/// `is_gits_answer` would judge it. Then `merge-base`, the name-only diff
-/// against it (`DIFF_FLAGS`) and `status` (`STATUS`), each failing with its
-/// own code (`version_stage`). On success stdout is `<merge-base> \0
-/// <name-only -z> \0 <status -z>` (`parse_version`). The `-c` pairs are
-/// `CONFIG`'s, passed in `"$@"`; a unit test holds the two flag lists to
-/// the constants.
-const VERSION_SCRIPT: &str = r#"base=$1 keys=$2
+/// The start of `VERSION_SCRIPT` and `DIFF_LIST_SCRIPT`: `$1` is the
+/// base ref, `$2` `FILTER_KEYS`, and the rest git with its options, so
+/// nothing the caller passes is ever script text. The filter probe runs
+/// first, before any call that reads an object: a match prints the key and exits
+/// `VERSION_FILTER`; an exit 1 that printed anything (stderr is folded in)
+/// is a failure, as `is_gits_answer` would judge it. Then `merge-base`,
+/// printed with a NUL after it. Each git call fails with its own code
+/// (`version_stage`).
+macro_rules! listing_start {
+    () => {
+        r#"base=$1 keys=$2
 shift 2
 found=$("$@" config --local --includes --name-only --get-regexp "$keys" 2>&1)
 case $? in
@@ -659,10 +812,144 @@ case $? in
 esac
 mb=$("$@" merge-base "$base" HEAD) || exit 83
 printf '%s\000' "$mb"
-"$@" diff --no-ext-diff --no-textconv --no-color --submodule=short --ignore-submodules=dirty --name-only -z "$mb" || exit 84
-printf '\000'
+"#
+    };
+}
+
+/// The end of both: a NUL after the listing, then `status` (`STATUS`).
+macro_rules! listing_end {
+    () => {
+        r#"printf '\000'
 "$@" status --porcelain=v2 -z --branch --no-ahead-behind --untracked-files=all --ignore-submodules=dirty || exit 82
+"#
+    };
+}
+
+/// `version`'s four git calls as one sandbox start (#174;
+/// `workspace::sandboxed_git_script`): `listing_start`, the name-only diff
+/// against the merge-base (`DIFF_FLAGS`, `VERSION_LISTING`) and
+/// `listing_end`. On success stdout is `<merge-base> \0 <name-only -z> \0
+/// <status -z>` (`parse_listing`). The `-c` pairs are `CONFIG`'s, passed in
+/// `"$@"`; a unit test holds the flag lists to the constants.
+const VERSION_SCRIPT: &str = concat!(
+    listing_start!(),
+    r#""$@" diff --no-ext-diff --no-textconv --no-color --submodule=short --ignore-submodules=dirty --name-only -z "$mb" || exit 84
+"#,
+    listing_end!()
+);
+
+/// `diff`'s listing in one sandbox start (#186): `VERSION_SCRIPT` with the
+/// name-status diff (`DIFF_LISTING`) for the name-only one, so the same
+/// stages, exits and output layout.
+const DIFF_LIST_SCRIPT: &str = concat!(
+    listing_start!(),
+    r#""$@" diff --no-ext-diff --no-textconv --no-color --submodule=short --ignore-submodules=dirty --name-status -z --find-renames "$mb" || exit 84
+"#,
+    listing_end!()
+);
+
+/// The listing diff's own flags after `DIFF_FLAGS`, in each script.
+const VERSION_LISTING: &[&str] = &["--name-only", "-z"];
+const DIFF_LISTING: &[&str] = &["--name-status", "-z", "--find-renames"];
+
+/// `diff`'s patches in one sandbox start (#186): the combined `-U3` diff of
+/// the tracked files, then one `--no-index` diff per untracked file, each
+/// section's stdout followed by the frame `\0<exit code>\n`
+/// (`SectionReader`). No git patch line starts with a NUL (content lines
+/// carry their ` `, `+`, `-` or `\` first, and a path cannot hold one), so
+/// a frame is told from a section by where it starts. The arguments are
+/// `$1` the merge-base; `$2` `FILTER_KEYS`; `$3` `none` (no combined
+/// diff), `all` or `paths` (the combined diff restricted to literal
+/// pathspecs); `$4` the number of pathspecs and `$5` of untracked paths;
+/// then the pathspecs, the
+/// untracked paths, and git with its options. POSIX `sh` has one list, so
+/// `combined` builds its command line after the inputs from the words of
+/// that list and drops the inputs (`for a do` walks the list as it was
+/// when the loop began), and `pick` reads one path by its position;
+/// functions get their own `"$@"`, so the list itself never changes. The
+/// filter probe runs again first, in this start, so the window between
+/// the probe and the reads it guards is no wider than one start: a match
+/// exits `VERSION_FILTER`, a failed probe 81, the probe's output on
+/// stderr (stdout is the sections). The
+/// script's own exit is `printf`'s: the codes are in the frames.
+const DIFF_PATCH_SCRIPT: &str = r#"mb=$1 keys=$2 mode=$3 nt=$4 nu=$5
+shift 5
+skip=$((nt + nu))
+probe() {
+shift "$skip"
+"$@" config --local --includes --name-only --get-regexp "$keys" 2>&1
+}
+found=$(probe "$@")
+case $? in
+0) printf '%s\n' "$found" >&2; exit 80 ;;
+1) if [ -n "$found" ]; then printf '%s\n' "$found" >&2; exit 81; fi ;;
+*) printf '%s\n' "$found" >&2; exit 81 ;;
+esac
+combined() {
+k=$# i=0
+for a do
+i=$((i + 1))
+if [ "$i" -gt "$skip" ]; then set -- "$@" "$a"; fi
+done
+if [ "$mode" = paths ]; then set -- "$@" --literal-pathspecs; fi
+set -- "$@" diff --no-ext-diff --no-textconv --no-color --submodule=short --ignore-submodules=dirty -U3 --find-renames "$mb"
+if [ "$mode" = paths ]; then
+set -- "$@" --
+i=0
+for a do
+i=$((i + 1))
+if [ "$i" -gt "$nt" ]; then break; fi
+set -- "$@" "$a"
+done
+fi
+shift "$k"
+"$@"
+}
+pick() { shift "$1"; p=$1; }
+untracked() {
+shift "$skip"
+"$@" diff --no-ext-diff --no-textconv --no-color --submodule=short --ignore-submodules=dirty --no-index -U3 -- /dev/null "$p"
+}
+if [ "$mode" != none ]; then
+combined "$@"
+printf '\000%d\n' "$?"
+fi
+j=0
+while [ "$j" -lt "$nu" ]; do
+j=$((j + 1))
+pick $((nt + j)) "$@"
+untracked "$@"
+printf '\000%d\n' "$?"
+done
 "#;
+
+/// `paths` cut in order into runs of at most `budget` bytes (a byte more
+/// per path, its NUL in the argument block), the first run sharing its
+/// budget with `used` bytes of other arguments (the combined diff's
+/// pathspecs). The first run is empty when not even the first path fits
+/// beside those; a path over the budget alone is a run of its own. The
+/// pathspecs themselves are never split: past the budget they go in one
+/// start, as they did before #186.
+fn batches<'a, 'p>(paths: &'a [&'p str], budget: usize, used: usize) -> Vec<&'a [&'p str]> {
+    let mut out = Vec::new();
+    let (mut start, mut bytes) = (0, used);
+    for (i, p) in paths.iter().enumerate() {
+        if bytes + p.len() + 1 > budget && (i > start || bytes > 0) {
+            out.push(&paths[start..i]);
+            (start, bytes) = (i, 0);
+        }
+        bytes += p.len() + 1;
+    }
+    if start < paths.len() {
+        out.push(&paths[start..]);
+    }
+    out
+}
+
+/// The most bytes of paths one `DIFF_PATCH_SCRIPT` start takes as
+/// arguments; untracked paths past it go to another start, so a list of
+/// long paths stays under the kernel's argument limit.
+const PATCH_ARGS_BUDGET: usize = 256 * 1024;
 
 /// `VERSION_SCRIPT`'s exit when the probe found a key (on stdout).
 const VERSION_FILTER: i32 = 80;
@@ -678,42 +965,200 @@ fn version_stage(code: i32) -> Option<&'static str> {
     }
 }
 
-/// `VERSION_SCRIPT`'s stdout: the merge-base, the name-only paths and the
-/// parsed status. The name-only records are non-empty and NUL-terminated,
-/// so the first empty record ends them; `None` when that structure is not
-/// there.
-pub fn parse_version(out: &str) -> Option<(String, BTreeSet<String>, Status)> {
+/// A listing script's stdout (`VERSION_SCRIPT`, `DIFF_LIST_SCRIPT`): the
+/// merge-base, the listing diff's records and `status`'s output. The
+/// listing's records are non-empty and NUL-terminated, so the first empty
+/// record ends them; `None` when that structure is not there.
+fn parse_listing(out: &str) -> Option<(String, Vec<&str>, &str)> {
     let (merge_base, mut rest) = out.split_once('\0')?;
-    let mut names = BTreeSet::new();
+    let mut records = Vec::new();
     loop {
         let (record, after) = rest.split_once('\0')?;
         rest = after;
         if record.is_empty() {
             break;
         }
-        names.insert(record.to_string());
+        records.push(record);
     }
-    Some((merge_base.trim().to_string(), names, parse_status(rest)))
+    Some((merge_base.trim().to_string(), records, rest))
+}
+
+/// A listing script that exited 0 without its output's layout.
+fn unexpected_listing(id: &str) -> WorkspaceError {
+    WorkspaceError::Tool {
+        id: id.to_string(),
+        subcommand: "sh".into(),
+        args: Vec::new(),
+        stderr: "unexpected output from the listing script".into(),
+    }
+}
+
+/// `VERSION_SCRIPT`'s stdout: the merge-base, the name-only paths and the
+/// parsed status.
+pub fn parse_version(out: &str) -> Option<(String, BTreeSet<String>, Status)> {
+    let (merge_base, names, status) = parse_listing(out)?;
+    Some((
+        merge_base,
+        names.into_iter().map(str::to_string).collect(),
+        parse_status(status),
+    ))
+}
+
+/// What one `DIFF_PATCH_SCRIPT` start prints, read as it streams: the
+/// combined diff's section into a `PatchSplitter`, each untracked file's
+/// into a buffer of its own (at most `SECTION_CAP` bytes, like the
+/// splitter's), and each frame's exit code. A frame is a NUL at the start
+/// of a line, the code, and a newline. Output that breaks that shape (a
+/// frame that is not one, a section past the last expected) leaves the
+/// reader `broken`.
+pub struct SectionReader {
+    combined: Option<PatchSplitter>,
+    untracked: Vec<Vec<u8>>,
+    wanted: usize,
+    codes: Vec<i32>,
+    at_line_start: bool,
+    frame: Option<Vec<u8>>,
+    broken: bool,
+}
+
+/// What a `SectionReader` read: the combined diff split per file (`None`
+/// when there was none), the untracked files' patches in order, and the
+/// codes, one per section.
+pub struct Sections {
+    pub combined: Option<BTreeMap<String, String>>,
+    pub untracked: Vec<String>,
+    pub codes: Vec<i32>,
+}
+
+impl SectionReader {
+    pub fn new(combined: bool, untracked: usize) -> Self {
+        Self {
+            combined: combined.then(|| PatchSplitter::new(SECTION_CAP)),
+            untracked: Vec::new(),
+            wanted: untracked,
+            codes: Vec::new(),
+            at_line_start: true,
+            frame: None,
+            broken: false,
+        }
+    }
+
+    fn expected(&self) -> usize {
+        usize::from(self.combined.is_some()) + self.wanted
+    }
+
+    pub fn feed(&mut self, mut chunk: &[u8]) {
+        while !chunk.is_empty() && !self.broken {
+            if let Some(frame) = &mut self.frame {
+                let end = chunk.iter().position(|b| *b == b'\n');
+                frame.extend_from_slice(&chunk[..end.unwrap_or(chunk.len())]);
+                // a minus sign and the ten digits of an `i32` fit
+                if frame.len() > 12 {
+                    self.broken = true;
+                    return;
+                }
+                let Some(end) = end else {
+                    return;
+                };
+                chunk = &chunk[end + 1..];
+                let code = std::str::from_utf8(frame)
+                    .ok()
+                    .and_then(|c| c.parse::<i32>().ok());
+                self.frame = None;
+                self.at_line_start = true;
+                match code {
+                    Some(code) if self.codes.len() < self.expected() => self.codes.push(code),
+                    _ => self.broken = true,
+                }
+                continue;
+            }
+            if self.at_line_start && chunk[0] == 0 {
+                self.frame = Some(Vec::new());
+                chunk = &chunk[1..];
+                continue;
+            }
+            let end = chunk
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(chunk.len(), |i| i + 1);
+            let (line, rest) = chunk.split_at(end);
+            chunk = rest;
+            self.at_line_start = line.last() == Some(&b'\n');
+            self.content(line);
+        }
+    }
+
+    fn content(&mut self, bytes: &[u8]) {
+        let index = self.codes.len();
+        let index = match &mut self.combined {
+            Some(splitter) if index == 0 => {
+                splitter.feed(bytes);
+                return;
+            }
+            Some(_) => index - 1,
+            None => index,
+        };
+        if index >= self.wanted {
+            self.broken = true;
+            return;
+        }
+        // the sections before it that printed nothing
+        while self.untracked.len() <= index {
+            self.untracked.push(Vec::new());
+        }
+        let section = &mut self.untracked[index];
+        let room = SECTION_CAP.saturating_sub(section.len());
+        section.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+
+    /// The sections, or `None` when the output was not one section and
+    /// one frame for each expected.
+    pub fn finish(mut self) -> Option<Sections> {
+        let expected = self.expected();
+        if self.broken || self.frame.is_some() || self.codes.len() != expected {
+            return None;
+        }
+        // the last sections, when they printed nothing
+        while self.untracked.len() < self.wanted {
+            self.untracked.push(Vec::new());
+        }
+        Some(Sections {
+            combined: self.combined.map(PatchSplitter::finish),
+            untracked: self
+                .untracked
+                .into_iter()
+                .map(|v| String::from_utf8_lossy(&v).into_owned())
+                .collect(),
+            codes: self.codes,
+        })
+    }
 }
 
 impl WorkspaceReader for Runtime {
-    /// `refuse_filters`, one `status`, `merge-base`, `--name-status`, one
-    /// combined `diff -U3` split per file, and one `--no-index` diff per
-    /// untracked file (#108: each call is a sandbox start, ~55 ms).
+    /// Two sandbox starts (#108: each is ~55 ms idle, far more on a loaded
+    /// host; #186): the listing (`DIFF_LIST_SCRIPT`: the filter probe,
+    /// `merge-base`, `--name-status`, `status`), then the patches
+    /// (`DIFF_PATCH_SCRIPT`: one combined `diff -U3` split per file, and one
+    /// `--no-index` diff per untracked file) of the files the cap keeps. A
+    /// file the combined diff does not name as expected is diffed on its
+    /// own, one more start each.
     fn diff(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceDiff, WorkspaceError> {
         let id = agent.to_string();
         let (paths, crew) = self.sandboxed_workspace_of(agent)?;
-        let git = |args: &[&str], ok: &[i32]| self.inspect_git(&id, &crew, &paths, args, ok);
-        refuse_filters(&id, &git)?;
-        let status = parse_status(&git(STATUS, &[0])?);
-        let merge_base = git(&["merge-base", base_ref, "HEAD"], &[0])?
-            .trim()
-            .to_string();
+        let listing = self.run_listing(
+            &id,
+            &crew,
+            &paths,
+            (DIFF_LIST_SCRIPT, DIFF_LISTING),
+            base_ref,
+        )?;
+        let (merge_base, records, status) =
+            parse_listing(&listing).ok_or_else(|| unexpected_listing(&id))?;
+        let status = parse_status(status);
+        let mut name_status = records.join("\0");
+        name_status.push('\0');
+        let mut files = parse_name_status(&name_status);
         let head = status.head.unwrap_or_default();
-        let mut name_status_args: Vec<&str> = vec!["diff"];
-        name_status_args.extend(DIFF_FLAGS);
-        name_status_args.extend(["--name-status", "-z", "--find-renames", &merge_base]);
-        let mut files = parse_name_status(&git(&name_status_args, &[0])?);
         let all_tracked = files.len();
         let dirty = status.changed;
         let untracked = status.untracked;
@@ -732,66 +1177,70 @@ impl WorkspaceReader for Runtime {
         let truncated = files.len() > WORKSPACE_FILE_COUNT_LIMIT;
         files.truncate(WORKSPACE_FILE_COUNT_LIMIT);
 
-        // The tracked files that survived the cap, in one call: every
-        // one when none was cut, else those named as literal pathspecs.
+        // The tracked files that survived the cap, in one combined diff:
+        // every one when none was cut, else those named as literal
+        // pathspecs; and the untracked ones that survived it.
         let tracked: Vec<&FileDiff> = files
             .iter()
             .filter(|f| !untracked.contains(&f.path))
             .collect();
-        let mut sections = BTreeMap::new();
-        if !tracked.is_empty() {
-            let mut args: Vec<&str> = Vec::new();
-            if tracked.len() < all_tracked {
-                args.push("--literal-pathspecs");
-            }
-            args.push("diff");
-            args.extend(DIFF_FLAGS);
-            args.extend(["-U3", "--find-renames", merge_base.as_str()]);
-            if tracked.len() < all_tracked {
-                args.push("--");
-                for f in &tracked {
-                    if let Some(old) = &f.old_path {
-                        args.push(old);
-                    }
-                    args.push(&f.path);
+        let mode = if tracked.is_empty() {
+            "none"
+        } else if tracked.len() < all_tracked {
+            "paths"
+        } else {
+            "all"
+        };
+        let mut pathspecs: Vec<&str> = Vec::new();
+        if mode == "paths" {
+            for f in &tracked {
+                if let Some(old) = &f.old_path {
+                    pathspecs.push(old);
                 }
+                pathspecs.push(&f.path);
             }
-            let mut splitter = PatchSplitter::new(SECTION_CAP);
-            self.inspect_git_streaming(&id, &crew, &paths, &args, &mut |chunk| {
-                splitter.feed(chunk)
-            })?;
-            sections = splitter.finish();
         }
+        let kept_untracked: Vec<&str> = files
+            .iter()
+            .filter(|f| untracked.contains(&f.path))
+            .map(|f| f.path.as_str())
+            .collect();
+        let (mut sections, untracked_patches) = if mode == "none" && kept_untracked.is_empty() {
+            (BTreeMap::new(), Vec::new())
+        } else {
+            self.run_patches(
+                &id,
+                &crew,
+                &paths,
+                &merge_base,
+                mode,
+                &pathspecs,
+                &kept_untracked,
+            )?
+        };
+        let mut untracked_patches = untracked_patches.into_iter();
 
         for f in &mut files {
             f.uncommitted = f.uncommitted
                 || dirty.contains(&f.path)
                 || f.old_path.as_deref().is_some_and(|o| dirty.contains(o));
-            let combined = if untracked.contains(&f.path) {
-                None
+            let raw = if untracked.contains(&f.path) {
+                // in the order `kept_untracked` gave them
+                untracked_patches.next().unwrap_or_default()
+            } else if let Some(section) = patch_header(f).and_then(|h| sections.remove(&h)) {
+                section
             } else {
-                patch_header(f).and_then(|h| sections.remove(&h))
-            };
-            let raw = match combined {
-                Some(section) => section,
-                None => {
-                    // untracked, or a path the combined patch does not
-                    // name as expected (quoted, or prefixes the clone's
-                    // config changed): this file on its own, as before
-                    let mut args: Vec<&str> = vec!["diff"];
-                    args.extend(DIFF_FLAGS);
-                    if untracked.contains(&f.path) {
-                        args.extend(["--no-index", "-U3", "--", "/dev/null", f.path.as_str()]);
-                        self.inspect_git_answer(&id, &crew, &paths, &args, &[0, 1], true)?
-                    } else {
-                        args.extend(["-U3", "--find-renames", merge_base.as_str(), "--"]);
-                        if let Some(old) = &f.old_path {
-                            args.push(old);
-                        }
-                        args.push(&f.path);
-                        git(&args, &[0])?
-                    }
+                // a path the combined patch does not name as expected
+                // (quoted, or prefixes the clone's config changed): this
+                // file on its own, as before
+                let mut args: Vec<&str> = vec!["diff"];
+                args.extend(DIFF_FLAGS);
+                args.extend(["-U3", "--find-renames", merge_base.as_str(), "--"]);
+                if let Some(old) = &f.old_path {
+                    args.push(old);
                 }
+                args.push(&f.path);
+                self.inspect_git(&id, &crew, &paths, &args)?
             };
             let (patch, binary, cut) = shape_patch(raw);
             f.patch = patch;
@@ -899,56 +1348,15 @@ impl WorkspaceReader for Runtime {
     fn version(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceVersion, WorkspaceError> {
         let id = agent.to_string();
         let (paths, crew) = self.sandboxed_workspace_of(agent)?;
-        let tool_error =
-            |subcommand: &str, args: Vec<String>, stderr: String| WorkspaceError::Tool {
-                id: id.clone(),
-                subcommand: subcommand.to_string(),
-                args,
-                stderr,
-            };
-        let out = sandboxed_git_script(
-            &self.tools,
-            self.socket_policy,
+        let out = self.run_listing(
+            &id,
             &crew,
             &paths,
-            VERSION_SCRIPT,
-            &[base_ref, FILTER_KEYS],
-            CONFIG,
-            &[0, VERSION_FILTER, 81, 82, 83, 84],
-        )
-        .map_err(|f| tool_error(&f.subcommand, f.args, f.stderr))?;
-        // each stage's own git arguments, as `inspect_git` reports them
-        let stage_args = |stage: &str| -> Vec<String> {
-            let mut args: Vec<&str> = CONFIG.to_vec();
-            let merge_base = out.stdout.split('\0').next().unwrap_or_default();
-            match stage {
-                "config" => args.extend(PROBE.iter().chain([&FILTER_KEYS])),
-                "merge-base" => args.extend(["merge-base", base_ref, "HEAD"]),
-                "diff" => {
-                    args.push("diff");
-                    args.extend(DIFF_FLAGS);
-                    args.extend(["--name-only", "-z", merge_base]);
-                }
-                _ => args.extend(STATUS),
-            }
-            args.into_iter().map(str::to_string).collect()
-        };
-        if out.code == VERSION_FILTER {
-            return Err(match filter_key(&out.stdout) {
-                Some(key) => WorkspaceError::Filter { key },
-                None => tool_error("config", stage_args("config"), out.stdout.clone()),
-            });
-        }
-        if let Some(stage) = version_stage(out.code) {
-            return Err(tool_error(stage, stage_args(stage), out.stderr));
-        }
-        let (merge_base, mut paths_seen, status) = parse_version(&out.stdout).ok_or_else(|| {
-            tool_error(
-                "sh",
-                Vec::new(),
-                format!("unexpected output from the version script: {}", out.stderr),
-            )
-        })?;
+            (VERSION_SCRIPT, VERSION_LISTING),
+            base_ref,
+        )?;
+        let (merge_base, mut paths_seen, status) =
+            parse_version(&out).ok_or_else(|| unexpected_listing(&id))?;
         let head = status.head.unwrap_or_default();
         paths_seen.extend(status.changed);
         // `BTreeSet`s: sorted and deduplicated, so the hash order is fixed.
@@ -1145,24 +1553,197 @@ mod tests {
         assert!(cut.ends_with('\n'), "cut at a line boundary");
     }
 
-    /// The script spells `STATUS` and `DIFF_FLAGS` out; they must not drift.
+    /// The scripts spell `STATUS`, `DIFF_FLAGS` and the probe out; they
+    /// must not drift.
     #[test]
-    fn the_version_script_runs_the_same_flags_as_the_constants() {
-        assert!(VERSION_SCRIPT.contains(&format!("\"$@\" {} ||", STATUS.join(" "))));
-        assert!(VERSION_SCRIPT.contains(&format!(
-            "\"$@\" diff {} --name-only -z \"$mb\" ||",
-            DIFF_FLAGS.join(" ")
-        )));
-        assert!(VERSION_SCRIPT.contains(&format!("\"$@\" {} \"$keys\"", PROBE.join(" "))));
-        // nothing but the positional parameters reaches a command
-        assert!(!VERSION_SCRIPT.contains("eval"));
-        for code in 81..=84 {
-            let stage = version_stage(code).unwrap();
-            assert!(VERSION_SCRIPT.contains(&format!("exit {code}")), "{stage}");
+    fn the_scripts_run_the_same_flags_as_the_constants() {
+        let diff = DIFF_FLAGS.join(" ");
+        for (script, listing) in [
+            (VERSION_SCRIPT, VERSION_LISTING),
+            (DIFF_LIST_SCRIPT, DIFF_LISTING),
+        ] {
+            assert!(script.contains(&format!("\"$@\" {} ||", STATUS.join(" "))));
+            assert!(script.contains(&format!(
+                "\"$@\" diff {diff} {} \"$mb\" || exit 84",
+                listing.join(" ")
+            )));
+            assert!(script.contains(&format!("\"$@\" {} \"$keys\"", PROBE.join(" "))));
+            for code in 81..=84 {
+                let stage = version_stage(code).unwrap();
+                assert!(script.contains(&format!("exit {code}")), "{stage}");
+            }
+            assert!(script.contains(&format!("exit {VERSION_FILTER}")));
         }
-        assert!(VERSION_SCRIPT.contains(&format!("exit {VERSION_FILTER}")));
+        assert!(DIFF_PATCH_SCRIPT.contains(&format!(
+            "set -- \"$@\" diff {diff} -U3 --find-renames \"$mb\"\n"
+        )));
+        assert!(DIFF_PATCH_SCRIPT.contains(&format!(
+            "\"$@\" diff {diff} --no-index -U3 -- /dev/null \"$p\"\n"
+        )));
+        assert!(DIFF_PATCH_SCRIPT.contains(&format!("\"$@\" {} \"$keys\"", PROBE.join(" "))));
+        for code in [VERSION_FILTER, 81] {
+            assert!(
+                DIFF_PATCH_SCRIPT.contains(&format!("exit {code}")),
+                "{code}"
+            );
+        }
+        // nothing but the positional parameters reaches a command
+        for script in [VERSION_SCRIPT, DIFF_LIST_SCRIPT, DIFF_PATCH_SCRIPT] {
+            assert!(!script.contains("eval"));
+        }
         assert_eq!(version_stage(0), None);
         assert_eq!(version_stage(1), None);
+    }
+
+    /// The patch script's frames: a NUL at a line start, the code, a
+    /// newline; whatever the chunking. A NUL inside a line is content.
+    #[test]
+    fn the_section_reader_splits_on_frames_at_line_starts() {
+        let combined = "diff --git a/a b/a\n+x\0y\n";
+        let raw = format!("{combined}\x000\n\x001\n+u\0\n\x001\n");
+        for size in [1, 2, 3, 7, 64] {
+            let mut r = SectionReader::new(true, 2);
+            for chunk in raw.as_bytes().chunks(size) {
+                r.feed(chunk);
+            }
+            let s = r.finish().unwrap();
+            assert_eq!(s.codes, [0, 1, 1], "chunks of {size}");
+            assert_eq!(s.combined.unwrap()["diff --git a/a b/a"], combined);
+            assert_eq!(s.untracked, ["", "+u\0\n"], "an empty section first");
+        }
+        let untracked_only = |raw: &str, n| {
+            let mut r = SectionReader::new(false, n);
+            r.feed(raw.as_bytes());
+            r.finish()
+        };
+        let s = untracked_only("a\n\x001\nb\n\x00128\n", 2).unwrap();
+        assert_eq!(
+            (s.untracked, s.codes),
+            (vec!["a\n".into(), "b\n".into()], vec![1, 128])
+        );
+        assert!(s.combined.is_none());
+        // a frame missing, one too many, one that is not a code, or cut
+        assert!(untracked_only("a\n\x001\n", 2).is_none());
+        assert!(untracked_only("\x001\n\x001\n", 1).is_none());
+        assert!(untracked_only("\x001\nextra\n", 1).is_none());
+        assert!(untracked_only("\x00x\n", 1).is_none());
+        assert!(untracked_only("\x000", 1).is_none());
+        assert!(untracked_only(&format!("\x00{}\n", "1".repeat(20)), 1).is_none());
+        assert!(untracked_only("", 0).is_some());
+    }
+
+    /// `DIFF_PATCH_SCRIPT` under a plain `/bin/sh`, git a stub that prints
+    /// its arguments: the probe goes first and stops the script, and each
+    /// call gets exactly its own words, whatever the paths hold.
+    #[test]
+    fn the_patch_script_probes_first_and_passes_each_call_its_own_words() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("balerix-patch-script-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("git");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\ncase \"$*\" in *--get-regexp*) printf '%s' \"$PROBE_SAYS\"; exit \"$PROBE_EXIT\" ;; esac\n\
+             printf '%s|' \"$@\"; echo\ncase \"$*\" in *--no-index*) exit 1 ;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |probe: (&str, &str), args: &[&str]| {
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", DIFF_PATCH_SCRIPT, "sh"])
+                .args(args)
+                .args([stub.to_str().unwrap(), "-c", "k=v"])
+                .env("PROBE_SAYS", probe.0)
+                .env("PROBE_EXIT", probe.1)
+                .output()
+                .unwrap();
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+        let args = [
+            "MB",
+            FILTER_KEYS,
+            "paths",
+            "2",
+            "2",
+            "a b",
+            "-c",
+            "u 1",
+            "-x",
+        ];
+        let (code, stdout, stderr) = run(("", "1"), &args);
+        assert_eq!(code, Some(0), "{stderr}");
+        let flags = DIFF_FLAGS.join("|");
+        assert_eq!(
+            stdout,
+            format!(
+                "-c|k=v|--literal-pathspecs|diff|{flags}|-U3|--find-renames|MB|--|a b|-c|\n\x000\n\
+                 -c|k=v|diff|{flags}|--no-index|-U3|--|/dev/null|u 1|\n\x001\n\
+                 -c|k=v|diff|{flags}|--no-index|-U3|--|/dev/null|-x|\n\x001\n"
+            )
+        );
+        let (code, stdout, _) = run(("", "1"), &["MB", FILTER_KEYS, "all", "0", "0"]);
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            stdout,
+            format!("-c|k=v|diff|{flags}|-U3|--find-renames|MB|\n\x000\n")
+        );
+        // a key: exit 80, the key on stderr, no section run
+        let (code, stdout, stderr) = run(("filter.x.clean", "0"), &args);
+        assert_eq!((code, stdout.as_str()), (Some(VERSION_FILTER), ""));
+        assert_eq!(filter_key(&stderr).as_deref(), Some("filter.x.clean"));
+        // a failed probe, or a "no" that printed anything: 81
+        assert_eq!(run(("fatal: bad", "128"), &args).0, Some(81));
+        assert_eq!(run(("warning: odd", "1"), &args).0, Some(81));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn untracked_paths_are_batched_under_the_argument_budget() {
+        let paths = ["aaa", "bb", "c", "dddddddd", "e"];
+        assert_eq!(
+            batches(&paths, 7, 0),
+            [&paths[..2], &paths[2..3], &paths[3..4], &paths[4..]]
+        );
+        assert_eq!(batches(&paths, 100, 0), [&paths[..]]);
+        assert!(batches(&[], 7, 0).is_empty());
+        // the pathspecs' bytes count against the first start
+        assert_eq!(
+            batches(&paths, 7, 3),
+            [&paths[..1], &paths[1..3], &paths[3..4], &paths[4..]]
+        );
+        assert_eq!(
+            batches(&paths, 7, 4),
+            [
+                &paths[..0],
+                &paths[..2],
+                &paths[2..3],
+                &paths[3..4],
+                &paths[4..]
+            ],
+            "aaa does not fit beside 4 bytes: the first start is the combined diff alone"
+        );
+        assert_eq!(batches(&paths, 100, 90), [&paths[..3], &paths[3..]]);
+        assert_eq!(
+            batches(&paths, 7, 50)[0],
+            &paths[..0],
+            "pathspecs over the budget"
+        );
+        assert!(
+            batches(&[], 7, 50).is_empty(),
+            "the caller adds the combined diff's start"
+        );
+    }
+
+    #[test]
+    fn a_listing_splits_into_merge_base_records_and_status() {
+        let out = "abc\0R100\0old\0new\0M\0x\0\0# branch.oid h\0";
+        let (mb, records, status) = parse_listing(out).unwrap();
+        assert_eq!((mb.as_str(), status), ("abc", "# branch.oid h\0"));
+        assert_eq!(records, ["R100", "old", "new", "M", "x"]);
     }
 
     /// #19: a git-supplied path is held to `check_path` before the `stat`,

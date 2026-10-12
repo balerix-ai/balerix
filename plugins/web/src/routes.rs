@@ -3,6 +3,7 @@
 //! index polls `agents.json`; the terminal page runs the vendored
 //! xterm.js against `agents/{id}/ws`, which relays to the daemon's attach.
 
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use axum::body::Bytes;
@@ -17,6 +18,7 @@ use balerix_api::{PluginAction, ResizeFrame, TextFrame};
 use balerix_plugin_sdk::SdkError;
 use balerix_plugin_sdk::metrics::{IntCounter, IntGauge};
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
 
 use crate::plugin::Shared;
 use crate::review::{MAX_MESSAGE_BYTES, ReviewBody, render_message, validate};
@@ -738,7 +740,7 @@ async fn events_json(
     let mut events = shared.cache.events_after(&id, after);
     events.workspace = bounded_version(
         &id,
-        shared.host.workspace_version(&id),
+        shared_version(&shared, &id),
         VERSION_DEADLINE,
         &shared.version_failures_total,
     )
@@ -750,6 +752,75 @@ async fn events_json(
 /// without it (#18): the column keeps flowing when the daemon is slow, not
 /// only when it fails. Under the page's 2 s poll.
 const VERSION_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// What a daemon `version` call answered; `None` until it has.
+type VersionAnswer = Option<Result<balerix_api::WorkspaceVersion, SdkError>>;
+
+/// The daemon `version` call in flight for each agent (#185). A poll
+/// that times out drops only its wait, never the call, so without this
+/// a version slower than the page's 2 s poll would have one call per
+/// poll running on the daemon at once. The entry goes when its call ends.
+#[derive(Default)]
+pub struct VersionFlights(std::sync::Mutex<HashMap<String, watch::Receiver<VersionAnswer>>>);
+
+impl VersionFlights {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, watch::Receiver<VersionAnswer>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Removes an agent's flight when its call task ends, also by panic or
+/// abort, so the next poll starts a fresh call.
+struct Landing {
+    shared: Arc<Shared>,
+    id: String,
+}
+
+impl Drop for Landing {
+    fn drop(&mut self) {
+        self.shared.versions.lock().remove(&self.id);
+    }
+}
+
+/// `id`'s worktree version through the call in flight for it, starting
+/// one when there is none. The call runs in its own task: a caller that
+/// stops waiting (`bounded_version`'s deadline) leaves it running for
+/// the polls after it.
+fn shared_version(
+    shared: &Arc<Shared>,
+    id: &str,
+) -> impl std::future::Future<Output = Result<balerix_api::WorkspaceVersion, SdkError>> + use<> {
+    let mut rx = {
+        let mut flights = shared.versions.lock();
+        match flights.get(id) {
+            Some(rx) => rx.clone(),
+            None => {
+                let (tx, rx) = watch::channel(None);
+                flights.insert(id.to_string(), rx.clone());
+                let landing = Landing {
+                    shared: shared.clone(),
+                    id: id.to_string(),
+                };
+                tokio::spawn(async move {
+                    let answer = landing.shared.host.workspace_version(&landing.id).await;
+                    // a poll between these two lines reads this answer
+                    tx.send_replace(Some(answer));
+                    drop(landing);
+                });
+                rx
+            }
+        }
+    };
+    async move {
+        match rx.wait_for(Option::is_some).await.as_deref() {
+            Ok(Some(answer)) => answer.clone(),
+            // the task ended without an answer: it panicked
+            _ => Err(SdkError::Transport(
+                "workspace version call ended without an answer".into(),
+            )),
+        }
+    }
+}
 
 /// `version`, or `None` when it fails or outlives `deadline`; a timeout
 /// counts in `version_failures_total` like any failure but the routine

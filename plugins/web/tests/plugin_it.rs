@@ -692,3 +692,117 @@ async fn a_review_is_one_send_text_and_a_divider_in_the_column() {
         "a failed send adds no divider"
     );
 }
+
+/// The pages served against a stub daemon whose `version` route is
+/// `answer` (called with the 0-based call number): how many calls it
+/// got, and a poll of alice's `events.json` that returns its `workspace`.
+async fn pages_with_version<F, Fut>(
+    answer: F,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    impl AsyncFn() -> Value,
+)
+where
+    F: Fn(usize) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
+{
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let daemon = axum::Router::new().route(
+        "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/workspace/version",
+        axum::routing::get(move || {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            answer(n)
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, daemon).await });
+    let env = Env {
+        api_url: format!("http://{addr}"),
+        name: "web".into(),
+        token: "tok".into(),
+        scratch: "/s".into(),
+        ca: None,
+        tls: None,
+        listen: "127.0.0.1:0".into(),
+        revision: None,
+    };
+    let plugin = WebPlugin::new(Host::new(env).unwrap()).unwrap();
+    plugin.shared().cache.set_enabled(ALICE, true);
+    let pages = balerix_plugin_web::routes::router(plugin.shared());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/agents/e2e/c/alice/events.json",
+        listener.local_addr().unwrap()
+    );
+    tokio::spawn(async move { axum::serve(listener, pages).await });
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let poll = async move || {
+        let v: Value = http.get(&url).send().await.unwrap().json().await.unwrap();
+        v["workspace"].clone()
+    };
+    (calls, poll)
+}
+
+fn version_answer() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    axum::Json(json!({ "head": "h", "fingerprint": "f" })).into_response()
+}
+
+/// #185: a daemon whose first `version` takes 3.75 s, against the poll's
+/// 1.5 s deadline (every margin below is 0.75 s or more). Two polls at
+/// once share that call and answer `null` at 1.5 s; a third shares it
+/// too and gives up at 3 s; a fourth gets its answer at 3.75 s; the
+/// first poll after the call ended starts the next one.
+#[tokio::test]
+async fn polls_share_one_in_flight_version_call() {
+    use std::sync::atomic::Ordering;
+    let (calls, poll) = pages_with_version(|n| async move {
+        if n == 0 {
+            tokio::time::sleep(Duration::from_millis(3750)).await;
+        }
+        version_answer()
+    })
+    .await;
+    let (a, b) = tokio::join!(poll(), poll());
+    assert!(a.is_null() && b.is_null(), "both timed out: {a} {b}");
+    let c = poll().await;
+    assert!(c.is_null(), "the third gave up before the call ended: {c}");
+    assert_eq!(
+        poll().await["head"],
+        "h",
+        "the fourth poll got the first call's answer"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "four polls, one call");
+    assert_eq!(poll().await["head"], "h");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the next poll makes a fresh call"
+    );
+}
+
+/// #185: a flight that ends in an error goes as one that answers does:
+/// the poll waiting on it answers `null`, and the next poll makes a fresh
+/// call instead of reading the stale error.
+#[tokio::test]
+async fn a_failed_version_call_is_not_reused() {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::Ordering;
+    let (calls, poll) = pages_with_version(|n| async move {
+        if n == 0 {
+            tokio::time::sleep(Duration::from_millis(2250)).await;
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "broken").into_response();
+        }
+        version_answer()
+    })
+    .await;
+    assert!(poll().await.is_null(), "timed out at 1.5 s");
+    assert!(poll().await.is_null(), "the shared call failed at 2.25 s");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(poll().await["head"], "h", "a fresh call");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}

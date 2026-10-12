@@ -23,6 +23,8 @@ pub struct Shared {
     pub events_buffered_total: IntCounter,
     pub diff_refreshes_total: IntCounter,
     pub version_failures_total: IntCounter,
+    /// The one daemon `version` call in flight per agent (#185).
+    pub versions: crate::routes::VersionFlights,
 }
 
 pub struct WebPlugin {
@@ -74,6 +76,7 @@ impl WebPlugin {
                 events_buffered_total,
                 diff_refreshes_total,
                 version_failures_total,
+                versions: Default::default(),
             }),
             metrics,
         })

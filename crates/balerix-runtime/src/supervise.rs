@@ -12,7 +12,10 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use rustix::io::Errno;
-use rustix::process::{Pid, Signal, WaitOptions, getpid, kill_process, set_child_subreaper, wait};
+use rustix::process::{
+    Pid, PidfdFlags, Signal, WaitOptions, getpid, kill_process, pidfd_open, pidfd_send_signal,
+    set_child_subreaper, wait,
+};
 
 /// How long the tree gets to exit after the hangup before it is killed
 /// (NS-9). Fixed.
@@ -107,12 +110,22 @@ impl Procfs {
     /// all is an error (#120): the kill loop would see nothing and never
     /// end.
     pub(crate) fn parents(&self) -> io::Result<Vec<(u32, u32)>> {
+        Ok(self
+            .table()?
+            .into_iter()
+            .map(|(pid, stat)| (pid, stat.ppid))
+            .collect())
+    }
+
+    /// `parents`, with each process's whole `Stat`: one read gives both
+    /// its parent and its identity.
+    pub(crate) fn table(&self) -> io::Result<Vec<(u32, Stat)>> {
         let entries = std::fs::read_dir(&self.root)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", self.root.display())))?;
         Ok(entries
             .flatten()
             .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-            .filter_map(|pid| Some((pid, self.stat(pid).ok()??.ppid)))
+            .filter_map(|pid| Some((pid, self.stat(pid).ok()??)))
             .collect())
     }
 
@@ -233,6 +246,140 @@ fn kill_until_empty(main: u32, status: &mut Option<i32>) -> io::Result<()> {
         std::thread::sleep(backoff.after(&found));
     }
     Ok(())
+}
+
+/// How long `terminate_tree`'s kill loop keeps at a tree after the grace,
+/// and then how long it waits to reap the child: a process that cannot
+/// die yet (uninterruptible sleep) is left behind rather than holding the
+/// caller.
+const TERMINATE_KILL_BOUND: Duration = Duration::from_secs(5);
+
+/// A process as one `table` row shows it: `None` for a zombie.
+fn identity_of(pid: u32, stat: &Stat) -> Option<ProcIdentity> {
+    (stat.state != 'Z').then_some(ProcIdentity {
+        pid,
+        start: stat.start,
+    })
+}
+
+/// The tracked processes that one `table` read shows still running, as
+/// the same processes (same start time).
+fn alive(table: &[(u32, Stat)], tree: &[ProcIdentity]) -> Vec<ProcIdentity> {
+    tree.iter()
+        .filter(|id| {
+            table
+                .iter()
+                .any(|(pid, stat)| identity_of(*pid, stat) == Some(**id))
+        })
+        .copied()
+        .collect()
+}
+
+/// Adds to `tree` every live process below `root` or below a process
+/// already in it, from one `table` read: each one's identity comes from
+/// the same `stat` that named its parent. Tracked by identity, not by
+/// parentage alone: one whose parent exits is re-parented away from
+/// `root` (to pid 1 or a subreaper), and `descendants_of(root, …)` would
+/// no longer see it.
+fn track_tree(table: &[(u32, Stat)], root: u32, tree: &mut Vec<ProcIdentity>) {
+    let parents: Vec<(u32, u32)> = table.iter().map(|(pid, s)| (*pid, s.ppid)).collect();
+    let mut roots = vec![root];
+    roots.extend(alive(table, tree).iter().map(|id| id.pid));
+    for r in roots {
+        for pid in descendants_of(r, &parents) {
+            let id = table
+                .iter()
+                .find(|(p, _)| *p == pid)
+                .and_then(|(p, stat)| identity_of(*p, stat));
+            if let Some(id) = id
+                && !tree.contains(&id)
+            {
+                tree.push(id);
+            }
+        }
+    }
+}
+
+/// `sig` to `id` and to no later process that reuses its pid: the pidfd
+/// is opened first and the identity checked after, so a pidfd that
+/// passes the check names `id` for good. Without pidfds (`ENOSYS`), the
+/// check and a plain kill, which leaves the window between them open.
+fn signal_process(proc: &Procfs, id: &ProcIdentity, sig: Signal) {
+    let Some(pid) = pid_of(id.pid) else {
+        return;
+    };
+    let same = || proc.identity(id.pid).is_ok_and(|now| now == Some(*id));
+    match pidfd_open(pid, PidfdFlags::empty()) {
+        Ok(fd) => {
+            if same() {
+                let _ = pidfd_send_signal(&fd, sig);
+            }
+        }
+        Err(e) if e == Errno::NOSYS => {
+            if same() {
+                let _ = kill_process(pid, sig);
+            }
+        }
+        // gone already (`ESRCH`), or not ours to signal
+        Err(_) => {}
+    }
+}
+
+/// Ends `child`, a process this one spawned, and every process below it:
+/// SIGTERM to the child, up to `grace` for the whole tree to exit, then
+/// SIGKILL to every descendant still running and to the child for up to
+/// `TERMINATE_KILL_BOUND`, and the child reaped within as long again. For
+/// a deadline on a wrapper that forwards SIGTERM but not SIGKILL to what
+/// it runs. The child is reaped only at the end, so its pid stays its own
+/// throughout; its descendants are tracked from before the SIGTERM
+/// (`track_tree`), so one that outlives its parent is still found, and
+/// each is signalled through a pidfd (`signal_process`). Not a
+/// subreaper's kill loop: the caller is not one, and a process that left
+/// the tree before the first scan is not seen. A child that cannot be
+/// reaped within the bound is left unreaped.
+pub(crate) fn terminate_tree(child: &mut std::process::Child, grace: Duration) {
+    let proc = Procfs::default();
+    let table = || proc.table().unwrap_or_default();
+    let root = child.id();
+    let mut tree = Vec::new();
+    track_tree(&table(), root, &mut tree);
+    if let Some(pid) = pid_of(root) {
+        // not reaped yet, so the pid is still the child's
+        let _ = kill_process(pid, Signal::TERM);
+    }
+    let deadline = Instant::now() + grace;
+    loop {
+        let now = table();
+        track_tree(&now, root, &mut tree);
+        // a zombie has no identity: the child has exited, unreaped
+        let child_exited = !now
+            .iter()
+            .any(|(pid, stat)| *pid == root && identity_of(*pid, stat).is_some());
+        if (child_exited && alive(&now, &tree).is_empty()) || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(POLL);
+    }
+    let bound = Instant::now() + TERMINATE_KILL_BOUND;
+    let mut backoff = KillBackoff::default();
+    loop {
+        let now = table();
+        track_tree(&now, root, &mut tree);
+        let found = alive(&now, &tree);
+        for id in &found {
+            signal_process(&proc, id, Signal::KILL);
+        }
+        let _ = child.kill();
+        if found.is_empty() || Instant::now() >= bound {
+            break;
+        }
+        let pids: Vec<u32> = found.iter().map(|id| id.pid).collect();
+        std::thread::sleep(backoff.after(&pids));
+    }
+    let reap_by = Instant::now() + TERMINATE_KILL_BOUND;
+    while matches!(child.try_wait(), Ok(None)) && Instant::now() < reap_by {
+        std::thread::sleep(POLL);
+    }
 }
 
 /// Runs `argv` under this process as a child subreaper and returns the

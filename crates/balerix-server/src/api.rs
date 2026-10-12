@@ -128,6 +128,8 @@ impl From<balerix_core::WorkspaceError> for ApiError {
             W::Missing(_) | W::NoSuchPath => StatusCode::NOT_FOUND,
             W::InvalidPath(_) | W::NotAFile | W::NotADirectory => StatusCode::BAD_REQUEST,
             W::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            // the daemon's own read of the worktree outlived its deadline
+            W::TimedOut { .. } => StatusCode::GATEWAY_TIMEOUT,
             W::Tool { .. } | W::Filter { .. } | W::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::new(status, e.to_string())
@@ -803,6 +805,24 @@ mod tests {
         assert_eq!(
             (e.status, e.message.as_str()),
             (StatusCode::INTERNAL_SERVER_ERROR, "kv: storage error")
+        );
+    }
+
+    /// #213: a workspace read that outlived its deadline is the daemon's
+    /// gateway timeout, not a tool failure.
+    #[test]
+    fn a_timed_out_workspace_read_is_a_504() {
+        let e = ApiError::from(balerix_core::WorkspaceError::TimedOut {
+            id: "f/c/a".into(),
+            subcommand: "diff".into(),
+            after: std::time::Duration::from_secs(30),
+        });
+        assert_eq!(
+            (e.status, e.message.as_str()),
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "f/c/a: workspace diff: timed out after 30s"
+            )
         );
     }
 }

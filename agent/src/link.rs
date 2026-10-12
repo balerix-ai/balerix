@@ -230,13 +230,18 @@ pub fn workspace_failure(e: WorkspaceError) -> LinkFailure {
         W::NotAFile => FailureKind::NotAFile,
         W::NotADirectory => FailureKind::NotADirectory,
         W::TooLarge { limit } => FailureKind::TooLarge { limit: *limit },
-        W::Tool { .. } => FailureKind::Tool,
+        // `FailureKind` is published wire format with no variant for a
+        // timeout, so it crosses as a tool failure, its text the message
+        W::Tool { .. } | W::TimedOut { .. } => FailureKind::Tool,
         W::Filter { .. } => FailureKind::Filter,
         W::Io { .. } => FailureKind::Io,
     };
     let message = match e {
         W::Missing(field) | W::InvalidPath(field) | W::Filter { key: field } => field,
         W::Tool { stderr, .. } => stderr,
+        W::TimedOut {
+            subcommand, after, ..
+        } => format!("workspace {subcommand}: timed out after {after:?}"),
         other => other.to_string(),
     };
     LinkFailure { reason, message }
@@ -392,6 +397,17 @@ mod tests {
             stderr: failure.message,
         };
         assert_eq!(rebuilt.to_string(), "f/c/a: git link: fatal: bad revision");
+        // a timeout has no reason of its own on the wire (#213): a tool
+        // failure whose text says what timed out
+        let failure = workspace_failure(WorkspaceError::TimedOut {
+            id: "f/c/a".into(),
+            subcommand: "version".into(),
+            after: std::time::Duration::from_secs(10),
+        });
+        assert_eq!(
+            serde_json::to_value(&failure).unwrap(),
+            json!({ "reason": "tool", "message": "workspace version: timed out after 10s" })
+        );
         // the others carry their display text
         let failure = workspace_failure(WorkspaceError::TooLarge { limit: 1 << 20 });
         assert_eq!(failure.reason, FailureKind::TooLarge { limit: 1 << 20 });

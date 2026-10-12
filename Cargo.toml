@@ -72,8 +72,9 @@ prometheus = "0.14.0"
 chacha20poly1305 = "0.11.0"
 rand = "0.10.2"
 # The agent supervisor's three syscalls (Spec N amendment §13): the child
-# subreaper flag, kill and wait, without `unsafe`.
-rustix = { version = "1.1.4", default-features = false, features = ["std", "process"] }
+# subreaper flag, kill and wait, without `unsafe`; `pidfd_*` for a deadline's
+# kills, and `fs` for the workspace reader's no-follow `openat` walk (#213).
+rustix = { version = "1.1.4", default-features = false, features = ["std", "process", "fs"] }
 # `balerix sandbox-exec`'s seccomp filter (Linux only): no Unix socket
 # creation for a sandboxed process.
 seccompiler = "0.5.0"

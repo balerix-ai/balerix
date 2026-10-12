@@ -7,6 +7,85 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
+
+/// The stderr a run keeps: its last 64 KiB (`StderrTail`). One sandbox
+/// start of the workspace reader runs up to 500 git commands, and their
+/// stderr is the only output not bounded by its consumer.
+pub(crate) const STDERR_LIMIT: usize = 64 * 1024;
+
+/// How long a timed-out child's tree gets between SIGTERM and SIGKILL
+/// (`supervise::terminate_tree`). SIGTERM first because a wrapper such
+/// as `nono` forwards it to what it runs, and SIGKILL to the wrapper alone
+/// would leave that running.
+pub(crate) const TIMEOUT_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a timed-out run waits for the tree's stderr to reach its end,
+/// for the log.
+const STDERR_AFTER_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// The last `cap` bytes of a stream, read as it arrives, and how many
+/// bytes before them were dropped.
+#[derive(Debug)]
+pub(crate) struct StderrTail {
+    buf: Vec<u8>,
+    dropped: u64,
+    cap: usize,
+}
+
+impl StderrTail {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            dropped: 0,
+            cap,
+        }
+    }
+
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        // only the end of a chunk larger than the cap can survive it
+        let bytes = if bytes.len() > self.cap {
+            let skip = bytes.len() - self.cap;
+            self.dropped += skip as u64;
+            &bytes[skip..]
+        } else {
+            bytes
+        };
+        self.buf.extend_from_slice(bytes);
+        if self.buf.len() > self.cap {
+            let excess = self.buf.len() - self.cap;
+            self.dropped += excess as u64;
+            self.buf.drain(..excess);
+        }
+    }
+
+    /// Reads `r` to its end (or first error), keeping the tail.
+    fn read(mut r: impl Read, cap: usize) -> Self {
+        let mut tail = Self::new(cap);
+        let mut chunk = vec![0u8; 16 * 1024];
+        loop {
+            match r.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => tail.push(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        tail
+    }
+
+    /// The kept bytes as text, after a line that says how many were
+    /// dropped when any were.
+    pub(crate) fn into_string(self) -> String {
+        let kept = String::from_utf8_lossy(&self.buf);
+        if self.dropped == 0 {
+            kept.into_owned()
+        } else {
+            format!("[… {} bytes of stderr dropped]\n{kept}", self.dropped)
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPaths {
@@ -77,6 +156,8 @@ pub(crate) struct CmdFailure {
     pub subcommand: String,
     pub args: Vec<String>,
     pub stderr: String,
+    /// Set when the run was ended by its `timeout`, which this was.
+    pub timed_out: Option<Duration>,
 }
 
 impl fmt::Display for CmdFailure {
@@ -154,10 +235,11 @@ impl Cmd {
         self.log_stdout = false;
         self
     }
-    /// Kills the child and fails if it outlives `d`. Only the daemon pool
-    /// install sets this today (Spec F §6); every other call is unbounded as
-    /// before.
-    pub(crate) fn timeout(mut self, d: std::time::Duration) -> Self {
+    /// Fails the run if the child outlives `d`, after ending the child and
+    /// every process below it (`spawn_and_wait`). Set by the daemon pool
+    /// install (Spec F §6), the sandbox probes and the workspace reader's
+    /// sandbox starts; every other call is unbounded.
+    pub(crate) fn timeout(mut self, d: Duration) -> Self {
         self.timeout = Some(d);
         self
     }
@@ -209,123 +291,52 @@ impl Cmd {
     }
 
     fn exec(&self, accepted: &[i32], stdin: Option<&[u8]>) -> Result<CmdOutput, CmdFailure> {
-        let mut c = Command::new(&self.program);
-        c.args(&self.args);
-        if self.env_clear {
-            c.env_clear();
-        }
-        c.envs(&self.env);
-        for k in &self.env_removals {
-            c.env_remove(k);
-        }
-        if let Some(d) = &self.cwd {
-            c.current_dir(d);
-        }
-        let failure = |stderr: String| CmdFailure {
-            tool: self.tool(),
-            subcommand: self.subcommand(),
-            args: self.args.clone(),
-            stderr,
-        };
-        let cannot_execute =
-            |e: std::io::Error| failure(format!("cannot execute {}: {e}", self.program.display()));
-        let out = match stdin {
-            None => match self.timeout {
-                None => c.output().map_err(cannot_execute)?,
-                Some(d) => {
-                    let mut child = c
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .map_err(cannot_execute)?;
-                    // Only the pipe handles move to the drain threads; the
-                    // parent keeps the `Child` so it can poll and, on
-                    // expiry, kill it directly (safe: no PATH lookup, no
-                    // `unsafe`). Draining stdout and stderr on their own
-                    // threads is what keeps a chatty child from filling a
-                    // pipe buffer and deadlocking us while we poll.
-                    let (mut stdout_pipe, mut stderr_pipe) =
-                        match (child.stdout.take(), child.stderr.take()) {
-                            (Some(o), Some(e)) => (o, e),
-                            _ => {
-                                return Err(failure(
-                                    "cannot capture output: stdout/stderr pipe missing after spawn"
-                                        .to_string(),
-                                ));
-                            }
-                        };
-                    let stdout_thread = std::thread::spawn(move || {
-                        let mut buf = Vec::new();
-                        let _ = stdout_pipe.read_to_end(&mut buf);
-                        buf
-                    });
-                    let stderr_thread = std::thread::spawn(move || {
-                        let mut buf = Vec::new();
-                        let _ = stderr_pipe.read_to_end(&mut buf);
-                        buf
-                    });
-                    let deadline = std::time::Instant::now() + d;
-                    let status = loop {
-                        match child.try_wait().map_err(cannot_execute)? {
-                            Some(status) => break Some(status),
-                            None if std::time::Instant::now() >= deadline => break None,
-                            None => std::thread::sleep(std::time::Duration::from_millis(20)),
-                        }
-                    };
-                    match status {
-                        Some(status) => std::process::Output {
-                            status,
-                            stdout: stdout_thread.join().unwrap_or_default(),
-                            stderr: stderr_thread.join().unwrap_or_default(),
-                        },
-                        None => {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Err(failure(format!("timed out after {}s", d.as_secs())));
-                        }
-                    }
-                }
-            },
-            Some(input) => {
-                let mut child = c
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .map_err(cannot_execute)?;
-                // Dropped (and so closed) before the wait: the child sees EOF.
-                let written = match child.stdin.take() {
-                    Some(mut pipe) => pipe.write_all(input),
-                    None => Ok(()),
-                };
-                if let Err(e) = written {
-                    // Do not wait on a child that may never read its input.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(failure(format!(
-                        "cannot write to {}: {e}",
-                        self.program.display()
-                    )));
-                }
-                child.wait_with_output().map_err(cannot_execute)?
-            }
-        };
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        self.finish(accepted, out.status, stdout, stderr)
+        let mut stdout = Vec::new();
+        let (status, stderr) = self.spawn_and_wait(stdin, &mut |chunk| {
+            stdout.extend_from_slice(chunk);
+        })?;
+        let stdout = String::from_utf8_lossy(&stdout).into_owned();
+        self.finish(accepted, status, stdout, stderr)
     }
 
     /// `run_with_exit_codes`, handing stdout to `sink` in chunks as it
     /// arrives instead of collecting it: for output only its consumer can
     /// bound (`inspect.rs`'s combined diff keeps 256 KiB per file of a
     /// diff that may be far larger). `CmdOutput::stdout` is empty, and
-    /// the log never carries stdout. stderr is drained on its own thread
-    /// so a chatty child cannot deadlock on a full pipe.
+    /// the log never carries stdout. The `timeout`, if set, holds here too.
     pub(crate) fn run_streaming(
         &self,
         accepted: &[i32],
         sink: &mut dyn FnMut(&[u8]),
     ) -> Result<CmdOutput, CmdFailure> {
+        let (status, stderr) = self.spawn_and_wait(None, sink)?;
+        self.finish(accepted, status, String::new(), stderr)
+    }
+
+    fn failure(&self, stderr: String) -> CmdFailure {
+        CmdFailure {
+            tool: self.tool(),
+            subcommand: self.subcommand(),
+            args: self.args.clone(),
+            stderr,
+            timed_out: None,
+        }
+    }
+
+    /// Runs the child to its exit: `stdin` written and closed first (no
+    /// stdin at all without it), stdout handed to `on_stdout` on this
+    /// thread as it arrives, stderr kept to its last `STDERR_LIMIT` bytes
+    /// (`StderrTail`). stdout and stderr are each drained on a thread of
+    /// their own, which is what keeps a chatty child from filling a pipe
+    /// and deadlocking the wait. Past the `timeout`, the child's whole tree
+    /// is ended (`supervise::terminate_tree`: SIGTERM, `TIMEOUT_GRACE`,
+    /// then SIGKILL to every descendant and the child) and the run fails
+    /// with `timed_out` set; the drain threads are not waited for then.
+    fn spawn_and_wait(
+        &self,
+        stdin: Option<&[u8]>,
+        on_stdout: &mut dyn FnMut(&[u8]),
+    ) -> Result<(std::process::ExitStatus, String), CmdFailure> {
         let mut c = Command::new(&self.program);
         c.args(&self.args);
         if self.env_clear {
@@ -338,48 +349,132 @@ impl Cmd {
         if let Some(d) = &self.cwd {
             c.current_dir(d);
         }
-        let failure = |stderr: String| CmdFailure {
-            tool: self.tool(),
-            subcommand: self.subcommand(),
-            args: self.args.clone(),
-            stderr,
-        };
         let mut child = c
-            .stdin(Stdio::null())
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| failure(format!("cannot execute {}: {e}", self.program.display())))?;
-        let (Some(mut stdout_pipe), Some(mut stderr_pipe)) =
-            (child.stdout.take(), child.stderr.take())
+            .map_err(|e| self.failure(format!("cannot execute {}: {e}", self.program.display())))?;
+        let started = Instant::now();
+        if let Some(input) = stdin {
+            // Dropped (and so closed) before the wait: the child sees EOF.
+            // The write is synchronous and the pipe buffer is 64 KiB (see
+            // `run_with_stdin`).
+            let written = match child.stdin.take() {
+                Some(mut pipe) => pipe.write_all(input),
+                None => Ok(()),
+            };
+            if let Err(e) = written {
+                // Do not wait on a child that may never read its input.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(
+                    self.failure(format!("cannot write to {}: {e}", self.program.display()))
+                );
+            }
+        }
+        let (Some(mut stdout_pipe), Some(stderr_pipe)) = (child.stdout.take(), child.stderr.take())
         else {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(failure(
+            return Err(self.failure(
                 "cannot capture output: stdout/stderr pipe missing after spawn".to_string(),
             ));
         };
-        let stderr_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr_pipe.read_to_end(&mut buf);
-            buf
+        // a channel, not a join: after a timeout this waits for the tail
+        // only briefly, in case something outside the tree holds the pipe
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel::<String>(1);
+        std::thread::spawn(move || {
+            let _ = stderr_tx.send(StderrTail::read(stderr_pipe, STDERR_LIMIT).into_string());
         });
-        let mut chunk = vec![0u8; 64 * 1024];
+        // Bounded, so a sink slower than the child holds the child back
+        // rather than this process's memory.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+        std::thread::spawn(move || {
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                match stdout_pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(chunk[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        let deadline = self.timeout.map(|d| (started + d, d));
+        let timed_out = |child: &mut std::process::Child, d: Duration| {
+            crate::supervise::terminate_tree(child, TIMEOUT_GRACE);
+            // the tree is gone, so its pipe has closed: what it said is
+            // the log's, not the caller's
+            let said = stderr_rx
+                .recv_timeout(STDERR_AFTER_TIMEOUT)
+                .unwrap_or_default();
+            self.write_log("", &said, &format_args!("timed out after {d:?}"));
+            CmdFailure {
+                timed_out: Some(d),
+                ..self.failure(format!("timed out after {d:?}"))
+            }
+        };
+        // stdout first, to its end
         loop {
-            match stdout_pipe.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => sink(&chunk[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
+            let chunk = match deadline {
+                None => rx.recv().map_err(|_| ()),
+                Some((at, d)) => {
+                    match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                        Ok(chunk) => Ok(chunk),
+                        Err(RecvTimeoutError::Disconnected) => Err(()),
+                        Err(RecvTimeoutError::Timeout) => return Err(timed_out(&mut child, d)),
+                    }
+                }
+            };
+            match chunk {
+                Ok(chunk) => on_stdout(&chunk),
+                Err(()) => break,
             }
         }
-        drop(stdout_pipe);
-        let status = child
-            .wait()
-            .map_err(|e| failure(format!("cannot wait for {}: {e}", self.program.display())))?;
-        let stderr =
-            String::from_utf8_lossy(&stderr_thread.join().unwrap_or_default()).into_owned();
-        self.finish(accepted, status, String::new(), stderr)
+        // then the exit
+        let status = match deadline {
+            None => child.wait(),
+            Some((at, d)) => loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) if Instant::now() >= at => return Err(timed_out(&mut child, d)),
+                    Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                    Err(e) => break Err(e),
+                }
+            },
+        }
+        .map_err(|e| self.failure(format!("cannot wait for {}: {e}", self.program.display())))?;
+        let stderr = stderr_rx.recv().unwrap_or_default();
+        Ok((status, stderr))
+    }
+
+    /// The log entry: `$ argv`, stdout (unless `log_argv_only`), stderr
+    /// and `[outcome]`.
+    fn write_log(&self, stdout: &str, stderr: &str, outcome: &dyn fmt::Display) {
+        let Some(log) = &self.log else {
+            return;
+        };
+        if let Some(dir) = log.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log) {
+            let logged_stdout = if self.log_stdout { stdout } else { "" };
+            let _ = writeln!(
+                f,
+                "$ {} {}\n{logged_stdout}{stderr}[{outcome}]",
+                self.tool(),
+                self.args.join(" "),
+            );
+        }
     }
 
     /// The log line and the exit-code check every run ends with.
@@ -390,30 +485,10 @@ impl Cmd {
         stdout: String,
         stderr: String,
     ) -> Result<CmdOutput, CmdFailure> {
-        let failure = |stderr: String| CmdFailure {
-            tool: self.tool(),
-            subcommand: self.subcommand(),
-            args: self.args.clone(),
-            stderr,
-        };
-        if let Some(log) = &self.log {
-            if let Some(dir) = log.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log) {
-                let logged_stdout = if self.log_stdout { stdout.as_str() } else { "" };
-                let _ = writeln!(
-                    f,
-                    "$ {} {}\n{logged_stdout}{stderr}[{}]",
-                    self.tool(),
-                    self.args.join(" "),
-                    status
-                );
-            }
-        }
+        self.write_log(&stdout, &stderr, &status);
         let code = status.code().filter(|c| accepted.contains(c));
         let Some(code) = code else {
-            return Err(failure(if stderr.trim().is_empty() {
+            return Err(self.failure(if stderr.trim().is_empty() {
                 // `ExitStatus` displays as `exit status: 3` (or `signal: 9`)
                 status.to_string()
             } else {
@@ -567,16 +642,16 @@ mod tests {
         let err = Cmd::new(Path::new("/bin/sh"))
             .args(["-c", &format!("echo $$ > {}; sleep 30", pidfile.display())])
             .log(&log)
-            .timeout(std::time::Duration::from_millis(300))
+            .timeout(std::time::Duration::from_secs(2))
             .run()
-            .expect_err("a 30s sleep under a 300ms timeout must fail");
+            .expect_err("a 30s sleep under a 2s timeout must fail");
         assert!(
             err.stderr.contains("timed out"),
             "expected a timeout message, got {:?}",
             err.stderr
         );
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
+            start.elapsed() < std::time::Duration::from_secs(20),
             "the timeout must not wait out the child"
         );
 
@@ -608,6 +683,157 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// Reads the pid a test's shell wrote to `file`.
+    fn pid_in(file: &Path) -> u32 {
+        std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("no pid in {file:?}: {e}"))
+            .trim()
+            .parse()
+            .expect("not a pid")
+    }
+
+    /// `pid` has exited (a zombie counts: re-parented to pid 1, it waits
+    /// for that to reap it), within 5 s.
+    fn assert_gone(pid: u32) {
+        let proc = crate::supervise::Procfs::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while proc.identity(pid).unwrap().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "pid {pid} still runs 5 s after the timeout ended its tree"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// #213: a deadline ends the whole tree, not just the child. The shell
+    /// dies of the SIGTERM and its `sleep` is re-parented away from it; a
+    /// kill of the child alone would leave that `sleep` running.
+    #[test]
+    fn a_timeout_ends_the_grandchildren_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sh_pid, sleep_pid) = (dir.path().join("sh"), dir.path().join("sleep"));
+        let err = Cmd::new(Path::new("/bin/sh"))
+            .args([
+                "-c",
+                &format!(
+                    "echo $$ > {}; sleep 30 & echo $! > {}; wait",
+                    sh_pid.display(),
+                    sleep_pid.display()
+                ),
+            ])
+            .timeout(Duration::from_secs(2))
+            .run()
+            .expect_err("a 30 s sleep under a 2 s timeout must fail");
+        assert_eq!(err.timed_out, Some(Duration::from_secs(2)));
+        assert_eq!(err.stderr, "timed out after 2s");
+        assert_gone(pid_in(&sh_pid));
+        assert_gone(pid_in(&sleep_pid));
+    }
+
+    /// A tree that ignores SIGTERM gets `TIMEOUT_GRACE`, then SIGKILL, and
+    /// the streaming run is bounded the same way.
+    #[test]
+    fn a_tree_that_ignores_sigterm_is_killed_after_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sh_pid, sleep_pid) = (dir.path().join("sh"), dir.path().join("sleep"));
+        let start = Instant::now();
+        let mut seen = Vec::new();
+        let err = Cmd::new(Path::new("/bin/sh"))
+            .args([
+                "-c",
+                &format!(
+                    "trap '' TERM; echo $$ > {}; sleep 30 & echo $! > {}; echo hi; wait",
+                    sh_pid.display(),
+                    sleep_pid.display()
+                ),
+            ])
+            .timeout(Duration::from_secs(2))
+            .run_streaming(&[0], &mut |chunk| seen.extend_from_slice(chunk))
+            .expect_err("a 30 s sleep under a 2 s timeout must fail");
+        assert!(err.timed_out.is_some(), "{err:?}");
+        assert_eq!(seen, b"hi\n", "stdout up to the deadline reached the sink");
+        let took = start.elapsed();
+        assert!(
+            took >= Duration::from_secs(2) + TIMEOUT_GRACE && took < Duration::from_secs(30),
+            "SIGTERM is ignored, so the grace runs out: {took:?}"
+        );
+        assert_gone(pid_in(&sh_pid));
+        assert_gone(pid_in(&sleep_pid));
+    }
+
+    /// A timed-out run's log says so, as a finished one's says its status.
+    #[test]
+    fn a_timeout_is_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs").join("git.log");
+        Cmd::new(Path::new("/bin/sh"))
+            .args(["-c", "echo said >&2; sleep 30"])
+            .log_argv_only(&log)
+            .timeout(Duration::from_secs(2))
+            .run()
+            .unwrap_err();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains("$ sh -c echo said >&2; sleep 30\nsaid\n[timed out after 2s]"),
+            "the partial stderr is logged: {logged}"
+        );
+    }
+
+    /// #213: stderr keeps its last `STDERR_LIMIT` bytes, after a line that
+    /// says how many went, on every path: a failure, a success, a run
+    /// under a timeout and a streamed one.
+    #[test]
+    fn stderr_is_capped_to_its_tail() {
+        let flood = "head -c 200000 /dev/zero | tr '\\0' a >&2; echo END >&2";
+        let check = |stderr: &str| {
+            let dropped = 200_000 + 4 - STDERR_LIMIT;
+            let (marker, kept) = stderr.split_once('\n').unwrap();
+            assert_eq!(marker, format!("[… {dropped} bytes of stderr dropped]"));
+            assert_eq!(kept.len(), STDERR_LIMIT);
+            assert!(kept.ends_with("aaaaEND\n"), "the tail is kept");
+        };
+        let sh = |script: String| Cmd::new(Path::new("/bin/sh")).args(["-c".to_string(), script]);
+        let err = sh(format!("{flood}; exit 3")).run().unwrap_err();
+        check(&err.stderr);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "sh -c: [… {} bytes of stderr dropped]",
+                200_004 - STDERR_LIMIT
+            )
+        );
+        check(&sh(flood.to_string()).run().unwrap().stderr);
+        check(
+            &sh(flood.to_string())
+                .timeout(Duration::from_secs(60))
+                .run()
+                .unwrap()
+                .stderr,
+        );
+        check(
+            &sh(flood.to_string())
+                .run_streaming(&[0], &mut |_| {})
+                .unwrap()
+                .stderr,
+        );
+        // under the cap, stderr is as it was
+        assert_eq!(sh("echo e >&2".into()).run().unwrap().stderr, "e\n");
+    }
+
+    #[test]
+    fn the_tail_keeps_the_last_bytes_whatever_the_chunks() {
+        let mut tail = StderrTail::new(4);
+        tail.push(b"ab");
+        tail.push(b"cdef");
+        assert_eq!(tail.dropped, 2);
+        tail.push(b"0123456789");
+        assert_eq!(tail.into_string(), "[… 12 bytes of stderr dropped]\n6789");
+        let mut small = StderrTail::new(4);
+        small.push(b"abcd");
+        assert_eq!(small.into_string(), "abcd");
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::process::Command;
 
 use balerix_api::{EntryKind, FileStatus, WORKSPACE_FILE_LIMIT};
 use balerix_core::{AgentId, RepoRef, WorkspaceError, WorkspaceReader};
+use balerix_runtime::inspect::{DIFF_BUDGET, SKIPPED_NOT_A_FILE, VERSION_BUDGET, symlink_patch};
 use balerix_runtime::{Runtime, SocketPolicy, Workspace};
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -1137,10 +1138,11 @@ fn diff_is_two_sandboxed_calls() {
                 assert!(f.binary && f.status == FileStatus::Added, "{f:?}");
                 String::new()
             }
-            // git cannot read it as a file; the patch is empty, as before
+            // a link to a directory, which git would follow: never handed
+            // to git, its target text shown instead (#213)
             "to-dir" => {
                 assert!(f.uncommitted && f.status == FileStatus::Added, "{f:?}");
-                String::new()
+                symlink_patch("to-dir", b"dir")
             }
             "notes.txt" | "a b.txt" | "-dash" | "quote\"d" => {
                 assert!(f.uncommitted && f.status == FileStatus::Added, "{f:?}");
@@ -1246,4 +1248,276 @@ fn diff_is_two_sandboxed_calls() {
     );
     assert!(!marker.exists(), "the filter ran under diff");
     assert_eq!(starts(), 1);
+}
+
+/// `no_index`'s patch without its `index` line, which `symlink_patch`
+/// leaves out.
+fn without_index_line(patch: &str) -> String {
+    patch
+        .lines()
+        .filter(|l| !l.starts_with("index "))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+/// #213: an untracked symlink to a FIFO (and the FIFO, where `status`
+/// lists it) never reaches `--no-index`, where git 2.42 and later would
+/// follow it, read the FIFO and block until something wrote to it: the
+/// diff answers at once. A link git would follow, or one out of the
+/// worktree, shows its target text as git prints it, without the target
+/// being looked at; a nested repository shows as skipped; the regular
+/// files and safe links beside them are git's own.
+#[test]
+fn an_untracked_fifo_is_skipped_not_read() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("inspect-fifo");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (id, layout) = clone_with_changes(&root, &tools);
+    let w = &layout.agent(&id).workspace;
+    let mkfifo = Command::new("mkfifo").arg(w.join("pipe")).status().unwrap();
+    assert!(mkfifo.success());
+    std::os::unix::fs::symlink("pipe", w.join("to-pipe")).unwrap();
+    std::os::unix::fs::symlink("notes.txt", w.join("to-notes")).unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", w.join("out")).unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", w.join("out\tquoted")).unwrap();
+    let nested = w.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    git(&nested, &["init", "-q"]);
+    std::fs::write(nested.join("x"), "x\n").unwrap();
+    let rt = Runtime::new(layout.clone(), tools.clone());
+
+    let start = std::time::Instant::now();
+    let d = rt.diff(&id, "origin/main").unwrap();
+    let took = start.elapsed();
+    assert!(
+        took < DIFF_BUDGET / 2,
+        "a skipped FIFO costs nothing: {took:?}"
+    );
+    let patch = |p: &str| {
+        let f = d
+            .files
+            .iter()
+            .find(|f| f.path == p)
+            .unwrap_or_else(|| panic!("{p}: {:#?}", d.files));
+        assert!(f.uncommitted && f.status == FileStatus::Added, "{f:?}");
+        f.patch.clone()
+    };
+    // `status` does not list the FIFO itself (git 2.47), only the link
+    if d.files.iter().any(|f| f.path == "pipe") {
+        assert_eq!(patch("pipe"), SKIPPED_NOT_A_FILE);
+    }
+    assert_eq!(patch("to-pipe"), symlink_patch("to-pipe", b"pipe"));
+    assert_eq!(patch("nested/"), SKIPPED_NOT_A_FILE);
+    for out in ["out", "out\tquoted"] {
+        assert_eq!(patch(out), without_index_line(&no_index(w, out)), "{out}");
+        assert!(patch(out).contains("+/etc/hostname"));
+    }
+    assert_eq!(patch("notes.txt"), no_index(w, "notes.txt"));
+    // a link to a regular file inside is git's own diff of it
+    assert_eq!(patch("to-notes"), no_index(w, "to-notes"));
+    assert!(patch("to-notes").contains("+notes.txt"));
+    rt.version(&id, "origin/main").unwrap();
+}
+
+/// #214: a git the git profile cannot run (here a shim that needs a file
+/// outside it, exiting 127 as the loader does, or one that exits 126 as a
+/// shell does for a git it may not execute) fails `version` and `diff`
+/// with the `sandbox.git_read` hint and both logs named, as the clone
+/// step's canary does. A git that runs and fails, `Permission denied`
+/// included, gets no hint.
+#[test]
+fn a_git_the_profile_cannot_run_names_git_read() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("inspect-git-read");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (id, layout) = clone_with_changes(&root, &tools);
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let prefix = root.join("prefix");
+    std::fs::create_dir_all(prefix.join("lib")).unwrap();
+    std::fs::write(prefix.join("lib/marker"), "lib\n").unwrap();
+    // `--exec-path` (asked outside the sandbox) is answered by the real git
+    let shim = |name: &str, failure: &str| {
+        let path = root.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --exec-path ] && exec {git} \"$@\"; done\n{failure}\nexec {git} \"$@\"\n",
+                git = tools.git.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let loader = shim(
+        "git-with-a-prefix.sh",
+        &format!(
+            "if ! read line < '{}'; then echo 'git: error while loading shared libraries: libmarker.so' >&2; exit 127; fi",
+            prefix.join("lib/marker").display()
+        ),
+    );
+    let denied = shim(
+        "git-denied.sh",
+        "echo 'sh: 1: git: Permission denied' >&2; exit 126",
+    );
+    let hint = format!(
+        "git could not run under the git profile (the sandbox itself starts); if it loads \
+         libraries from outside /usr, /lib, /lib64 and /bin, add that prefix to \
+         `sandbox.git_read` in the daemon's config.toml; see {} and {}: ",
+        crew.logs.join("git.log").display(),
+        paths.logs.join("nono-git.log").display()
+    );
+    for (git, said) in [
+        (loader, "error while loading shared libraries"),
+        (denied, "Permission denied"),
+    ] {
+        let rt = Runtime::new(
+            layout.clone(),
+            balerix_runtime::ToolPaths {
+                git,
+                ..tools.clone()
+            },
+        );
+        for e in [
+            rt.version(&id, "origin/main").unwrap_err(),
+            rt.diff(&id, "origin/main").unwrap_err(),
+        ] {
+            let WorkspaceError::Tool {
+                subcommand, stderr, ..
+            } = &e
+            else {
+                panic!("{e:?}");
+            };
+            assert_eq!(subcommand, "config", "the probe is the first git call");
+            assert!(stderr.starts_with(&hint) && stderr.contains(said), "{e:?}");
+            // the hint and git's own first line, on the one line shown
+            assert!(
+                e.to_string()
+                    .starts_with(&format!("f/c/a: git config: {hint}")),
+                "{e}"
+            );
+        }
+    }
+    // the real git, for contrast: no hint on an error that is not git's
+    // failing to run
+    let rt = Runtime::new(layout.clone(), tools.clone());
+    let e = rt.version(&id, "origin/no-such-branch").unwrap_err();
+    assert!(!e.to_string().contains("git_read"), "{e}");
+    // nor on a file the agent made unreadable, though git says
+    // `Permission denied` about it
+    let secret = paths.workspace.join("secret");
+    std::fs::write(&secret, "s\n").unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&secret).is_err() {
+        let e = rt.diff(&id, "origin/main").unwrap_err();
+        let WorkspaceError::Tool { stderr, .. } = &e else {
+            panic!("{e:?}");
+        };
+        assert!(stderr.contains("Permission denied"), "{e:?}");
+        assert!(!stderr.contains("git_read"), "{e:?}");
+    }
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+/// #213: a `version` whose git hangs is ended within `VERSION_BUDGET` and
+/// fails as `TimedOut`, and nothing it started is left running: nono
+/// forwards SIGTERM to the sandboxed shell, which leaves the shim's
+/// `sleep` re-parented away, and the deadline still ends it.
+#[test]
+fn a_hung_version_is_ended_with_everything_it_started() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("inspect-hung");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let (id, layout) = clone_with_changes(&root, &tools);
+    let paths = layout.agent(&id);
+    // a duration no other process on the host sleeps for
+    let secs = (1_000_000 + std::process::id()).to_string();
+    let shim = root.join("git-hangs.sh");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --exec-path ] && exec {git} \"$@\"; done\nsleep {secs} &\nwait\n",
+            git = tools.git.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let rt = Runtime::new(
+        layout.clone(),
+        balerix_runtime::ToolPaths {
+            git: shim,
+            ..tools.clone()
+        },
+    );
+    let sleeps = || -> Vec<u32> {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                let live = balerix_runtime::supervise::Procfs::default()
+                    .identity(*pid)
+                    .is_ok_and(|id| id.is_some());
+                live && cmdline.ends_with(format!("\0{secs}\0").as_bytes())
+            })
+            .collect()
+    };
+
+    let start = std::time::Instant::now();
+    let e = rt.version(&id, "origin/main").unwrap_err();
+    let took = start.elapsed();
+    assert_eq!(
+        e,
+        WorkspaceError::TimedOut {
+            id: "f/c/a".into(),
+            subcommand: "version".into(),
+            after: VERSION_BUDGET,
+        }
+    );
+    assert_eq!(
+        e.to_string(),
+        "f/c/a: workspace version: timed out after 6s"
+    );
+    // the start's deadline is the budget less the grace, and the grace
+    // comes after it; the plugin SDK gives up at 10 s
+    assert!(
+        took >= VERSION_BUDGET - std::time::Duration::from_secs(2)
+            && took < std::time::Duration::from_secs(10),
+        "{took:?}"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !sleeps().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shim's sleep outlived the deadline: {:?}",
+            sleeps()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // and the start's nono home went with it
+    let homes: Vec<_> = std::fs::read_dir(paths.nono_home.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".nono-git-"))
+        .collect();
+    assert!(homes.is_empty(), "{homes:?}");
+    let log = std::fs::read_to_string(layout.crew(&id.crew_ref()).logs.join("git.log")).unwrap();
+    assert!(log.contains("[timed out after "), "{log}");
 }

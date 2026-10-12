@@ -2590,6 +2590,7 @@ fn a_nono_that_cannot_run_fails_the_removal_and_keeps_the_clone() {
     assert!(e.starts_with("f/c/a: git "), "{e}");
     assert!(
         e.starts_with("f/c/a: git version: the sandbox did not start; see ")
+            && e.contains("/logs/git.log and ")
             && e.contains("/logs/nono-git.log: "),
         "{e}"
     );
@@ -2900,7 +2901,8 @@ fn a_git_outside_the_system_prefixes_needs_git_read() {
             "f/c/a: git version: git could not run under the git profile (the sandbox itself starts); \
              if it loads libraries from outside /usr, /lib, /lib64 and /bin, add that prefix to \
              `sandbox.git_read` in the daemon's config.toml; see "
-        ) && e.contains("/logs/nono-git.log: "),
+        ) && e.contains("/logs/git.log and ")
+            && e.contains("/logs/nono-git.log: "),
         "{e}"
     );
     assert!(paths.workspace.exists(), "a failed removal deletes nothing");

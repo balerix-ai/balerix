@@ -2,17 +2,17 @@
 //! The Phase 3 journey on a kind cluster (Spec O §15, §21.4): apply a
 //! Daemon and a Fleet, wait Ready, evict a pod and see it resume on its
 //! claim, drop an agent and find its branch in the crew cache, delete the
-//! Fleet with `retain: None` and find the crew's directories emptied and
-//! the fleet gone from the Daemon's list. And the plugin journey (§23.6):
-//! flow and web listed and Ready, a flow rule acting on an agent's Stop,
-//! web's review page through the Daemon, web's config rolling its pod, and
-//! the fake plugin's managed Fleet coming and going. Each journey has a
-//! namespace of its own. The operator runs in the cluster, installed by
-//! `scripts/operator.sh e2e` from the chart (§24.3); each journey installs
-//! the daemon chart into its namespace. Needs `KUBECONFIG`
-//! (scripts/kind-up.sh), `BALERIX_K8S_IMAGES` and `BALERIX_K8S_CHARTS`, and
-//! `BALERIX_K8S_PLUGIN_IMAGES` for the plugin journey; skips without them,
-//! fails under `BALERIX_REQUIRE_TOOLS=1`.
+//! Fleet with `retain: None` and `balerix.ai/purge: "true"` and find the
+//! crew's directories emptied and the fleet gone from the Daemon. And the
+//! plugin journey (§23.6): flow and web listed and Ready, a flow rule
+//! acting on an agent's Stop, web's review page through the Daemon, web's
+//! config rolling its pod, and the fake plugin's managed Fleet coming and
+//! going. Each journey has a namespace of its own. The operator runs in the
+//! cluster, installed by `scripts/operator.sh e2e` from the chart (§24.3);
+//! each journey installs the daemon chart into its namespace. Needs
+//! `KUBECONFIG` (scripts/kind-up.sh), `BALERIX_K8S_IMAGES` and
+//! `BALERIX_K8S_CHARTS`, and `BALERIX_K8S_PLUGIN_IMAGES` for the plugin
+//! journey; skips without them, fails under `BALERIX_REQUIRE_TOOLS=1`.
 //! kind's network plugin does not enforce NetworkPolicy: the operator's
 //! policies are applied here but inert.
 mod support;
@@ -22,7 +22,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use balerix_api::FleetRecord;
 use balerix_operator::api::{Agent, Crew, Daemon, Fleet, FleetSpec, Plugin, PluginSpec};
 use futures_util::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
@@ -579,7 +578,19 @@ async fn the_phase_3_journey_on_kind() {
         "branch {branch} not in the cache: {listed:?}"
     );
 
-    // 6. the Fleet deleted with retain: None: the crew's directories emptied
+    // 6. the Fleet, marked `balerix.ai/purge: "true"`, deleted with
+    // retain: None: the crew's directories emptied and the Daemon's record
+    // purged, with no shell on the Daemon's pod (§25, #135)
+    fleets
+        .patch(
+            "f",
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": { "balerix.ai/purge": "true" } }
+            })),
+        )
+        .await
+        .unwrap();
     fleets.delete("f", &DeleteParams::default()).await.unwrap();
     wait_for("the Fleet gone", Duration::from_secs(600), || async {
         fleets.get_opt("f").await.unwrap().is_none().then_some(())
@@ -595,38 +606,35 @@ async fn the_phase_3_journey_on_kind() {
     )
     .unwrap();
 
-    // and the Daemon still lists the fleet, downed (O-16: `retain: None` is a
-    // plain `down`, which keeps the record; only a purge drops it): asked as
-    // the operator asks, with the
-    // admin token and the authority the operator minted, through the
-    // port-forward under the Service's own name
+    // and the Daemon no longer has the fleet: the finalizer went after the
+    // purge was taken, and the Daemon drops the record right after its
+    // reply. Asked as the operator asks, with the admin token and the
+    // authority the operator minted, through the port-forward under the
+    // Service's own name
     let (http, base, token) = admin_http(&client, &ns, forward_port).await;
-    // the port-forward restarts now and then: retry the transport, not the answer
-    let response = wait_for("the Daemon to answer", Duration::from_secs(60), || async {
-        http.get(format!("{base}/v1/fleets/f"))
+    // the port-forward restarts now and then: retry the transport, and
+    // the answer until the record is gone; a timeout names the last answer
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let last = match http
+            .get(format!("{base}/v1/fleets/f"))
             .bearer_auth(&token)
             .send()
             .await
-            .ok()
-    })
-    .await;
-    // the Down reply is sent after the mirror pass, so the phase is already
-    // Down and the Daemon's view of the pods is cleared
-    assert_eq!(
-        response.status(),
-        reqwest::StatusCode::OK,
-        "the Daemon keeps the downed fleet f"
-    );
-    let record: FleetRecord = response.json().await.unwrap();
-    assert!(
-        record.is_down(),
-        "fleet f is not down: {:?}",
-        record.desired
-    );
-    assert!(
-        record.status.agents.is_empty(),
-        "the downed fleet f still lists agents"
-    );
+        {
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => break,
+            Ok(r) => {
+                let status = r.status();
+                format!("{status}: {}", r.text().await.unwrap_or_default())
+            }
+            Err(e) => format!("no answer: {}", e.without_url()),
+        };
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the Daemon to drop fleet f; its last answer: {last}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Spec O §17 sub-project 4 / §23.6: flow and web listed and Ready; a flow

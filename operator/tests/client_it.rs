@@ -91,7 +91,8 @@ async fn each_answer_has_its_meaning() {
             )
             .route(
                 "/v1/fleets/broken",
-                put(|| async { refusal(StatusCode::INTERNAL_SERVER_ERROR, "disk full") }),
+                put(|| async { refusal(StatusCode::INTERNAL_SERVER_ERROR, "disk full") })
+                    .delete(|| async { refusal(StatusCode::INTERNAL_SERVER_ERROR, "disk full") }),
             )
             .route(
                 "/v1/fleets/absent",
@@ -124,6 +125,15 @@ async fn each_answer_has_its_meaning() {
     );
     assert_eq!(c.get("absent").await.unwrap(), None);
     c.down("absent").await.unwrap();
+    // a record the Daemon no longer has is purged already (§25)
+    c.purge("absent").await.unwrap();
+    assert_eq!(
+        c.purge("broken").await.unwrap_err(),
+        ClientError::Unexpected {
+            status: 500,
+            message: "disk full".into()
+        }
+    );
     assert_eq!(
         c.ready().await.unwrap_err(),
         ClientError::Unavailable("daemon pool: pending".into())
@@ -391,6 +401,19 @@ async fn a_real_kubernetes_mode_daemon_takes_the_operators_apply() {
         ClientError::Conflict("this daemon is in kubernetes mode; create a Fleet object".into())
     );
     c.down("payments").await.unwrap();
+    // O-16: a down keeps the record; §25: the purge after it drops it, and
+    // a second purge finds nothing and is fine
+    assert!(c.get("payments").await.unwrap().unwrap().is_down());
+    c.purge("payments").await.unwrap();
+    // the actor purges right after its reply
+    for _ in 0..50 {
+        if c.get("payments").await.unwrap().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(c.get("payments").await.unwrap(), None);
+    c.purge("payments").await.unwrap();
 
     // a client holding another authority does not trust this Daemon
     let stranger = pki::new_authority("team-a", "default", now()).unwrap();

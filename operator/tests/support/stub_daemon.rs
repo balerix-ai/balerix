@@ -1,25 +1,30 @@
 //! A scripted Daemon over plain HTTP (Spec O §21.3): records every `PUT`
-//! and `DELETE`, answers `GET` with the record it keeps, and can be told
-//! to reject or to stop.
+//! and `DELETE` (with its query), answers `GET` with the record it keeps,
+//! and can be told to reject, to answer a purge with given statuses, or
+//! to stop.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use balerix_api::{
-    AgentStatus, DeclaredPlugins, ErrorBody, FleetRecord, FleetRequest, ManagedFleet, PluginStatus,
+    AgentStatus, DeclaredPlugins, DownQuery, ErrorBody, FleetRecord, FleetRequest, ManagedFleet,
+    PluginStatus,
 };
 
 #[derive(Default)]
 struct Inner {
     puts: Vec<FleetRequest>,
-    deletes: Vec<String>,
+    deletes: Vec<(String, DownQuery)>,
+    /// The statuses the next purges answer, in order; the last one
+    /// answers every purge after it. 204 when empty.
+    purge_answers: Vec<StatusCode>,
     records: BTreeMap<String, FleetRecord>,
     reject: Option<String>,
     /// `<fleet>` to (`fleet/crew/agent` to status), laid over every record read.
@@ -89,11 +94,31 @@ async fn get_fleet(State(s): State<Shared>, Path(name): Path<String>) -> axum::r
     }
 }
 
-async fn delete_fleet(State(s): State<Shared>, Path(name): Path<String>) -> StatusCode {
+async fn delete_fleet(
+    State(s): State<Shared>,
+    Path(name): Path<String>,
+    Query(query): Query<DownQuery>,
+) -> axum::response::Response {
     let mut inner = s.0.lock().unwrap();
-    inner.deletes.push(name.clone());
+    let purge = query.purge;
+    inner.deletes.push((name.clone(), query));
+    if purge && let Some(&first) = inner.purge_answers.first() {
+        let status = first;
+        if inner.purge_answers.len() > 1 {
+            inner.purge_answers.remove(0);
+        }
+        if !status.is_success() {
+            return (
+                status,
+                Json(ErrorBody {
+                    error: format!("no purge of {name} ({status})"),
+                }),
+            )
+                .into_response();
+        }
+    }
     inner.records.remove(&name);
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn put_plugins(
@@ -158,8 +183,18 @@ impl StubDaemon {
     pub fn puts(&self) -> Vec<FleetRequest> {
         self.state.0.lock().unwrap().puts.clone()
     }
+    /// The fleet each `DELETE` named.
     pub fn deletes(&self) -> Vec<String> {
+        self.delete_queries().into_iter().map(|(f, _)| f).collect()
+    }
+    /// Each `DELETE`'s fleet and query, in order.
+    pub fn delete_queries(&self) -> Vec<(String, DownQuery)> {
         self.state.0.lock().unwrap().deletes.clone()
+    }
+    /// The next purges answer these statuses, in order, the last one for
+    /// good: until the test calls this again.
+    pub fn answer_purges(&self, statuses: &[StatusCode]) {
+        self.state.0.lock().unwrap().purge_answers = statuses.to_vec();
     }
     pub fn lists(&self) -> Vec<DeclaredPlugins> {
         self.state.0.lock().unwrap().lists.clone()

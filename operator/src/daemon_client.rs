@@ -1,9 +1,10 @@
 //! The Daemon's admin API, as the operator uses it (Spec O §5.2, §7.4):
-//! `PUT /v1/fleets/{name}` with one token per agent, the forced `DELETE`,
-//! the fleet's record, `/readyz`, and the plugins' `PUT`/`GET /v1/plugins`
-//! and `GET /v1/managed-fleets` (§23). It trusts one authority, the
-//! Daemon's own (§10.3), and nothing else; the Daemon holds no Kubernetes
-//! credentials, so everything between the two goes through here (O-8).
+//! `PUT /v1/fleets/{name}` with one token per agent, the forced `DELETE`
+//! (a down, or a purge), the fleet's record, `/readyz`, and the plugins'
+//! `PUT`/`GET /v1/plugins` and `GET /v1/managed-fleets` (§23). It trusts
+//! one authority, the Daemon's own (§10.3), and nothing else; the Daemon
+//! holds no Kubernetes credentials, so everything between the two goes
+//! through here (O-8).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -234,8 +235,21 @@ impl DaemonClient {
     /// The operator's down: `DELETE …?force=true` (§7.4). A fleet the
     /// Daemon does not have is already down.
     pub async fn down(&self, fleet: &str) -> Result<(), ClientError> {
+        self.delete(fleet, false).await
+    }
+
+    /// The purge of a deleted Fleet marked `balerix.ai/purge` (#135):
+    /// `DELETE …?force=true&purge=true`, which drops the Daemon's record
+    /// and its sealed secrets. A fleet the Daemon does not have is already
+    /// purged, so a repeat is a no-op.
+    pub async fn purge(&self, fleet: &str) -> Result<(), ClientError> {
+        self.delete(fleet, true).await
+    }
+
+    async fn delete(&self, fleet: &str, purge: bool) -> Result<(), ClientError> {
         let query = DownQuery {
             force: true,
+            purge,
             ..Default::default()
         }
         .to_query_string();

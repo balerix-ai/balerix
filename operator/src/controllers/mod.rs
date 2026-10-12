@@ -87,6 +87,11 @@ pub enum Error {
     Join(#[from] tokio::task::JoinError),
     #[error("{0}")]
     Daemon(#[from] ClientError),
+    /// The Daemon did not take a deleted Fleet's purge (§25, #135):
+    /// backed off like any Daemon failure, and named as the purge on the
+    /// Fleet's `Deleting`.
+    #[error("the purge: {0}")]
+    Purge(ClientError),
     #[error("{0}")]
     Desired(#[from] DesiredError),
     #[error("{0}")]

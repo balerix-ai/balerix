@@ -34,6 +34,12 @@ pub struct FleetSpec {
 }
 
 /// `Branches` is `down --keep-repos`, `None` is plain `down` (O-16).
+/// Either keeps the fleet's record on the Daemon. The annotation
+/// `balerix.ai/purge: "true"` on the Fleet counts only once the Fleet is
+/// deleted: it then skips every agent's harvest and purges that record
+/// after the down and any cleanup. An agent dropped while the Fleet lives
+/// is still harvested. With `Branches` the crew cache, and the branches
+/// harvested into it before, is kept (Spec O §25).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum Retain {
     #[default]

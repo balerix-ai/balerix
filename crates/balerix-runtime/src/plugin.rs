@@ -1,6 +1,6 @@
 //! Materializing a plugin (plugins spec §5.1): the sandboxed home, the
-//! profile, `launch.sh` running `nono run → mise run <start>` from the
-//! package root, and the daemon-side `mise install`.
+//! profile, `launch.sh` running `agent-supervise → nono run → mise run
+//! <start>` from the package root, and the daemon-side `mise install`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -115,8 +115,11 @@ pub fn plugin_grants(
     }
 }
 
-/// `launch.sh` and the `LaunchPlan`: `cd <package> && exec env -i … nono
-/// run --profile … -- mise run <start>`. No secret is an input here.
+/// `launch.sh` and the `LaunchPlan`: `cd <package> && exec env -i …
+/// balerix agent-supervise -- nono run --profile … -- mise run <start>`.
+/// The supervisor stands in front of nono as it does for an agent (Spec N
+/// amendment §13.4, #119), so a plugin's stop and restart end its whole
+/// process tree. No secret is an input here.
 pub fn render_plugin_launch(
     plugin: &ResolvedPlugin,
     paths: &PluginPaths,
@@ -128,6 +131,9 @@ pub fn render_plugin_launch(
         ("HOME".to_string(), paths.nono_home.display().to_string()),
     ]);
     let mut argv: Vec<String> = vec![
+        tools.balerix.display().to_string(),
+        "agent-supervise".into(),
+        "--".into(),
         tools.nono.display().to_string(),
         "-s".into(),
         "--log-file".into(),
@@ -471,7 +477,14 @@ mod tests {
         assert!(!script.contains("tok"), "no token input exists here");
         assert_eq!(plan.cwd, Path::new("/data/plugins/web/abc123def456"));
         assert_eq!(plan.script, paths.launch);
-        assert_eq!(plan.argv[0], "/opt/nono");
+        assert!(
+            script.contains("'/opt/balerix' 'agent-supervise' '--' '/opt/nono' '-s' '--log-file'"),
+            "{script}"
+        );
+        assert_eq!(
+            plan.argv[..4],
+            ["/opt/balerix", "agent-supervise", "--", "/opt/nono"].map(String::from)
+        );
         assert_eq!(plan.argv.last().unwrap(), "serve");
         assert_eq!(plan.env.len(), 2);
     }

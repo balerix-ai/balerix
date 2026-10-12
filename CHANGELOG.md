@@ -61,6 +61,14 @@
   run under the daemon's git profile (it exits 126 or 127), `diff` and
   `version` now name `sandbox.git_read` and both logs, as a removal
   already did (#214).
+- A plugin now starts under `balerix agent-supervise`, as an agent has
+  since 0.2.1 (#119). Stopping, restarting or purging a plugin ends
+  everything it started, including processes that ignore the hangup or
+  detach (`setsid`, a double fork), and waits for them: such a plugin
+  now takes the 2 s grace to stop, and a stop still failing after 5 s
+  reports `agent processes still running after stop`. Nothing to do: the
+  upgraded daemon restarts every running plugin on its first pass, and
+  that restart's stop is the last one without the wrapper.
 
 ## 0.2.4 - 2026-10-10
 

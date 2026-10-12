@@ -132,11 +132,12 @@ credentials, hook input, or sandbox rules.
   project that uses them: a core dependency in the root
   `[workspace.dependencies]`, a plugin dependency in that plugin's own
   manifest. Exact version either way, and say why in the commit.
-- An agent's `launch.sh` starts under `balerix agent-supervise` (Spec N
-  amendment §13). `balerix-runtime`'s test support fills the `balerix`
-  tool slot with the test executable, so a test there must not execute a
-  rendered `launch.sh`; tests that need the wrapper live in
-  `crates/balerix/tests/cli_supervise.rs`. Never call
+- An agent's and a plugin's `launch.sh` start under `balerix
+  agent-supervise` (Spec N amendment §13, #119). `balerix-runtime`'s test
+  support fills the `balerix` tool slot with the test executable, so a
+  test there must not execute a rendered `launch.sh` (`plugin_it` runs
+  the plugin's with the wrapper's words taken out); tests that need the
+  wrapper live in `crates/balerix/tests/cli_supervise.rs`. Never call
   `balerix_runtime::supervise::supervise` inside a test process: it makes
   the process a subreaper and kills every descendant.
 - `agent/` is standalone like a plugin (own `Cargo.lock`, `deny.toml`,

@@ -244,6 +244,7 @@ mod tests {
                 sender: "@rahul:h".into(),
                 thread_root: Some("$root:h".into()),
                 body: "run the tests".into(),
+                history: false,
             }))
             .unwrap();
         for _ in 0..2048 {

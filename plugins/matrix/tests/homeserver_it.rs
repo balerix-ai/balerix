@@ -19,8 +19,9 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
+use balerix_api::PluginAction;
 use balerix_plugin_matrix::MatrixLauncher;
-use balerix_plugin_matrix::actor::{Counters, Health, Queue};
+use balerix_plugin_matrix::actor::{Command, Counters, Health, Queue};
 use balerix_plugin_matrix::client::restore_and_prove;
 use balerix_plugin_matrix::config::{self, Secret};
 use balerix_plugin_matrix::plugin::Launcher;
@@ -174,7 +175,9 @@ async fn room_send(
 async fn not_found() -> Response {
     (
         StatusCode::NOT_FOUND,
-        Json(json!({ "errcode": "M_UNRECOGNIZED", "error": "not in the mock" })),
+        // `M_NOT_FOUND`, so a state lookup such as a room's encryption
+        // event reads as "no such state" rather than as a failure.
+        Json(json!({ "errcode": "M_NOT_FOUND", "error": "not in the mock" })),
     )
         .into_response()
 }
@@ -324,4 +327,237 @@ async fn a_token_refreshed_during_start_up_is_sealed_and_the_next_start_uses_it(
         .await
         .expect("the next start restores the re-sealed pair");
     assert_eq!(mock.lock().refreshes, 1, "no second refresh was needed");
+}
+
+const ROOM: &str = "!crew:mock";
+const RAHUL: &str = "@rahul:mock";
+const ROOT: &str = "$root:mock";
+
+fn reply(id: &str, ts: u64, body: &str) -> Value {
+    reply_from(RAHUL, id, ts, body)
+}
+
+fn reply_from(sender: &str, id: &str, ts: u64, body: &str) -> Value {
+    json!({
+        "type": "m.room.message",
+        "event_id": id,
+        "sender": sender,
+        "origin_server_ts": ts,
+        "content": {
+            "msgtype": "m.text",
+            "body": body,
+            "m.relates_to": {
+                "rel_type": "m.thread",
+                "event_id": ROOT,
+                "is_falling_back": true,
+                "m.in_reply_to": { "event_id": ROOT }
+            }
+        }
+    })
+}
+
+/// Our own membership changing to `membership`, by `sender`, from `prev`.
+fn member(id: &str, ts: u64, sender: &str, membership: &str, prev: Option<&str>) -> Value {
+    let mut event = json!({
+        "type": "m.room.member",
+        "event_id": id,
+        "sender": sender,
+        "state_key": USER,
+        "origin_server_ts": ts,
+        "content": { "membership": membership }
+    });
+    if let Some(prev) = prev {
+        event["unsigned"] = json!({ "prev_content": { "membership": prev } });
+    }
+    event
+}
+
+fn joined(state: Vec<Value>, timeline: Vec<Value>) -> Value {
+    joined_limited(state, timeline, false)
+}
+
+fn joined_limited(state: Vec<Value>, timeline: Vec<Value>, limited: bool) -> Value {
+    json!({ "join": { ROOM: {
+        "state": { "events": state },
+        "timeline": { "events": timeline, "limited": limited, "prev_batch": "p0" }
+    }}})
+}
+
+fn create() -> Value {
+    json!({
+        "type": "m.room.create", "event_id": "$create:mock", "sender": RAHUL,
+        "state_key": "", "origin_server_ts": 1, "content": { "creator": RAHUL }
+    })
+}
+
+/// A launched plugin with alice's thread in `ROOM`, and the actor
+/// configured, ready for scripted syncs.
+async fn launched_with_thread(fake: &FakeHost, mock: &Mock, dir: &Scratch) -> Started {
+    let started = launcher(fake, mock, dir);
+    session::store(&started.host, &cached(mock, "at-1", "rt-1"))
+        .await
+        .unwrap();
+    // The thread the replies belong to, as an earlier `SessionStart` left it.
+    started
+        .host
+        .kv_put(
+            "thread/f/c/alice",
+            &serde_json::to_vec(&json!({
+                "session_id": "s1", "root": ROOT, "room": ROOM, "closed": false
+            }))
+            .unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    started
+        .queue
+        .push(Command::Configure(started.config.clone()))
+        .unwrap();
+    // Alice is active, as the daemon re-activates every agent at start.
+    started
+        .queue
+        .push(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: config::parse_agent(&json!({})).unwrap(),
+        })
+        .unwrap();
+    started
+        .launcher
+        .launch(started.config.clone(), started.queue.clone())
+        .await
+        .unwrap();
+    started
+}
+
+/// Waits until `n` actions reached alice, failing after 20 s.
+async fn routed(fake: &FakeHost, n: usize) -> Vec<PluginAction> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while fake.actions_for("f/c/alice").len() < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out; routed so far: {:?}",
+            fake.actions_for("f/c/alice")
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fake.actions_for("f/c/alice")
+}
+
+fn text(t: &str) -> PluginAction {
+    PluginAction::SendText {
+        text: t.into(),
+        submit: true,
+    }
+}
+
+/// #262 over the real pump: the bot is in the crew room and routes a
+/// reply; it is kicked and invited back; the join sync carries the room's
+/// recent history — the reply it already routed, and one sent while it was
+/// out — and neither reaches the agent. Every reply in a later sync does,
+/// whatever its timestamp: one from a homeserver whose clock runs ahead,
+/// then one from a homeserver whose clock runs behind, stamped even before
+/// the bot's join. A later sync that
+/// delivers an already handled event id again routes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejoin_routes_nothing_from_the_history_its_join_sync_carries() {
+    let mock = Mock::start("at-1").await;
+    let fake = FakeHost::start("tok", json!({}), Vec::new()).await;
+    let dir = scratch("rejoin");
+    let started = launched_with_thread(&fake, &mock, &dir).await;
+    let create = create();
+    {
+        let mut hs = mock.lock();
+        // In the room, and a reply that is routed.
+        hs.syncs.push_back(joined(
+            vec![create],
+            vec![
+                member("$join1:mock", 100, USER, "join", None),
+                reply("$r1:mock", 200, "first"),
+            ],
+        ));
+        // Kicked.
+        hs.syncs.push_back(json!({ "leave": { ROOM: {
+            "state": { "events": [] },
+            "timeline": { "events": [
+                member("$kick:mock", 300, RAHUL, "leave", Some("join"))
+            ]}
+        }}}));
+        // Invited back.
+        hs.syncs.push_back(json!({ "invite": { ROOM: {
+            "invite_state": { "events": [{
+                "type": "m.room.member", "sender": RAHUL, "state_key": USER,
+                "content": { "membership": "invite" }
+            }]}
+        }}}));
+        // The join sync, with the history since before the kick.
+        hs.syncs.push_back(joined(
+            vec![],
+            vec![
+                reply("$r1:mock", 200, "first"),
+                member("$kick:mock", 300, RAHUL, "leave", Some("join")),
+                reply("$r2:mock", 350, "while kicked"),
+                member("$invite:mock", 400, RAHUL, "invite", Some("leave")),
+                member("$join2:mock", 500, USER, "join", Some("invite")),
+            ],
+        ));
+        // Live again: a reply stamped by a clock far ahead.
+        let ahead = reply_from("@ann:fast", "$r3:fast", 900_000, "new reply");
+        hs.syncs.push_back(joined(vec![], vec![ahead.clone()]));
+        // The same event again, then a reply stamped by a clock behind.
+        hs.syncs.push_back(joined(
+            vec![],
+            vec![
+                ahead,
+                reply_from("@bob:slow", "$r4:slow", 450, "slow clock"),
+            ],
+        ));
+    }
+
+    routed(&fake, 3).await;
+    assert_eq!(
+        fake.actions_for("f/c/alice"),
+        vec![text("first"), text("new reply"), text("slow clock")],
+        "the join sync's history and the redelivery routed nothing; both \
+         live replies routed, out of timestamp order"
+    );
+    assert_eq!(
+        started
+            .launcher
+            .counters
+            .inbound
+            .with_label_values(&["before_join"])
+            .get(),
+        2,
+        "the pump dropped both history messages, without queueing them"
+    );
+}
+
+/// A gappy join: the bot joined, then more happened than one timeline
+/// holds, so the response's timeline is `limited` and the join is only in
+/// its state section. Nothing in that timeline is history — it all follows
+/// the join — so every reply is routed, even one stamped earlier than the
+/// join by a homeserver whose clock runs behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gappy_join_routes_everything_its_timeline_carries() {
+    let mock = Mock::start("at-1").await;
+    let fake = FakeHost::start("tok", json!({}), Vec::new()).await;
+    let dir = scratch("gappy");
+    let _started = launched_with_thread(&fake, &mock, &dir).await;
+
+    mock.lock().syncs.push_back(joined_limited(
+        vec![
+            create(),
+            member("$join:mock", 100, USER, "join", Some("invite")),
+        ],
+        vec![
+            reply_from("@bob:slow", "$g1:slow", 50, "gappy one"),
+            reply("$g2:mock", 200, "gappy two"),
+        ],
+        true,
+    ));
+    assert_eq!(
+        routed(&fake, 2).await,
+        vec![text("gappy one"), text("gappy two")]
+    );
 }

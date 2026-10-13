@@ -38,6 +38,10 @@ pub struct Inbound {
     /// The `m.thread` relation's root, when the message has one.
     pub thread_root: Option<String>,
     pub body: String,
+    /// Delivered by the sync whose timeline carries the bot's own join, and
+    /// from before that join: history the rejoin brought, never a reply
+    /// (`replay::history`, #262).
+    pub history: bool,
 }
 
 pub trait MatrixPort: Send + Sync + 'static {

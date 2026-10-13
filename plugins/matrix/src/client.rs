@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use balerix_plugin_common::queue::Full;
 use balerix_plugin_sdk::Host;
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::config::{RequestConfig, SyncSettings};
@@ -25,18 +26,25 @@ use matrix_sdk::ruma::events::InitialStateEvent;
 use matrix_sdk::ruma::events::reaction::ReactionEventContent;
 use matrix_sdk::ruma::events::relation::{Annotation, Thread};
 use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
-use matrix_sdk::ruma::events::room::message::{
-    MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+use matrix_sdk::ruma::events::room::member::MembershipState;
+use matrix_sdk::ruma::events::room::message::{MessageType, Relation, RoomMessageEventContent};
+use matrix_sdk::ruma::events::{
+    AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
+    SyncStateEvent,
 };
 use matrix_sdk::ruma::{EventId, RoomId, UserId, uint};
 use matrix_sdk::store::{RoomLoadSettings, StateStoreDataKey};
-use matrix_sdk::{Client, HttpError, RoomState, SessionChange, SessionMeta, SessionTokens};
+use matrix_sdk::sync::SyncResponse;
+use matrix_sdk::{
+    Client, HttpError, LoopCtrl, RoomState, SessionChange, SessionMeta, SessionTokens,
+};
 use tokio::sync::broadcast;
 
 use crate::actor::{Actor, Command, Counters, Health, Queue};
 use crate::config::{DaemonConfig, Secret};
 use crate::matrix::{FAILED, Inbound, MatrixError, MatrixPort};
 use crate::plugin::Launcher;
+use crate::replay::{self, Entry};
 use crate::session::{self, Plan, Session};
 
 /// What a rate limit costs when the homeserver refuses to say. The actor
@@ -374,82 +382,109 @@ impl RefusalThrottle {
     }
 }
 
-/// The inbound pump: a sync loop that reconnects for as long as the process
-/// lives, pushing `Command::Inbound` onto `queue` for every text message in
-/// a room the account is in. It gives up only when the homeserver rejects
-/// the session, which no amount of reconnecting would mend, and it fails
-/// `health` on the way out so `plugin list` says so.
-async fn start_inbound_pump(client: Client, queue: Arc<Queue>, counters: Counters, health: Health) {
-    // The returned handle only exists to remove the handler again, which
-    // nothing here ever does: the pump lives as long as the process.
-    let pump_counters = counters.clone();
-    let throttle = Arc::new(RefusalThrottle::default());
-    client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
-        let queue = queue.clone();
-        let counters = pump_counters.clone();
-        let throttle = throttle.clone();
-        async move {
-            // Everything the actor never needs to see is dropped here: a
-            // reaction, a state event, an emote, a room we only watch from
-            // an invite, and an empty body.
-            if room.state() != RoomState::Joined {
-                return;
+/// One timeline event, reduced to what `replay::history` needs.
+fn entry<'a>(own_user_id: &UserId, event: Option<&'a AnySyncTimelineEvent>) -> Entry<'a> {
+    match event {
+        Some(AnySyncTimelineEvent::State(AnySyncStateEvent::RoomMember(
+            SyncStateEvent::Original(member),
+        ))) if member.state_key == own_user_id => {
+            // Only `prev_content` says what the membership was before. With
+            // it absent the event is taken as a join from outside the room:
+            // the spec makes `prev_content` part of every state event that
+            // replaced another, and the bot never changes its own profile,
+            // so the one case misread — a join-on-join profile change sent
+            // without `prev_content` — needs an operator editing the bot's
+            // profile and a homeserver leaving the field out. ruma's
+            // member `unsigned` does not carry `replaces_state`, so it
+            // cannot stand in.
+            let was_joined = member
+                .unsigned
+                .prev_content
+                .as_ref()
+                .is_some_and(|prev| prev.membership == MembershipState::Join);
+            if member.content.membership == MembershipState::Join && !was_joined {
+                Entry::OwnJoin {
+                    ts: member.origin_server_ts.0.into(),
+                }
+            } else {
+                Entry::Other
             }
+        }
+        Some(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+            SyncMessageLikeEvent::Original(message),
+        ))) => Entry::Message {
+            sender: message.sender.as_str(),
+            ts: message.origin_server_ts.0.into(),
+        },
+        _ => Entry::Other,
+    }
+}
+
+/// Every text message in the joined rooms of one sync response, in each
+/// room's timeline order, as the `Inbound` the actor takes.
+///
+/// This reads the response rather than registering an event handler,
+/// because whether a message is history is a fact about the response it
+/// came in: one whose timeline also carries our own join, ahead of it
+/// (`replay::history`, #262). A handler sees one event at a time and
+/// cannot tell. The timeline events are the SDK's processed ones, so a
+/// message in an encrypted room arrives decrypted, as it did to a handler.
+fn inbound_from(own_user_id: &UserId, response: &SyncResponse) -> Vec<Inbound> {
+    let mut inbound = Vec::new();
+    for (room, update) in &response.rooms.joined {
+        let events: Vec<Option<AnySyncTimelineEvent>> = update
+            .timeline
+            .events
+            .iter()
+            .map(|e| e.raw().deserialize().ok())
+            .collect();
+        let entries: Vec<Entry<'_>> = events
+            .iter()
+            .map(|e| entry(own_user_id, e.as_ref()))
+            .collect();
+        let history = replay::history(own_user_id.as_str(), &entries);
+        for (event, history) in events.iter().zip(history) {
+            let Some(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                SyncMessageLikeEvent::Original(event),
+            ))) = event
+            else {
+                continue;
+            };
+            // Everything the actor never needs to see is dropped here: a
+            // reaction, a state event, an emote, and an empty body.
             let MessageType::Text(text) = &event.content.msgtype else {
-                return;
+                continue;
             };
             if text.body.trim().is_empty() {
-                return;
+                continue;
             }
             let thread_root = match &event.content.relates_to {
                 Some(Relation::Thread(thread)) => Some(thread.event_id.to_string()),
                 _ => None,
             };
-            let threaded = thread_root.is_some();
-            let pushed = queue.push(Command::Inbound(Inbound {
-                room: room.room_id().to_string(),
+            inbound.push(Inbound {
+                room: room.to_string(),
                 event_id: event.event_id.to_string(),
                 // The same ruma `OwnedUserId` rendering `whoami` gave the
                 // port's `user_id`, so the actor's byte comparison holds.
                 sender: event.sender.to_string(),
                 thread_root,
                 body: text.body.clone(),
-            }));
-            let Err(full) = pushed else {
-                return;
-            };
-            // #260: the actor is too far behind. Every refusal is counted.
-            // A thread reply, the only kind that could have reached an
-            // agent, gets ❗ as one that could not be delivered, so its
-            // sender can send it again: from a task of its own, since this
-            // handler runs inside sync and would hold up every room, and
-            // at most once per sender and room per `REFUSAL_EVERY`, so a
-            // flood is not answered with one. Our own echoes get nothing.
-            counters.inbound.with_label_values(&["queue_full"]).inc();
-            if !threaded
-                || event.sender == room.own_user_id()
-                || !throttle.allow(
-                    room.room_id().as_str(),
-                    event.sender.as_str(),
-                    Instant::now(),
-                )
-            {
-                return;
-            }
-            tracing::warn!("matrix: refused a reply in {}: {full}", room.room_id());
-            tokio::spawn(async move {
-                let content = ReactionEventContent::new(Annotation::new(
-                    event.event_id.clone(),
-                    FAILED.to_string(),
-                ));
-                if let Err(e) = room.send(content).await {
-                    counters.errors.with_label_values(&["react"]).inc();
-                    tracing::warn!("matrix: reacting to {}: {e}", event.event_id);
-                }
+                history,
             });
         }
-    });
+    }
+    inbound
+}
 
+/// The inbound pump: a sync loop that reconnects for as long as the process
+/// lives, pushing `Command::Inbound` onto `queue` for every text message in
+/// a room the account is in. It gives up only when the homeserver rejects
+/// the session, which no amount of reconnecting would mend, and it fails
+/// `health` on the way out so `plugin list` says so.
+async fn start_inbound_pump(client: Client, queue: Arc<Queue>, counters: Counters, health: Health) {
+    // One throttle for the pump's lifetime, across reconnects (#260).
+    let throttle = Arc::new(RefusalThrottle::default());
     // A homeserver can be down for an hour; the plugin should still be
     // reading replies when it comes back. The SDK's own retry is off (it
     // would swallow the rate limit the actor is written to handle), so the
@@ -459,9 +494,9 @@ async fn start_inbound_pump(client: Client, queue: Arc<Queue>, counters: Counter
     let mut auth_failures: u32 = 0;
     loop {
         let started = Instant::now();
-        let Err(e) = sync(&client).await else {
-            // `Client::sync` returns `Ok` only if a sync callback asked it
-            // to stop, and ours never does.
+        let Err(e) = sync(&client, &queue, &counters, &throttle).await else {
+            // The sync loop returns `Ok` only if its callback asked it to
+            // stop, and ours never does.
             tracing::error!("matrix: the sync loop ended; no reply can arrive");
             return;
         };
@@ -521,7 +556,16 @@ async fn start_inbound_pump(client: Client, queue: Arc<Queue>, counters: Counter
 /// one sync with a filter that asks for no timeline events at all and start
 /// the live sync from the token it returns. The store keeps that token, so
 /// both a reconnect and a restart resume instead of replaying.
-async fn sync(client: &Client) -> Result<(), matrix_sdk::Error> {
+async fn sync(
+    client: &Client,
+    queue: &Arc<Queue>,
+    counters: &Counters,
+    throttle: &Arc<RefusalThrottle>,
+) -> Result<(), matrix_sdk::Error> {
+    let own_user_id = client
+        .user_id()
+        .map(ToOwned::to_owned)
+        .ok_or(matrix_sdk::Error::AuthenticationRequired)?;
     if client
         .state_store()
         .get_kv_data(StateStoreDataKey::SyncToken)
@@ -532,11 +576,88 @@ async fn sync(client: &Client) -> Result<(), matrix_sdk::Error> {
         filter.room.timeline.limit = Some(uint!(0));
         let settings =
             SyncSettings::new().filter(sync_events::v3::Filter::FilterDefinition(filter));
+        // Nothing in it is routed: it exists to fetch a token, and what a
+        // homeserver that ignored the filter sent would be history.
         client.sync_once(settings).await?;
     }
     // `SyncSettings::new()` resumes from the token the store holds, which is
     // the one the filtered sync above just wrote.
-    client.sync(SyncSettings::new()).await
+    client
+        .sync_with_result_callback(SyncSettings::new(), |result| {
+            let client = client.clone();
+            let own_user_id = own_user_id.clone();
+            let queue = queue.clone();
+            let counters = counters.clone();
+            let throttle = throttle.clone();
+            async move {
+                let response = result?;
+                for message in inbound_from(&own_user_id, &response) {
+                    // History never takes a queue slot: a join sync can
+                    // carry a timeline's worth of it, which would use up
+                    // the inbound lane's budget and have live replies
+                    // refused. It is never answered with ❗ either. The
+                    // actor checks the flag again, as a backstop.
+                    if message.history {
+                        counters.inbound.with_label_values(&["before_join"]).inc();
+                        continue;
+                    }
+                    if let Err(full) = queue.push(Command::Inbound(message)) {
+                        refused(&client, &own_user_id, &counters, &throttle, full);
+                    }
+                }
+                Ok(LoopCtrl::Continue)
+            }
+        })
+        .await
+}
+
+/// A reply the queue refused because the actor is too far behind (#260).
+/// Every refusal is counted. A thread reply, the only kind that could have
+/// reached an agent, gets ❗ as one that could not be delivered, so its
+/// sender can send it again: from a task of its own, since this runs inside
+/// sync and would hold up every room, and at most once per sender and room
+/// per `REFUSAL_EVERY`, so a flood is not answered with one. Our own echoes
+/// get nothing, and history never gets here.
+fn refused(
+    client: &Client,
+    own_user_id: &UserId,
+    counters: &Counters,
+    throttle: &RefusalThrottle,
+    full: Full<Command>,
+) {
+    counters.inbound.with_label_values(&["queue_full"]).inc();
+    let Command::Inbound(message) = full.0 else {
+        return;
+    };
+    if message.thread_root.is_none()
+        || message.sender == own_user_id.as_str()
+        || !throttle.allow(&message.room, &message.sender, Instant::now())
+    {
+        return;
+    }
+    tracing::warn!(
+        "matrix: refused a reply in {}: the actor is too far behind",
+        message.room
+    );
+    let (Ok(room_id), Ok(event_id)) = (
+        RoomId::parse(&message.room),
+        EventId::parse(&message.event_id),
+    ) else {
+        return;
+    };
+    let client = client.clone();
+    let counters = counters.clone();
+    tokio::spawn(async move {
+        let Some(room) = client.get_room(&room_id) else {
+            return;
+        };
+        let content =
+            ReactionEventContent::new(Annotation::new(event_id.clone(), FAILED.to_string()));
+        if let Err(e) = room.send(content).await {
+            counters.errors.with_label_values(&["react"]).inc();
+            tracing::warn!("matrix: reacting to {event_id}: {e}");
+        }
+    });
 }
 
 /// `matrix-sdk` rotates the access token when it spends the refresh token,

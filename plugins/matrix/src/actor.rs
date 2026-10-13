@@ -2,7 +2,7 @@
 //! bounded drop-oldest queue that feeds it (G-11), and the counters and
 //! health cell it publishes through.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +21,7 @@ use crate::matrix::{ACK, CONFIRMED, FAILED, Inbound, MatrixError, MatrixPort, RE
 use crate::pending::{OpenQuestion, Questions};
 use crate::question;
 use crate::render::{self, PhaseChange};
+use crate::replay::Marks;
 use crate::routing::{Maps, Thread, crew_of};
 
 pub use balerix_plugin_common::queue::{Health, QUEUE};
@@ -215,6 +216,9 @@ pub struct Actor<M: MatrixPort> {
     /// Prompts sent and not yet confirmed by the agent's own
     /// `UserPromptSubmit` (Spec M §8.7).
     deliveries: Deliveries<Sent>,
+    /// The event ids of the inbound messages handled per room, so one
+    /// delivered again is never handled twice (Spec G §9.3, #262).
+    marks: Marks,
 }
 
 impl<M: MatrixPort> Actor<M> {
@@ -231,6 +235,7 @@ impl<M: MatrixPort> Actor<M> {
             questions: Questions::default(),
             cooldowns: HashMap::new(),
             deliveries: Deliveries::default(),
+            marks: Marks::default(),
         }
     }
 
@@ -267,6 +272,10 @@ impl<M: MatrixPort> Actor<M> {
         match Questions::load(&self.host).await {
             Ok(questions) => self.questions = questions,
             Err(e) => tracing::warn!("matrix: loading questions: {e}"),
+        }
+        match Marks::load(&self.host).await {
+            Ok(marks) => self.marks = marks,
+            Err(e) => tracing::warn!("matrix: loading handled event ids: {e}"),
         }
         self.publish_gauges();
     }
@@ -314,6 +323,7 @@ impl<M: MatrixPort> Actor<M> {
                 if let Err(e) = self.maps.forget(&self.host, &agent).await {
                     tracing::warn!("matrix: forgetting {agent}: {e}");
                 }
+                self.prune_marks().await;
                 self.publish_gauges();
             }
             Command::Events { dropped, events } => {
@@ -332,6 +342,48 @@ impl<M: MatrixPort> Actor<M> {
             }
             Command::Inbound(message) => self.on_inbound(message).await,
             Command::Tick => self.on_tick().await,
+        }
+    }
+
+    /// The rooms a message can still reach an agent through: every room an
+    /// agent's thread is in, every pinned room, and the room of every
+    /// active agent's crew.
+    fn live_rooms(&self) -> BTreeSet<String> {
+        let mut live: BTreeSet<String> = self.maps.thread_rooms().map(str::to_string).collect();
+        if let Some(config) = &self.config {
+            live.extend(config.rooms.values().cloned());
+        }
+        for agent in self.agents.keys() {
+            if let Some(room) = crew_of(agent).and_then(|crew| self.maps.room(crew)) {
+                live.insert(room.to_string());
+            }
+        }
+        live
+    }
+
+    /// `live_rooms().contains(room)`, without building the set.
+    fn is_live(&self, room: &str) -> bool {
+        self.maps.thread_rooms().any(|r| r == room)
+            || self
+                .config
+                .as_ref()
+                .is_some_and(|c| c.rooms.values().any(|r| r == room))
+            || self
+                .agents
+                .keys()
+                .filter_map(|agent| crew_of(agent).and_then(|crew| self.maps.room(crew)))
+                .any(|r| r == room)
+    }
+
+    /// Drops the handled ids of rooms no longer in use (#262), so the KV
+    /// record holds only what can still guard a delivery. Run at
+    /// `deactivate` only: at load the config, and so the pinned rooms, are
+    /// not known yet, and at `configure` the agents have not been activated
+    /// again, so either would drop rooms still in use.
+    async fn prune_marks(&mut self) {
+        let live = self.live_rooms();
+        if let Err(e) = self.marks.retain(&self.host, &live).await {
+            tracing::warn!("matrix: pruning handled event ids: {e}");
         }
     }
 
@@ -765,6 +817,28 @@ impl<M: MatrixPort> Actor<M> {
         if message.sender == self.port.user_id() {
             count("own_message");
             return;
+        }
+        // History a rejoin carries, or a message already handled: dropped
+        // before any other rule, so not even a refusal is repeated (#262).
+        if message.history {
+            count("before_join");
+            return;
+        }
+        if self.marks.seen(&message.room, &message.event_id) {
+            count("replayed");
+            return;
+        }
+        // Recorded before anything is done with it: a crash part-way through
+        // may lose this message, but it can never type it in twice. Only in
+        // a room still in use, which is the only kind whose message can
+        // reach an agent, and the only kind `prune_marks` keeps.
+        if self.is_live(&message.room)
+            && let Err(e) = self
+                .marks
+                .record(&self.host, &message.room, &message.event_id)
+                .await
+        {
+            tracing::warn!("matrix: recording a handled event id: {e}");
         }
         let Some(root) = message.thread_root.clone() else {
             count("not_a_thread");
@@ -1737,9 +1811,14 @@ mod tests {
     use crate::matrix::{ACK, FAILED, REFUSED, SENT};
     use balerix_api::PluginAction;
 
+    /// A new message each call, with its own event id, as a homeserver
+    /// would send.
     fn inbound(room: &str, root: Option<&str>, sender: &str, body: &str) -> Inbound {
-        inbound_with_id(room, root, sender, body, "$msg:fake")
+        let n = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        inbound_with_id(room, root, sender, body, &format!("$msg{n}:fake"))
     }
+
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
     fn inbound_with_id(
         room: &str,
@@ -1754,6 +1833,7 @@ mod tests {
             sender: sender.to_string(),
             thread_root: root.map(str::to_string),
             body: body.to_string(),
+            history: false,
         }
     }
 
@@ -2243,14 +2323,157 @@ mod tests {
         assert!(again.questions.is_open("f/c/alice"));
     }
 
+    fn history(mut message: Inbound) -> Inbound {
+        message.history = true;
+        message
+    }
+
+    /// #262: the join sync after a kick and re-invite carries the room's
+    /// recent history. None of it is typed in or refused again — a 🚫 on
+    /// every old room-level message would be noise too — and a reply after
+    /// the join is routed as usual.
+    #[tokio::test]
+    async fn history_from_before_the_join_is_neither_routed_nor_refused() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        let rahul = "@rahul:example.org";
+        for message in [
+            history(inbound(&room, Some(&root), rahul, "old reply")),
+            history(inbound(&room, None, rahul, "old chatter")),
+        ] {
+            a.handle(Command::Inbound(message)).await;
+        }
+        assert!(fake.actions_for("f/c/alice").is_empty());
+        assert!(port.calls().is_empty(), "{:?}", port.calls());
+        assert_eq!(
+            a.counters.inbound.with_label_values(&["before_join"]).get(),
+            2
+        );
+
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            rahul,
+            "new reply",
+        )))
+        .await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendText {
+                text: "new reply".into(),
+                submit: true
+            }]
+        );
+    }
+
+    /// #262's second guard: an event id already handled is not handled
+    /// again, by this actor or by the next one; a different id always is.
+    #[tokio::test]
+    async fn a_redelivered_event_id_is_dropped_even_after_a_restart() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        let rahul = "@rahul:example.org";
+        let reply = inbound_with_id(&room, Some(&root), rahul, "go", "$go:fake");
+        a.handle(Command::Inbound(reply.clone())).await;
+        a.handle(Command::Inbound(reply.clone())).await;
+        assert_eq!(fake.actions_for("f/c/alice").len(), 1);
+        assert_eq!(reactions(&port.calls()), vec![SENT.to_string()]);
+        assert_eq!(a.counters.inbound.with_label_values(&["replayed"]).get(), 1);
+        drop(a);
+
+        let host = Host::new(fake.env("matrix", std::path::Path::new("scratch"))).unwrap();
+        let mut again = Actor::new(
+            host,
+            FakePort::new("@balerix:example.org"),
+            counters(),
+            Health::new(),
+        );
+        again.load().await;
+        again.handle(Command::Configure(daemon_config())).await;
+        again
+            .handle(Command::Activate {
+                agent: "f/c/alice".into(),
+                config: agent_config(&[]),
+            })
+            .await;
+        again.handle(Command::Inbound(reply)).await;
+        assert_eq!(fake.actions_for("f/c/alice").len(), 1, "nothing replayed");
+        assert_eq!(
+            again
+                .counters
+                .inbound
+                .with_label_values(&["replayed"])
+                .get(),
+            1
+        );
+
+        again
+            .handle(Command::Inbound(inbound(&room, Some(&root), rahul, "next")))
+            .await;
+        assert_eq!(fake.actions_for("f/c/alice").len(), 2);
+    }
+
+    /// The `routed` record keeps only rooms still in use: a room whose last
+    /// thread is gone loses its ids at `deactivate`; a restart keeps every
+    /// room's ids, pinned ones included, since the config is not known at
+    /// load; and a message in a room not in use is not recorded at all.
+    #[tokio::test]
+    async fn handled_ids_are_kept_for_rooms_in_use_only() {
+        let (fake, _port, mut a, room, root) = with_thread().await;
+        let rahul = "@rahul:example.org";
+        a.handle(Command::Inbound(inbound(&room, Some(&root), rahul, "go")))
+            .await;
+        a.handle(Command::Inbound(inbound(
+            "!elsewhere:fake",
+            None,
+            rahul,
+            "hi",
+        )))
+        .await;
+        let routed = || fake.kv_json(crate::replay::ROUTED_KEY).unwrap();
+        assert!(routed().get(&room).is_some());
+        assert!(
+            routed().get("!elsewhere:fake").is_none(),
+            "a room not in use is not recorded"
+        );
+
+        // A pinned room with no thread yet, and a restart.
+        let host = Host::new(fake.env("matrix", std::path::Path::new("scratch"))).unwrap();
+        let mut pinned = daemon_config();
+        pinned.rooms.insert("f/p".into(), "!pinned:fake".into());
+        a.handle(Command::Configure(pinned.clone())).await;
+        a.handle(Command::Inbound(inbound("!pinned:fake", None, rahul, "hi")))
+            .await;
+        assert!(routed().get("!pinned:fake").is_some());
+        drop(a);
+        let mut again = Actor::new(
+            host,
+            FakePort::new("@balerix:example.org"),
+            counters(),
+            Health::new(),
+        );
+        again.load().await;
+        again.handle(Command::Configure(pinned)).await;
+        assert!(
+            routed().get("!pinned:fake").is_some(),
+            "a restart keeps a pinned room's ids"
+        );
+
+        again.handle(deactivate("f/c/alice")).await;
+        assert_eq!(
+            routed(),
+            json!({ "!pinned:fake": [routed()["!pinned:fake"][0].clone()] }),
+            "the room's only thread is gone; the pinned room stays"
+        );
+    }
+
     #[tokio::test]
     async fn a_thread_reply_is_marked_sent_and_confirmed_when_claude_takes_it() {
         let (fake, port, mut a, room, root) = with_thread().await;
-        a.handle(Command::Inbound(inbound(
+        a.handle(Command::Inbound(inbound_with_id(
             &room,
             Some(&root),
             "@rahul:example.org",
             "run the tests",
+            "$msg:fake",
         )))
         .await;
         assert_eq!(

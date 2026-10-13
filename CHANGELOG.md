@@ -114,6 +114,33 @@
   cleanup Jobs no longer have one either; they are deleted an hour after
   they finish (`ttlSecondsAfterFinished: 3600`). A harvest or cleanup
   still under way at the upgrade starts again once.
+- An Agent whose branch changes (its `branch` in the Fleet set, changed
+  or removed) now gets the host's behaviour (Spec O §8.5, §27, #128): the
+  pod is deleted, a harvest Job (`harvest --branch <new>`, with only the
+  clone's directory of the claim writable) fetches the old branch into
+  the crew cache and empties the clone, and only then does the new pod
+  start, on the same claim, and clone the new branch. It used to leave
+  the agent down with a `Materialized=False` git error. A clone with
+  uncommitted changes, or any harvest that fails, keeps the clone and the
+  pod away, with `Ready=False`, reason `BranchChangeBlocked`. Set the
+  branch back, commit or discard the changes in the pod, then change it
+  again; or annotate the Agent `balerix.ai/purge=true`, which discards
+  the clone's uncommitted changes and unpushed commits. The operator
+  never removes that annotation: remove it yourself; until you do, every
+  branch change and the Agent's removal discard unpushed work (a
+  `PurgeAnnotationKept` Warning Event on the Agent says so). The agent
+  claim now records its clone's branch in the annotation
+  `balerix.ai/branch`. Existing claims get the Agent's current branch on
+  the first reconcile, with no harvest. An Agent already stuck on a
+  branch change at the upgrade is recorded under its new branch and
+  stays stuck: set its branch back (the pod starts on the old clone),
+  then change it again.
+- An Agent's deletion now waits for its own harvest Job while it is still
+  running, up to the Job's deadline (an hour), instead of replacing it
+  when the Job's input changed (after an image bump at the upgrade, for
+  instance); the Agent's `Ready` says `Deleting`, naming the Job. A
+  branch change likewise waits for a running harvest Job, and no pod
+  starts while one runs.
 - A plugin whose name contains `-` now has its metric families under
   `balerix_plugin_<name>_`, with `-` in the name written as `_` (#224):
   `my-plugin`'s are `balerix_plugin_my_plugin_…`. Registering any family

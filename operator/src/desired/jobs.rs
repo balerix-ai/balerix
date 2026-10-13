@@ -80,7 +80,20 @@ struct Parts {
     slices: Vec<Slice>,
     volumes: Vec<Value>,
     mounts: Vec<Value>,
+    /// More of the input hash, beyond the pod's own shape: a branch
+    /// change's old branch (§27.2). `Null` adds nothing, so the other
+    /// Jobs' hashes are what they were.
+    also_hashed: Value,
+    /// A directory under the agent claim's `AGENT_DIR` the `slice` init
+    /// container makes as the Job's user, with that sub-path (never the
+    /// whole claim) at `CLAIM_INIT`: a sub-path the kubelet made would be
+    /// root's.
+    claim_dir: Option<String>,
 }
+
+/// Where a branch change's `slice` init container sees the claim's
+/// `AGENT_DIR`.
+const CLAIM_INIT: &str = "/balerix/claim";
 
 fn tool_args(table: &BTreeMap<String, String>) -> Vec<String> {
     table
@@ -109,6 +122,11 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
             .iter()
             .map(|s| format!("{VOLUME}/{}", s.sub_path)),
     );
+    let mut init_mounts = vec![json!({ "name": "shared", "mountPath": VOLUME })];
+    if let Some(dir) = &parts.claim_dir {
+        mkdir.push(format!("{CLAIM_INIT}/{dir}"));
+        init_mounts.push(json!({ "name": "agent", "mountPath": CLAIM_INIT, "subPath": AGENT_DIR }));
+    }
     let mut mounts: Vec<Value> = parts
         .slices
         .iter()
@@ -140,6 +158,9 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
     // earlier object of the same name is stale, not this one's outcome
     if !parts.owned {
         input["for"] = ctx.owner["uid"].clone();
+    }
+    if !parts.also_hashed.is_null() {
+        input["also"] = parts.also_hashed;
     }
     let input = hash(&input);
     let mut metadata = json!({
@@ -173,7 +194,7 @@ fn job(ctx: &JobContext<'_>, parts: Parts) -> Result<Job, DesiredError> {
                         // a failed `mkdir` reports its stderr as the message
                         "terminationMessagePolicy": "FallbackToLogsOnError",
                         "securityContext": container_security(),
-                        "volumeMounts": [{ "name": "shared", "mountPath": VOLUME }],
+                        "volumeMounts": init_mounts,
                     }],
                     "containers": [{
                         "name": "job",
@@ -217,6 +238,8 @@ pub fn remove_job(ctx: &JobContext<'_>, fleet: &str, crew: &str) -> Result<Job, 
             ],
             volumes: vec![],
             mounts: vec![],
+            also_hashed: Value::Null,
+            claim_dir: None,
         },
     )
 }
@@ -234,6 +257,8 @@ pub fn daemon_pool_job(ctx: &JobContext<'_>) -> Result<Job, DesiredError> {
             slices: vec![slice(names::vol_daemon_pool(), "daemon", true)],
             volumes: vec![],
             mounts: vec![],
+            also_hashed: Value::Null,
+            claim_dir: None,
         },
     )
 }
@@ -261,6 +286,8 @@ pub fn fleet_pool_job(
             ],
             volumes: vec![],
             mounts: vec![],
+            also_hashed: Value::Null,
+            claim_dir: None,
         },
     )
 }
@@ -316,6 +343,8 @@ pub fn crew_sync_job(
             ],
             volumes,
             mounts,
+            also_hashed: Value::Null,
+            claim_dir: None,
         },
     )
 }
@@ -328,8 +357,59 @@ pub fn harvest_job(
     agent_name: &str,
     agent: &AgentSpec,
 ) -> Result<Job, DesiredError> {
+    harvest(ctx, agent_name, agent, None)
+}
+
+/// A branch change (§27): the clone on the claim was made for `from`,
+/// and the Agent's branch is now `to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchMove<'a> {
+    pub from: &'a str,
+    pub to: &'a str,
+    /// The Agent's `balerix.ai/purge`: the clone is removed unread.
+    pub purge: bool,
+}
+
+/// The harvest Job of a branch change (§27.2), by the harvest Job's name
+/// and labels: `harvest --branch <to>` settles the clone as the pod's
+/// `ensure_clone` would, with the cache writable, so the claim is
+/// mounted read-write: the old branch harvested and the clone removed,
+/// or the clone kept where a host keeps it. Its hash also holds `from`,
+/// so it is never a removal's harvest, nor the change before it.
+pub fn branch_change_job(
+    ctx: &JobContext<'_>,
+    agent_name: &str,
+    agent: &AgentSpec,
+    change: &BranchMove<'_>,
+) -> Result<Job, DesiredError> {
+    harvest(ctx, agent_name, agent, Some(change))
+}
+
+fn harvest(
+    ctx: &JobContext<'_>,
+    agent_name: &str,
+    agent: &AgentSpec,
+    change: Option<&BranchMove<'_>>,
+) -> Result<Job, DesiredError> {
     let mut args = strings(&["harvest", "--agent"]);
     args.push(format!("{}/{}/{}", agent.fleet, agent.crew, agent.agent));
+    let mut also_hashed = Value::Null;
+    if let Some(change) = change {
+        args.extend(["--branch".to_string(), change.to.to_string()]);
+        if change.purge {
+            args.push("--purge".to_string());
+        }
+        also_hashed = json!({ "from": change.from });
+    }
+    // the claim read-only; a branch change's clone alone read-write,
+    // where the Job empties it (§27.2)
+    let mut mounts = vec![
+        json!({ "name": "agent", "mountPath": "/balerix/agent", "subPath": AGENT_DIR, "readOnly": true }),
+    ];
+    let claim_dir = change.map(|_| "workspace".to_string());
+    if change.is_some() {
+        mounts.push(json!({ "name": "agent", "mountPath": "/balerix/agent/workspace", "subPath": format!("{AGENT_DIR}/workspace"), "readOnly": false }));
+    }
     job(
         ctx,
         Parts {
@@ -357,11 +437,11 @@ pub fn harvest_job(
             ],
             volumes: vec![json!({
                 "name": "agent",
-                "persistentVolumeClaim": { "claimName": agent_name, "readOnly": true },
+                "persistentVolumeClaim": { "claimName": agent_name, "readOnly": change.is_none() },
             })],
-            mounts: vec![
-                json!({ "name": "agent", "mountPath": "/balerix/agent", "subPath": AGENT_DIR, "readOnly": true }),
-            ],
+            mounts,
+            also_hashed,
+            claim_dir,
         },
     )
 }
@@ -625,6 +705,121 @@ mod tests {
         assert_eq!(
             hash_of(&crew_sync_job(&c, &crew("gh"), Some("gh-token")).unwrap()),
             hash_of(&crew_sync_job(&later, &crew("gh"), Some("gh-token")).unwrap())
+        );
+    }
+
+    /// §27.2: a branch change's harvest is the harvest Job by name and
+    /// labels, with the new branch in its args and the claim writable;
+    /// its hash is never a removal's, the change before it, or its
+    /// purged form's.
+    #[test]
+    fn a_branch_changes_harvest_names_its_branch_and_hashes_the_old_one() {
+        let images = images();
+        let c = ctx(&images);
+        let hash_of =
+            |job: &Job| job.metadata.annotations.as_ref().unwrap()[HASH_ANNOTATION].clone();
+        let change = |from, to, purge| {
+            branch_change_job(
+                &c,
+                "payments-backend-alice",
+                &agent(),
+                &BranchMove { from, to, purge },
+            )
+            .unwrap()
+        };
+        let removal = harvest_job(&c, "payments-backend-alice", &agent()).unwrap();
+        let a_to_b = change("a", "b", false);
+        assert_eq!(a_to_b.metadata.name, removal.metadata.name);
+        assert_eq!(a_to_b.metadata.labels, removal.metadata.labels);
+        let pod = serde_json::to_value(&a_to_b.spec.as_ref().unwrap().template.spec).unwrap();
+        assert_eq!(
+            pod["containers"][0]["args"],
+            json!([
+                "harvest",
+                "--agent",
+                "payments/backend/alice",
+                "--branch",
+                "b"
+            ])
+        );
+        // the claim read-only, but for its clone (§27.2)
+        let agent_mounts: Vec<_> = pod["containers"][0]["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["name"] == "agent")
+            .map(|m| {
+                (
+                    m["mountPath"].clone(),
+                    m["subPath"].clone(),
+                    m["readOnly"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            agent_mounts,
+            [
+                (json!("/balerix/agent"), json!("agent"), json!(true)),
+                (
+                    json!("/balerix/agent/workspace"),
+                    json!("agent/workspace"),
+                    json!(false)
+                ),
+            ]
+        );
+        let init = &pod["initContainers"][0];
+        assert_eq!(
+            init["command"].as_array().unwrap().last().unwrap(),
+            "/balerix/claim/workspace"
+        );
+        // the claim's `agent/` alone, never the whole claim
+        assert!(init["volumeMounts"].as_array().unwrap().contains(
+            &json!({ "name": "agent", "mountPath": "/balerix/claim", "subPath": "agent" })
+        ));
+        insta::assert_yaml_snapshot!("job_branch_change", a_to_b);
+        assert_eq!(
+            a_to_b
+                .spec
+                .as_ref()
+                .unwrap()
+                .ttl_seconds_after_finished
+                .map(i64::from),
+            Some(FINISHED_TTL_SECONDS)
+        );
+        assert_eq!(a_to_b.metadata.owner_references, None);
+
+        assert_eq!(hash_of(&a_to_b), hash_of(&change("a", "b", false)));
+        assert_ne!(hash_of(&a_to_b), hash_of(&removal));
+        // a -> b, b -> a, a -> b: each the one before's successor is
+        // stale, never read as its own success
+        assert_ne!(hash_of(&a_to_b), hash_of(&change("b", "a", false)));
+        // the same new branch from another old one
+        assert_ne!(hash_of(&a_to_b), hash_of(&change("c", "b", false)));
+        // the purge replaces a failed harvest
+        let purged = change("a", "b", true);
+        assert_ne!(hash_of(&a_to_b), hash_of(&purged));
+        let args = serde_json::to_value(&purged.spec.as_ref().unwrap().template.spec).unwrap()
+            ["containers"][0]["args"]
+            .clone();
+        assert_eq!(args.as_array().unwrap().last().unwrap(), "--purge");
+        // and its owner's uid, as any unowned Job's (§26.3)
+        let mut later = ctx(&images);
+        later.owner["uid"] = json!("another-uid");
+        assert_ne!(
+            hash_of(&a_to_b),
+            hash_of(
+                &branch_change_job(
+                    &later,
+                    "payments-backend-alice",
+                    &agent(),
+                    &BranchMove {
+                        from: "a",
+                        to: "b",
+                        purge: false
+                    }
+                )
+                .unwrap()
+            )
         );
     }
 

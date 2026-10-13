@@ -200,6 +200,40 @@ fn harvest_with_no_clone_says_so() {
         ],
     );
     assert_eq!((code, line.as_str()), (Some(0), "nothing to harvest"));
+    // the branch-change Job over a claim with no clone (Spec O §8.5)
+    let (code, line) = run(
+        &d,
+        &[
+            "harvest",
+            "--agent",
+            "f/c/a",
+            "--agent-dir",
+            &claim.display().to_string(),
+            "--branch",
+            "feature/x",
+        ],
+    );
+    assert_eq!(
+        (code, line.as_str()),
+        (Some(0), "no clone; feature/x is cloned anew")
+    );
+    let (code, line) = run(
+        &d,
+        &[
+            "harvest",
+            "--agent",
+            "f/c/a",
+            "--agent-dir",
+            &claim.display().to_string(),
+            "--branch",
+            "feature/x",
+            "--purge",
+        ],
+    );
+    assert_eq!(
+        (code, line.as_str()),
+        (Some(0), "clone removed unharvested (purge) for feature/x")
+    );
     let (code, line) = run(
         &d,
         &[

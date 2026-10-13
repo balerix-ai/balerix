@@ -6,7 +6,8 @@
 in §7.4; sub-project 3a decisions in §20; sub-project 4 decisions in
 §23; sub-project 5 decisions in §24; the purge of a deleted Fleet's
 record (#135) in §25; objects found by name, names that meet and
-foreground deletion (#232, #233) in §26
+foreground deletion (#232, #233) in §26; an Agent's branch change
+(#128) in §27
 **Scope:** running balerix on Kubernetes. A `balerix-operator` reconciles
 five custom resources (Daemon, Fleet, Crew, Agent, Plugin) into pods,
 claims, Secrets and Jobs. Each Daemon object is a `balerix serve` instance
@@ -642,13 +643,15 @@ the crew's agents wait.
 claim read-only and the crew cache read-write: `check_clone`, then the
 fetch from inside the cache under the git nono profile, exactly as
 `harvest_and_remove` does (Spec N). It needs Landlock like any agent.
+With `--branch <new>` it is a branch change's (§27): the clone alone
+writable, settled as the pod's `ensure_clone` would.
 
 ### 8.5 Removal
 
 | Event | Harvest | Claim | Cache |
 |---|---|---|---|
 | Agent dropped from a live Fleet | yes | deleted | kept |
-| Agent's `branch` changed | yes | recreated | kept |
+| Agent's `branch` changed | yes | kept, its clone removed (§27) | kept |
 | Fleet deleted, `retain: Branches` | yes | deleted | kept |
 | Fleet deleted, `retain: None` | no | deleted | deleted |
 
@@ -1760,13 +1763,14 @@ Known in 3b and left open:
 - The lost requests are hyper#4207 (a stale HTTP/1 want pools a connection
   mid-watch); until a fixed hyper ships, the watches run on an unpooled
   client (#129). The per-request timeout is §22.1.
-- §8.5's "the Agent's branch changed" row is not built: a branch change is
-  a spec change, so the Pod is replaced on the same claim, and the
-  sidecar's `ensure_clone` then wants to recreate the clone, which
-  harvests into a crew cache mounted read-only in the pod. The agent stays
-  down with a `Materialized=False` git error; the old clone is kept. The
-  fix is the controller's: note the branch the claim was made for, and on
-  a change run the harvest Job, delete the claim and make a new one.
+- Done in §27 (#128): §8.5's "the Agent's branch changed" row was not
+  built: a branch change is a spec change, so the Pod was replaced on
+  the same claim, and the sidecar's `ensure_clone` then wanted to
+  recreate the clone, which harvests into a crew cache mounted read-only
+  in the pod. The agent stayed down with a `Materialized=False` git
+  error; the old clone was kept. The claim now records its clone's branch, and a change
+  runs the harvest Job and removes the clone before the new pod starts;
+  the claim is kept, not made again.
 - What did not bite on kind (ubuntu-24.04): the `slice` init `mkdir`, the
   `/tmp` emptyDirs and the sidecar's sandbox self-test. The crew cache is a
   clone with a work tree (`repo/.git`). Pool Jobs took 4 to 19 s and the
@@ -2999,3 +3003,174 @@ before the Fleet's own finalizer runs.
 - **`plugins_it`** waits for the plugin's NetworkPolicy, the last object
   applied, before it checks the rest: each apply is now preceded by its
   ownership read.
+
+## 27. An Agent's branch changed (2026-10, #128)
+
+§21.6 left §8.5's second row open. On a host, a changed branch is
+`ensure_clone`'s (Spec N §4): `decide_clone` harvests the old branch into
+the crew cache and re-creates a clean clone, refuses a dirty one naming
+both branches, and keeps a clone whose HEAD is detached or already on the
+new branch. In a pod the crew cache is mounted read-only, so the
+sidecar's `ensure_clone` cannot harvest: the operator does it first.
+
+### 27.1 The record
+
+- **The agent claim records its clone's branch** in the annotation
+  `balerix.ai/branch`: the Agent's branch as `ResolvedAgent::branch`
+  names it (`settings.branch`, else `balerix/<fleet>/<crew>/<agent>`),
+  set by the apply that creates the claim. The claim is applied only
+  when it is created, so a later spec never moves the record past a
+  harvest. The record moves only by a merge patch under
+  `balerix-operator-patch` (§26.1), with the claim's uid in the patch.
+- **A claim with no record** (an earlier operator's) is recorded under
+  the Agent's branch on the next reconcile, with no harvest and no new
+  pod: its pod was made from the same spec. An Agent already stuck on a
+  branch change at the upgrade is recorded under its new branch and
+  stays stuck; setting its branch back lets the pod start on the old
+  clone (the Job below keeps a clone whose marker names the branch), and
+  a second change then harvests.
+
+### 27.2 The change
+
+When the Agent's branch differs from the claim's record, after the
+claim, bundle and policy are judged and applied (§26.1), and before the
+Pod:
+
+1. **The old pod is deleted** (`delete_read`): the branch is part of the
+   `specHash`, so the pod was being replaced anyway. No new pod is made
+   while the record differs. `Ready=False`, reason `BranchChanging`.
+2. **The harvest Job runs over the claim:** `names::harvest_job`, the
+   harvest Job's labels, no owner reference and the TTL (§26.3), through
+   `ensure_job` with the crew lock, as the removal's harvest. Its
+   command is `balerix-agent harvest --agent <id> --branch <new>`, which
+   runs `Workspace::settle_clone`, the existing-clone half of
+   `ensure_clone`, with the cache writable: a clean clone has the
+   marker's branch harvested and is emptied out; a dirty one, or a 0.1
+   worktree, fails; one already on `<new>` (its marker or HEAD) or with
+   a detached HEAD is kept, as on a host.
+3. **On its success the record moves to the new branch,** and the pod is
+   made in the same reconcile. Its `ensure_clone` finds no clone and
+   clones the new branch from `origin/<branch>` or the crew's `ref`. A
+   pod's cache slice holds objects only, so unlike a host it does not
+   seed from a harvested copy of the new branch; the harvested old
+   branch stays in the cache, as a removal's does (§8.5).
+
+- **Only the clone is writable.** The Job mounts the claim read-only at
+  `/balerix/agent` and the clone alone read-write over it, the sub-path
+  `agent/workspace` at `/balerix/agent/workspace`; its `slice` init
+  container mounts the sub-path `agent` (never the whole claim) and makes
+  `workspace` there as uid 10001 (a sub-path the kubelet made would be
+  root's). `agent/` itself is the agent pod's `claim` init container's
+  (§21.6), made before any clone existed to change. `settle_clone` itself removes nothing and writes
+  no marker: a host's `ensure_clone` removes the directory and writes the
+  marker; the Job empties the directory, which is its mount point, and
+  leaves a `Record` case's marker to the pod's `ensure_clone`. Emptying
+  renames `.git` to `.git.removing` first, so a Job stopped part-way
+  leaves no half-deleted clone, only leftovers without `.git`, which the
+  next run or the pod's `ensure_clone` removes. Entries are removed by
+  their own type, so a symlink the agent planted in its clone is removed
+  and never followed. The empty directory is what the pod's
+  `ensure_clone` takes for no clone (`discard_half_made` already accepts
+  an emptied mount point).
+- **Why the Job removes the clone, not the sidecar.** Teaching the
+  sidecar to re-clone would need it to know the harvest happened, from a
+  record only the operator writes, and the sidecar would carry a second
+  removal path. A separate removal Job after a read-only harvest would
+  be a second Job name, attempt count and wait for one step. The harvest
+  Job already runs the checks, the sandbox and the fetch, and
+  `settle_clone` is the host's own decision, so a host and a pod judge a
+  clone alike, a dirty clone included. The cost is the one Job with a
+  writable mount of the claim, narrowed to the clone.
+- **Why the claim is kept,** where §21.6 proposed making it again: it
+  also holds the agent's home and state, which a host keeps across a
+  branch change. Only the clone goes.
+- **The hash.** The Job's args carry the new branch and `--purge`, and
+  its input hash also holds the old branch (`also.from`) and, as any
+  unowned Job's, the Agent's uid. So it is never read as a removal's
+  harvest, whose hash is unchanged, nor as the change before it: a →
+  b, b → a, a → b each differs from the Job before it, and a finished
+  Job kept by its TTL is `Stale` to the next. A repeat of the same change
+  after a lost record patch finds its own success and only moves the
+  record.
+- **A running harvest Job is let finish.** A harvest Job of the Agent's
+  that still runs, or is being deleted with its pod, holds the pod
+  whatever it was made for: the branch set back mid-harvest makes the
+  record match again, and the pod would otherwise start while the Job
+  empties the clone (`Ready=False`, `BranchChanging`, "harvest Job `<job>`
+  not finished; the pod waits for it"). A Job being deleted holds only
+  until `stuck_after` (5 min) past its deletion timestamp, the crew
+  lock's bound for a lost node (§22.3): its pod there never finishes
+  deleting, and the deadline and TTL do not apply to a Job being deleted.
+  Past it the Job is logged and no longer waited for. One made from other input is
+  waited for, not replaced: `ensure_job` would delete it in the
+  foreground, stopping it part-way. The finalizer's harvest waits the
+  same way, up to the Job's deadline (an hour), where it used to replace
+  a running harvest made from other input (after an image bump, say).
+
+### 27.3 Failures
+
+- **A failed Job keeps the clone and the pod away.** The record stays,
+  the Job is retried under the Job rule (§21.6), and the Agent's `Ready`
+  is `False`, reason `BranchChangeBlocked`: "Agent `<ns>/<name>`: its
+  branch changed from `<old>` to `<new>`; Job `<job>` failed:
+  `<message>`; the clone is kept and no pod starts; set the branch back
+  to `<old>`, commit or discard the changes in the pod, then change it
+  again; or annotate the Agent balerix.ai/purge=true, which discards the
+  clone's uncommitted changes and unpushed commits". While the Job
+  merely runs, `BranchChanging` names it and no escape. The Job's own
+  refusals carry no host remedy: a dirty clone is "the clone was created
+  on branch `<old>` but the agent's branch is `<new>`, and the clone has
+  local changes"; a 0.1 worktree names the annotation.
+- **Uncommitted work holds the change** until one of the two is done: no
+  pod runs while the change is blocked, so the work is committed or
+  discarded on the old branch, in its pod, or given up with the
+  annotation.
+- **The annotation.** The Agent's `balerix.ai/purge: "true"` (§8.5, §25)
+  makes the Job `harvest --branch <new> --purge`, which empties the clone
+  unread, as `--purge` does; its other input replaces the failed Job at
+  once. The operator never removes it: remove the annotation yourself;
+  until you do, every branch change and the Agent's removal discard
+  unpushed work. A purged change that succeeds leaves a Warning Event on
+  the Agent, `PurgeAnnotationKept`, saying so. Only the Agent's own mark
+  counts here; the Fleet's counts only while the Fleet is deleted.
+
+### 27.4 Testing
+
+- **Unit.** `desired::agent`: the claim records `agent_branch`, which is
+  `ResolvedAgent::branch`; a claim's record is the same, missing (or
+  empty) or changed. `desired::jobs`: the branch change's Job has the
+  harvest Job's name and labels, `--branch`, the claim read-only but for
+  the clone, the init container making the clone's directory, no owner
+  and the TTL (snapshot `job_branch_change`); its hash differs from the
+  removal's, from the reverse change, from another old branch and from
+  its `--purge` form. The removal's snapshot, hash included, is
+  unchanged. The `Ready` conditions and their messages.
+- **`balerix-runtime` (`jobs_it`).** With the claim read-only but for
+  `workspace/`, a clean clone's old branch reaches the cache, the clone
+  is emptied and nothing else under the claim changes, and the pod's
+  `ensure_clone` with a read-only cache then clones the new branch; a
+  dirty clone fails naming both branches, with no host remedy, and is
+  kept; a clone already on the branch is kept; `purge` empties a dirty
+  clone and harvests nothing; links planted in the clone to the claim's
+  state and to the crew cache are removed and their targets kept, with
+  and without `purge`
+  (`a_branch_change_removes_planted_links_and_never_their_targets`); a
+  run stopped after `.git` was renamed aside leaves leftovers the next
+  run removes.
+- **envtest (`controllers_it`).** A branch change deletes the pod, runs
+  the harvest Job with `--branch` and only the clone writable, makes no
+  pod while it runs and keeps the record, then records the new branch
+  and starts the pod on the same claim, with no second harvest. A failed
+  Job is `BranchChangeBlocked` with no pod and the old record; the purge
+  annotation replaces it with a `--purge` Job, whose success starts the
+  pod and leaves a `PurgeAnnotationKept` Warning. A branch set back while
+  the Job runs makes no pod until the Job ends. A unit test: a Job being
+  deleted holds until the bound and not after.
+- **`e2e-k8s` step 5b** proves the nested mounts on kind: alice's
+  `branch` set to `main`; the harvest Job with `--branch` succeeds, the
+  claim records `main`, a new pod is Ready on the same claim (same uid)
+  with its clone on `main`, and alice's old branch is in the crew cache.
+  A failed Job, or a wait past its own bound, panics with the Job pod's
+  termination message and the Agent's conditions. A claim without a record
+  is backfilled by the patch manager, with no harvest Job and the pod
+  kept.

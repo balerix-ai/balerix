@@ -93,6 +93,40 @@ pub fn decide_clone<E>(
     })
 }
 
+/// What `Workspace::settle_clone` found of an existing clone, and what
+/// its caller does next. It writes nothing outside the cache: removing
+/// the clone and writing the marker are the caller's, so a host removes
+/// the directory and a Job empties its mount (Spec O §27).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Settled {
+    /// The clone stays: its marker is the branch, or HEAD is detached.
+    Kept,
+    /// The clone stays and HEAD is already on the branch: the marker is
+    /// to be written (the pod's `ensure_clone` writes it).
+    Record,
+    /// There is no clone (`workspace/.git` absent): whatever is left in
+    /// `workspace/` is a half-made clone to remove, and one is made.
+    NoClone,
+    /// The clone was on `old`, and `old` was fetched into the cache
+    /// (`harvested`; false when the clone no longer had that branch):
+    /// the clone is to be removed.
+    Remove { old: String, harvested: bool },
+    /// A clone on `old` with local changes: refused, in the caller's
+    /// words, since the remedy differs on a host and in a pod.
+    Dirty { old: String },
+    /// `workspace/.git` is a file: a 0.1 worktree, refused likewise.
+    Worktree,
+}
+
+/// The refusal of a dirty clone whose branch changed, without a remedy:
+/// the caller adds the one that fits a host or a pod.
+pub fn dirty_clone(old: &str, branch: &str) -> String {
+    format!(
+        "the clone was created on branch {old:?} but the agent's branch is {branch:?}, \
+         and the clone has local changes"
+    )
+}
+
 /// Whether an exit code `agent_git` accepted is git's own answer. The
 /// yes/no probes (`config --get-regexp`, `rev-parse --verify --quiet`,
 /// `symbolic-ref -q`) print nothing when they exit 1. nono's own failure
@@ -1074,6 +1108,53 @@ impl Workspace<'_> {
         branch: &str,
         start_ref: &str,
     ) -> Result<(), MaterializeError> {
+        match self.settle_clone(id, crew, agent, branch)? {
+            Settled::Kept => return Ok(()),
+            Settled::Record => return Self::record_branch(id, agent, branch),
+            Settled::Dirty { old } => {
+                return Err(MaterializeError::Invalid {
+                    id: id.to_string(),
+                    message: format!(
+                        "{}; commit or discard them in {} first",
+                        dirty_clone(&old, branch),
+                        agent.workspace.display()
+                    ),
+                });
+            }
+            Settled::Worktree => {
+                // `id` is `<fleet>/<crew>/<agent>`
+                let fleet = id.split('/').next().unwrap_or(id);
+                return Err(MaterializeError::Invalid {
+                    id: id.to_string(),
+                    message: format!(
+                        "{}: created by balerix 0.1 as a worktree; run `balerix down {fleet} \
+                         --purge` and `up` again (push unpushed work first)",
+                        agent.workspace.display()
+                    ),
+                });
+            }
+            Settled::Remove { .. } | Settled::NoClone => remove_tree(id, &agent.workspace)?,
+        }
+        self.create_clone(id, crew, agent, repo, branch, start_ref)
+            .map_err(|e| discard_half_made(id, &agent.workspace, e))?;
+        Self::record_branch(id, agent, branch)
+    }
+
+    /// `ensure_clone`'s judgement of an existing clone for `branch`
+    /// (Spec N §4 step 1, Spec L §12's marker rule), without the new
+    /// clone: a clean clone on another branch has its old branch
+    /// harvested into the cache (`Remove`); a dirty one is `Dirty`; any
+    /// other is kept. It removes nothing and writes no marker (see
+    /// `Settled`). The branch-change Job (Spec O §27) runs it with the
+    /// cache writable and the clone alone writable, so that the pod's
+    /// `ensure_clone`, whose cache is read-only, finds no clone to move.
+    pub fn settle_clone(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        agent: &AgentPaths,
+        branch: &str,
+    ) -> Result<Settled, MaterializeError> {
         let dot_git = agent.workspace.join(".git");
         if dot_git.is_dir() {
             check_clone(id, crew, agent)?;
@@ -1081,7 +1162,7 @@ impl Workspace<'_> {
             if marker.as_deref().map(str::trim) == Some(branch) {
                 // Spec L §12: marker equals `branch` → done, with no git
                 // call; `decide_clone` agrees (`Reuse`)
-                return Ok(());
+                return Ok(Settled::Kept);
             }
             self.prepare_sandbox(id, crew, agent)?;
             self.check_clone_config(id, crew, agent)?;
@@ -1090,42 +1171,20 @@ impl Workspace<'_> {
                 self.agent_git(id, crew, agent, &["status", "--porcelain"], &[0])
                     .map(|s| !s.trim().is_empty())
             })?;
-            match decision {
-                CloneDecision::Reuse => return Ok(()),
-                CloneDecision::Record => return Self::record_branch(id, agent, branch),
-                CloneDecision::Dirty { old } => {
-                    return Err(MaterializeError::Invalid {
-                        id: id.to_string(),
-                        message: format!(
-                            "the clone was created on branch {old:?} but the agent's \
-                             branch is {branch:?}, and the clone has local changes; \
-                             commit or discard them in {} first",
-                            agent.workspace.display()
-                        ),
-                    });
-                }
+            Ok(match decision {
+                CloneDecision::Reuse => Settled::Kept,
+                CloneDecision::Record => Settled::Record,
+                CloneDecision::Dirty { old } => Settled::Dirty { old },
                 CloneDecision::Recreate { old } => {
-                    self.harvest(id, crew, agent, &old, || {})?;
-                    remove_tree(id, &agent.workspace)?;
+                    let harvested = self.harvest(id, crew, agent, &old, || {})?;
+                    Settled::Remove { old, harvested }
                 }
-            }
+            })
         } else if dot_git.exists() {
-            // `id` is `<fleet>/<crew>/<agent>`
-            let fleet = id.split('/').next().unwrap_or(id);
-            return Err(MaterializeError::Invalid {
-                id: id.to_string(),
-                message: format!(
-                    "{}: created by balerix 0.1 as a worktree; run `balerix down {fleet} \
-                     --purge` and `up` again (push unpushed work first)",
-                    agent.workspace.display()
-                ),
-            });
+            Ok(Settled::Worktree)
         } else {
-            remove_tree(id, &agent.workspace)?;
+            Ok(Settled::NoClone)
         }
-        self.create_clone(id, crew, agent, repo, branch, start_ref)
-            .map_err(|e| discard_half_made(id, &agent.workspace, e))?;
-        Self::record_branch(id, agent, branch)
     }
 
     /// Spec N §4 step 3. These calls run in a clone the agent has never

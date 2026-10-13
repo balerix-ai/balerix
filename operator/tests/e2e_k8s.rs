@@ -578,6 +578,156 @@ async fn the_phase_3_journey_on_kind() {
         "branch {branch} not in the cache: {listed:?}"
     );
 
+    // 5b. alice's branch changed (Spec O §27): the harvest Job runs over
+    // her claim, with only the clone writable (the nested mounts), the
+    // claim's record moves, and a new pod is Ready on the same claim with
+    // a clone of the new branch. `main` is a branch the remote has.
+    let claims: Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+        Api::namespaced(client.clone(), &ns);
+    let claim = claims.get("f-c-alice").await.unwrap();
+    assert_eq!(
+        claim
+            .annotations()
+            .get("balerix.ai/branch")
+            .map(String::as_str),
+        Some("balerix/f/c/alice")
+    );
+    let before = pods.get("f-c-alice").await.unwrap();
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .patch(
+            "f",
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Merge(serde_json::json!({
+                "spec": { "crews": { "c": { "agents": { "alice": { "branch": "main" } } } } }
+            })),
+        )
+        .await
+        .unwrap();
+    // what a CI failure needs: the Job's pod's message, the Agent's Ready
+    let diagnose = |what: &'static str| {
+        let (pods, agents) = (pods.clone(), agents.clone());
+        async move {
+            let messages: Vec<String> = pods
+                .list(&ListParams::default().labels("job-name=f-c-alice-harvest"))
+                .await
+                .map(|l| {
+                    l.items
+                        .into_iter()
+                        .filter_map(|p| {
+                            p.status?
+                                .container_statuses?
+                                .into_iter()
+                                .find_map(|c| c.state?.terminated?.message)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let ready = agents
+                .get_opt("f-c-alice")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|a| a.status)
+                .map(|s| format!("{:?}", s.conditions));
+            format!("{what}: harvest pod messages {messages:?}; Agent conditions {ready:?}")
+        }
+    };
+    // each wait gives up on its own before `wait_for`'s bound, so a
+    // timeout panics with the diagnosis rather than only its name
+    let started = std::time::Instant::now();
+    let late = move |limit: u64| started.elapsed() > Duration::from_secs(limit);
+    let outcome = wait_for(
+        "alice's branch-change harvest",
+        Duration::from_secs(660),
+        || async {
+            if late(600) {
+                return Some(Err("not succeeded within 600 s"));
+            }
+            let job = jobs.get_opt("f-c-alice-harvest").await.unwrap()?;
+            let args = job.spec.as_ref()?.template.spec.as_ref()?.containers[0]
+                .args
+                .clone()
+                .unwrap_or_default();
+            if !args.iter().any(|a| a == "--branch") {
+                return None;
+            }
+            let status = job.status?;
+            if status.failed.unwrap_or(0) > 0 {
+                return Some(Err("failed"));
+            }
+            (status.succeeded.unwrap_or(0) > 0).then_some(Ok(()))
+        },
+    )
+    .await;
+    if let Err(why) = outcome {
+        panic!("{}", diagnose(why).await);
+    }
+    wait_for(
+        "alice's claim records main",
+        Duration::from_secs(120),
+        || async {
+            let c = claims.get("f-c-alice").await.unwrap();
+            (c.annotations().get("balerix.ai/branch").map(String::as_str) == Some("main"))
+                .then_some(())
+        },
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let after = wait_for(
+        "alice's new pod Ready",
+        Duration::from_secs(660),
+        || async {
+            if started.elapsed() > Duration::from_secs(600) {
+                return Some(None);
+            }
+            let p = pods.get_opt("f-c-alice").await.unwrap()?;
+            if p.metadata.uid == before.metadata.uid {
+                return None;
+            }
+            let pod_ready = p
+                .status
+                .as_ref()?
+                .conditions
+                .as_ref()?
+                .iter()
+                .any(|c| c.type_ == "Ready" && c.status == "True");
+            let a = agents.get("f-c-alice").await.unwrap().status?;
+            (pod_ready && condition_true(&a.conditions, "Ready")).then_some(Some(p))
+        },
+    )
+    .await;
+    let Some(after) = after else {
+        panic!(
+            "{}",
+            diagnose("alice's new pod not Ready within 600 s").await
+        );
+    };
+    assert_eq!(
+        claims.get("f-c-alice").await.unwrap().metadata.uid,
+        claim.metadata.uid,
+        "the same claim"
+    );
+    let head = exec(
+        &ns,
+        &after.name_any(),
+        "agent",
+        "git -C /balerix/agent/workspace symbolic-ref --short HEAD",
+    )
+    .unwrap_or_else(|e| panic!("alice's new clone: {e}"));
+    assert_eq!(head.trim(), "main", "alice's new clone");
+    let listed = exec(
+        &ns,
+        "probe",
+        "probe",
+        "git --git-dir=/balerix/volume/fleets/f/crews/c/repo/.git branch --list balerix/f/c/alice",
+    )
+    .unwrap();
+    assert!(
+        listed.contains("balerix/f/c/alice"),
+        "alice's old branch not in the cache: {listed:?}"
+    );
+
     // 6. the Fleet, marked `balerix.ai/purge: "true"`, deleted with
     // retain: None: the crew's directories emptied and the Daemon's record
     // purged, with no shell on the Daemon's pod (§25, #135)

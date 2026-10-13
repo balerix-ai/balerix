@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, anyhow};
 use balerix_core::{AgentId, CrewRef, FleetName, RepoRef};
-use balerix_runtime::jobs::{self, PoolLevel};
+use balerix_runtime::jobs::{self, BranchChange, PoolLevel};
 use balerix_runtime::layout::SharedSlice;
 use balerix_runtime::{ToolPaths, embedded_system_tools};
 
@@ -79,6 +79,18 @@ pub fn harvest(args: &HarvestArgs) -> Result<String> {
         .agent
         .parse()
         .map_err(|e| anyhow!("--agent {}: {e}", args.agent))?;
+    if let Some(branch) = &args.branch {
+        let done = jobs::change_branch(
+            &tools()?,
+            &SharedSlice::new(&args.dirs.shared_dir),
+            &args.dirs.scratch_dir,
+            &id,
+            &args.agent_dir,
+            branch,
+            args.purge,
+        )?;
+        return Ok(branch_change_line(&done, branch));
+    }
     let branch = jobs::harvest(
         &tools()?,
         &SharedSlice::new(&args.dirs.shared_dir),
@@ -90,6 +102,23 @@ pub fn harvest(args: &HarvestArgs) -> Result<String> {
         Some(b) => format!("harvested {b}"),
         None => "nothing to harvest".to_string(),
     })
+}
+
+/// The branch-change Job's outcome line, for the operator's log.
+fn branch_change_line(done: &BranchChange, branch: &str) -> String {
+    match done {
+        BranchChange::Removed {
+            old,
+            harvested: true,
+        } => format!("harvested {old}; clone removed for {branch}"),
+        BranchChange::Removed {
+            old,
+            harvested: false,
+        } => format!("no {old} to harvest; clone removed for {branch}"),
+        BranchChange::Kept => format!("clone kept for {branch}"),
+        BranchChange::NoClone => format!("no clone; {branch} is cloned anew"),
+        BranchChange::Purged => format!("clone removed unharvested (purge) for {branch}"),
+    }
 }
 
 pub fn crew_remove(args: &CrewRemoveArgs) -> Result<String> {

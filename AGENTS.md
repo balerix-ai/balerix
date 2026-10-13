@@ -176,7 +176,12 @@ credentials, hook input, or sandbox rules.
   so a harvest that saw the cache anywhere else would refuse every
   clone. `harvest` writes nothing under the claim; its git profile,
   nono's home and its logs are in the scratch directory, which is why
-  `AgentPaths::git_profile` is a field.
+  `AgentPaths::git_profile` is a field. The exception is `harvest
+  --branch` (a branch change, Spec O §27): it mounts the clone alone
+  (`agent/workspace`) read-write over the read-only claim and empties
+  it after `Workspace::settle_clone`, the host's own judgement, which
+  removes nothing and writes no marker itself; keep that the one place
+  a Job writes under the claim.
 - In a pod `CrewPaths::logs` is on the agent claim
   (`.balerix/state/crew-logs`): the crew root is a read-only mount.
   Never write `crew.root.join("logs")`.

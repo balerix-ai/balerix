@@ -88,7 +88,7 @@ fn failed_at(job: &Job) -> Option<i64> {
 }
 
 /// Whether a Job is still running: created and not yet succeeded or failed.
-fn unfinished(job: &Job) -> bool {
+pub fn unfinished(job: &Job) -> bool {
     job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0) == 0 && !job_failed(job)
 }
 

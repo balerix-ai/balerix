@@ -137,6 +137,7 @@ async fn a_session_gets_a_thread_and_a_reply_in_it_reaches_the_agent() {
             sender: "@rahul:h".into(),
             thread_root: Some(root),
             body: "run the tests".into(),
+            history: false,
         }))
         .unwrap();
 

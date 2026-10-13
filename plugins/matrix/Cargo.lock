@@ -304,6 +304,7 @@ name = "balerix-plugin-matrix"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "axum",
  "balerix-api",
  "balerix-plugin-common",
  "balerix-plugin-sdk",

@@ -138,6 +138,11 @@ impl Maps {
         Ok(())
     }
 
+    /// Every room an agent's thread is in, open or closed.
+    pub fn thread_rooms(&self) -> impl Iterator<Item = &str> {
+        self.threads.values().map(|t| t.room.as_str())
+    }
+
     pub fn route(&self, room: &str, root: &str) -> Option<&str> {
         self.routes
             .get(&(room.to_string(), root.to_string()))

@@ -244,7 +244,11 @@ struct Session {
    configured `deviceId` and display name, seal the result into `auth`, and log
    at warn that the password source can now be removed.
 3. Prove the session with `whoami`. A failure here exits 1, so the daemon
-   reports the plugin as not ready and restarts it with backoff.
+   reports the plugin as not ready and restarts it with backoff. `whoami` is
+   also where an expired cached access token is refreshed, so the client is
+   subscribed to its session changes before it, and whatever pair it holds
+   after `whoami` is sealed before the plugin reports ready (#261): the
+   homeserver has spent the old refresh token.
 4. A 401 later triggers a refresh. If the refresh also fails and a password
    source is configured, log in again and log at warn that it happened. If none
    is configured, fail with a message naming the likely cause, a revoked
@@ -349,6 +353,9 @@ A message is routed only when all of these hold. Each rejection increments
 `inbound_total` with its outcome label, which is what makes this debuggable.
 
 - It is not from our own user id (`own_message`).
+- It is not history (§9.3): not delivered ahead of the bot's own join in the
+  sync that carries that join (`before_join`), and not an event id already
+  handled in that room (`replayed`). Neither is reacted to.
 - It carries an `m.thread` relation (`not_a_thread`). A message posted at room
   level is ignored and gets a reaction saying so; this is the case OpenClaw has
   open as #32744.
@@ -386,6 +393,47 @@ run or after a purge, the plugin performs one sync with the timeline limited to
 zero events, keeps the resulting batch token, and starts from there. Without
 this an operator who purges the plugin replays a room's entire history into
 live agents.
+
+A rejoin is the other way history arrives (#262): after the bot is kicked and
+invited back, the join sync carries the room's recent history, and an old reply
+in a thread that is still live would be typed in again. Two guards, both in
+`replay.rs`. Neither may lose a fresh message, so neither compares a clock
+across the stream: `origin_server_ts` is the sending homeserver's clock, and a
+federated server's runs ahead of or behind another's.
+
+- **Join-sync history, by position.** The inbound pump reads each sync
+  response (`sync_with_result_callback`) rather than registering an event
+  handler, because whether a message is history is a fact about the response
+  it came in, and a handler sees one event at a time. In a joined room's
+  timeline, which is in the homeserver's order, every message before the
+  bot's own member event changing to `join` (not a profile change on top of a
+  join) is history (`before_join`), and the pump drops it there, so history
+  never takes a slot in the drop-oldest queue; the actor checks the flag
+  again as a backstop. A timeline with no such event has none: the join is
+  in an earlier response, or before the timeline's start (a `limited`
+  timeline whose join is only in the state section). A member event without
+  `unsigned.prev_content` is taken as a join from outside the room: the spec
+  gives every state event that replaced another its `prev_content`, and the
+  bot never changes its own profile, so only an operator editing the bot's
+  profile on a homeserver that omits the field is misread. One secondary
+  check, inside the join's own timeline only: a message after the join from
+  a sender on the bot's own homeserver, stamped earlier than the join, is
+  history too, since both stamps are that homeserver's clock. A bridge
+  puppet on the bot's homeserver can set an old timestamp (an appservice's
+  `?ts=`), so a bridged message in that one response can be misread as
+  history; nothing outside the join's own response is affected. A message
+  in any later sync is never judged by its timestamp.
+- **Handled event ids.** The actor keeps the ids of the last 256 messages it
+  handled in each room under the KV record `routed` (one JSON object of
+  arrays keyed by room id, since a room id is not a valid key segment),
+  written before the message is acted on. An id in the set is dropped
+  (`replayed`), across restarts and purges; any other id is handled. The
+  record holds only rooms still in use — a thread's room, a pinned room, an
+  active agent's crew room: an id is recorded only in such a room, and the
+  rest are pruned at `deactivate`. Not at load or `configure`, when the
+  config or the agents are not known yet and a room still in use would lose
+  its ids. It is also kept under 256 KiB, a quarter of the plugin-host body
+  cap, by dropping the oldest ids of the longest lists first.
 
 ## 10. Failure, back-pressure and metrics
 

@@ -1415,6 +1415,447 @@ async fn a_changed_spec_hash_replaces_the_pod_and_keeps_the_claim() {
     operator.abort();
 }
 
+/// The claim's record of its clone's branch (§8.5).
+async fn claim_branch(claims: &Api<PersistentVolumeClaim>, name: &str) -> Option<String> {
+    claims
+        .get(name)
+        .await
+        .unwrap()
+        .metadata
+        .annotations
+        .and_then(|a| a.get("balerix.ai/branch").cloned())
+}
+
+/// The args of a harvest Job, and the paths where it mounts the agent
+/// claim writable.
+fn harvest_shape(job: &Job) -> (Vec<String>, Vec<String>) {
+    let pod = job.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+    let container = &pod.containers[0];
+    let writable = container
+        .volume_mounts
+        .iter()
+        .flatten()
+        .filter(|m| m.name == "agent" && m.read_only != Some(true))
+        .map(|m| m.mount_path.clone())
+        .collect();
+    (container.args.clone().unwrap_or_default(), writable)
+}
+
+/// A Fleet `f` with crew `c` and agent `a`, synced, and the agent's
+/// first pod. The stub Daemon is the caller's to keep.
+async fn branch_world(
+    label: &str,
+) -> (
+    kube::Client,
+    String,
+    Api<Fleet>,
+    Pod,
+    StubDaemon,
+    tokio::task::AbortHandle,
+) {
+    let (env, ns, stub, _clock, operator) = world(label).await;
+    let client = env.client.clone();
+    let fleets: Api<Fleet> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .create(
+            &PostParams::default(),
+            &Fleet::new("f", fleet_spec("default", &[("c", &["a"])], "Branches")),
+        )
+        .await
+        .unwrap();
+    crew_ready(&client, &ns, "f", "c").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let first = wait_for("the pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    (client, ns, fleets, first, stub, operator)
+}
+
+fn set_branch(branch: &str) -> Patch<serde_json::Value> {
+    Patch::Merge(serde_json::json!({
+        "spec": { "crews": { "c": { "agents": { "a": { "branch": branch } } } } }
+    }))
+}
+
+/// §8.5: a changed branch deletes the pod, runs the harvest Job for the
+/// old one over the claim, and only then records the new branch on the
+/// claim and makes the new pod, on the same claim.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_branch_change_harvests_the_old_branch_before_the_new_pod() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (client, ns, fleets, first, _stub, operator) = branch_world("branch").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let claim = claims.get("f-c-a").await.unwrap();
+    assert_eq!(
+        claim_branch(&claims, "f-c-a").await.as_deref(),
+        Some("balerix/f/c/a")
+    );
+
+    fleets
+        .patch("f", &PatchParams::default(), &set_branch("feature/x"))
+        .await
+        .unwrap();
+    reap_pod_uid(
+        &client,
+        &ns,
+        "f-c-a",
+        first.metadata.uid.as_deref().unwrap(),
+        Duration::from_secs(60),
+    )
+    .await;
+    let job = wait_for("the harvest Job", Duration::from_secs(60), || async {
+        jobs.get_opt("f-c-a-harvest").await.unwrap()
+    })
+    .await;
+    let (args, writable) = harvest_shape(&job);
+    assert_eq!(
+        args,
+        ["harvest", "--agent", "f/c/a", "--branch", "feature/x"]
+    );
+    assert_eq!(writable, ["/balerix/agent/workspace"], "only the clone");
+    assert_eq!(job.metadata.owner_references, None);
+    let ready = wait_for(
+        "Ready=False/BranchChanging",
+        Duration::from_secs(60),
+        || async {
+            let s = agents.get("f-c-a").await.unwrap().status?;
+            let c = condition(&s.conditions, "Ready").clone();
+            (c.reason == "BranchChanging" && c.message.contains("harvest Job")).then_some(c)
+        },
+    )
+    .await;
+    assert_eq!(
+        ready.message,
+        format!(
+            "Agent {ns}/f-c-a: its branch changed from balerix/f/c/a to feature/x; harvest Job f-c-a-harvest not finished"
+        )
+    );
+    // no pod while the Job runs, and the record has not moved
+    hold_for(
+        "a pod before the harvest",
+        Duration::from_secs(3),
+        || async { pods.get_opt("f-c-a").await.unwrap() },
+    )
+    .await;
+    assert_eq!(
+        claim_branch(&claims, "f-c-a").await.as_deref(),
+        Some("balerix/f/c/a")
+    );
+
+    finish_job(
+        &client,
+        &ns,
+        "f-c-a-harvest",
+        true,
+        Some("harvested balerix/f/c/a; clone removed for feature/x"),
+    )
+    .await;
+    wait_for("the new pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    assert_eq!(
+        claim_branch(&claims, "f-c-a").await.as_deref(),
+        Some("feature/x")
+    );
+    let after = claims.get("f-c-a").await.unwrap();
+    assert_eq!(after.metadata.uid, claim.metadata.uid, "the same claim");
+    // the change is done: no second harvest
+    hold_for("another harvest Job", Duration::from_secs(3), || async {
+        jobs.get_opt("f-c-a-harvest")
+            .await
+            .unwrap()
+            .filter(|j| j.metadata.uid != job.metadata.uid)
+    })
+    .await;
+    operator.abort();
+}
+
+/// §8.5: a failed harvest keeps the clone and the pod away and says
+/// why; the Agent's purge annotation re-runs the Job with `--purge`,
+/// and the pod starts on the new branch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_branch_change_blocks_the_pod_until_purged() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (client, ns, fleets, first, _stub, operator) = branch_world("branchfail").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+
+    fleets
+        .patch("f", &PatchParams::default(), &set_branch("feature/x"))
+        .await
+        .unwrap();
+    reap_pod_uid(
+        &client,
+        &ns,
+        "f-c-a",
+        first.metadata.uid.as_deref().unwrap(),
+        Duration::from_secs(60),
+    )
+    .await;
+    let failed = wait_for("the harvest Job", Duration::from_secs(60), || async {
+        jobs.get_opt("f-c-a-harvest").await.unwrap()
+    })
+    .await;
+    finish_job(
+        &client,
+        &ns,
+        "f-c-a-harvest",
+        false,
+        Some("f/c/a: the clone has local changes"),
+    )
+    .await;
+    let ready = wait_for(
+        "Ready=False/BranchChangeBlocked",
+        Duration::from_secs(60),
+        || async {
+            let s = agents.get("f-c-a").await.unwrap().status?;
+            let c = condition(&s.conditions, "Ready").clone();
+            (c.reason == "BranchChangeBlocked").then_some(c)
+        },
+    )
+    .await;
+    assert_eq!(ready.status, "False");
+    assert_eq!(
+        ready.message,
+        format!(
+            "Agent {ns}/f-c-a: its branch changed from balerix/f/c/a to feature/x; Job f-c-a-harvest failed: f/c/a: the clone has local changes; the clone is kept and no pod starts; set the branch back to balerix/f/c/a, commit or discard the changes in the pod, then change it again; or annotate the Agent balerix.ai/purge=true, which discards the clone's uncommitted changes and unpushed commits"
+        )
+    );
+    hold_for(
+        "a pod on the wrong branch",
+        Duration::from_secs(3),
+        || async { pods.get_opt("f-c-a").await.unwrap() },
+    )
+    .await;
+    assert_eq!(
+        claim_branch(&claims, "f-c-a").await.as_deref(),
+        Some("balerix/f/c/a")
+    );
+
+    // the escape the condition names
+    agents
+        .patch(
+            "f-c-a",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "metadata": { "annotations": { "balerix.ai/purge": "true" } } })),
+        )
+        .await
+        .unwrap();
+    // the failed Job is stale now, deleted in the foreground: the test is
+    // the garbage collector
+    reap_job(
+        &client,
+        &ns,
+        "f-c-a-harvest",
+        failed.metadata.uid.as_deref().unwrap(),
+        Duration::from_secs(60),
+    )
+    .await;
+    let purge = wait_for("the purging Job", Duration::from_secs(60), || async {
+        jobs.get_opt("f-c-a-harvest")
+            .await
+            .unwrap()
+            .filter(|j| j.metadata.uid != failed.metadata.uid)
+    })
+    .await;
+    assert_eq!(
+        harvest_shape(&purge).0,
+        [
+            "harvest",
+            "--agent",
+            "f/c/a",
+            "--branch",
+            "feature/x",
+            "--purge"
+        ]
+    );
+    finish_job(
+        &client,
+        &ns,
+        "f-c-a-harvest",
+        true,
+        Some("clone removed unharvested (purge) for feature/x"),
+    )
+    .await;
+    wait_for("the new pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    assert_eq!(
+        claim_branch(&claims, "f-c-a").await.as_deref(),
+        Some("feature/x")
+    );
+    // the annotation stays, and the Agent says what it will do next time
+    let events: Api<k8s_openapi::api::events::v1::Event> = Api::namespaced(client.clone(), &ns);
+    let event = wait_for(
+        "a PurgeAnnotationKept Event",
+        Duration::from_secs(30),
+        || async {
+            events
+                .list(&Default::default())
+                .await
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|e| e.reason.as_deref() == Some("PurgeAnnotationKept"))
+        },
+    )
+    .await;
+    assert_eq!(event.type_.as_deref(), Some("Warning"));
+    assert!(event.note.as_deref().unwrap().contains(
+        "until you do, every branch change and the Agent's removal discard unpushed work"
+    ));
+    operator.abort();
+}
+
+/// §27.2: a -> b, then back to a while the a -> b Job empties the clone.
+/// The claim still records a, but no pod is made until that Job ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_branch_set_back_mid_harvest_waits_for_the_job() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (client, ns, fleets, first, _stub, operator) = branch_world("branchback").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    let agents: Api<Agent> = Api::namespaced(client.clone(), &ns);
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+    fleets
+        .patch("f", &PatchParams::default(), &set_branch("feature/x"))
+        .await
+        .unwrap();
+    reap_pod_uid(
+        &client,
+        &ns,
+        "f-c-a",
+        first.metadata.uid.as_deref().unwrap(),
+        Duration::from_secs(60),
+    )
+    .await;
+    let job = wait_for("the harvest Job", Duration::from_secs(60), || async {
+        jobs.get_opt("f-c-a-harvest").await.unwrap()
+    })
+    .await;
+    // back to the default branch, the one the claim records
+    fleets
+        .patch(
+            "f",
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "spec": { "crews": { "c": { "agents": { "a": { "branch": null } } } } }
+            })),
+        )
+        .await
+        .unwrap();
+    let ready = wait_for(
+        "Ready waits on the Job",
+        Duration::from_secs(60),
+        || async {
+            let s = agents.get("f-c-a").await.unwrap().status?;
+            let c = condition(&s.conditions, "Ready").clone();
+            c.message.ends_with("the pod waits for it").then_some(c)
+        },
+    )
+    .await;
+    assert_eq!(ready.reason, "BranchChanging");
+    assert_eq!(
+        ready.message,
+        format!("Agent {ns}/f-c-a: harvest Job f-c-a-harvest not finished; the pod waits for it")
+    );
+    hold_for(
+        "a pod while the Job runs",
+        Duration::from_secs(3),
+        || async { pods.get_opt("f-c-a").await.unwrap() },
+    )
+    .await;
+    // the same Job, never replaced while it runs
+    assert_eq!(
+        jobs.get("f-c-a-harvest").await.unwrap().metadata.uid,
+        job.metadata.uid
+    );
+    finish_job(
+        &client,
+        &ns,
+        "f-c-a-harvest",
+        true,
+        Some("harvested balerix/f/c/a; clone removed for feature/x"),
+    )
+    .await;
+    wait_for("the pod", Duration::from_secs(60), || async {
+        pods.get_opt("f-c-a").await.unwrap()
+    })
+    .await;
+    assert_eq!(
+        claim_branch(&claims, "f-c-a").await.as_deref(),
+        Some("balerix/f/c/a")
+    );
+    operator.abort();
+}
+
+/// §8.5 on upgrade: a claim an earlier operator made has no record; it
+/// gets the Agent's branch, with no harvest and no new pod.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_without_a_branch_record_is_backfilled_without_a_harvest() {
+    if envtest().await.is_none() {
+        return;
+    }
+    let (client, ns, _fleets, first, _stub, operator) = branch_world("branchfill").await;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+    claims
+        .patch(
+            "f-c-a",
+            &PatchParams::default(),
+            &Patch::Merge(
+                serde_json::json!({ "metadata": { "annotations": { "balerix.ai/branch": null } } }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claim_branch(&claims, "f-c-a").await, None);
+    wait_for("the record backfilled", Duration::from_secs(60), || async {
+        claim_branch(&claims, "f-c-a").await
+    })
+    .await;
+    assert_eq!(
+        claim_branch(&claims, "f-c-a").await.as_deref(),
+        Some("balerix/f/c/a")
+    );
+    // written by the operator's merge-patch manager (§26.1)
+    let managed = claims.get("f-c-a").await.unwrap().metadata.managed_fields;
+    assert!(
+        managed.iter().flatten().any(|m| {
+            m.manager.as_deref() == Some("balerix-operator-patch")
+                && serde_json::to_string(&m.fields_v1)
+                    .unwrap()
+                    .contains("balerix.ai/branch")
+        }),
+        "{managed:?}"
+    );
+    hold_for("a harvest Job", Duration::from_secs(3), || async {
+        jobs.get_opt("f-c-a-harvest").await.unwrap()
+    })
+    .await;
+    assert_eq!(
+        pods.get("f-c-a").await.unwrap().metadata.uid,
+        first.metadata.uid,
+        "the pod is kept"
+    );
+    operator.abort();
+}
+
 /// §11, #234: the kubelet's node-pressure eviction leaves the pod object
 /// in phase `Failed`; its specHash still matches, and it is replaced on
 /// the same claim all the same. Pods evicted young wait before their

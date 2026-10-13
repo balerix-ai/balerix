@@ -1,6 +1,7 @@
 //! The Agent controller (Spec O §5.4, §8.5, §21.2): once its Crew is
 //! ready, the claim, the bundle Secret, the policy and the Pod; a Pod
-//! whose `specHash` differs is replaced on the same claim; status is the
+//! whose `specHash` differs is replaced on the same claim, after a
+//! harvest Job has settled the clone when the branch changed; status is the
 //! Pod plus the Daemon's record for the agent. On deletion: the Pod
 //! gone, the harvest Job (unless purged, or the Fleet goes with
 //! `retain: None`, or there is no claim), then the claim.
@@ -26,10 +27,13 @@ use super::jobs::ensure_job;
 use super::owned::{apply_read, delete_read, observe, observe_desired};
 use super::{Context, Error, api_in, bounded, error_policy, patch_status, reconciled, report};
 use crate::api::{Agent, AgentStatus, Crew, Daemon, Fleet, Retain};
-use crate::desired::agent::{AgentInputs, SPEC_HASH_ANNOTATION, agent_objects, agent_status};
-use crate::desired::common::{Cond, JobOutcome, conditions, labels, owner_of};
+use crate::desired::agent::{
+    AgentInputs, BRANCH_ANNOTATION, ClaimBranch, SPEC_HASH_ANNOTATION, agent_branch, agent_objects,
+    agent_status, claim_branch,
+};
+use crate::desired::common::{Cond, HASH_ANNOTATION, JobOutcome, conditions, labels, owner_of};
 use crate::desired::fleet::HARVEST_FINALIZER;
-use crate::desired::jobs::{JobContext, harvest_job};
+use crate::desired::jobs::{BranchMove, JobContext, branch_change_job, harvest_job};
 use crate::desired::names;
 use crate::desired::ownership::{
     AGENT_LABEL, COMPONENT_LABEL, CREW_LABEL, DAEMON_LABEL, FLEET_LABEL, Identity, identity_of,
@@ -47,6 +51,72 @@ pub fn harvest_escape() -> String {
     format!(
         "the annotation {PURGE_ANNOTATION}=true on the Agent skips its harvest; on the Fleet, while the Fleet is deleted, it skips every harvest and also purges the Fleet's record on the Daemon"
     )
+}
+
+/// What a branch change waits on (§8.5, §27).
+#[derive(Debug, Clone, Copy)]
+pub enum BranchWait<'a> {
+    /// The old pod, deleted, still listed.
+    Pod,
+    /// A harvest Job of the Agent's that still runs, whatever it was
+    /// made for: the branch was set back while it emptied the clone.
+    Running(&'a str),
+    /// The harvest Job, not succeeded.
+    Job {
+        name: &'a str,
+        outcome: &'a JobOutcome,
+    },
+}
+
+/// The escape a blocked branch change names (§27.3). No pod runs while
+/// the change is blocked, so the clone's changes are committed or
+/// discarded on the old branch.
+pub fn branch_change_escape(from: &str) -> String {
+    format!(
+        "set the branch back to {from}, commit or discard the changes in the pod, then change it again; or annotate the Agent {PURGE_ANNOTATION}=true, which discards the clone's uncommitted changes and unpushed commits"
+    )
+}
+
+/// The Warning a purged branch change leaves while the annotation stays.
+pub fn purge_kept_note(agent: &str) -> String {
+    format!(
+        "Agent {agent}: its clone was removed unharvested under {PURGE_ANNOTATION}=true; remove the annotation yourself: until you do, every branch change and the Agent's removal discard unpushed work"
+    )
+}
+
+/// The Agent's `Ready` while its branch change holds the pod (§8.5):
+/// `BranchChangeBlocked` once the harvest Job failed, else
+/// `BranchChanging` (§27.3). `agent` is `<namespace>/<name>`.
+pub fn branch_change_condition(agent: &str, from: &str, to: &str, wait: BranchWait<'_>) -> Cond {
+    let changed = format!("Agent {agent}: its branch changed from {from} to {to}");
+    match wait {
+        BranchWait::Pod => Cond::no(
+            "Ready",
+            "BranchChanging",
+            &format!("{changed}; waiting for its pod to go"),
+        ),
+        BranchWait::Running(name) => Cond::no(
+            "Ready",
+            "BranchChanging",
+            &format!("{changed}; harvest Job {name} not finished"),
+        ),
+        BranchWait::Job {
+            name,
+            outcome: JobOutcome::Failed(message),
+        } => Cond::no(
+            "Ready",
+            "BranchChangeBlocked",
+            &format!(
+                "{changed}; Job {name} failed: {message}; the clone is kept and no pod starts; {}",
+                branch_change_escape(from)
+            ),
+        ),
+        BranchWait::Job { name, .. } => Cond::no(
+            "Ready",
+            "BranchChanging",
+            &format!("{changed}; harvest Job {name} not finished"),
+        ),
+    }
 }
 
 /// The object carries `balerix.ai/purge: "true"`.
@@ -412,11 +482,27 @@ async fn apply_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Err
     // the claim: created when absent; one an earlier operator made owned
     // by the Agent is released, so no garbage collector takes it before
     // the harvest (§26.3)
-    match claim {
+    match &claim {
         None => {
             apply_read(&claims, &objects.claim, None).await?;
         }
-        Some(claim) => release_claim(&claims, &claim, &agent).await?,
+        Some(claim) => release_claim(&claims, claim, &agent).await?,
+    }
+
+    // §8.5, §27: a claim whose clone was made for another branch holds the
+    // pod until a harvest Job has settled the clone
+    if let Some(claim) = &claim
+        && let Some(wait) = settle_branch(
+            &ctx,
+            &agent,
+            &claims,
+            claim,
+            existing_pod.as_ref(),
+            reported.as_ref(),
+        )
+        .await?
+    {
+        return Ok(wait);
     }
 
     // the Pod: created when absent, replaced when its specHash differs
@@ -449,6 +535,225 @@ async fn apply_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, Err
     patch_status(&ctx.client, agent.as_ref(), &status).await?;
     reconciled(&ctx, agent.as_ref());
     Ok(Action::requeue(again))
+}
+
+/// §8.5, §27: the Agent's branch against the one its claim's clone was made
+/// for. `None` lets the pod be made. Otherwise the pod waits, and the
+/// answer is when to look again: the old pod is deleted first (the
+/// branch is in the specHash, so it is being replaced anyway), then the
+/// harvest Job settles the clone (`harvest --branch`: the old branch
+/// into the crew cache and the clone removed, as a host's
+/// `ensure_clone` does), and only its success moves the claim's record
+/// to the new branch. A failed Job keeps the clone and the pod away,
+/// `Ready=False/BranchChangeBlocked`, until it is retried, the branch
+/// is set back, or the Agent's `balerix.ai/purge` makes the Job remove
+/// the clone unread. A claim with no record (an earlier operator's) is
+/// recorded under the Agent's branch, with no harvest.
+async fn settle_branch(
+    ctx: &Arc<Context>,
+    agent: &Agent,
+    claims: &Api<PersistentVolumeClaim>,
+    claim: &PersistentVolumeClaim,
+    pod: Option<&Pod>,
+    reported: Option<&balerix_api::AgentStatus>,
+) -> Result<Option<Action>, Error> {
+    let namespace = agent.namespace().unwrap_or_default();
+    let name = agent.name_any();
+    let to = agent_branch(&agent.spec)?;
+    let who = format!("{namespace}/{name}");
+    let from = match claim_branch(claim, &to) {
+        ClaimBranch::Changed { from } => from,
+        unchanged => {
+            if unchanged == ClaimBranch::Unrecorded {
+                tracing::info!(agent = %name, branch = %to, "recording the branch of a claim made before §27");
+                record_branch(claims, claim, &to).await?;
+            }
+            // the branch set back while a change's Job empties the clone:
+            // no pod until that Job has ended (§27.2)
+            let Some(running) = unfinished_harvest(ctx, agent, None).await? else {
+                return Ok(None);
+            };
+            let condition = Cond::no(
+                "Ready",
+                "BranchChanging",
+                &format!("Agent {who}: harvest Job {running} not finished; the pod waits for it"),
+            );
+            let status = with_condition(ctx, agent, pod, reported, condition);
+            patch_status(&ctx.client, agent, &status).await?;
+            reconciled(ctx, agent);
+            return Ok(Some(Action::requeue(std::time::Duration::from_secs(5))));
+        }
+    };
+    let hold = |wait: BranchWait<'_>| branch_change_condition(&who, &from, &to, wait);
+    let wait = |condition: Cond, again: std::time::Duration| async move {
+        let status = with_condition(ctx, agent, None, reported, condition);
+        patch_status(&ctx.client, agent, &status).await?;
+        reconciled(ctx, agent);
+        Ok::<_, Error>(Some(Action::requeue(again)))
+    };
+
+    // 1. the old pod gone; no new one is made meanwhile
+    if let Some(pod) = pod {
+        if pod.metadata.deletion_timestamp.is_none() {
+            tracing::info!(agent = %name, "branch changed from {from} to {to}: deleting the pod");
+            let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace);
+            delete_read(&pods, pod, DeleteParams::default()).await?;
+        }
+        return wait(hold(BranchWait::Pod), std::time::Duration::from_secs(2)).await;
+    }
+
+    // 2. the harvest Job over the claim
+    let purge = purge_marked(agent);
+    let job_ctx = JobContext {
+        namespace: &namespace,
+        daemon: &agent.spec.daemon,
+        images: &ctx.cfg.images,
+        owner: owner_of(agent)?,
+    };
+    let job = branch_change_job(
+        &job_ctx,
+        &name,
+        &agent.spec,
+        &BranchMove {
+            from: &from,
+            to: &to,
+            purge,
+        },
+    )?;
+    let job_name = job.name_any();
+    if let Some(running) = unfinished_harvest(ctx, agent, Some(&job)).await? {
+        return wait(
+            hold(BranchWait::Running(&running)),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+    }
+    let ensured = ensure_job(
+        ctx.as_ref(),
+        agent,
+        job,
+        Some((&agent.spec.fleet, &agent.spec.crew)),
+    )
+    .await?;
+    match &ensured.outcome {
+        JobOutcome::Succeeded(message) => {
+            tracing::info!(agent = %name, "branch changed from {from} to {to}: {message}");
+            // 3. the record moves; the pod is made on the new branch
+            record_branch(claims, claim, &to).await?;
+            if purge {
+                ctx.warn(agent, "PurgeAnnotationKept", purge_kept_note(&who))
+                    .await;
+            }
+            Ok(None)
+        }
+        outcome => {
+            wait(
+                hold(BranchWait::Job {
+                    name: &job_name,
+                    outcome,
+                }),
+                ensured.again,
+            )
+            .await
+        }
+    }
+}
+
+/// The claim's record of its clone's branch (§27.1), by a merge patch
+/// over the claim read: its uid is a precondition.
+async fn record_branch(
+    claims: &Api<PersistentVolumeClaim>,
+    claim: &PersistentVolumeClaim,
+    branch: &str,
+) -> Result<(), Error> {
+    claims
+        .patch(
+            &claim.name_any(),
+            &super::owned::merge_params(),
+            &Patch::Merge(serde_json::json!({ "metadata": {
+                "uid": claim.uid(),
+                "annotations": { BRANCH_ANNOTATION: branch },
+            } })),
+        )
+        .await?;
+    Ok(())
+}
+
+/// The name of the Agent's harvest Job while it runs, or is being
+/// deleted with its pod. With `other_than`, only one made from other
+/// input: it is let finish before that one replaces it. A branch
+/// change's empties the clone; stopped part-way, or overtaken by a pod
+/// after the branch was set back, it would leave half a clone (§27.2).
+async fn unfinished_harvest(
+    ctx: &Context,
+    agent: &Agent,
+    other_than: Option<&Job>,
+) -> Result<Option<String>, Error> {
+    let namespace = agent.namespace().unwrap_or_default();
+    let name = agent.name_any();
+    // the harvest Job's name and identity, whatever it is for
+    let probe = harvest_job(
+        &JobContext {
+            namespace: &namespace,
+            daemon: &agent.spec.daemon,
+            images: &ctx.cfg.images,
+            owner: owner_of(agent)?,
+        },
+        &name,
+        &agent.spec,
+    )?;
+    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
+    let existing = observe(
+        &jobs,
+        &probe.name_any(),
+        &super::owned::identity_of(&probe),
+        agent.uid().as_deref(),
+    )
+    .await?;
+    let Some(job) = existing else {
+        return Ok(None);
+    };
+    match harvest_holds(&job, ctx.now(), ctx.run.stuck_after, other_than) {
+        Holds::No => Ok(None),
+        Holds::Yes => Ok(Some(job.name_any())),
+        Holds::Stuck => {
+            tracing::warn!(agent = %name, job = %job.name_any(), "the harvest Job has been deleting past the bound (a lost node?): no longer waited for");
+            Ok(None)
+        }
+    }
+}
+
+/// Whether a harvest Job holds the Agent's pod, or a harvest from other
+/// input (§27.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Holds {
+    No,
+    Yes,
+    /// Being deleted for `stuck_after` or more: its pod is on a lost node
+    /// and never finishes deleting (§22.3), so it holds nothing.
+    Stuck,
+}
+
+/// A Job holds while it runs, or while it is deleted with its pod, up to
+/// `stuck_after` past its deletion timestamp: the crew lock's rule for a
+/// lost node (`jobs::stuck`). With `other_than`, a Job made from that
+/// one's input holds nothing: it is that one. `now` is unix seconds.
+pub fn harvest_holds(
+    job: &Job,
+    now: i64,
+    stuck_after: std::time::Duration,
+    other_than: Option<&Job>,
+) -> Holds {
+    let hash = |job: &Job| job.annotations().get(HASH_ANNOTATION).cloned();
+    if other_than.is_some_and(|wanted| hash(job) == hash(wanted)) {
+        return Holds::No;
+    }
+    match job.metadata.deletion_timestamp.as_ref() {
+        Some(t) if now - t.0.as_second() >= stuck_after.as_secs() as i64 => Holds::Stuck,
+        Some(_) => Holds::Yes,
+        None if super::jobs::unfinished(job) => Holds::Yes,
+        None => Holds::No,
+    }
 }
 
 /// An ended pod (§11, #234) deleted, so the next reconcile makes it again
@@ -645,6 +950,22 @@ async fn cleanup_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, E
         };
         let job = harvest_job(&job_ctx, &name, &agent.spec)?;
         let job_name = job.name_any();
+        let purge = harvest_escape();
+        // a branch change's harvest still running is let finish (§27.2)
+        if let Some(running) = unfinished_harvest(&ctx, &agent, Some(&job)).await? {
+            return Err(deleting(
+                &ctx,
+                &agent,
+                Cond::no(
+                    "Ready",
+                    "Deleting",
+                    &format!(
+                        "Agent {namespace}/{name}: harvest Job {running} not finished; {purge}"
+                    ),
+                ),
+            )
+            .await);
+        }
         let ensured = ensure_job(
             ctx.as_ref(),
             agent.as_ref(),
@@ -652,7 +973,6 @@ async fn cleanup_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, E
             Some((&agent.spec.fleet, &agent.spec.crew)),
         )
         .await?;
-        let purge = harvest_escape();
         match ensured.outcome {
             JobOutcome::Succeeded(message) => tracing::info!(agent = %name, "{message}"),
             // the namespace takes the claim with it; there is nowhere to harvest to
@@ -693,4 +1013,100 @@ async fn cleanup_agent(agent: Arc<Agent>, ctx: Arc<Context>) -> Result<Action, E
     delete_read(&claims, &claim, DeleteParams::default()).await?;
     tracing::info!(agent = %name, "removed");
     Ok(Action::await_change())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_branch_change_says_what_it_waits_on_and_names_the_escape() {
+        let escape = "set the branch back to a, commit or discard the changes in the pod, then change it again; or annotate the Agent balerix.ai/purge=true, which discards the clone's uncommitted changes and unpushed commits";
+        let pod = branch_change_condition("ns/f-c-x", "a", "b", BranchWait::Pod);
+        assert_eq!(
+            (pod.status, pod.reason.as_str(), pod.message.as_str()),
+            (
+                Some(false),
+                "BranchChanging",
+                "Agent ns/f-c-x: its branch changed from a to b; waiting for its pod to go"
+            )
+        );
+        // a Job that merely runs names no escape
+        let running = JobOutcome::Running;
+        for wait in [
+            BranchWait::Running("f-c-x-harvest"),
+            BranchWait::Job {
+                name: "f-c-x-harvest",
+                outcome: &running,
+            },
+        ] {
+            let c = branch_change_condition("ns/f-c-x", "a", "b", wait);
+            assert_eq!(c.reason, "BranchChanging");
+            assert_eq!(
+                c.message,
+                "Agent ns/f-c-x: its branch changed from a to b; harvest Job f-c-x-harvest not finished"
+            );
+        }
+        let failed = JobOutcome::Failed("harvest: f/c/x: dirty".into());
+        let c = branch_change_condition(
+            "ns/f-c-x",
+            "a",
+            "b",
+            BranchWait::Job {
+                name: "f-c-x-harvest",
+                outcome: &failed,
+            },
+        );
+        assert_eq!((c.type_, c.status), ("Ready", Some(false)));
+        assert_eq!(c.reason, "BranchChangeBlocked");
+        assert_eq!(
+            c.message,
+            format!(
+                "Agent ns/f-c-x: its branch changed from a to b; Job f-c-x-harvest failed: harvest: f/c/x: dirty; the clone is kept and no pod starts; {escape}"
+            )
+        );
+        assert!(purge_kept_note("ns/f-c-x").contains("remove the annotation yourself"));
+    }
+
+    #[test]
+    fn a_harvest_job_holds_while_it_runs_or_deletes_up_to_the_stuck_bound() {
+        let job = |hash: &str, status: serde_json::Value, deleting: Option<&str>| -> Job {
+            let mut v = serde_json::json!({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": { "name": "f-c-x-harvest", "annotations": { HASH_ANNOTATION: hash } },
+                "status": status,
+            });
+            if let Some(t) = deleting {
+                v["metadata"]["deletionTimestamp"] = serde_json::json!(t);
+            }
+            serde_json::from_value(v).unwrap_or_else(|e| panic!("{e}"))
+        };
+        let bound = std::time::Duration::from_secs(300);
+        // 2026-10-03T00:00:00Z
+        let deleted_at = 1_790_985_600;
+        let running = job("a", serde_json::json!({}), None);
+        let done = job("a", serde_json::json!({ "succeeded": 1 }), None);
+        let deleting = job(
+            "a",
+            serde_json::json!({ "succeeded": 1 }),
+            Some("2026-10-03T00:00:00Z"),
+        );
+        assert_eq!(harvest_holds(&running, 0, bound, None), Holds::Yes);
+        assert_eq!(harvest_holds(&done, 0, bound, None), Holds::No);
+        assert_eq!(
+            harvest_holds(&deleting, deleted_at + 299, bound, None),
+            Holds::Yes
+        );
+        // a pod on a lost node never lets its Job go: past the bound, it
+        // holds nothing
+        assert_eq!(
+            harvest_holds(&deleting, deleted_at + 300, bound, None),
+            Holds::Stuck
+        );
+        // the wanted Job itself is ensure_job's to wait on, not a holder
+        let same = job("a", serde_json::json!({}), None);
+        let other = job("b", serde_json::json!({}), None);
+        assert_eq!(harvest_holds(&running, 0, bound, Some(&same)), Holds::No);
+        assert_eq!(harvest_holds(&running, 0, bound, Some(&other)), Holds::Yes);
+    }
 }

@@ -1,0 +1,123 @@
+---
+source: src/desired/jobs.rs
+expression: a_to_b
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    balerix.ai/input-hash: 5f63887c59c528e29a9c0459715e25ec078dabe9f45e743fbac99d835863b990
+  labels:
+    app.kubernetes.io/managed-by: balerix-operator
+    balerix.ai/agent: alice
+    balerix.ai/component: harvest
+    balerix.ai/crew: backend
+    balerix.ai/daemon: default
+    balerix.ai/fleet: payments
+  name: payments-backend-alice-harvest
+  namespace: team-a
+spec:
+  activeDeadlineSeconds: 3600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: balerix-operator
+        balerix.ai/agent: alice
+        balerix.ai/component: harvest
+        balerix.ai/crew: backend
+        balerix.ai/daemon: default
+        balerix.ai/fleet: payments
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - args:
+            - harvest
+            - "--agent"
+            - payments/backend/alice
+            - "--branch"
+            - b
+          command:
+            - balerix-agent
+          env:
+            - name: HOME
+              value: /balerix/scratch
+          image: "ghcr.io/balerix-ai/balerix-agent:0.2.0"
+          name: job
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - mountPath: /balerix/shared/repo
+              name: shared
+              readOnly: false
+              subPath: fleets/payments/crews/backend/repo
+            - mountPath: /balerix/shared/crew
+              name: shared
+              readOnly: false
+              subPath: fleets/payments/crews/backend/pool
+            - mountPath: /balerix/scratch
+              name: scratch
+            - mountPath: /tmp
+              name: tmp
+            - mountPath: /balerix/agent
+              name: agent
+              readOnly: true
+              subPath: agent
+            - mountPath: /balerix/agent/workspace
+              name: agent
+              readOnly: false
+              subPath: agent/workspace
+      enableServiceLinks: false
+      initContainers:
+        - command:
+            - mkdir
+            - "-p"
+            - /balerix/volume/fleets/payments/crews/backend/repo
+            - /balerix/volume/fleets/payments/crews/backend/pool
+            - /balerix/claim/workspace
+          image: "ghcr.io/balerix-ai/balerix-agent:0.2.0"
+          name: slice
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          terminationMessagePolicy: FallbackToLogsOnError
+          volumeMounts:
+            - mountPath: /balerix/volume
+              name: shared
+            - mountPath: /balerix/claim
+              name: agent
+              subPath: agent
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: balerix-default-shared
+        - emptyDir: {}
+          name: scratch
+        - emptyDir: {}
+          name: tmp
+        - name: agent
+          persistentVolumeClaim:
+            claimName: payments-backend-alice
+            readOnly: false
+  ttlSecondsAfterFinished: 3600

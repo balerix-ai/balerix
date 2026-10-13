@@ -5,6 +5,8 @@ expression: o.claim
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
+  annotations:
+    balerix.ai/branch: balerix/payments/backend/alice
   labels:
     app.kubernetes.io/managed-by: balerix-operator
     balerix.ai/agent: alice

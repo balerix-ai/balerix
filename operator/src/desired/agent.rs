@@ -17,10 +17,53 @@ use super::common::{
 };
 use super::jobs::{AGENT_DIR, SHARED};
 use super::names;
-use crate::api::{Agent, AgentStatus, ClaimSpec, Daemon};
+use crate::api::{Agent, AgentSpec, AgentStatus, ClaimSpec, Daemon};
 
 /// On the pod: the Agent's `specHash` it was made from (§5.4).
 pub const SPEC_HASH_ANNOTATION: &str = "balerix.ai/spec-hash";
+
+/// On the agent claim: the branch its clone was made for (§27.1). Written
+/// when the claim is made, and moved only once a branch change's harvest
+/// Job has settled the clone; the pod is never made while it differs
+/// from the Agent's branch.
+pub const BRANCH_ANNOTATION: &str = "balerix.ai/branch";
+
+/// The branch the agent's clone is on, as `ResolvedAgent::branch` names
+/// it: `settings.branch` when set, else `balerix/<fleet>/<crew>/<agent>`.
+pub fn agent_branch(spec: &AgentSpec) -> Result<String, DesiredError> {
+    let settings: AgentSettings = typed(spec.settings.clone())?;
+    Ok(settings
+        .branch
+        .unwrap_or_else(|| format!("balerix/{}/{}/{}", spec.fleet, spec.crew, spec.agent)))
+}
+
+/// The claim's recorded branch against the Agent's (§27).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimBranch {
+    /// The clone was made for the Agent's branch.
+    Same,
+    /// No record: a claim an earlier operator made. Recorded as the
+    /// Agent's branch, with no harvest: its pod was made from the same
+    /// spec.
+    Unrecorded,
+    /// The Agent's branch moved off `from`: the pod waits for the
+    /// branch change's harvest Job.
+    Changed { from: String },
+}
+
+pub fn claim_branch(claim: &PersistentVolumeClaim, branch: &str) -> ClaimBranch {
+    match claim
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(BRANCH_ANNOTATION))
+        .filter(|b| !b.is_empty())
+    {
+        None => ClaimBranch::Unrecorded,
+        Some(b) if b == branch => ClaimBranch::Same,
+        Some(b) => ClaimBranch::Changed { from: b.clone() },
+    }
+}
 
 /// No `Debug`: `token` and `credentials` are secrets.
 pub struct AgentInputs<'a> {
@@ -94,7 +137,7 @@ pub fn agent_objects(inputs: &AgentInputs<'_>) -> Result<AgentObjects, DesiredEr
         .and_then(|s| s.get("size"))
         .and_then(Value::as_str)
         .unwrap_or(&default.size);
-    let agent_claim = claim(
+    let mut agent_claim = claim(
         namespace,
         name,
         labels,
@@ -104,6 +147,13 @@ pub fn agent_objects(inputs: &AgentInputs<'_>) -> Result<AgentObjects, DesiredEr
         },
         "ReadWriteOnce",
     )?;
+    // the branch its clone is made for (§27.1): applied only when the
+    // claim is made, so a later spec never moves it past a harvest
+    agent_claim.metadata.annotations = Some(
+        [(BRANCH_ANNOTATION.to_string(), agent_branch(spec)?)]
+            .into_iter()
+            .collect(),
+    );
 
     let bundle = AgentBundle {
         agent: format!("{}/{}/{}", spec.fleet, spec.crew, spec.agent),
@@ -622,6 +672,62 @@ mod tests {
         assert_eq!(
             o.pod.spec.unwrap().automount_service_account_token,
             Some(false)
+        );
+    }
+
+    /// §27.1: the claim records the agent's branch, `ResolvedAgent`'s rule.
+    #[test]
+    fn the_claim_records_the_agents_branch() {
+        let o = objects(json!({ "type": "pod" }));
+        assert_eq!(
+            o.claim.metadata.annotations.as_ref().unwrap()[BRANCH_ANNOTATION],
+            "balerix/payments/backend/alice"
+        );
+        let mut a = agent(json!({ "type": "pod" }));
+        a.spec.settings["branch"] = json!("feature/x");
+        assert_eq!(agent_branch(&a.spec).unwrap(), "feature/x");
+        // the same rule as the host's
+        for spec in [agent(json!({ "type": "pod" })).spec, a.spec] {
+            let resolved = balerix_core::ResolvedAgent {
+                id: format!("{}/{}/{}", spec.fleet, spec.crew, spec.agent)
+                    .parse()
+                    .unwrap(),
+                repo: balerix_core::RepoRef::parse(&spec.repo).unwrap(),
+                git_ref: spec.git_ref.clone(),
+                git: serde_json::from_value(spec.git.clone()).unwrap(),
+                settings: serde_json::from_value(spec.settings.clone()).unwrap(),
+            };
+            assert_eq!(agent_branch(&spec).unwrap(), resolved.branch());
+        }
+    }
+
+    #[test]
+    fn a_claims_recorded_branch_is_the_same_unrecorded_or_changed() {
+        let claim = |annotations: Value| -> PersistentVolumeClaim {
+            serde_json::from_value(
+                json!({ "metadata": { "name": "c", "annotations": annotations } }),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            claim_branch(&claim(json!({ BRANCH_ANNOTATION: "main" })), "main"),
+            ClaimBranch::Same
+        );
+        assert_eq!(
+            claim_branch(&claim(json!({ BRANCH_ANNOTATION: "a" })), "b"),
+            ClaimBranch::Changed { from: "a".into() }
+        );
+        assert_eq!(
+            claim_branch(&claim(json!({ "other": "x" })), "b"),
+            ClaimBranch::Unrecorded
+        );
+        assert_eq!(
+            claim_branch(&claim(json!({ BRANCH_ANNOTATION: "" })), "b"),
+            ClaimBranch::Unrecorded
+        );
+        assert_eq!(
+            claim_branch(&claim(Value::Null), "b"),
+            ClaimBranch::Unrecorded
         );
     }
 

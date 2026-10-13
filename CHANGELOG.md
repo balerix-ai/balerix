@@ -190,6 +190,10 @@
   session cookie is now `Secure` when the daemon serves TLS or
   `public_url` is https. `X-Forwarded-Proto` is not trusted: behind a
   TLS-terminating proxy, set an https `public_url`.
+- With `CLAUDE_CONFIG_DIR` set, the client now reads the Claude account
+  (`oauthAccount`, `hasCompletedOnboarding`) from
+  `$CLAUDE_CONFIG_DIR/.claude.json`, where Claude Code keeps it, instead
+  of `~/.claude.json`.
 
 ## 0.2.4 - 2026-10-10
 

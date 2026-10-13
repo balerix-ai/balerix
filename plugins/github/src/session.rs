@@ -48,6 +48,46 @@ pub struct Session {
     pub last_activity: u64,
     #[serde(default)]
     pub closed: bool,
+    /// The comments and reviews acted on for this number, newest last,
+    /// at most `SEEN_LIMIT`: a redelivery is ignored after a restart and
+    /// without a delivery id (#259).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seen: Vec<Seen>,
+}
+
+/// How many `Seen` ids a row keeps.
+pub const SEEN_LIMIT: usize = 256;
+
+/// A webhook's own id, which GitHub keeps across redeliveries. Comment
+/// and review ids are separate sequences, so each is tagged; a number
+/// opens once, so its opening needs no id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Seen {
+    Comment(u64),
+    Review(u64),
+    /// The issue or PR's opening, which the row started from.
+    Opening,
+}
+
+impl Session {
+    pub fn has_seen(&self, id: Seen) -> bool {
+        self.seen.contains(&id)
+    }
+
+    /// Records `id`, dropping the oldest past `SEEN_LIMIT`; `false` when
+    /// it was already there.
+    pub fn see(&mut self, id: Seen) -> bool {
+        if self.has_seen(id) {
+            return false;
+        }
+        self.seen.push(id);
+        if self.seen.len() > SEEN_LIMIT {
+            let over = self.seen.len() - SEEN_LIMIT;
+            self.seen.drain(..over);
+        }
+        true
+    }
 }
 
 #[derive(Debug, Default)]
@@ -189,7 +229,27 @@ mod tests {
             session_id: None,
             last_activity: 0,
             closed: false,
+            seen: Vec::new(),
         }
+    }
+
+    #[test]
+    fn seen_ids_are_bounded_tagged_and_round_trip() {
+        let mut r = row("a/b", 1);
+        assert!(r.see(Seen::Comment(5)));
+        assert!(!r.see(Seen::Comment(5)));
+        assert!(!r.has_seen(Seen::Review(5)), "a review id is its own");
+        for id in 0..SEEN_LIMIT as u64 {
+            r.see(Seen::Review(id));
+        }
+        assert_eq!(r.seen.len(), SEEN_LIMIT);
+        assert!(!r.has_seen(Seen::Comment(5)), "the oldest went first");
+        assert!(r.has_seen(Seen::Review(0)));
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["seen"][0], json!({ "review": 0 }));
+        assert_eq!(serde_json::from_value::<Session>(v).unwrap(), r);
+        let empty = serde_json::to_value(row("a/b", 1)).unwrap();
+        assert!(empty.get("seen").is_none(), "{empty}");
     }
 
     #[tokio::test]
@@ -246,7 +306,11 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !r.closed && r.status_comment.is_none() && r.last_activity == 0 && r.base.is_none()
+            !r.closed
+                && r.status_comment.is_none()
+                && r.last_activity == 0
+                && r.base.is_none()
+                && r.seen.is_empty()
         );
         assert_eq!(fleet_of("gh-a-b/repo/pr-2"), "gh-a-b");
         assert_eq!(crew_of("gh-a-b/backend/pr-2"), "backend");

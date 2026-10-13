@@ -171,6 +171,7 @@ struct Session {
     session_id: Option<String>, // the live Claude session, once seen
     last_activity: u64,         // unix seconds
     closed: bool,
+    seen: Vec<Seen>,            // comment and review ids acted on, last 256 (#259)
 }
 ```
 
@@ -905,3 +906,20 @@ credentials or the gh token (Spec L-3).
   new key: the old row is replaced, not resumed, so it gets a new default
   branch (`balerix/<fleet>/<new crew>/<agent>`) and no branch line for
   the earlier work.
+- Replay protection does not rest on the delivery-id ring alone, which
+  a request without `X-GitHub-Delivery`, a restart, or a captured body
+  under a fresh id gets past (#259). Each row keeps the comment and
+  review ids it acted on (`seen`, tagged by kind, the last 256), written
+  to KV before the comment or review is acted on (a review once its
+  comments are read, so a failed read leaves it to a redelivery). A
+  comment or review whose id the number's row holds is counted
+  `inbound_total{outcome="duplicate"}` and dropped before the permission
+  check. The comment that starts a session goes into the new row, or
+  `opening` when the issue or PR body started it: a number opens once,
+  so a replayed opening on a closed row is a duplicate too and no longer
+  resumes (amending the #96 entry above; a mention still does). A
+  resumed row, or one replacing a row under an old crew key, keeps the
+  ids before it. A review's inline comments come with the review, so its
+  id covers them. The ids go when the row does: a mention replayed after
+  the seven-day retention starts a session, as a new mention would. The
+  ring stays as the first check.

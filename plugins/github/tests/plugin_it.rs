@@ -150,6 +150,30 @@ async fn a_mention_starts_a_session_and_the_first_prompt_reaches_the_agent() {
         fake.actions_for("gh-acme-api/repo/issue-12")[0],
         PluginAction::SendText { submit: true, .. }
     ));
+
+    // #259: one new comment, sent with a delivery id, again without the
+    // header (past the ring), and again under a fresh id: acted on once.
+    let payload = json!({ "action": "created", "repository": { "full_name": "acme/api" }, "installation": { "id": 7 }, "issue": { "number": 12 }, "comment": { "id": 6, "body": "carry on", "user": { "login": "alice", "type": "User" } } });
+    let body = serde_json::to_vec(&payload).unwrap();
+    for delivery in [Some("d2"), None, Some("d3")] {
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{listen}/webhook"))
+            .header("X-Hub-Signature-256", sign("s3cret", &body))
+            .header("X-GitHub-Event", "issue_comment")
+            .body(body.clone());
+        if let Some(d) = delivery {
+            req = req.header("X-GitHub-Delivery", d);
+        }
+        assert_eq!(req.send().await.unwrap().status(), 202);
+    }
+    let c = counters.clone();
+    eventually("both redeliveries", || {
+        c.inbound.with_label_values(&["duplicate"]).get() == 2
+    })
+    .await;
+    let sent = fake.actions_for("gh-acme-api/repo/issue-12");
+    assert_eq!(sent.len(), 2, "the first prompt and the comment, once");
+    assert!(matches!(&sent[1], PluginAction::SendText { text, .. } if text == "carry on"));
     assert!(h.health().await.is_ok());
     assert!(
         h.metrics()

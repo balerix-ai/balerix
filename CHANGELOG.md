@@ -194,6 +194,9 @@
   (`oauthAccount`, `hasCompletedOnboarding`) from
   `$CLAUDE_CONFIG_DIR/.claude.json`, where Claude Code keeps it, instead
   of `~/.claude.json`.
+- `plugin install --sha256` compares the digest case-insensitively, and a
+  huge `--timeout` (`down --purge`, `plugin remove --purge`) waits
+  instead of panicking on overflow.
 
 ## 0.2.4 - 2026-10-10
 

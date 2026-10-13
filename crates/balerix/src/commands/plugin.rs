@@ -17,7 +17,7 @@ use crate::cli::{
     ApiOnlyArgs, ListArgs, PluginInstallArgs, PluginOpenArgs, PluginPackageArgs, PluginRemoveArgs,
 };
 use crate::client::{Client, HttpStatus, NOT_RUNNING};
-use crate::commands::fleet::{label, parse_duration, wait_purged};
+use crate::commands::fleet::{deadline_after, label, parse_duration, wait_purged};
 use crate::wiring::layout_from_env;
 
 const NOT_SYNCED: &str = "daemon not running; `balerix serve` syncs plugins at start\n";
@@ -173,8 +173,9 @@ fn describe_source(
     }
     let bytes = std::fs::read(&path).with_context(|| path.display().to_string())?;
     let digest = sha256_hex(&bytes);
+    // `sha256sum` prints lowercase, other tools uppercase: the same digest
     if let Some(expected) = sha256
-        && expected != digest
+        && !expected.trim().eq_ignore_ascii_case(&digest)
     {
         bail!(
             "digest mismatch for {} (expected {expected}, got {digest})",
@@ -272,7 +273,7 @@ pub fn remove_command(args: &PluginRemoveArgs) -> Result<String> {
         save_file(&path, &file)?;
     }
     if args.purge {
-        let deadline = Instant::now() + timeout;
+        let deadline = deadline_after(timeout);
         let client = Client::connect(args.api_url.as_deref())
             .map_err(|e| anyhow!("{e}; --purge needs a running daemon (the entry was removed)"))?;
         // Spec L-6: the daemon downs the plugin's up fleets during the

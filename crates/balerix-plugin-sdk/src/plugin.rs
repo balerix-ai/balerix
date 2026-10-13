@@ -54,13 +54,14 @@ pub trait Plugin: Send + Sync + 'static {
         let _ = events;
         async {}
     }
-    /// The daemon lost `n` observer events for this plugin since the last
-    /// batch the plugin acknowledged (`EVENTS_DROPPED_HEADER`,
-    /// plugin-protocol §4, `events`). Called before `observe` for the
-    /// batch that reports it; never with zero. The lost events came
-    /// before that batch's first one, so state tracked from the events
-    /// may be stale. The same count can arrive again if the batch is not
-    /// acknowledged, so handling it should be idempotent.
+    /// The plugin missed `n` hook events — observed or intercepted —
+    /// since a call last told it so (`EVENTS_DROPPED_HEADER`,
+    /// plugin-protocol §4, `events`). Called before `observe` or
+    /// `intercept` for the call that reports it; never with zero, and
+    /// with 1 for a count the SDK cannot read. The missed events came
+    /// before that call's own, so state tracked from the events may be
+    /// stale. The same count can arrive again if the call fails, so
+    /// handling it should be idempotent.
     fn events_dropped(&self, n: u64) -> impl Future<Output = ()> + Send {
         let _ = n;
         async {}
@@ -198,16 +199,19 @@ async fn deactivate<P: Plugin>(
     Json(json!({})).into_response()
 }
 
-/// The `EVENTS_DROPPED_HEADER` count; absent, zero or unreadable is none.
+/// The `EVENTS_DROPPED_HEADER` count; absent or zero is none. A header
+/// present but unreadable still says something was lost: at least one.
 fn events_dropped(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get(EVENTS_DROPPED_HEADER)?
+    let value = headers.get(EVENTS_DROPPED_HEADER)?;
+    match value
         .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
         .ok()
-        .filter(|n| *n > 0)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(1),
+    }
 }
 
 async fn events<P: Plugin>(
@@ -228,12 +232,16 @@ async fn events<P: Plugin>(
 
 async fn intercept<P: Plugin>(
     State(p): State<Arc<P>>,
+    headers: HeaderMap,
     body: Result<Json<InterceptRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(req) = match body {
         Ok(b) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
+    if let Some(n) = events_dropped(&headers) {
+        p.events_dropped(n).await;
+    }
     let verdict = p
         .intercept(req.event, req.response_so_far, req.deadline_ms)
         .await;
@@ -544,10 +552,25 @@ mod tests {
                 .unwrap()
                 .push(format!("observe {}", events.len()));
         }
+        async fn intercept(
+            &self,
+            event: HookEvent,
+            response_so_far: Value,
+            _deadline_ms: u64,
+        ) -> InterceptResponse {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("intercept {}", event.name));
+            InterceptResponse {
+                response: response_so_far,
+                actions: Vec::new(),
+            }
+        }
     }
 
     #[tokio::test]
-    async fn the_dropped_header_reaches_events_dropped_before_observe() {
+    async fn the_dropped_header_reaches_events_dropped_before_observe_or_intercept() {
         let (listener, listen) = bind().await.unwrap();
         let plugin = Arc::new(Gaps::default());
         tokio::spawn(run(listener, plugin.clone(), "tok", None));
@@ -574,9 +597,27 @@ mod tests {
                 "dropped 7",
                 "observe 1",
                 "observe 1",
+                "dropped 1",
                 "observe 1"
             ],
-            "no header, a zero or an unreadable count: no call"
+            "no header or a zero: no call; an unreadable count is at least one"
+        );
+        plugin.0.lock().unwrap().clear();
+        let req = json!({ "event": event, "response_so_far": {}, "deadline_ms": 5 });
+        for header in [None, Some("4")] {
+            let mut r = c
+                .post(format!("http://{listen}/v1/intercept"))
+                .bearer_auth("tok")
+                .json(&req);
+            if let Some(h) = header {
+                r = r.header(EVENTS_DROPPED_HEADER, h);
+            }
+            assert_eq!(r.send().await.unwrap().status().as_u16(), 200);
+        }
+        assert_eq!(
+            *plugin.0.lock().unwrap(),
+            ["intercept Stop", "dropped 4", "intercept Stop"],
+            "reported before the intercept it rides on"
         );
     }
 

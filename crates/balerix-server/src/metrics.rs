@@ -287,6 +287,15 @@ impl Metrics {
         }
     }
 
+    /// An interceptor not called at all (`not_ready`): a failure with no
+    /// duration to observe.
+    pub fn intercept_skipped(&self, plugin: &str, reason: &str) {
+        self.inner
+            .plugin_intercept_failures
+            .with_label_values(&[plugin, reason])
+            .inc();
+    }
+
     pub fn events_dropped(&self, plugin: &str, reason: DropReason, n: u64) {
         self.inner
             .plugin_events_dropped

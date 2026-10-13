@@ -21,15 +21,34 @@ use crate::metrics::{DropReason, Metrics};
 /// How long a delivery task waits for a batch to fill before sending.
 pub const BATCH_WINDOW: Duration = Duration::from_millis(100);
 
+/// Hook events one plugin missed — observed or intercepted — since a
+/// call last told it so. The next `events` or `intercept` call to the
+/// plugin takes the count and reports it (`EVENTS_DROPPED_HEADER`); a
+/// call that fails puts it back, so only a 2xx settles it. Taking it
+/// whole means two concurrent calls never report, or settle, the same
+/// events twice.
+#[derive(Debug, Default)]
+pub struct Losses(AtomicU64);
+
+impl Losses {
+    pub fn add(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::SeqCst);
+    }
+
+    pub fn take(&self) -> u64 {
+        self.0.swap(0, Ordering::SeqCst)
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 pub struct ObserverQueue {
     plugin: AgentName,
     buf: Mutex<VecDeque<HookEvent>>,
     notify: Notify,
-    /// Events this plugin lost since its last acknowledged batch: the
-    /// next batch reports it (`EVENTS_DROPPED_HEADER`), and the
-    /// acknowledgement of that batch takes it back off. Only `deliver`
-    /// subtracts, so what it read is never more than what is here.
-    dropped: AtomicU64,
+    losses: Arc<Losses>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -37,12 +56,12 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl ObserverQueue {
-    pub fn new(plugin: AgentName) -> Arc<Self> {
+    pub fn new(plugin: AgentName, losses: Arc<Losses>) -> Arc<Self> {
         Arc::new(Self {
             plugin,
             buf: Mutex::new(VecDeque::with_capacity(OBSERVER_QUEUE)),
             notify: Notify::new(),
-            dropped: AtomicU64::new(0),
+            losses,
         })
     }
 
@@ -78,12 +97,12 @@ impl ObserverQueue {
 
     /// Counts `n` events this plugin will never get.
     pub fn lose(&self, n: u64) {
-        self.dropped.fetch_add(n, Ordering::SeqCst);
+        self.losses.add(n);
     }
 
-    /// Events lost since the last acknowledged batch.
+    /// Events lost and not yet reported.
     pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::SeqCst)
+        self.losses.get()
     }
 
     pub fn len(&self) -> usize {
@@ -132,19 +151,14 @@ impl ObserverQueue {
                 self.lose(n);
                 continue;
             };
-            let reported = self.dropped();
-            match client
+            let reported = self.losses.take();
+            if let Err(e) = client
                 .events(&addr, &EventBatch { events: batch }, reported)
                 .await
             {
-                Ok(()) => {
-                    self.dropped.fetch_sub(reported, Ordering::SeqCst);
-                }
-                Err(e) => {
-                    tracing::warn!(plugin = %self.plugin, events = n, "observer batch not acknowledged: {e}");
-                    metrics.events_dropped(self.plugin.as_str(), DropReason::Unacknowledged, n);
-                    self.lose(n);
-                }
+                tracing::warn!(plugin = %self.plugin, events = n, "observer batch not acknowledged: {e}");
+                metrics.events_dropped(self.plugin.as_str(), DropReason::Unacknowledged, n);
+                self.lose(reported + n);
             }
         }
     }
@@ -161,6 +175,7 @@ pub struct PluginEventHandler {
     client: PluginClient,
     metrics: Metrics,
     observers: Mutex<BTreeMap<AgentName, Observer>>,
+    losses: Mutex<BTreeMap<AgentName, Arc<Losses>>>,
 }
 
 impl PluginEventHandler {
@@ -170,7 +185,31 @@ impl PluginEventHandler {
             client,
             metrics,
             observers: Mutex::new(BTreeMap::new()),
+            losses: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// The plugin's loss count, shared by its observer queue and its
+    /// intercepts. `None` once the registry no longer lists the plugin;
+    /// `remove` drops it under the same lock, as with `queue_for`.
+    fn losses_for(&self, name: &AgentName) -> Option<Arc<Losses>> {
+        let mut map = lock(&self.losses);
+        if let Some(l) = map.get(name) {
+            return Some(l.clone());
+        }
+        if !self.registry.is_installed(name.as_str()) {
+            return None;
+        }
+        let l = Arc::new(Losses::default());
+        map.insert(name.clone(), l.clone());
+        Some(l)
+    }
+
+    /// Counts one event `name` missed, for it to hear of on its next call.
+    fn missed(&self, name: &AgentName) {
+        if let Some(l) = self.losses_for(name) {
+            l.add(1);
+        }
     }
 
     /// The plugin's queue, its delivery task spawned on first use. Needs
@@ -186,10 +225,8 @@ impl PluginEventHandler {
         if let Some(o) = map.get(name) {
             return Some(o.queue.clone());
         }
-        if !self.registry.is_installed(name.as_str()) {
-            return None;
-        }
-        let queue = ObserverQueue::new(name.clone());
+        let losses = self.losses_for(name)?;
+        let queue = ObserverQueue::new(name.clone(), losses);
         let task = tokio::spawn(queue.clone().deliver(
             self.registry.clone(),
             self.client.clone(),
@@ -226,6 +263,7 @@ impl PluginEventHandler {
         if let Some(o) = lock(&self.observers).remove(name) {
             o.task.abort();
         }
+        lock(&self.losses).remove(name);
     }
 
     pub fn queue_len(&self, name: &AgentName) -> usize {
@@ -238,22 +276,37 @@ impl PluginEventHandler {
         };
         let mut outcome = Outcome::allow();
         let deadline = Instant::now() + Duration::from_millis(CHAIN_BUDGET_MS);
-        for (name, addr) in self.registry.interceptors(&agent, &event.name) {
+        let intercepting = self.registry.intercepting(&agent, &event.name);
+        // An interceptor that is not ready, skipped for want of budget, or
+        // whose call fails misses the event: it hears how many with its
+        // next call (`EVENTS_DROPPED_HEADER`).
+        for name in &intercepting.unready {
+            self.metrics.intercept_skipped(name.as_str(), "not_ready");
+            self.missed(name);
+        }
+        for (name, addr) in intercepting.ready {
             self.metrics
                 .plugin_event(name.as_str(), &event.name, "intercept");
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 self.metrics
                     .intercept(name.as_str(), &event.name, 0.0, Some("timeout"));
+                self.missed(&name);
                 continue;
             }
+            let losses = self.losses_for(&name);
+            let reported = losses.as_ref().map_or(0, |l| l.take());
             let req = InterceptRequest {
                 event: event.clone(),
                 response_so_far: outcome.response.clone(),
                 deadline_ms: u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
             };
             let started = Instant::now();
-            match self.client.intercept(&addr, &req, remaining).await {
+            match self
+                .client
+                .intercept(&addr, &req, remaining, reported)
+                .await
+            {
                 Ok(verdict) => {
                     outcome.response = verdict.response;
                     // A merged chain no longer says who asked for what, so
@@ -271,6 +324,9 @@ impl PluginEventHandler {
                 }
                 Err(e) => {
                     tracing::warn!(plugin = %name, agent = %agent, event = %event.name, "interceptor skipped: {e}");
+                    if let Some(l) = &losses {
+                        l.add(reported + 1);
+                    }
                     self.metrics.intercept(
                         name.as_str(),
                         &event.name,
@@ -280,7 +336,8 @@ impl PluginEventHandler {
                 }
             }
         }
-        for (name, _) in self.registry.observers(&agent, &event.name) {
+        let observing = self.registry.observing(&agent, &event.name);
+        for (name, _) in observing.ready {
             self.metrics
                 .plugin_event(name.as_str(), &event.name, "observe");
             if self.queue_for(&name).is_some_and(|q| q.push(event.clone())) {
@@ -290,9 +347,9 @@ impl PluginEventHandler {
         }
         // Subscribed but not ready: the event is never queued, and the
         // plugin hears how many it missed with its next batch.
-        for name in self.registry.unready_observers(&agent, &event.name) {
-            if let Some(q) = self.queue_for(&name) {
-                q.lose(1);
+        for name in observing.unready {
+            if let Some(l) = self.losses_for(&name) {
+                l.add(1);
                 self.metrics
                     .events_dropped(name.as_str(), DropReason::NotReady, 1);
             }
@@ -969,9 +1026,101 @@ mod tests {
         assert_eq!(seen_batches(&seen, 2).await[1], (Some(3), 1));
     }
 
+    /// An interceptor whose `/v1/intercept` records each call's
+    /// `EVENTS_DROPPED_HEADER` and answers the next status in `statuses`
+    /// (200, passing the response through, once they run out).
+    async fn intercept_recorder(statuses: &[u16]) -> (String, Arc<StdMutex<Vec<Option<u64>>>>) {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let statuses = Arc::new(StdMutex::new(
+            statuses.iter().copied().collect::<VecDeque<_>>(),
+        ));
+        let app = Router::new().route(
+            "/v1/intercept",
+            post({
+                let seen = seen.clone();
+                move |headers: axum::http::HeaderMap, Json(v): Json<Value>| async move {
+                    let dropped = headers
+                        .get(balerix_api::EVENTS_DROPPED_HEADER)
+                        .map(|v| v.to_str().unwrap().parse::<u64>().unwrap());
+                    seen.lock().unwrap().push(dropped);
+                    let status = statuses.lock().unwrap().pop_front().unwrap_or(200);
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        Json(json!({ "response": v["response_so_far"] })),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, seen)
+    }
+
+    /// An interceptor that misses events while not ready, or whose call
+    /// fails, hears how many with its next intercept; a 2xx settles it.
+    #[tokio::test]
+    async fn an_interceptor_hears_of_the_events_it_missed() {
+        let r = PluginRegistry::new();
+        r.replace_plugins(&[plugin("flow", &["Stop"], &[])], &[]);
+        let (listen, seen) = intercept_recorder(&[500]).await;
+        let flow: AgentName = "flow".parse().unwrap();
+        r.set_listen(&flow, listen, "t".into());
+        active(&r, "flow");
+        let (h, m) = handler(&r);
+        r.set_ready(&flow, false);
+        h.handle(&event("Stop")).await;
+        h.handle(&event("Stop")).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "not called while not ready"
+        );
+        r.set_ready(&flow, true);
+        h.handle(&event("Stop")).await; // answered 500
+        h.handle(&event("Stop")).await;
+        h.handle(&event("Stop")).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [Some(2), Some(3), None],
+            "the two missed; then those two again with the failed call's own"
+        );
+        let text = m.encode();
+        assert!(
+            text.contains(
+                "balerix_plugin_intercept_failures_total{plugin=\"flow\",reason=\"not_ready\"} 2"
+            ),
+            "{text}"
+        );
+    }
+
+    /// An interceptor the chain's budget did not reach missed the event.
+    #[tokio::test]
+    async fn an_interceptor_past_the_budget_hears_of_the_event_it_missed() {
+        let r = PluginRegistry::new();
+        r.replace_plugins(
+            &[
+                plugin("slow", &["PreToolUse"], &[]),
+                plugin("flow", &["PreToolUse"], &[]),
+            ],
+            &[],
+        );
+        let (slow, _) = stub(Behaviour::Sleep(5_000), 200).await;
+        let (flow, seen) = intercept_recorder(&[]).await;
+        r.set_listen(&"slow".parse().unwrap(), slow, "t".into());
+        r.set_listen(&"flow".parse().unwrap(), flow, "t".into());
+        active(&r, "slow");
+        active(&r, "flow");
+        let (h, _m) = handler(&r);
+        h.handle(&event("PreToolUse")).await;
+        assert!(seen.lock().unwrap().is_empty(), "no budget left for flow");
+        r.set_ready(&"slow".parse().unwrap(), false);
+        h.handle(&event("PreToolUse")).await;
+        assert_eq!(*seen.lock().unwrap(), [Some(1)]);
+    }
+
     #[test]
     fn the_queue_drops_the_oldest_on_overflow() {
-        let q = ObserverQueue::new("web".parse().unwrap());
+        let q = ObserverQueue::new("web".parse().unwrap(), Arc::default());
         for i in 0..(OBSERVER_QUEUE as i64 + 5) {
             let mut e = event("Stop");
             e.payload = json!({ "i": i });

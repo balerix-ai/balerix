@@ -88,7 +88,7 @@ async fn the_client_sends_the_documented_bodies() {
     let f = fixture("intercept");
     let req: InterceptRequest = serde_json::from_value(f["request"].clone()).unwrap();
     let v = c
-        .intercept(&addr, &req, Duration::from_secs(1))
+        .intercept(&addr, &req, Duration::from_secs(1), 0)
         .await
         .unwrap();
     assert_eq!(stub.calls_named("intercept")[0], f["request"]);

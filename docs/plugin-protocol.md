@@ -317,16 +317,20 @@ queued for a plugin that is removed (by a sync, or dropped from the
 operator's list in Kubernetes mode) are discarded with its queue and not
 counted.
 
-A batch may carry the request header `x-balerix-events-dropped: <n>`
-(`balerix_api::EVENTS_DROPPED_HEADER`): `n`, a decimal count above zero, is
-how many events the plugin lost — every one the metric above counts —
-since the last batch it acknowledged. The count is settled only by a 2xx
-for a batch that carried it; a batch that is not acknowledged leaves it
-in place and adds its own events, so the next batch reports both. The
-header is optional and additive: no header means nothing was lost, and a
-plugin that does not read it loses nothing else. A plugin that tracks
-state from the events should treat it as a gap before the batch's first
-event. The SDK hands it to `Plugin::events_dropped` before `observe`.
+An `events` or `intercept` request may carry the header
+`x-balerix-events-dropped: <n>` (`balerix_api::EVENTS_DROPPED_HEADER`):
+`n`, a decimal count above zero, is
+how many hook events the plugin missed since a call last told it so —
+every one the metric above counts, and, for an interceptor, every event
+it was not called for (not ready, the chain's budget spent) or whose call
+failed (see `intercept` below). One count per plugin, reported on its
+next `events` or `intercept` call, whichever comes first. A call that
+fails puts the count back, adding its own events; only a 2xx settles it.
+The header is optional and additive: no header means nothing was missed,
+and a plugin that does not read it loses nothing else. A plugin that
+tracks state from the events should treat it as a gap before the call's
+own events. The SDK hands it to `Plugin::events_dropped` before `observe`
+or `intercept`, and a header it cannot read as at least one.
 
 **`intercept`**: `response_so_far` is the chain's response before this
 plugin (`{}` for the first); `deadline_ms` is what remains of the chain's
@@ -335,7 +339,11 @@ plugin (`{}` for the first); `deadline_ms` is what remains of the chain's
 after the response is written, and is omitted when empty. A plugin that
 times out, refuses the connection, answers a non-2xx, or answers a
 non-object `response` is skipped for this event: `response_so_far` passes
-through unchanged and the chain continues (fail-open).
+through unchanged and the chain continues (fail-open). The skipped
+plugin, like one not called because it was not ready (counted in
+`balerix_plugin_intercept_failures_total` as `not_ready`) or because the
+budget was spent (`timeout`), hears of the missed event through
+`x-balerix-events-dropped` on its next call (`events` above).
 
 **`health`**: a 2xx keeps the plugin's status clear; anything else marks it
 degraded. Never causes a restart.

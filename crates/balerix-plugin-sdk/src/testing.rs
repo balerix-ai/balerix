@@ -1118,10 +1118,16 @@ impl Harness {
     }
 
     async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
-        let resp = self
-            .http
-            .post(self.url(path))
-            .bearer_auth(&self.token)
+        self.post_reporting(path, body, None).await
+    }
+
+    /// `post`, with `dropped` as `EVENTS_DROPPED_HEADER` when given.
+    async fn post_reporting(&self, path: &str, body: &Value, dropped: Option<u64>) -> (u16, Value) {
+        let mut req = self.http.post(self.url(path)).bearer_auth(&self.token);
+        if let Some(n) = dropped {
+            req = req.header(balerix_api::EVENTS_DROPPED_HEADER, n);
+        }
+        let resp = req
             .json(body)
             .send()
             .await
@@ -1167,17 +1173,9 @@ impl Harness {
     /// `observe`, the batch reporting `dropped` events lost before it
     /// (`EVENTS_DROPPED_HEADER`), as the daemon sends it after a loss.
     pub async fn observe_after_drop(&self, dropped: u64, events: Vec<HookEvent>) {
-        let resp = self
-            .http
-            .post(self.url("/v1/events"))
-            .bearer_auth(&self.token)
-            .header(balerix_api::EVENTS_DROPPED_HEADER, dropped)
-            .json(&json!({ "events": events }))
-            .send()
-            .await
-            .unwrap_or_else(|e| panic!("Harness POST /v1/events: {e}"));
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
+        let (status, body) = self
+            .post_reporting("/v1/events", &json!({ "events": events }), Some(dropped))
+            .await;
         assert_eq!(status, 200, "events: {body}");
     }
 
@@ -1197,8 +1195,27 @@ impl Harness {
             response_so_far: so_far,
             deadline_ms,
         };
+        self.intercept_reporting(req, None).await
+    }
+
+    /// `intercept`, the call reporting `dropped` events missed before it
+    /// (`EVENTS_DROPPED_HEADER`), as the daemon sends it after a miss.
+    pub async fn intercept_after_drop(&self, dropped: u64, event: HookEvent) -> InterceptResponse {
+        let req = InterceptRequest {
+            event,
+            response_so_far: json!({}),
+            deadline_ms: CHAIN_BUDGET_MS,
+        };
+        self.intercept_reporting(req, Some(dropped)).await
+    }
+
+    async fn intercept_reporting(
+        &self,
+        req: InterceptRequest,
+        dropped: Option<u64>,
+    ) -> InterceptResponse {
         let body = serde_json::to_value(&req).unwrap_or_else(|e| panic!("intercept body: {e}"));
-        let (status, body) = self.post("/v1/intercept", &body).await;
+        let (status, body) = self.post_reporting("/v1/intercept", &body, dropped).await;
         assert_eq!(status, 200, "intercept: {body}");
         serde_json::from_value(body).unwrap_or_else(|e| panic!("intercept reply: {e}"))
     }

@@ -9,7 +9,8 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use balerix_api::{
     CredentialBundle, EntryKind, FleetSpec, GitSettings, Timestamp, TreeEntry,
-    WORKSPACE_FILE_LIMIT, WorkspaceDiff, WorkspaceTree, WorkspaceVersion, check_path,
+    WORKSPACE_FILE_LIMIT, WORKSPACE_TREE_ENTRY_LIMIT, WorkspaceDiff, WorkspaceTree,
+    WorkspaceVersion, check_path,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -516,20 +517,14 @@ fn tree_of(files: &BTreeMap<String, Vec<u8>>, path: &str) -> Option<WorkspaceTre
         };
         match rest.split_once('/') {
             Some((dir, _)) => {
-                entries.entry(dir.to_string()).or_insert(TreeEntry {
-                    name: dir.to_string(),
-                    kind: EntryKind::Dir,
-                    size: None,
-                });
+                entries
+                    .entry(dir.to_string())
+                    .or_insert_with(|| TreeEntry::new(dir, EntryKind::Dir));
             }
             None => {
                 entries.insert(
                     rest.to_string(),
-                    TreeEntry {
-                        name: rest.to_string(),
-                        kind: EntryKind::File,
-                        size: Some(bytes.len() as u64),
-                    },
+                    TreeEntry::new(rest, EntryKind::File).with_size(Some(bytes.len() as u64)),
                 );
             }
         }
@@ -537,10 +532,13 @@ fn tree_of(files: &BTreeMap<String, Vec<u8>>, path: &str) -> Option<WorkspaceTre
     if entries.is_empty() && !path.is_empty() {
         return None;
     }
-    Some(WorkspaceTree {
-        path: path.to_string(),
-        entries: entries.into_values().collect(),
-    })
+    // the daemon's cap: the first entries by name, then `truncated`
+    let truncated = entries.len() > WORKSPACE_TREE_ENTRY_LIMIT;
+    let kept = entries
+        .into_values()
+        .take(WORKSPACE_TREE_ENTRY_LIMIT)
+        .collect();
+    Some(WorkspaceTree::new(path, kept).with_truncated(truncated))
 }
 
 /// The fakes' fingerprint: `sha256(head \0 (path \0 bytes \0)*)` over the
@@ -564,10 +562,9 @@ impl WorkspaceReader for FakeWorkspace {
     fn diff(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceDiff, WorkspaceError> {
         let _ = lock(&self.rec).record("diff", &format!("{agent} {base_ref}"));
         self.with(agent, |t| {
-            Ok(WorkspaceDiff {
-                base_ref: base_ref.to_string(),
-                ..t.diff.clone()
-            })
+            let mut diff = t.diff.clone();
+            diff.base_ref = base_ref.to_string();
+            Ok(diff)
         })
     }
     fn read_file(&self, agent: &AgentId, path: &str) -> Result<Vec<u8>, WorkspaceError> {
@@ -597,10 +594,10 @@ impl WorkspaceReader for FakeWorkspace {
     fn version(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceVersion, WorkspaceError> {
         let _ = lock(&self.rec).record("version", &format!("{agent} {base_ref}"));
         self.with(agent, |t| {
-            Ok(WorkspaceVersion {
-                head: t.diff.head.clone(),
-                fingerprint: fake_fingerprint(&t.diff.head, &t.files),
-            })
+            Ok(WorkspaceVersion::new(
+                t.diff.head.clone(),
+                fake_fingerprint(&t.diff.head, &t.files),
+            ))
         })
     }
 }
@@ -1081,21 +1078,16 @@ mod tests {
             w.diff(&id("f/c/a"), "origin/main"),
             Err(WorkspaceError::Missing("f/c/a".into()))
         );
-        let diff = WorkspaceDiff {
-            base_ref: String::new(),
-            merge_base: "m".into(),
-            head: "h".into(),
-            files: vec![FileDiff {
-                path: "src/lib.rs".into(),
-                old_path: None,
-                status: FileStatus::Modified,
-                uncommitted: true,
-                binary: false,
-                patch: "p".into(),
-                truncated: false,
-            }],
-            truncated: false,
-        };
+        let diff = WorkspaceDiff::new(
+            "",
+            "m",
+            "h",
+            vec![
+                FileDiff::new("src/lib.rs", FileStatus::Modified)
+                    .with_uncommitted(true)
+                    .with_patch("p"),
+            ],
+        );
         w.set(
             &id("f/c/a"),
             diff.clone(),
@@ -1164,6 +1156,19 @@ mod tests {
         assert_eq!(
             w.list_dir(&id("f/c/z"), ""),
             Err(WorkspaceError::Missing("f/c/z".into()))
+        );
+        assert!(!root.truncated);
+        // the daemon's entry cap: the first by name, and `truncated`
+        let many = (0..=WORKSPACE_TREE_ENTRY_LIMIT)
+            .map(|i| (format!("d/f{i:05}"), Vec::new()))
+            .collect();
+        w.set(&id("f/c/m"), diff.clone(), many);
+        let d = w.list_dir(&id("f/c/m"), "d").unwrap();
+        assert!(d.truncated);
+        assert_eq!(d.entries.len(), WORKSPACE_TREE_ENTRY_LIMIT);
+        assert_eq!(
+            d.entries.last().unwrap().name,
+            format!("f{:05}", WORKSPACE_TREE_ENTRY_LIMIT - 1)
         );
         assert!(w.calls().contains(&"diff f/c/a origin/main".to_string()));
         assert!(

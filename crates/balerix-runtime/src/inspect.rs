@@ -752,15 +752,7 @@ pub fn parse_name_status(z: &str) -> Vec<FileDiff> {
                 None => break,
             },
         };
-        out.push(FileDiff {
-            path,
-            old_path,
-            status,
-            uncommitted: false,
-            binary: false,
-            patch: String::new(),
-            truncated: false,
-        });
+        out.push(FileDiff::new(path, status).with_old_path(old_path));
     }
     out
 }
@@ -1605,15 +1597,7 @@ impl WorkspaceReader for Runtime {
         let dirty = status.changed;
         let untracked = status.untracked;
         for path in &untracked {
-            files.push(FileDiff {
-                path: path.clone(),
-                old_path: None,
-                status: FileStatus::Added,
-                uncommitted: true,
-                binary: false,
-                patch: String::new(),
-                truncated: false,
-            });
+            files.push(FileDiff::new(path.clone(), FileStatus::Added).with_uncommitted(true));
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let truncated = files.len() > WORKSPACE_FILE_COUNT_LIMIT;
@@ -1715,13 +1699,7 @@ impl WorkspaceReader for Runtime {
             f.truncated = cut;
         }
         let cut = fit_diff(&mut files);
-        Ok(WorkspaceDiff {
-            base_ref: base_ref.to_string(),
-            merge_base,
-            head,
-            files,
-            truncated: truncated || cut,
-        })
+        Ok(WorkspaceDiff::new(base_ref, merge_base, head, files).with_truncated(truncated || cut))
     }
 
     fn read_file(&self, agent: &AgentId, path: &str) -> Result<Vec<u8>, WorkspaceError> {
@@ -1785,6 +1763,7 @@ impl WorkspaceReader for Runtime {
         // read, so a huge directory costs no more than the limit. Keyed by
         // the raw name too: two names may read alike once made lossy.
         let mut kept: BTreeMap<(String, std::ffi::OsString), std::fs::DirEntry> = BTreeMap::new();
+        let mut truncated = false;
         for entry in std::fs::read_dir(&full).map_err(|e| io_error(&full, e))? {
             let entry = entry.map_err(|e| io_error(&full, e))?;
             let raw = entry.file_name();
@@ -1795,6 +1774,7 @@ impl WorkspaceReader for Runtime {
             kept.insert((name, raw), entry);
             if kept.len() > WORKSPACE_TREE_ENTRY_LIMIT {
                 kept.pop_last();
+                truncated = true;
             }
         }
         let mut entries = Vec::with_capacity(kept.len());
@@ -1810,16 +1790,9 @@ impl WorkspaceReader for Runtime {
             } else {
                 EntryKind::Other
             };
-            entries.push(TreeEntry {
-                name,
-                kind,
-                size: m.is_file().then_some(m.len()),
-            });
+            entries.push(TreeEntry::new(name, kind).with_size(m.is_file().then_some(m.len())));
         }
-        Ok(WorkspaceTree {
-            path: path.to_string(),
-            entries,
-        })
+        Ok(WorkspaceTree::new(path, entries).with_truncated(truncated))
     }
     /// The filter probe, `merge-base`, one name-only diff against it and
     /// one `status`, in one sandbox start (`VERSION_SCRIPT`, #174).
@@ -1841,10 +1814,8 @@ impl WorkspaceReader for Runtime {
         paths_seen.extend(status.changed);
         // `BTreeSet`s: sorted and deduplicated, so the hash order is fixed.
         let (entries, total) = stat_paths(&paths.workspace, paths_seen, status.untracked);
-        Ok(WorkspaceVersion {
-            fingerprint: fingerprint_of(&head, &merge_base, &entries, total),
-            head,
-        })
+        let fingerprint = fingerprint_of(&head, &merge_base, &entries, total);
+        Ok(WorkspaceVersion::new(head, fingerprint))
     }
 }
 
@@ -2027,15 +1998,9 @@ mod tests {
     }
 
     fn patched(path: &str, patch: &str) -> FileDiff {
-        FileDiff {
-            path: path.into(),
-            old_path: None,
-            status: FileStatus::Added,
-            uncommitted: true,
-            binary: false,
-            patch: patch.into(),
-            truncated: false,
-        }
+        FileDiff::new(path, FileStatus::Added)
+            .with_uncommitted(true)
+            .with_patch(patch)
     }
 
     /// The file list stays within `WORKSPACE_DIFF_LIMIT` as serialized:
@@ -2155,14 +2120,8 @@ mod tests {
 
     #[test]
     fn a_header_is_expected_only_for_paths_git_does_not_quote() {
-        let file = |path: &str, old: Option<&str>| FileDiff {
-            path: path.into(),
-            old_path: old.map(str::to_string),
-            status: FileStatus::Modified,
-            uncommitted: false,
-            binary: false,
-            patch: String::new(),
-            truncated: false,
+        let file = |path: &str, old: Option<&str>| {
+            FileDiff::new(path, FileStatus::Modified).with_old_path(old.map(str::to_string))
         };
         assert_eq!(
             patch_header(&file("a b", None)).as_deref(),

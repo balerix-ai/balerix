@@ -20,8 +20,8 @@ use axum::{Json, Router};
 use balerix_api::{
     CHAIN_BUDGET_MS, Desired, DownQuery, EntryKind, ErrorBody, FleetPhase, FleetRecord, FleetSpec,
     HelloRequest, HelloResponse, HookEvent, InterceptRequest, InterceptResponse, Keep, KvKeys,
-    PluginAction, ResizeFrame, TextFrame, Timestamp, TreeEntry, WorkspaceDiff, WorkspaceTree,
-    WorkspaceVersion,
+    PluginAction, ResizeFrame, TextFrame, Timestamp, TreeEntry, WORKSPACE_TREE_ENTRY_LIMIT,
+    WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -717,20 +717,14 @@ fn tree_of(files: &BTreeMap<String, Vec<u8>>, path: &str) -> Option<WorkspaceTre
         };
         match rest.split_once('/') {
             Some((dir, _)) => {
-                entries.entry(dir.to_string()).or_insert(TreeEntry {
-                    name: dir.to_string(),
-                    kind: EntryKind::Dir,
-                    size: None,
-                });
+                entries
+                    .entry(dir.to_string())
+                    .or_insert_with(|| TreeEntry::new(dir, EntryKind::Dir));
             }
             None => {
                 entries.insert(
                     rest.to_string(),
-                    TreeEntry {
-                        name: rest.to_string(),
-                        kind: EntryKind::File,
-                        size: Some(bytes.len() as u64),
-                    },
+                    TreeEntry::new(rest, EntryKind::File).with_size(Some(bytes.len() as u64)),
                 );
             }
         }
@@ -738,10 +732,13 @@ fn tree_of(files: &BTreeMap<String, Vec<u8>>, path: &str) -> Option<WorkspaceTre
     if entries.is_empty() && !path.is_empty() {
         return None;
     }
-    Some(WorkspaceTree {
-        path: path.to_string(),
-        entries: entries.into_values().collect(),
-    })
+    // the daemon's cap: the first entries by name, then `truncated`
+    let truncated = entries.len() > WORKSPACE_TREE_ENTRY_LIMIT;
+    let kept = entries
+        .into_values()
+        .take(WORKSPACE_TREE_ENTRY_LIMIT)
+        .collect();
+    Some(WorkspaceTree::new(path, kept).with_truncated(truncated))
 }
 
 fn with_workspace<T: IntoResponse>(
@@ -825,10 +822,10 @@ async fn workspace_version(
     AxumPath(id): AxumPath<(String, String, String)>,
 ) -> Response {
     with_workspace(&inner, &headers, id, |diff, files| {
-        Json(WorkspaceVersion {
-            head: diff.head.clone(),
-            fingerprint: fake_fingerprint(&diff.head, files),
-        })
+        Json(WorkspaceVersion::new(
+            diff.head.clone(),
+            fake_fingerprint(&diff.head, files),
+        ))
     })
 }
 
@@ -1003,13 +1000,7 @@ async fn delete_key(
 /// A `HookEvent` with the boilerplate filled: `session_id` "test",
 /// `received_at` 1.
 pub fn event(agent: &str, name: &str, payload: Value) -> HookEvent {
-    HookEvent {
-        agent: agent.to_string(),
-        name: name.to_string(),
-        session_id: Some("test".into()),
-        received_at: Timestamp(1),
-        payload,
-    }
+    HookEvent::new(agent, name, Timestamp(1), payload).with_session_id(Some("test".into()))
 }
 
 /// The value of the first sample of `family` whose labels include every

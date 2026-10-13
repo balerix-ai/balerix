@@ -2461,11 +2461,7 @@ async fn agent_status_mirrors_the_daemons_record_and_readiness_counts() {
     stub.set_agent(
         "f",
         "f/c/a",
-        DaemonAgentStatus {
-            phase: AgentPhase::Ready,
-            restarts: 2,
-            ..Default::default()
-        },
+        DaemonAgentStatus::new(AgentPhase::Ready).with_restarts(2),
     );
     // the kubelet: the sidecar is ready
     pods.patch_status("f-c-a", &PatchParams::default(), &Patch::Merge(serde_json::json!({

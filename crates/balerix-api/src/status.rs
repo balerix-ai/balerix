@@ -29,8 +29,12 @@ impl SpecHash {
     }
 }
 
+/// `#[non_exhaustive]`, with `Unknown` for a phase a later daemon adds:
+/// such a phase reads as `Unknown` rather than failing the whole fleet
+/// record. The daemon never produces `Unknown` itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum FleetPhase {
     Pending,
     Reconciling,
@@ -38,10 +42,17 @@ pub enum FleetPhase {
     Degraded,
     Terminating,
     Down,
+    /// A phase this version does not know (serialized as `"unknown"`).
+    #[serde(other)]
+    Unknown,
 }
 
+/// `#[non_exhaustive]`, with `Unknown` for a phase a later daemon or
+/// sidecar adds (see `FleetPhase`). The daemon never produces `Unknown`
+/// itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum AgentPhase {
     Pending,
     Materializing,
@@ -52,6 +63,9 @@ pub enum AgentPhase {
     Failed,
     Dead,
     Stopped,
+    /// A phase this version does not know (serialized as `"unknown"`).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Where a plugin stands for one agent (plugins spec §16.3).
@@ -94,7 +108,10 @@ impl PluginActivation {
     }
 }
 
+/// `#[non_exhaustive]`: outside this crate, build one with
+/// [`AgentStatus::new`] (or `default()`) and the `with_*` methods.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AgentStatus {
     pub phase: AgentPhase,
     #[serde(default)]
@@ -132,6 +149,52 @@ impl Default for AgentStatus {
             plugins: BTreeMap::new(),
             plugin_hello: 0,
         }
+    }
+}
+
+impl AgentStatus {
+    /// `phase`, and everything else as `default()` has it.
+    pub fn new(phase: AgentPhase) -> Self {
+        Self {
+            phase,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_last_event_at(mut self, at: Option<Timestamp>) -> Self {
+        self.last_event_at = at;
+        self
+    }
+
+    #[must_use]
+    pub fn with_applied_hash(mut self, hash: Option<SpecHash>) -> Self {
+        self.applied_hash = hash;
+        self
+    }
+
+    #[must_use]
+    pub fn with_restarts(mut self, restarts: u32) -> Self {
+        self.restarts = restarts;
+        self
+    }
+
+    #[must_use]
+    pub fn with_next_restart_at(mut self, at: Option<Timestamp>) -> Self {
+        self.next_restart_at = at;
+        self
+    }
+
+    #[must_use]
+    pub fn with_plugins(mut self, plugins: BTreeMap<String, PluginActivation>) -> Self {
+        self.plugins = plugins;
+        self
     }
 }
 
@@ -185,6 +248,56 @@ mod tests {
     fn timestamp_addition_saturates() {
         assert_eq!(Timestamp(10).plus_secs(5), Timestamp(15));
         assert_eq!(Timestamp(u64::MAX).plus_secs(5), Timestamp(u64::MAX));
+    }
+
+    /// A phase a later daemon adds reads as `Unknown` instead of failing
+    /// the record around it, and `Unknown` round-trips as `"unknown"`.
+    #[test]
+    fn an_unknown_phase_parses_as_unknown() {
+        let st: AgentStatus =
+            serde_json::from_value(json!({ "phase": "hibernating", "restarts": 3 })).unwrap();
+        assert_eq!(st, AgentStatus::new(AgentPhase::Unknown).with_restarts(3));
+        let v = serde_json::to_value(&st).unwrap();
+        assert_eq!(v["phase"], "unknown");
+        assert_eq!(serde_json::from_value::<AgentStatus>(v).unwrap(), st);
+        let fleet: FleetStatus = serde_json::from_value(json!({
+            "generation": 2, "observed_generation": 2, "phase": "paused",
+            "agents": { "f/c/a": { "phase": "ready" }, "f/c/b": { "phase": "migrating" } }
+        }))
+        .unwrap();
+        assert_eq!(fleet.phase, FleetPhase::Unknown);
+        assert_eq!(fleet.agents["f/c/a"].phase, AgentPhase::Ready);
+        assert_eq!(fleet.agents["f/c/b"].phase, AgentPhase::Unknown);
+        assert_eq!(
+            serde_json::to_value(FleetPhase::Unknown).unwrap(),
+            json!("unknown")
+        );
+    }
+
+    #[test]
+    fn the_status_builders_set_each_field() {
+        let mut plugins = BTreeMap::new();
+        plugins.insert("web".to_string(), PluginActivation::active());
+        let st = AgentStatus::new(AgentPhase::Failed)
+            .with_message("m")
+            .with_last_event_at(Some(Timestamp(1)))
+            .with_applied_hash(Some(SpecHash::new("h".into())))
+            .with_restarts(4)
+            .with_next_restart_at(Some(Timestamp(9)))
+            .with_plugins(plugins.clone());
+        assert_eq!(
+            st,
+            AgentStatus {
+                phase: AgentPhase::Failed,
+                message: "m".into(),
+                last_event_at: Some(Timestamp(1)),
+                applied_hash: Some(SpecHash::new("h".into())),
+                restarts: 4,
+                next_restart_at: Some(Timestamp(9)),
+                plugins,
+                plugin_hello: 0,
+            }
+        );
     }
 
     #[test]

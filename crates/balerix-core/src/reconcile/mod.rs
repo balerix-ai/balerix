@@ -503,13 +503,10 @@ mod tests {
     fn a_noted_exit_restarts_only_once_due() {
         let f = fleet(&[("a", 1)]);
         let mut st = FleetStatus::default();
-        *st.entry("f/c/a") = AgentStatus {
-            phase: AgentPhase::Ready,
-            applied_hash: Some(hash_of(&f, "a")),
-            restarts: 1,
-            next_restart_at: Some(Timestamp(10)),
-            ..AgentStatus::default()
-        };
+        *st.entry("f/c/a") = AgentStatus::new(AgentPhase::Ready)
+            .with_applied_hash(Some(hash_of(&f, "a")))
+            .with_restarts(1)
+            .with_next_restart_at(Some(Timestamp(10)));
         let mut obs = ObservedState::default();
         obs.set(&id("f/c/a"), ProcessState::Exited { code: None });
         assert_eq!(
@@ -525,12 +522,9 @@ mod tests {
     fn dead_agents_are_left_alone_until_the_hash_changes() {
         let f = fleet(&[("a", 1)]);
         let mut st = FleetStatus::default();
-        *st.entry("f/c/a") = AgentStatus {
-            phase: AgentPhase::Dead,
-            applied_hash: Some(hash_of(&f, "a")),
-            restarts: 6,
-            ..AgentStatus::default()
-        };
+        *st.entry("f/c/a") = AgentStatus::new(AgentPhase::Dead)
+            .with_applied_hash(Some(hash_of(&f, "a")))
+            .with_restarts(6);
         let mut obs = ObservedState::default();
         obs.set(&id("f/c/a"), ProcessState::Exited { code: Some(1) });
         assert_eq!(
@@ -551,11 +545,8 @@ mod tests {
     fn a_vanished_window_is_recreated() {
         let f = fleet(&[("a", 1)]);
         let mut st = FleetStatus::default();
-        *st.entry("f/c/a") = AgentStatus {
-            phase: AgentPhase::Ready,
-            applied_hash: Some(hash_of(&f, "a")),
-            ..AgentStatus::default()
-        };
+        *st.entry("f/c/a") =
+            AgentStatus::new(AgentPhase::Ready).with_applied_hash(Some(hash_of(&f, "a")));
         let got = plan_for(Some(&f), &[], &st, &ObservedState::default(), 0);
         assert_eq!(got.len(), 3);
         assert_eq!(got[1], "materialize f/c/a");
@@ -611,12 +602,9 @@ mod tests {
     fn resuming_a_stopped_agent_restarts_it() {
         let f = fleet(&[("a", 1)]);
         let mut st = FleetStatus::default();
-        *st.entry("f/c/a") = AgentStatus {
-            phase: AgentPhase::Stopped,
-            applied_hash: Some(hash_of(&f, "a")),
-            restarts: 3,
-            ..AgentStatus::default()
-        };
+        *st.entry("f/c/a") = AgentStatus::new(AgentPhase::Stopped)
+            .with_applied_hash(Some(hash_of(&f, "a")))
+            .with_restarts(3);
         let got = plan_for(Some(&f), &[], &st, &ObservedState::default(), 0);
         assert_eq!(
             got,

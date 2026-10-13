@@ -1690,13 +1690,8 @@ impl Daemon {
             })
             .await
             .map_err(|_| DaemonError::Internal("fleet task is gone".into()))?;
-        let hook_event = HookEvent {
-            agent: agent.to_string(),
-            name: event.name,
-            session_id: event.session_id,
-            received_at: at,
-            payload: event.payload,
-        };
+        let hook_event = HookEvent::new(agent.to_string(), event.name, at, event.payload)
+            .with_session_id(event.session_id);
         tracing::debug!(agent = %agent, event = %hook_event.name, payload = %hook_event.payload, "hook event");
         let outcome = self.handler.handle(&hook_event).await;
         self.shared

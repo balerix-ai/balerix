@@ -20,7 +20,10 @@ pub const HOOK_EVENTS: &[&str] = &[
     "PreCompact",
 ];
 
+/// `#[non_exhaustive]`: outside this crate, build one with
+/// [`HookEvent::new`] and [`HookEvent::with_session_id`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct HookEvent {
     /// `fleet/crew/agent`.
     pub agent: String,
@@ -30,6 +33,30 @@ pub struct HookEvent {
     pub session_id: Option<String>,
     pub received_at: Timestamp,
     pub payload: Value,
+}
+
+impl HookEvent {
+    /// An event with no `session_id`.
+    pub fn new(
+        agent: impl Into<String>,
+        name: impl Into<String>,
+        received_at: Timestamp,
+        payload: Value,
+    ) -> Self {
+        Self {
+            agent: agent.into(),
+            name: name.into(),
+            session_id: None,
+            received_at,
+            payload,
+        }
+    }
+
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -50,5 +77,14 @@ mod tests {
         assert!(v.get("session_id").is_none());
         let back: HookEvent = serde_json::from_value(v).unwrap();
         assert_eq!(back, e);
+        let built = HookEvent::new("f/c/a", "PreToolUse", Timestamp(5), e.payload.clone());
+        assert_eq!(built, e);
+        assert_eq!(
+            built
+                .with_session_id(Some("s".into()))
+                .session_id
+                .as_deref(),
+            Some("s")
+        );
     }
 }

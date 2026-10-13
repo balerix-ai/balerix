@@ -99,7 +99,7 @@ daemon by `crates/balerix-server/tests/events_it.rs` (§6).
 | `GET agents/…/attach`, agent not active for this plugin | `attach` | — | `{ "error": "plugin is not active for agent <id>" }` | 404 | (as for actions) |
 | `GET agents/{fleet}/{crew}/{agent}/workspace/diff` | `workspace` | — | `WorkspaceDiff` | 200 | `workspace-diff.json` |
 | `GET agents/…/workspace/file?path=<rel>` | `workspace` | — | raw bytes | 200 | `workspace-file.json` |
-| `GET agents/…/workspace/tree?path=<rel>` | `workspace` | — | `{ path, entries }` | 200 | `workspace-tree.json` |
+| `GET agents/…/workspace/tree?path=<rel>` | `workspace` | — | `{ path, entries, truncated }` | 200 | `workspace-tree.json` |
 | `GET agents/…/workspace/version` | `workspace` | — | `{ head, fingerprint }` | 200 | `workspace-version.json` |
 | `GET agents/…/workspace/*`, agent not active for this plugin | `workspace` | — | `{ "error": "plugin is not active for agent <id>" }` | 404 | (as for actions) |
 | `GET agents/…/workspace/*`, no worktree yet | `workspace` | — | `{ "error": "no workspace for agent <id>" }` | 404 | (asserted by `workspace_it.rs`, §6) |
@@ -200,8 +200,9 @@ a regular file, skipped`. `file` answers the bytes of one regular file, 404
 `no such path`, 400 `not a regular file` (a symlink is never followed),
 413 `file larger than 1 MiB`. `tree` lists one directory (`{ name, kind:
 file|dir|symlink|other, size }`, sorted, `.git` never listed, never
-recursive), at most 5000 entries, the first by name (nothing in the
-answer says when more were left out); the empty path is the root. `path` is relative, `/`-separated,
+recursive), at most 5000 entries, the first by name; `truncated` is
+`true` when more were left out (absent from a daemon before 0.3.0, read
+as `false`); the empty path is the root. `path` is relative, `/`-separated,
 at most 4096 bytes, with no empty, `.` or `..` segment, no `\`, no NUL and
 no `.git` segment, else 400 `workspace: invalid path: <reason>`. Two 404
 texts: `no workspace for agent <id>` (no worktree) and `no such path`.

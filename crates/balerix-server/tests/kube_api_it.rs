@@ -383,10 +383,7 @@ async fn link_as(port: u16, agent: &str, token: &str) -> Ws {
 fn status_frame(phase: AgentPhase) -> Message {
     Message::Text(
         serde_json::to_string(&SidecarFrame::Status(LinkStatus {
-            status: AgentStatus {
-                phase,
-                ..AgentStatus::default()
-            },
+            status: AgentStatus::new(phase),
             pid: Some(56),
             hook_failures: 0,
         }))

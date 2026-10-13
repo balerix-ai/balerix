@@ -129,11 +129,7 @@ async fn a_sidecar_links_sends_status_and_answers_calls() {
 
     // a status frame is mirrored into the record
     ws.send(text(&SidecarFrame::Status(LinkStatus {
-        status: AgentStatus {
-            phase: AgentPhase::Ready,
-            restarts: 2,
-            ..AgentStatus::default()
-        },
+        status: AgentStatus::new(AgentPhase::Ready).with_restarts(2),
         pid: Some(56),
         hook_failures: 0,
     })))

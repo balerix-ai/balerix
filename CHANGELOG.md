@@ -76,9 +76,9 @@
   then fill what is left in path order, the one that crosses the limit
   cut at a line and those after it empty, each with its file's
   `truncated` set (the review page shows `patch truncated`). A `tree`
-  answers the first 5000 entries by name and nothing in it says that
-  more were left out. A diff under 8 MiB, and a directory of up to 5000
-  entries, answer as before. In Kubernetes mode the link carries
+  answers the first 5000 entries by name, with its new `truncated` set
+  (#240; absent, read as `false`, from an older daemon). A diff under
+  8 MiB, and a directory of up to 5000 entries, answer as before. In Kubernetes mode the link carries
   messages of up to 16 MiB, and a sidecar reply that would still be
   larger fails that call with a 500 (`<agent>: git link: the reply is
   <n> bytes, over the link's limit of 16777216`) where it used to drop
@@ -197,6 +197,44 @@
 - `plugin install --sha256` compares the digest case-insensitively, and a
   huge `--timeout` (`down --purge`, `plugin remove --purge`) waits
   instead of panicking on overflow.
+- **Breaking for plugin code (Rust):** these `balerix-api` types are now
+  `#[non_exhaustive]` (#240), so a later field or variant is not a
+  breaking change: `WorkspaceTree`, `TreeEntry`, `WorkspaceDiff`,
+  `FileDiff`, `WorkspaceVersion`, `AgentStatus`, `HookEvent`,
+  `AgentPhase` and `FleetPhase`. Outside `balerix-api`:
+  - the structs can no longer be built with a struct literal or
+    `..base` update syntax. Use the constructors and builders, for
+    instance in a test's fake answers:
+    `WorkspaceTree::new(path, entries).with_truncated(b)`,
+    `TreeEntry::new(name, kind).with_size(Some(n))`,
+    `WorkspaceDiff::new(base_ref, merge_base, head, files).with_truncated(b)`,
+    `FileDiff::new(path, status)` with `with_old_path`,
+    `with_uncommitted`, `with_binary`, `with_patch` and `with_truncated`,
+    `WorkspaceVersion::new(head, fingerprint)`,
+    `AgentStatus::new(phase)` (or `AgentStatus::default()`) with
+    `with_message`, `with_last_event_at`, `with_applied_hash`,
+    `with_restarts`, `with_next_restart_at` and `with_plugins`, and
+    `HookEvent::new(agent, name, received_at, payload)` with
+    `with_session_id` (the SDK's `testing::event` still works);
+  - a struct pattern needs `..` (`WorkspaceTree { entries, .. }`), and a
+    `match` on `AgentPhase` or `FleetPhase` needs a `_` arm.
+
+  Reading and assigning fields works as before. `AgentPhase` and
+  `FleetPhase` have a new `Unknown` variant: a phase a later daemon adds
+  reads as `Unknown` instead of failing the whole fleet record. The daemon
+  never reports `unknown` itself; in Kubernetes mode, a phase from a newer
+  sidecar that it does not know is shown as `starting`, with a message
+  saying so. A `TreeEntry` kind a later daemon adds reads as `other`.
+  `WorkspaceTree` has a new field, `truncated` (above). The SDK's
+  `FakeHost` now cuts a tree at 5000 entries and sets `truncated`, as the
+  daemon does.
+
+  Nothing on the wire changes except `truncated`. A plugin built on the
+  0.2 SDK keeps working against this daemon: it ignores `truncated` and
+  never receives `unknown`, a phase or a tree entry kind it does not
+  know. A non-Rust plugin that rejects unknown fields must accept
+  `truncated`. Rebuild a Rust plugin against `balerix-api` and
+  `balerix-plugin-sdk` 0.3 to read it.
 
 ## 0.2.4 - 2026-10-10
 

@@ -215,16 +215,15 @@ mod tests {
     fn the_largest_replies_the_workspace_caps_allow_fit_the_link() {
         let worst = |n: usize| "\u{1}".repeat(n);
         let tree = reply_len(LinkResult::Tree {
-            tree: WorkspaceTree {
-                path: worst(4096),
-                entries: (0..WORKSPACE_TREE_ENTRY_LIMIT)
-                    .map(|_| TreeEntry {
-                        name: worst(255),
-                        kind: EntryKind::Symlink,
-                        size: Some(u64::MAX),
+            tree: WorkspaceTree::new(
+                worst(4096),
+                (0..WORKSPACE_TREE_ENTRY_LIMIT)
+                    .map(|_| {
+                        TreeEntry::new(worst(255), EntryKind::Symlink).with_size(Some(u64::MAX))
                     })
                     .collect(),
-            },
+            )
+            .with_truncated(true),
         });
         assert!(tree < 7_960_000 + 24_600 + 100, "{tree}");
         let bytes = reply_len(LinkResult::File {
@@ -233,27 +232,18 @@ mod tests {
         assert!(bytes <= (4 << 20) + 100, "{bytes}");
         // a diff's `files` fill `WORKSPACE_DIFF_LIMIT`; the envelope is the
         // rest
-        let file = FileDiff {
-            path: worst(4096),
-            old_path: Some(worst(4096)),
-            status: FileStatus::Typechange,
-            uncommitted: true,
-            binary: false,
-            patch: worst(100_000),
-            truncated: true,
-        };
+        let file = FileDiff::new(worst(4096), FileStatus::Typechange)
+            .with_old_path(Some(worst(4096)))
+            .with_uncommitted(true)
+            .with_patch(worst(100_000))
+            .with_truncated(true);
         let one = serde_json::to_string(&file).unwrap().len() + 1; // and a comma
         let files: Vec<FileDiff> = std::iter::repeat_n(file, WORKSPACE_DIFF_LIMIT / one).collect();
         let files_len = serde_json::to_string(&files).unwrap().len();
         assert!(files_len <= WORKSPACE_DIFF_LIMIT, "{files_len}");
         let diff = reply_len(LinkResult::Diff {
-            diff: WorkspaceDiff {
-                base_ref: worst(4096),
-                merge_base: "f".repeat(64),
-                head: "f".repeat(64),
-                files,
-                truncated: true,
-            },
+            diff: WorkspaceDiff::new(worst(4096), "f".repeat(64), "f".repeat(64), files)
+                .with_truncated(true),
         });
         assert!(diff - files_len < 25 << 10, "{}", diff - files_len);
         for len in [tree, bytes, diff] {

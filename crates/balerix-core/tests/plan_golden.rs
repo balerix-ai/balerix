@@ -38,11 +38,7 @@ fn fleet(agents: &[(&str, &str)]) -> Fleet {
 
 fn applied(f: &Fleet, st: &mut FleetStatus, phase: AgentPhase) {
     for a in ResolvedAgent::from_fleet(f) {
-        *st.entry(&a.id.to_string()) = AgentStatus {
-            phase,
-            applied_hash: Some(a.hash()),
-            ..AgentStatus::default()
-        };
+        *st.entry(&a.id.to_string()) = AgentStatus::new(phase).with_applied_hash(Some(a.hash()));
     }
 }
 

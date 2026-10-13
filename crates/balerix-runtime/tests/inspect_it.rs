@@ -249,6 +249,7 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         .map(|e| (e.name.as_str(), e.kind))
         .collect();
     assert!(!names.iter().any(|(n, _)| *n == ".git"), "{names:?}");
+    assert!(!tree.truncated);
     assert!(names.contains(&("src", EntryKind::Dir)));
     assert!(names.contains(&("escape", EntryKind::Symlink)));
     assert!(names.contains(&("img.bin", EntryKind::File)));
@@ -261,17 +262,26 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         Err(WorkspaceError::NotADirectory)
     );
     assert_eq!(rt.list_dir(&id, "nope"), Err(WorkspaceError::NoSuchPath));
-    // a directory past the entry cap lists the first entries by name
+    // a directory at the entry cap is listed whole; past it, the first
+    // entries by name, and `truncated`
     let many = w.join("many");
     std::fs::create_dir(&many).unwrap();
-    for i in 0..WORKSPACE_TREE_ENTRY_LIMIT + 3 {
+    for i in 0..WORKSPACE_TREE_ENTRY_LIMIT {
         std::fs::write(many.join(format!("f{i:05}")), b"").unwrap();
     }
-    let listed = rt.list_dir(&id, "many").unwrap();
-    assert_eq!(listed.entries.len(), WORKSPACE_TREE_ENTRY_LIMIT);
     let expected: Vec<String> = (0..WORKSPACE_TREE_ENTRY_LIMIT)
         .map(|i| format!("f{i:05}"))
         .collect();
+    let whole = rt.list_dir(&id, "many").unwrap();
+    assert!(!whole.truncated, "exactly the cap is not truncated");
+    let got: Vec<&str> = whole.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(got, expected);
+    for i in WORKSPACE_TREE_ENTRY_LIMIT..WORKSPACE_TREE_ENTRY_LIMIT + 3 {
+        std::fs::write(many.join(format!("f{i:05}")), b"").unwrap();
+    }
+    let listed = rt.list_dir(&id, "many").unwrap();
+    assert!(listed.truncated);
+    assert_eq!(listed.entries.len(), WORKSPACE_TREE_ENTRY_LIMIT);
     let got: Vec<&str> = listed.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(got, expected);
     std::fs::remove_dir_all(&many).unwrap();

@@ -78,21 +78,16 @@ fn spec(agents: &[&str]) -> FleetSpec {
 }
 
 fn diff() -> WorkspaceDiff {
-    WorkspaceDiff {
-        base_ref: String::new(),
-        merge_base: "m".repeat(40),
-        head: "h".repeat(40),
-        files: vec![FileDiff {
-            path: "src/lib.rs".into(),
-            old_path: None,
-            status: FileStatus::Modified,
-            uncommitted: true,
-            binary: false,
-            patch: "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n".into(),
-            truncated: false,
-        }],
-        truncated: false,
-    }
+    WorkspaceDiff::new(
+        "",
+        "m".repeat(40),
+        "h".repeat(40),
+        vec![
+            FileDiff::new("src/lib.rs", FileStatus::Modified)
+                .with_uncommitted(true)
+                .with_patch("diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n"),
+        ],
+    )
 }
 
 async fn wait_active(w: &World, agent: &str) {

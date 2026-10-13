@@ -482,21 +482,14 @@ async fn a_reactivated_agent_gets_a_new_epoch_and_seq_from_one() {
 
 fn sample_diff() -> balerix_api::WorkspaceDiff {
     use balerix_api::{FileDiff, FileStatus, WorkspaceDiff};
-    WorkspaceDiff {
-        base_ref: "origin/main".into(),
-        merge_base: "m".repeat(40),
-        head: "3f9c2a1".to_string() + &"0".repeat(33),
-        files: vec![FileDiff {
-            path: "src/lib.rs".into(),
-            old_path: None,
-            status: FileStatus::Modified,
-            uncommitted: true,
-            binary: false,
-            patch: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn b() { c() }\n".into(),
-            truncated: false,
-        }],
-        truncated: false,
-    }
+    WorkspaceDiff::new(
+        "origin/main",
+        "m".repeat(40),
+        "3f9c2a1".to_string() + &"0".repeat(33),
+        vec![FileDiff::new("src/lib.rs", FileStatus::Modified)
+            .with_uncommitted(true)
+            .with_patch("diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn b() { c() }\n")],
+    )
 }
 
 #[tokio::test]

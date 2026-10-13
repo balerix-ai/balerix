@@ -37,23 +37,18 @@ impl WorkspaceReader for TwoFiles {
     fn diff(&self, _: &AgentId, base_ref: &str) -> Result<WorkspaceDiff, WorkspaceError> {
         // ten bytes a line as JSON (`\n` is escaped)
         let patch = "+abcdefg\n".repeat((256 << 10) / 10);
-        Ok(WorkspaceDiff {
-            base_ref: base_ref.into(),
-            merge_base: String::new(),
-            head: String::new(),
-            files: (0..BIG_DIFF / patch.len())
-                .map(|i| FileDiff {
-                    path: format!("f{i}"),
-                    old_path: None,
-                    status: FileStatus::Added,
-                    uncommitted: true,
-                    binary: false,
-                    patch: patch.clone(),
-                    truncated: false,
+        Ok(WorkspaceDiff::new(
+            base_ref,
+            "",
+            "",
+            (0..BIG_DIFF / patch.len())
+                .map(|i| {
+                    FileDiff::new(format!("f{i}"), FileStatus::Added)
+                        .with_uncommitted(true)
+                        .with_patch(patch.clone())
                 })
                 .collect(),
-            truncated: false,
-        })
+        ))
     }
     fn read_file(&self, _: &AgentId, path: &str) -> Result<Vec<u8>, WorkspaceError> {
         if path == "f" {
@@ -63,25 +58,32 @@ impl WorkspaceReader for TwoFiles {
         }
     }
     /// `huge` is a listing larger than the link carries, as no capped
-    /// reader would answer.
+    /// reader would answer; `capped` is one a capped reader cut short.
     fn list_dir(&self, _: &AgentId, path: &str) -> Result<WorkspaceTree, WorkspaceError> {
-        if path != "huge" {
-            return Err(WorkspaceError::NoSuchPath);
+        match path {
+            "huge" => Ok(WorkspaceTree::new(
+                path,
+                (0..80_000)
+                    .map(|i| {
+                        TreeEntry::new(format!("{i:0>250}"), EntryKind::File).with_size(Some(0))
+                    })
+                    .collect(),
+            )),
+            "capped" => Ok(capped_tree()),
+            _ => Err(WorkspaceError::NoSuchPath),
         }
-        Ok(WorkspaceTree {
-            path: path.into(),
-            entries: (0..80_000)
-                .map(|i| TreeEntry {
-                    name: format!("{i:0>250}"),
-                    kind: EntryKind::File,
-                    size: Some(0),
-                })
-                .collect(),
-        })
     }
     fn version(&self, _: &AgentId, _: &str) -> Result<WorkspaceVersion, WorkspaceError> {
         Err(WorkspaceError::NoSuchPath)
     }
+}
+
+fn capped_tree() -> WorkspaceTree {
+    WorkspaceTree::new(
+        "capped",
+        vec![TreeEntry::new("a", EntryKind::File).with_size(Some(1))],
+    )
+    .with_truncated(true)
 }
 
 struct Side {
@@ -281,10 +283,7 @@ async fn the_link_connects_answers_requests_and_reconnects() {
     // a status change is a frame
     side.status
         .send(LinkStatus {
-            status: AgentStatus {
-                phase: AgentPhase::Ready,
-                ..AgentStatus::default()
-            },
+            status: AgentStatus::new(AgentPhase::Ready),
             pid: Some(7),
             hook_failures: 1,
         })
@@ -362,6 +361,26 @@ async fn a_reply_over_the_link_limit_fails_the_call_not_the_link() {
             2,
             LinkResult::File {
                 bytes: b"hello".to_vec()
+            }
+        )
+    );
+    // a listing cut at the reader's cap reaches the Daemon with `truncated`
+    conn.to_sidecar
+        .send(LinkRequest {
+            id: 3,
+            op: LinkOp::WorkspaceTree {
+                path: "capped".into(),
+            },
+        })
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), reply(&mut conn))
+            .await
+            .unwrap(),
+        (
+            3,
+            LinkResult::Tree {
+                tree: capped_tree()
             }
         )
     );

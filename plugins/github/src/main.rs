@@ -35,7 +35,10 @@ fn run() -> anyhow::Result<()> {
         let queue = plugin.queue();
         let phase_watch = tokio::spawn(balerix_plugin_common::phases::run(
             host.clone(),
-            move |changes| queue.push(Command::Phases(changes)),
+            // Never refused: a full bounded lane drops its oldest instead.
+            move |changes| {
+                let _ = queue.push(Command::Phases(changes));
+            },
         ));
         eprintln!("github: starting");
         let result = serve(&host, env!("CARGO_PKG_VERSION"), plugin).await;

@@ -24,6 +24,7 @@ use crate::render::{self, PhaseChange};
 use crate::routing::{Maps, Thread, crew_of};
 
 pub use balerix_plugin_common::queue::{Health, QUEUE};
+use balerix_plugin_common::queue::{Lane, Laned};
 /// The actor's inbound queue over this plugin's commands.
 pub type Queue = balerix_plugin_common::queue::Queue<Command>;
 
@@ -45,6 +46,10 @@ const CREATE_COOLDOWN_MAX: Duration = Duration::from_secs(300);
 /// creation and by the event stream itself for a send. Blocking the only
 /// actor for up to a minute is the worse of the two.
 const MAX_INLINE_RETRY: Duration = Duration::from_secs(3);
+
+/// Why a reply to a thread whose agent the actor does not track was not
+/// delivered (#260).
+pub const UNTRACKED: &str = "the plugin is not following this agent right now (it is stopping, or starting again); send it once more shortly.";
 
 /// How often `main` pushes `Command::Tick`, which runs delivery expiry
 /// (Spec M §8.7).
@@ -112,6 +117,33 @@ pub enum Command {
     Inbound(Inbound),
     /// Runs delivery expiry; pushed by `main` every `TICK`.
     Tick,
+}
+
+/// #260: only events and phases may be dropped under backpressure.
+impl Laned for Command {
+    fn lane(&self) -> Lane {
+        match self {
+            Command::Configure(_) | Command::Activate { .. } | Command::Deactivate { .. } => {
+                Lane::Control
+            }
+            Command::Inbound(_) => Lane::Inbound,
+            Command::Events(_) | Command::Phases(_) => Lane::Lossy,
+            Command::Tick => Lane::Latest,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Command::Inbound(m) => {
+                m.room.len()
+                    + m.event_id.len()
+                    + m.sender.len()
+                    + m.thread_root.as_ref().map_or(0, String::len)
+                    + m.body.len()
+            }
+            _ => 0,
+        }
+    }
 }
 
 /// The metric families of Spec G §10: the shared set plus the two gauges
@@ -227,11 +259,13 @@ impl<M: MatrixPort> Actor<M> {
     pub async fn run(mut self, queue: Arc<Queue>) {
         loop {
             let command = queue.pop().await;
-            self.handle(command).await;
-            // A dropped command may have held hook events (Spec G-11).
+            // Dropped events may have confirmed a prompt (Spec G-11).
+            // Asked before `handle`, so the command in hand — a reply that
+            // arrived after the drop — meets the tracking already lost.
             if queue.take_gap() {
                 self.deliveries.lose_track();
             }
+            self.handle(command).await;
         }
     }
 
@@ -723,6 +757,17 @@ impl<M: MatrixPort> Actor<M> {
         if self.maps.thread(&agent).is_some_and(|t| t.closed) {
             count("stale_thread");
             self.react(&message, REFUSED).await;
+            return;
+        }
+        // #260: the thread routes from KV, which outlives the `Activate`
+        // (a restart, a `Deactivate` still on its way). An agent this actor
+        // does not track has no question state it can trust, so nothing
+        // goes to it: a reply to an open question would land as text.
+        if !self.agents.contains_key(&agent) {
+            count("untracked");
+            let body = format!("**not delivered to {agent}:** {UNTRACKED}");
+            self.send(&message.room, Some(&root), &body, "notice").await;
+            self.react(&message, FAILED).await;
             return;
         }
 
@@ -2633,6 +2678,56 @@ mod tests {
         assert!(
             port.calls().is_empty(),
             "a thread we do not own gets no reaction"
+        );
+    }
+
+    /// #260: the thread still routes from KV after a restart, before the
+    /// daemon's `Activate` arrives. With a question open, the reply would
+    /// have gone out as keys to an agent the actor no longer follows.
+    #[tokio::test]
+    async fn a_reply_for_an_agent_the_actor_does_not_track_is_not_delivered() {
+        let (fake, _port, mut a, room, root) = with_question_thread().await;
+        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            .await;
+        drop(a);
+        let host = Host::new(fake.env("matrix", std::path::Path::new("scratch"))).unwrap();
+        let port = FakePort::new("@balerix:example.org");
+        let mut again = Actor::new(host, port.clone(), counters(), Health::new());
+        again.load().await;
+        again.handle(Command::Configure(daemon_config())).await;
+        assert!(
+            again.questions.is_open("f/c/alice"),
+            "the question survived"
+        );
+
+        again
+            .handle(Command::Inbound(inbound(
+                &room,
+                Some(&root),
+                "@rahul:example.org",
+                "1",
+            )))
+            .await;
+        assert!(
+            fake.actions_for("f/c/alice").is_empty(),
+            "nothing reaches the agent"
+        );
+        let calls = port.calls();
+        assert_eq!(reactions(&calls), vec![FAILED.to_string()]);
+        assert_eq!(
+            sends(&calls),
+            vec![(
+                Some(root.clone()),
+                format!("**not delivered to f/c/alice:** {UNTRACKED}")
+            )]
+        );
+        assert_eq!(
+            again
+                .counters
+                .inbound
+                .with_label_values(&["untracked"])
+                .get(),
+            1
         );
     }
 

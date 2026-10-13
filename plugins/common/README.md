@@ -3,7 +3,8 @@
 Shared building blocks for [balerix](https://github.com/balerix-ai/balerix)
 chat plugins: rendering hook events as markdown, splitting long bodies,
 showing and answering Claude's `AskUserQuestion` dialogs, config helpers,
-a drop-oldest command queue, the shared metric families and phase diffing.
+a command queue that may drop events but never commands or replies, the
+shared metric families and phase diffing.
 The matrix and GitHub plugins are built on it; the flow plugin takes only
 `delivery`, for its submitted sends. This crate pairs with the
 `balerix-plugin-sdk` and `balerix-api` versions its manifest names.
@@ -26,7 +27,7 @@ use balerix_plugin_common::config::{EventFilter, deserialize, ConfigError};
 use balerix_plugin_common::metrics::Shared;
 use balerix_plugin_common::pending::{Questions, Stage};
 use balerix_plugin_common::phases::PhaseChange;
-use balerix_plugin_common::queue::{Health, Queue};
+use balerix_plugin_common::queue::{Health, Lane, Laned, Queue};
 use balerix_plugin_common::{question, render};
 use balerix_plugin_sdk::{Host, Metrics, Plugin};
 use serde_json::Value;
@@ -59,6 +60,24 @@ enum Command {
     Reply { agent: String, body: String },
 }
 
+/// Events may be dropped under backpressure; commands and replies never
+/// are, and a reply past `queue::KEPT` is refused instead.
+impl Laned for Command {
+    fn lane(&self) -> Lane {
+        match self {
+            Command::Activate { .. } | Command::Deactivate { .. } => Lane::Control,
+            Command::Reply { .. } => Lane::Inbound,
+            Command::Events(_) | Command::Phases(_) => Lane::Lossy,
+        }
+    }
+    fn bytes(&self) -> usize {
+        match self {
+            Command::Reply { body, .. } => body.len(),
+            _ => 0,
+        }
+    }
+}
+
 struct MyPlugin {
     metrics: Metrics,
     health: Health,
@@ -68,14 +87,17 @@ struct MyPlugin {
 impl Plugin for MyPlugin {
     async fn activate(&self, agent: &str, config: Value) -> Result<(), String> {
         let config = parse_agent(&config).map_err(|e| e.to_string())?;
-        self.queue.push(Command::Activate { agent: agent.to_string(), config });
-        Ok(())
+        self.queue
+            .push(Command::Activate { agent: agent.to_string(), config })
+            .map_err(|e| e.to_string())
     }
     async fn deactivate(&self, agent: &str) {
-        self.queue.push(Command::Deactivate { agent: agent.to_string() });
+        // A control command is never refused.
+        let _ = self.queue.push(Command::Deactivate { agent: agent.to_string() });
     }
     async fn observe(&self, events: Vec<HookEvent>) {
-        self.queue.push(Command::Events(events));
+        // Events are never refused: the oldest is dropped instead.
+        let _ = self.queue.push(Command::Events(events));
     }
     async fn health(&self) -> Result<(), String> {
         self.health.get()
@@ -108,7 +130,13 @@ fn on_event(questions: &mut Questions, config: &AgentConfig, event: &HookEvent) 
 /// `Decision::gates_on_post()` is true — a refusal posted while keys are
 /// already on their way must not overwrite the saved echo.
 fn on_reply(open: &balerix_plugin_common::pending::OpenQuestion, body: &str) -> Decision {
-    answer::on_reply(open, body, balerix_api::DEFAULT_KEY_DELAY_MS)
+    answer::on_reply(
+        open,
+        body,
+        balerix_api::DEFAULT_KEY_DELAY_MS,
+        tokio::time::Instant::now(),
+        &balerix_plugin_common::delivery::Allowlist::default(),
+    )
 }
 
 fn main() {
@@ -118,7 +146,7 @@ fn main() {
     let _plugin = MyPlugin { metrics, health: Health::new(), queue };
     // `balerix_plugin_sdk::serve(&host, env!("CARGO_PKG_VERSION"), plugin)`
     // says hello and serves; spawn the actor and
-    // `balerix_plugin_common::phases::run(host, |c| queue.push(Command::Phases(c)))`
+    // `balerix_plugin_common::phases::run(host, |c| { let _ = queue.push(Command::Phases(c)); })`
     // beside it.
     let _ = (on_event, on_reply, Stage::Open, None::<&Host>);
 }

@@ -7,8 +7,8 @@ pub mod config;
 /// The metric families every chat plugin registers.
 pub mod metrics;
 
-/// The bounded drop-oldest command queue and the health cell an actor
-/// publishes through.
+/// The two-lane command queue (events may be dropped, commands and
+/// replies are not) and the health cell an actor publishes through.
 pub mod queue;
 
 /// `AskUserQuestion` (Spec J §6): parse the dialog, match a thread reply

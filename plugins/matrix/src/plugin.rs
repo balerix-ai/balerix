@@ -69,23 +69,26 @@ impl<L: Launcher> Plugin for MatrixPlugin<L> {
         self.launcher
             .launch(config.clone(), self.queue.clone())
             .await?;
-        self.queue.push(Command::Configure(config));
-        Ok(())
+        self.queue
+            .push(Command::Configure(config))
+            .map_err(|e| e.to_string())
     }
 
     /// Validated here rather than in the actor, so a bad block fails the
     /// operator's `up` instead of failing silently later.
     async fn activate(&self, agent: &str, config: Value) -> Result<(), String> {
         let config = parse_agent(&config).map_err(|e| e.to_string())?;
-        self.queue.push(Command::Activate {
-            agent: agent.to_string(),
-            config,
-        });
-        Ok(())
+        self.queue
+            .push(Command::Activate {
+                agent: agent.to_string(),
+                config,
+            })
+            .map_err(|e| e.to_string())
     }
 
     async fn deactivate(&self, agent: &str) {
-        self.queue.push(Command::Deactivate {
+        // A control command: never refused, never dropped (#260).
+        let _ = self.queue.push(Command::Deactivate {
             agent: agent.to_string(),
         });
     }
@@ -93,7 +96,8 @@ impl<L: Launcher> Plugin for MatrixPlugin<L> {
     /// Enqueue and return: this is a daemon-to-plugin call and must never
     /// wait on a homeserver (Spec G-11).
     async fn observe(&self, events: Vec<HookEvent>) {
-        self.queue.push(Command::Events(events));
+        // Never refused: a full bounded lane drops its oldest instead.
+        let _ = self.queue.push(Command::Events(events));
     }
 
     async fn health(&self) -> Result<(), String> {
@@ -212,6 +216,42 @@ mod tests {
             p.health().await,
             Err("create room for f/c: no rights".into())
         );
+    }
+
+    /// #260, the issue's reproduction: Activate and a reply, then 2048
+    /// event batches. Both commands used to be pushed out; now only the
+    /// oldest batches go, and the rest leave in arrival order.
+    #[tokio::test]
+    async fn activate_and_a_reply_survive_a_flood_of_events() {
+        let (p, queue, _health) = plugin(FakeLauncher::default());
+        p.activate("f/c/alice", json!({})).await.unwrap();
+        queue
+            .push(Command::Inbound(crate::matrix::Inbound {
+                room: "!r:h".into(),
+                event_id: "$reply:h".into(),
+                sender: "@rahul:h".into(),
+                thread_root: Some("$root:h".into()),
+                body: "run the tests".into(),
+            }))
+            .unwrap();
+        for _ in 0..2048 {
+            p.observe(vec![event("f/c/alice", "Stop", json!({}))]).await;
+        }
+        let _ = queue.push(Command::Tick);
+        let _ = queue.push(Command::Tick);
+        assert!(queue.take_gap(), "the dropped batches mark a gap");
+        assert_eq!(
+            queue.len(),
+            3 + crate::actor::QUEUE,
+            "one tick, its twin merged"
+        );
+        assert!(matches!(queue.pop().await, Command::Activate { .. }));
+        assert!(matches!(queue.pop().await, Command::Inbound(_)));
+        for _ in 0..crate::actor::QUEUE {
+            assert!(matches!(queue.pop().await, Command::Events(_)));
+        }
+        assert_eq!(queue.pop().await, Command::Tick);
+        assert!(queue.is_empty());
     }
 
     /// The whole surface over the real §4.2 wire format.

@@ -8,6 +8,7 @@
 //! a translation between `matrix-sdk`'s types and the port's, and the one
 //! place in the crate that knows a Matrix error from any other.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -33,7 +34,7 @@ use matrix_sdk::{Client, HttpError, RoomState, SessionChange, SessionMeta, Sessi
 
 use crate::actor::{Actor, Command, Counters, Health, Queue};
 use crate::config::{DaemonConfig, Secret};
-use crate::matrix::{Inbound, MatrixError, MatrixPort};
+use crate::matrix::{FAILED, Inbound, MatrixError, MatrixPort};
 use crate::plugin::Launcher;
 use crate::session::{self, Plan, Session};
 
@@ -340,6 +341,38 @@ fn count_sync_failure(counters: &Counters, error: &MatrixError) {
     }
 }
 
+/// How often one sender in one room hears that a reply was refused for a
+/// full queue (#260).
+const REFUSAL_EVERY: Duration = Duration::from_secs(30);
+/// The most (room, sender) pairs `RefusalThrottle` remembers.
+const REFUSAL_PAIRS: usize = 256;
+
+/// When each (room, sender) was last told of a refused reply. Bounded: a
+/// pair is forgotten once `REFUSAL_EVERY` has passed, and while
+/// `REFUSAL_PAIRS` pairs are still within it a new one is not told.
+#[derive(Default)]
+struct RefusalThrottle(std::sync::Mutex<HashMap<(String, String), Instant>>);
+
+impl RefusalThrottle {
+    /// Whether `sender` in `room` may be told now, and if so records it.
+    fn allow(&self, room: &str, sender: &str, now: Instant) -> bool {
+        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = |at: &Instant| now.saturating_duration_since(*at) < REFUSAL_EVERY;
+        let key = (room.to_string(), sender.to_string());
+        if seen.get(&key).is_some_and(fresh) {
+            return false;
+        }
+        if seen.len() >= REFUSAL_PAIRS {
+            seen.retain(|_, at| fresh(at));
+            if seen.len() >= REFUSAL_PAIRS {
+                return false;
+            }
+        }
+        seen.insert(key, now);
+        true
+    }
+}
+
 /// The inbound pump: a sync loop that reconnects for as long as the process
 /// lives, pushing `Command::Inbound` onto `queue` for every text message in
 /// a room the account is in. It gives up only when the homeserver rejects
@@ -348,8 +381,12 @@ fn count_sync_failure(counters: &Counters, error: &MatrixError) {
 async fn start_inbound_pump(client: Client, queue: Arc<Queue>, counters: Counters, health: Health) {
     // The returned handle only exists to remove the handler again, which
     // nothing here ever does: the pump lives as long as the process.
+    let pump_counters = counters.clone();
+    let throttle = Arc::new(RefusalThrottle::default());
     client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
         let queue = queue.clone();
+        let counters = pump_counters.clone();
+        let throttle = throttle.clone();
         async move {
             // Everything the actor never needs to see is dropped here: a
             // reaction, a state event, an emote, a room we only watch from
@@ -367,7 +404,8 @@ async fn start_inbound_pump(client: Client, queue: Arc<Queue>, counters: Counter
                 Some(Relation::Thread(thread)) => Some(thread.event_id.to_string()),
                 _ => None,
             };
-            queue.push(Command::Inbound(Inbound {
+            let threaded = thread_root.is_some();
+            let pushed = queue.push(Command::Inbound(Inbound {
                 room: room.room_id().to_string(),
                 event_id: event.event_id.to_string(),
                 // The same ruma `OwnedUserId` rendering `whoami` gave the
@@ -376,6 +414,38 @@ async fn start_inbound_pump(client: Client, queue: Arc<Queue>, counters: Counter
                 thread_root,
                 body: text.body.clone(),
             }));
+            let Err(full) = pushed else {
+                return;
+            };
+            // #260: the actor is too far behind. Every refusal is counted.
+            // A thread reply, the only kind that could have reached an
+            // agent, gets ❗ as one that could not be delivered, so its
+            // sender can send it again: from a task of its own, since this
+            // handler runs inside sync and would hold up every room, and
+            // at most once per sender and room per `REFUSAL_EVERY`, so a
+            // flood is not answered with one. Our own echoes get nothing.
+            counters.inbound.with_label_values(&["queue_full"]).inc();
+            if !threaded
+                || event.sender == room.own_user_id()
+                || !throttle.allow(
+                    room.room_id().as_str(),
+                    event.sender.as_str(),
+                    Instant::now(),
+                )
+            {
+                return;
+            }
+            tracing::warn!("matrix: refused a reply in {}: {full}", room.room_id());
+            tokio::spawn(async move {
+                let content = ReactionEventContent::new(Annotation::new(
+                    event.event_id.clone(),
+                    FAILED.to_string(),
+                ));
+                if let Err(e) = room.send(content).await {
+                    counters.errors.with_label_values(&["react"]).inc();
+                    tracing::warn!("matrix: reacting to {}: {e}", event.event_id);
+                }
+            });
         }
     });
 
@@ -601,6 +671,33 @@ impl Launcher for MatrixLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #260: a refused reply is answered once per sender and room per
+    /// `REFUSAL_EVERY`, and the pairs remembered stay bounded.
+    #[test]
+    fn refusals_are_told_once_per_sender_and_room_per_window() {
+        let t = RefusalThrottle::default();
+        let now = Instant::now();
+        assert!(t.allow("!r", "@a", now));
+        assert!(!t.allow("!r", "@a", now + Duration::from_secs(29)));
+        assert!(t.allow("!r", "@b", now), "another sender");
+        assert!(t.allow("!s", "@a", now), "another room");
+        assert!(
+            t.allow("!r", "@a", now + REFUSAL_EVERY),
+            "the window passed"
+        );
+
+        let t = RefusalThrottle::default();
+        for i in 0..REFUSAL_PAIRS {
+            assert!(t.allow("!r", &format!("@{i}"), now));
+        }
+        assert!(!t.allow("!r", "@new", now), "full of live pairs");
+        assert!(
+            t.allow("!r", "@new", now + REFUSAL_EVERY),
+            "expired pairs make room"
+        );
+        assert_eq!(t.0.lock().unwrap().len(), 1);
+    }
 
     /// The one decision in `MatrixClient::room` that can be made without a
     /// homeserver: a pinned room the operator invited the bot to arrives

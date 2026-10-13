@@ -32,22 +32,25 @@ pub use layout::{
 };
 pub use materializer::{RenderOptions, RenderOutcome, Runtime};
 pub use plugin::{
-    install_plugin_tools, plugin_env, plugin_grants, render_plugin_launch, write_plugin_home,
+    install_plugin_tools, plugin_env, plugin_grants, plugin_install_env, plugin_install_grants,
+    plugin_install_profile, plugin_trust_env, plugin_trust_grants, plugin_trust_profile,
+    render_plugin_launch, write_plugin_home,
 };
 pub use quote::sh_quote;
 pub use sandbox::{
     Grants, PluginGrants, Roots, SIGNAL_SCOPING_ABI, SelfTestError, balerix_grants,
     check_conflicts, check_fleet_sandbox, check_plugin_sandbox, host_landlock_abi, landlock_abi,
-    merge_profile, render_git_profile, render_profile, sandbox_self_test, signal_scoping_warning,
-    validate_profile, validate_profile_at, write_git_profile, write_profile, write_profile_at,
+    merge_profile, render_git_profile, render_mise_profile, render_profile, sandbox_self_test,
+    signal_scoping_warning, validate_profile, validate_profile_at, write_git_profile,
+    write_profile, write_profile_at,
 };
 pub use socket_policy::{
     ProbeFailure, SocketPolicy, UnixSockets, resolve as resolve_socket_policy,
 };
 pub use tmux::{ANCHOR_WINDOW, ATTACH_SESSION_PREFIX, STOP_WAIT, TmuxAttach, TmuxRunner};
 pub use toolchain::{
-    Toolchain, embedded_system_tools, level_env, mise_env, render_level_toml, render_mise_toml,
-    system_tools,
+    Toolchain, agent_install_grants, agent_install_profile, embedded_system_tools, install_env,
+    level_env, mise_env, render_level_toml, render_mise_toml, system_tools,
 };
 pub use tools::{MissingTool, ToolPaths};
 pub use workspace::{CloneDecision, Settled, Workspace, decide_clone};

@@ -389,6 +389,30 @@ impl PluginPaths {
     pub fn installed_marker(&self) -> PathBuf {
         self.root.join(".installed")
     }
+    /// The nono profile the daemon's `mise install` for this plugin runs
+    /// under (`plugin::plugin_install_profile`). Daemon-owned: the plugin
+    /// root is outside every sandbox grant.
+    pub fn mise_profile(&self) -> PathBuf {
+        self.root.join("nono-mise-profile.json")
+    }
+    /// The nono profile the daemon's `mise trust` for this plugin runs
+    /// under (`plugin::plugin_trust_profile`): a profile of its own, since
+    /// it writes the plugin's `home/` and the install writes the daemon
+    /// pool, and no one sandbox writes both.
+    pub fn mise_trust_profile(&self) -> PathBuf {
+        self.root.join("nono-mise-trust-profile.json")
+    }
+    /// `MISE_STATE_DIR` of the daemon's `mise install` for this plugin:
+    /// daemon-owned, and kept, so a half-made install a killed daemon left
+    /// is still known as one.
+    pub fn mise_install_state(&self) -> PathBuf {
+        self.root.join("mise-state")
+    }
+    /// `$HOME` and `$TMPDIR` of those two calls: emptied before each and
+    /// removed after it, outside `home/`.
+    pub fn mise_install_home(&self) -> PathBuf {
+        self.root.join("mise-install")
+    }
     pub fn tmp_dir(&self) -> PathBuf {
         self.home.join("tmp")
     }
@@ -421,6 +445,17 @@ impl AgentPaths {
     /// rendered file changes (Phase 3 spec §6.2).
     pub fn installed_marker(&self) -> PathBuf {
         self.root.join(".installed")
+    }
+    /// The nono profile the daemon's `mise trust` and `mise install` for
+    /// this agent run under (`sandbox::render_mise_profile`).
+    /// Daemon-owned: the agent root is outside every sandbox grant.
+    pub fn mise_profile(&self) -> PathBuf {
+        self.root.join("nono-mise-profile.json")
+    }
+    /// `$HOME` and `$TMPDIR` of those two calls: emptied before each and
+    /// removed after it, outside `home/`.
+    pub fn mise_install_home(&self) -> PathBuf {
+        self.root.join("mise-install")
     }
     /// Holds the branch balerix last created the clone on. A changed agent
     /// `branch` is detected against this, never against the clone's HEAD,

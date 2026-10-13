@@ -21,7 +21,7 @@ use balerix_core::{
     ResolvedPlugin, WorkspaceReader,
 };
 use balerix_runtime::layout::{PodLayout, PodMounts};
-use balerix_runtime::sandbox::sandbox_self_test;
+use balerix_runtime::sandbox::{SelfTestError, sandbox_self_test};
 use balerix_runtime::{Runtime, SocketPolicy, StateLayout, TmuxRunner, ToolPaths, UnixSockets};
 use std::path::Path;
 use tokio::net::TcpListener;
@@ -224,7 +224,19 @@ async fn sidecar(args: SidecarArgs) -> Result<()> {
                     crew: &empty,
                 },
             )?;
-            rt.materialize(&agent, &creds, &hooks)?;
+            if let Err(e) = rt.materialize(&agent, &creds, &hooks) {
+                // the tool install runs under nono too: where the sandbox
+                // cannot start it fails first, and the termination
+                // message must still say `SandboxUnavailable` (§19.2)
+                let paths = rt.layout.agent(&agent.id);
+                if paths.profile.is_file()
+                    && let Err(unavailable @ SelfTestError::Unavailable(_)) =
+                        sandbox_self_test(&rt.tools, &paths)
+                {
+                    return Err(anyhow!("{unavailable}"));
+                }
+                return Err(e.into());
+            }
             Ok(())
         })
         .await??;

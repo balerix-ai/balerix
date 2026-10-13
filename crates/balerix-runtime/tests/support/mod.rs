@@ -77,3 +77,64 @@ pub fn landlock_works(tools: &ToolPaths, root: &Path) -> bool {
     let _ = std::fs::remove_dir_all(&home);
     result
 }
+
+/// A one-line tool, packed outside every balerix directory: the bytes of
+/// a tar holding `bin/balerix-probe`.
+pub fn probe_tarball(root: &std::path::Path) -> Vec<u8> {
+    let src = root.join("probe-src");
+    std::fs::create_dir_all(src.join("bin")).unwrap();
+    let script = src.join("bin").join("balerix-probe");
+    std::fs::write(&script, "#!/bin/sh\necho balerix-probe\n").unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let tarball = root.join("balerix-probe-1.0.0.tar");
+    let packed = std::process::Command::new("tar")
+        .arg("-C")
+        .arg(&src)
+        .arg("-cf")
+        .arg(&tarball)
+        .arg("bin")
+        .status()
+        .unwrap();
+    assert!(packed.success(), "tar");
+    std::fs::read(&tarball).unwrap()
+}
+
+/// Serves `body` to every request on a loopback port, in a thread that
+/// lives as long as the test process; the tarball's URL and a count of the
+/// `GET`s answered. A `HEAD` gets the headers alone.
+pub fn serve_tarball(body: Vec<u8>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://{}/balerix-probe-1.0.0.tar",
+        listener.local_addr().unwrap()
+    );
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                continue;
+            }
+            // the rest of the head; the body of a GET or HEAD is empty
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                line.clear();
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            if request_line.starts_with("GET ") {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.write_all(&body);
+            }
+        }
+    });
+    (url, hits)
+}

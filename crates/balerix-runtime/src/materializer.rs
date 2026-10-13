@@ -243,7 +243,7 @@ impl Runtime {
             tools: &self.tools,
             layout: &self.layout,
         }
-        .install(&agent.id, &paths)?;
+        .install(&agent.id, &paths, self.socket_policy)?;
         validate_profile(&self.tools, &agent.id, &paths)?;
         std::fs::write(paths.installed_marker(), b"").map_err(|e| MaterializeError::Io {
             id: agent.id.to_string(),

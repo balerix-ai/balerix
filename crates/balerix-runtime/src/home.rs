@@ -140,6 +140,35 @@ fn io_err(id: &AgentId, path: &Path, e: std::io::Error) -> MaterializeError {
     }
 }
 
+/// The directories mise makes under the agent's `home/` (`mise_env`):
+/// config, data and its `installs/`, state, cache.
+fn mise_dirs(paths: &AgentPaths) -> [std::path::PathBuf; 5] {
+    [
+        paths.mise_config_dir(),
+        paths.mise_data_dir(),
+        paths.mise_data_dir().join("installs"),
+        paths.mise_state_dir(),
+        paths.mise_cache_dir(),
+    ]
+}
+
+/// Makes `home/` and mise's directories under it as `write_home` does,
+/// without following a link below `home/`: a link or file found at any
+/// of them is replaced by a real directory. The daemon's install
+/// (`Toolchain::install`) calls it just before mise runs, so mise finds
+/// the directories it would otherwise make by path; the install's
+/// sandbox is what holds if the agent replaces one after this.
+pub(crate) fn ensure_mise_dirs(id: &AgentId, paths: &AgentPaths) -> Result<(), MaterializeError> {
+    let home =
+        open_dir_root(&paths.home, DirMode::Private).map_err(|e| io_err(id, &paths.home, e))?;
+    for d in mise_dirs(paths) {
+        relative_to(&paths.home, &d)
+            .and_then(|rel| ensure_path_at(home.as_fd(), rel, DirMode::Default))
+            .map_err(|e| io_err(id, &d, e))?;
+    }
+    Ok(())
+}
+
 /// Writes the agent's home. `root`, `logs` and nono's home are balerix's
 /// own; everything under `home/` is written without following a link
 /// below `home/` itself: `home/` is opened once, each directory beneath it
@@ -173,6 +202,9 @@ pub fn write_home(
     let gh_dir = paths.gh_dir();
     let gh = sub(&gh_dir, DirMode::Default)?;
     for d in [paths.xdg_data(), paths.xdg_state(), paths.xdg_cache()] {
+        sub(&d, DirMode::Default)?;
+    }
+    for d in mise_dirs(paths) {
         sub(&d, DirMode::Default)?;
     }
     let pretty = |v: &Value| serde_json::to_vec_pretty(v).unwrap_or_default();
@@ -541,6 +573,11 @@ mod tests {
             (paths.xdg_config(), 0o755),
             (paths.tmp_dir(), 0o700),
             (paths.xdg_cache(), 0o755),
+            (paths.mise_config_dir(), 0o755),
+            (paths.mise_data_dir(), 0o755),
+            (paths.mise_data_dir().join("installs"), 0o755),
+            (paths.mise_state_dir(), 0o755),
+            (paths.mise_cache_dir(), 0o755),
         ]
         .into_iter()
         .enumerate()

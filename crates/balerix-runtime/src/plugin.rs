@@ -17,11 +17,12 @@ use crate::layout::{PluginPaths, StateLayout};
 use crate::materializer::{RenderOutcome, Runtime};
 use crate::quote::sh_quote;
 use crate::sandbox::{
-    Grants, PluginGrants, SYSTEM_READ, check_plugin_sandbox, render_profile, validate_profile_at,
-    write_profile_at,
+    Grants, PluginGrants, SYSTEM_READ, check_plugin_sandbox, render_mise_profile, render_profile,
+    validate_profile_at, write_profile_at,
 };
 use crate::socket_policy::{SocketPolicy, apply_to_profile, wrap_command};
-use crate::tools::{Cmd, ToolPaths};
+use crate::toolchain::{InstallProfile, SandboxedInstall, install_env};
+use crate::tools::ToolPaths;
 
 /// Where mise's searches for config files must stop, colon-separated. Both
 /// ceilings are exclusive — mise scans neither the ceiling directory itself
@@ -221,30 +222,76 @@ pub fn write_plugin_home(name: &AgentName, paths: &PluginPaths) -> Result<(), Ma
     Ok(())
 }
 
-/// Daemon-side `mise trust <package>/mise.toml` then `mise install`, with
-/// the same `MISE_{DATA,CONFIG,STATE,CACHE}_DIR` the sandbox will see, so
-/// the trust record and the installed tools land where the sandboxed run
-/// looks for them. `cwd=/` as for agents, so the package's config is named
-/// outright here rather than discovered; the same `MISE_CEILING_PATHS` as
-/// the sandbox, so no config above the package or the plugin's home is
-/// read on the way (#4).
-pub fn install_plugin_tools(
-    tools: &ToolPaths,
-    layout: &StateLayout,
+/// What the daemon's `mise install` for one plugin may reach
+/// (`sandbox::render_mise_profile`). Read: the system prefixes, the `mise`
+/// binary (canonical) and the package, whose `mise.toml` mise reads.
+/// Read-write: the daemon pool, the plugin's `MISE_DATA_DIR` (its tools are
+/// installed there, beside the system table's, as before); the install's
+/// own state directory (`PluginPaths::mise_install_state`); and its own
+/// `$HOME` (`PluginPaths::mise_install_home`), which holds its config and
+/// cache directories. Nothing the plugin can write: a link the plugin
+/// left in its `home/` could otherwise carry a write into the pool.
+pub fn plugin_install_grants(
     plugin: &ResolvedPlugin,
     paths: &PluginPaths,
-) -> Result<(), MaterializeError> {
-    let id = plugin.id().to_string();
+    layout: &StateLayout,
+    mise: &Path,
+) -> Grants {
+    let mut read: Vec<std::path::PathBuf> = SYSTEM_READ.iter().map(Into::into).collect();
+    read.push(std::fs::canonicalize(mise).unwrap_or_else(|_| mise.to_path_buf()));
+    read.push(plugin.package.clone());
+    Grants {
+        read,
+        allow: vec![
+            layout.mise_data_dir(),
+            paths.mise_install_state(),
+            paths.mise_install_home(),
+        ],
+    }
+}
+
+/// What the daemon's `mise trust` for one plugin may reach: the trust
+/// record goes to the plugin's own `MISE_STATE_DIR`, where its sandboxed
+/// `mise run` looks for it. Read: the system prefixes, the `mise` binary,
+/// the package and the daemon pool. Read-write: the plugin's `home/`
+/// itself, never a directory below it, for the reason
+/// `toolchain::agent_install_grants` gives (the plugin can replace any of
+/// those with a link, never `home/`), and the install's own `$HOME`.
+pub fn plugin_trust_grants(
+    plugin: &ResolvedPlugin,
+    paths: &PluginPaths,
+    layout: &StateLayout,
+    mise: &Path,
+) -> Grants {
+    let mut read: Vec<std::path::PathBuf> = SYSTEM_READ.iter().map(Into::into).collect();
+    read.push(std::fs::canonicalize(mise).unwrap_or_else(|_| mise.to_path_buf()));
+    read.push(plugin.package.clone());
+    read.push(layout.mise_data_dir());
+    Grants {
+        read,
+        allow: vec![paths.home.clone(), paths.mise_install_home()],
+    }
+}
+
+/// The mise variables both daemon calls for one plugin share: the
+/// package's `mise.toml` as the global config, the daemon pool as the data
+/// dir, the sandbox's ceiling, `config`/`state`/`cache` as given.
+fn plugin_mise_vars(
+    plugin: &ResolvedPlugin,
+    paths: &PluginPaths,
+    layout: &StateLayout,
+    [config, state, cache]: [&Path; 3],
+) -> Result<BTreeMap<String, String>, MaterializeError> {
     let s = |p: &Path| p.display().to_string();
-    let env = BTreeMap::from([
+    let vars = BTreeMap::from([
         (
             "MISE_GLOBAL_CONFIG_FILE".to_string(),
             s(&plugin.package.join("mise.toml")),
         ),
         ("MISE_DATA_DIR".to_string(), s(&layout.mise_data_dir())),
-        ("MISE_CONFIG_DIR".to_string(), s(&paths.mise_config_dir())),
-        ("MISE_STATE_DIR".to_string(), s(&paths.mise_state_dir())),
-        ("MISE_CACHE_DIR".to_string(), s(&paths.mise_cache_dir())),
+        ("MISE_CONFIG_DIR".to_string(), s(config)),
+        ("MISE_STATE_DIR".to_string(), s(state)),
+        ("MISE_CACHE_DIR".to_string(), s(cache)),
         (
             "MISE_CEILING_PATHS".to_string(),
             mise_ceiling(plugin, paths)?,
@@ -253,25 +300,133 @@ pub fn install_plugin_tools(
         ("MISE_QUIET".to_string(), "1".to_string()),
         ("MISE_AUTO_INSTALL".to_string(), "false".to_string()),
     ]);
-    let log = paths.logs.join("mise.toolchain.log");
-    let run = |args: &[&str]| {
-        Cmd::new(&tools.mise)
-            .args(args.iter().copied())
-            .envs(&env)
-            .cwd(Path::new("/"))
-            .log(&log)
-            .run()
-            .map(|_| ())
-            .map_err(|f| MaterializeError::Tool {
-                id: id.clone(),
-                tool: f.tool,
-                subcommand: f.subcommand,
-                args: f.args,
-                stderr: f.stderr,
-            })
-    };
-    run(&["trust", &s(&plugin.package.join("mise.toml"))])?;
-    run(&["install"])
+    Ok(install_env(&vars, &paths.mise_install_home()))
+}
+
+/// The whole environment of the daemon's `mise install` for one plugin:
+/// state in `PluginPaths::mise_install_state`, config and cache in the
+/// install's own `$HOME`, so nothing it writes is under the plugin's
+/// `home/`.
+pub fn plugin_install_env(
+    plugin: &ResolvedPlugin,
+    paths: &PluginPaths,
+    layout: &StateLayout,
+) -> Result<BTreeMap<String, String>, MaterializeError> {
+    let home = paths.mise_install_home();
+    plugin_mise_vars(
+        plugin,
+        paths,
+        layout,
+        [
+            &home.join("config"),
+            &paths.mise_install_state(),
+            &home.join("cache"),
+        ],
+    )
+}
+
+/// The whole environment of the daemon's `mise trust` for one plugin: the
+/// plugin's own mise directories, as its sandbox sees them (`plugin_env`),
+/// so the trust record lands where its `mise run` looks.
+pub fn plugin_trust_env(
+    plugin: &ResolvedPlugin,
+    paths: &PluginPaths,
+    layout: &StateLayout,
+) -> Result<BTreeMap<String, String>, MaterializeError> {
+    plugin_mise_vars(
+        plugin,
+        paths,
+        layout,
+        [
+            &paths.mise_config_dir(),
+            &paths.mise_state_dir(),
+            &paths.mise_cache_dir(),
+        ],
+    )
+}
+
+/// The `mise install` profile for one plugin, before the socket policy.
+pub fn plugin_install_profile(
+    plugin: &ResolvedPlugin,
+    paths: &PluginPaths,
+    layout: &StateLayout,
+    mise: &Path,
+) -> Result<serde_json::Value, MaterializeError> {
+    Ok(render_mise_profile(
+        &format!("balerix-mise-plugin-{}", plugin.name),
+        &format!(
+            "generated by balerix for its own mise install for plugin {}",
+            plugin.name
+        ),
+        &plugin_install_grants(plugin, paths, layout, mise),
+        &plugin_install_env(plugin, paths, layout)?,
+    ))
+}
+
+/// The `mise trust` profile for one plugin, before the socket policy.
+pub fn plugin_trust_profile(
+    plugin: &ResolvedPlugin,
+    paths: &PluginPaths,
+    layout: &StateLayout,
+    mise: &Path,
+) -> Result<serde_json::Value, MaterializeError> {
+    Ok(render_mise_profile(
+        &format!("balerix-mise-trust-plugin-{}", plugin.name),
+        &format!(
+            "generated by balerix for its own mise trust for plugin {}",
+            plugin.name
+        ),
+        &plugin_trust_grants(plugin, paths, layout, mise),
+        &plugin_trust_env(plugin, paths, layout)?,
+    ))
+}
+
+/// Daemon-side `mise trust <package>/mise.toml` then `mise install`, each
+/// inside nono under a profile of its own: the trust writes the record to
+/// the plugin's `MISE_STATE_DIR`, the one its sandboxed `mise run` reads
+/// (`plugin_trust_profile`), and the install writes the tools into the
+/// daemon pool (`plugin_install_profile`). No call writes both the
+/// plugin's `home/` and the pool. From an empty environment, as an
+/// agent's install (`Toolchain::install`). `cwd=/` as for agents, so the
+/// package's config is named outright here rather than discovered; the
+/// same `MISE_CEILING_PATHS` as the sandbox, so no config above the
+/// package or the plugin's home is read on the way (#4).
+pub fn install_plugin_tools(
+    tools: &ToolPaths,
+    layout: &StateLayout,
+    plugin: &ResolvedPlugin,
+    paths: &PluginPaths,
+    policy: SocketPolicy,
+) -> Result<(), MaterializeError> {
+    let id = plugin.id();
+    // `home/` and the mise directories below it, made again without
+    // following links just before mise runs (the plugin can write them);
+    // the pool and the install's state: a grant must name a directory
+    // that exists when the sandbox starts
+    write_plugin_home(&plugin.name, paths)?;
+    for dir in [layout.mise_data_dir(), paths.mise_install_state()] {
+        std::fs::create_dir_all(&dir).map_err(|e| io(&plugin.name, &dir, e))?;
+    }
+    let (trust, install) = (paths.mise_trust_profile(), paths.mise_profile());
+    SandboxedInstall {
+        tools,
+        policy,
+        id: &id,
+        nono_home: &paths.nono_home,
+        install_home: &paths.mise_install_home(),
+        logs: &paths.logs,
+    }
+    .run(
+        InstallProfile {
+            path: &trust,
+            profile: plugin_trust_profile(plugin, paths, layout, &tools.mise)?,
+        },
+        InstallProfile {
+            path: &install,
+            profile: plugin_install_profile(plugin, paths, layout, &tools.mise)?,
+        },
+        &plugin.package.join("mise.toml"),
+    )
 }
 
 impl Runtime {
@@ -357,7 +512,13 @@ impl Runtime {
         }
         let paths = self.layout.plugin(&plugin.name);
         let marker = paths.installed_marker();
-        install_plugin_tools(&self.tools, &self.layout, plugin, &paths)?;
+        install_plugin_tools(
+            &self.tools,
+            &self.layout,
+            plugin,
+            &paths,
+            self.socket_policy,
+        )?;
         validate_profile_at(
             &self.tools,
             &plugin.id(),
@@ -602,6 +763,82 @@ mod tests {
             ] {
                 assert!(std::fs::symlink_metadata(&d).unwrap().is_dir());
             }
+        }
+    }
+
+    /// The plugin's two profiles, exactly. The install reads the system
+    /// prefixes, the mise binary and the package, and writes the daemon
+    /// pool (its `MISE_DATA_DIR`) and two directories in the plugin root,
+    /// none the plugin can write; the trust also reads the pool and writes
+    /// the plugin's `home/`, where its trust record goes, and not the pool.
+    #[test]
+    fn the_plugin_install_and_trust_profiles_never_write_both_home_and_the_pool() {
+        let layout = StateLayout::from_env(Path::new("/h"), |_| None);
+        let p = plugin();
+        let paths = layout.plugin(&p.name);
+        let base = "/h/.local/state/balerix/plugins/web";
+        let pool = "/h/.local/share/balerix/mise";
+        let mise = Path::new("/opt/mise/bin/mise");
+        let install = plugin_install_profile(&p, &paths, &layout, mise).unwrap();
+        let trust = plugin_trust_profile(&p, &paths, &layout, mise).unwrap();
+        let system = ["/usr", "/lib", "/lib64", "/bin", "/etc"];
+        assert_eq!(
+            install["filesystem"],
+            json!({
+                "read": ([system.as_slice(), &["/opt/mise/bin/mise", "/data/plugins/web/abc123def456"]].concat()),
+                "allow": [pool, format!("{base}/mise-state"), format!("{base}/mise-install")],
+            })
+        );
+        assert_eq!(
+            trust["filesystem"],
+            json!({
+                "read": ([system.as_slice(), &["/opt/mise/bin/mise", "/data/plugins/web/abc123def456", pool]].concat()),
+                "allow": [format!("{base}/home"), format!("{base}/mise-install")],
+            })
+        );
+        let shared = json!({
+            "HOME": format!("{base}/mise-install"),
+            "TMPDIR": format!("{base}/mise-install/tmp"),
+            "MISE_GLOBAL_CONFIG_FILE": "/data/plugins/web/abc123def456/mise.toml",
+            "MISE_DATA_DIR": pool,
+            "MISE_CEILING_PATHS": format!("/data/plugins/web:{base}/home"),
+            "MISE_YES": "1",
+            "MISE_QUIET": "1",
+            "MISE_AUTO_INSTALL": "false",
+        });
+        let with = |dirs: serde_json::Value| {
+            let mut vars = shared.clone();
+            for (k, v) in dirs.as_object().unwrap() {
+                vars[k] = v.clone();
+            }
+            json!({ "deny_vars": ["*"], "set_vars": vars })
+        };
+        assert_eq!(
+            install["environment"],
+            with(json!({
+                "MISE_CONFIG_DIR": format!("{base}/mise-install/config"),
+                "MISE_STATE_DIR": format!("{base}/mise-state"),
+                "MISE_CACHE_DIR": format!("{base}/mise-install/cache"),
+            }))
+        );
+        assert_eq!(
+            trust["environment"],
+            with(json!({
+                "MISE_CONFIG_DIR": format!("{base}/home/.config/mise"),
+                "MISE_STATE_DIR": format!("{base}/home/.local/state/mise"),
+                "MISE_CACHE_DIR": format!("{base}/home/.cache/mise"),
+            }))
+        );
+        // the trust record lands where the plugin's own `mise run` looks
+        let env = plugin_env(&p, &paths, &layout, "http://127.0.0.1:7643", "t").unwrap();
+        assert_eq!(
+            trust["environment"]["set_vars"]["MISE_STATE_DIR"],
+            env["MISE_STATE_DIR"].as_str()
+        );
+        for profile in [&install, &trust] {
+            assert_eq!(profile["security"], json!({ "signal_mode": "isolated" }));
+            assert_eq!(profile["workdir"], json!({ "access": "none" }));
+            assert!(profile.get("network").is_none());
         }
     }
 }

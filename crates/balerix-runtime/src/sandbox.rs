@@ -184,6 +184,37 @@ pub fn render_git_profile(
     })
 }
 
+/// The profile the daemon's own `mise trust` and `mise install` run under
+/// for one agent or plugin (`toolchain::install_sandboxed`). `grants.read`
+/// is read-only and `grants.allow` read-write; nothing else on the
+/// filesystem is reachable but what nono itself grants every process.
+/// `env` is the whole environment mise sees (`PATH` aside, which nono
+/// reserves and takes from its own). Network stays at nono's default,
+/// open: an install downloads. Signals are isolated, as for an agent, so
+/// an installer cannot signal the daemon or its supervisors.
+///
+/// Not derived from the agent's profile: no user `sandbox` block, no
+/// agent `env`, no daemon port and none of the agent's other grants.
+/// Every read-write entry must be a directory the sandboxed side cannot
+/// replace: nono resolves a granted path when the sandbox starts, so a
+/// grant named through a link the agent planted would grant the link's
+/// target (the callers grant `home/` itself, whose parent is the
+/// daemon's, never a directory below it).
+pub fn render_mise_profile(
+    name: &str,
+    description: &str,
+    grants: &Grants,
+    env: &BTreeMap<String, String>,
+) -> Value {
+    json!({
+        "meta": { "name": name, "description": description },
+        "filesystem": { "read": strs(&grants.read), "allow": strs(&grants.allow) },
+        "workdir": { "access": "none" },
+        "environment": { "deny_vars": ["*"], "set_vars": env },
+        "security": { "signal_mode": "isolated" },
+    })
+}
+
 /// The directory the host git runs its helpers from, resolved. Asked of
 /// git itself, unsandboxed: it names no repository and reads nothing the
 /// agent wrote. From an empty environment but `PATH`, as the sandboxed

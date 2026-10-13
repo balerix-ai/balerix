@@ -112,7 +112,14 @@ pub enum Command {
     Deactivate {
         agent: String,
     },
-    Events(Vec<HookEvent>),
+    /// A batch of hook events, and how many the daemon reported missed
+    /// before it: whatever was tracked from those may be stale. Carried
+    /// with its batch so nothing reorders the two; should the command be
+    /// dropped from a full queue, the queue's gap says the same.
+    Events {
+        dropped: u64,
+        events: Vec<HookEvent>,
+    },
     Phases(Vec<PhaseChange>),
     Inbound(Inbound),
     /// Runs delivery expiry; pushed by `main` every `TICK`.
@@ -127,7 +134,7 @@ impl Laned for Command {
                 Lane::Control
             }
             Command::Inbound(_) => Lane::Inbound,
-            Command::Events(_) | Command::Phases(_) => Lane::Lossy,
+            Command::Events { .. } | Command::Phases(_) => Lane::Lossy,
             Command::Tick => Lane::Latest,
         }
     }
@@ -143,6 +150,14 @@ impl Laned for Command {
             }
             _ => 0,
         }
+    }
+}
+
+#[cfg(test)]
+impl Command {
+    /// A batch with nothing reported missed before it.
+    pub(crate) fn events(events: Vec<HookEvent>) -> Self {
+        Command::Events { dropped: 0, events }
     }
 }
 
@@ -284,7 +299,11 @@ impl<M: MatrixPort> Actor<M> {
         match command {
             Command::Configure(_) => unreachable!("handled above"),
             Command::Activate { agent, config } => {
-                self.agents.insert(agent, config);
+                // Held already: a restarted daemon re-activating it, and
+                // what happened to the agent in between is unknown.
+                if self.agents.insert(agent.clone(), config).is_some() {
+                    self.deliveries.lose_track_agent(&agent);
+                }
             }
             Command::Deactivate { agent } => {
                 self.agents.remove(&agent);
@@ -297,7 +316,11 @@ impl<M: MatrixPort> Actor<M> {
                 }
                 self.publish_gauges();
             }
-            Command::Events(events) => {
+            Command::Events { dropped, events } => {
+                if dropped > 0 {
+                    tracing::info!("matrix: the daemon missed {dropped} events for this plugin");
+                    self.deliveries.lose_track();
+                }
                 for event in events {
                     self.on_event(event).await;
                 }
@@ -1091,7 +1114,7 @@ mod tests {
             config: agent_config(&["Notification"]),
         })
         .await;
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
         assert!(port.calls().is_empty(), "nothing before configure");
 
@@ -1115,7 +1138,7 @@ mod tests {
                 config: agent_config(&["Notification"]),
             })
             .await;
-            a.handle(Command::Events(vec![started(
+            a.handle(Command::events(vec![started(
                 &format!("f/c/{name}"),
                 "s1",
                 "startup",
@@ -1150,7 +1173,7 @@ mod tests {
             config: agent_config(&["Notification"]),
         })
         .await;
-        a.handle(Command::Events(vec![
+        a.handle(Command::events(vec![
             started("f/c/alice", "s1", "startup"),
             during(
                 "f/c/alice",
@@ -1185,12 +1208,12 @@ mod tests {
             config: agent_config(&["Notification"]),
         })
         .await;
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
         // Call 0 is the room creation, so the root is call 1.
         let root = minted_root(&port.take_calls(), 1);
 
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "compact")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "compact")]))
             .await;
         let s = sends(&port.take_calls());
         assert_eq!(s.len(), 1);
@@ -1201,7 +1224,7 @@ mod tests {
         );
         assert!(s[0].1.contains("restarted"), "{}", s[0].1);
 
-        a.handle(Command::Events(vec![started("f/c/alice", "s2", "clear")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s2", "clear")]))
             .await;
         let s = sends(&port.take_calls());
         assert_eq!(s.len(), 1);
@@ -1217,7 +1240,7 @@ mod tests {
             config: agent_config(&["Notification"]),
         })
         .await;
-        a.handle(Command::Events(vec![
+        a.handle(Command::events(vec![
             started("f/c/alice", "s1", "startup"),
             during(
                 "f/c/alice",
@@ -1251,7 +1274,7 @@ mod tests {
             config: agent_config(&["Notification"]),
         })
         .await;
-        a.handle(Command::Events(vec![
+        a.handle(Command::events(vec![
             started("f/c/alice", "s1", "startup"),
             during(
                 "f/c/alice",
@@ -1266,7 +1289,7 @@ mod tests {
         assert_eq!(fake.kv_json("thread/f/c/alice").unwrap()["closed"], true);
 
         // The operator resumes that very session.
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "resume")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "resume")]))
             .await;
 
         let s = sends(&port.take_calls());
@@ -1279,7 +1302,7 @@ mod tests {
         );
 
         // A later event posts in the same thread and leaves it open.
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "f/c/alice",
             "s1",
             "Notification",
@@ -1298,7 +1321,7 @@ mod tests {
             config: crate::config::parse_agent(&json!({ "enabled": false })).unwrap(),
         })
         .await;
-        a.handle(Command::Events(vec![
+        a.handle(Command::events(vec![
             started("f/c/alice", "s1", "startup"),
             started("f/c/ghost", "s1", "startup"),
         ]))
@@ -1317,7 +1340,7 @@ mod tests {
             config: agent_config(&[]),
         })
         .await;
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
 
         assert!(
@@ -1352,7 +1375,7 @@ mod tests {
         let deaf = "sync: the homeserver rejected our session".to_string();
         health.fail(deaf.clone());
 
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
 
         assert_eq!(sends(&port.calls()).len(), 1, "the event was still posted");
@@ -1379,7 +1402,7 @@ mod tests {
         })
         .await;
         async fn start(a: &mut Actor<FakePort>) {
-            a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+            a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
                 .await;
         }
         // The cooldown runs on the real clock, which the actor has no seam
@@ -1471,7 +1494,7 @@ mod tests {
         .await;
 
         port.fail_next(crate::matrix::MatrixError::Other("no rights".into()));
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
 
         assert!(sends(&port.calls()).is_empty(), "{:?}", port.calls());
@@ -1494,7 +1517,7 @@ mod tests {
         .await;
 
         port.fail_next(crate::matrix::MatrixError::Other("no rights".into()));
-        a.handle(Command::Events(vec![
+        a.handle(Command::events(vec![
             started("f/c/alice", "s1", "startup"),
             during(
                 "f/c/alice",
@@ -1534,12 +1557,12 @@ mod tests {
             config: agent_config(&["Stop"]),
         })
         .await;
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
         let root = minted_root(&port.take_calls(), 1);
 
         let long = "abcd\n".repeat(3000);
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "f/c/alice",
             "s1",
             "Stop",
@@ -1579,14 +1602,14 @@ mod tests {
             config: agent_config(&["Stop"]),
         })
         .await;
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
         port.take_calls();
 
         // Fails the first part; `retry_once` burns its one retry on it.
         port.fail_next(crate::matrix::MatrixError::Other("nope".into()));
         port.fail_next(crate::matrix::MatrixError::Other("nope again".into()));
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "f/c/alice",
             "s1",
             "Stop",
@@ -1613,13 +1636,13 @@ mod tests {
         .await;
         // The room and the thread root have to exist first, or the call the
         // rate limit lands on would be `create_room`, not a send.
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
         // Call 0 is the room creation, so the root is call 1.
         let root = minted_root(&port.take_calls(), 1);
 
         port.fail_next(crate::matrix::MatrixError::RateLimited { retry_after_ms: 1 });
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "f/c/alice",
             "s1",
             "Notification",
@@ -1650,7 +1673,7 @@ mod tests {
         // Nothing has been posted yet, so the first port call — and the one
         // the rate limit lands on — is the room creation.
         port.fail_next(crate::matrix::MatrixError::RateLimited { retry_after_ms: 1 });
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
 
         let calls = port.calls();
@@ -1678,7 +1701,7 @@ mod tests {
             config: agent_config(&[]),
         })
         .await;
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
         // Call 0 is the room creation, so the root is call 1.
         let root = minted_root(&port.take_calls(), 1);
@@ -1704,7 +1727,7 @@ mod tests {
             config: agent_config(&[]),
         })
         .await;
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
         assert!(fake.kv().contains_key("thread/f/c/alice"));
         a.handle(deactivate("f/c/alice")).await;
@@ -1756,6 +1779,52 @@ mod tests {
             .collect()
     }
 
+    /// A batch the daemon reports events missed before: the tracker loses
+    /// track of an idle turn before it reads the batch, whose `Stop`
+    /// then settles it again.
+    #[tokio::test]
+    async fn a_batch_reporting_missed_events_loses_track_first() {
+        let (_fake, _port, mut a, _room, _root) = with_thread().await;
+        assert!(a.deliveries.idle("f/c/alice"), "SessionStart");
+        a.handle(Command::Events {
+            dropped: 2,
+            events: Vec::new(),
+        })
+        .await;
+        assert!(!a.deliveries.idle("f/c/alice"));
+        a.handle(Command::Events {
+            dropped: 1,
+            events: vec![event("f/c/alice", "Stop", json!({}))],
+        })
+        .await;
+        assert!(
+            a.deliveries.idle("f/c/alice"),
+            "the gap came before the Stop"
+        );
+    }
+
+    /// Re-activated (a restarted daemon re-sends `activate`), an agent's
+    /// turn tracking is reset; a first activation changes nothing.
+    #[tokio::test]
+    async fn a_reactivated_agent_has_its_turn_tracking_reset() {
+        let (_fake, _port, mut a, _room, _root) = with_thread().await;
+        a.handle(Command::Activate {
+            agent: "f/c/bob".into(),
+            config: agent_config(&[]),
+        })
+        .await;
+        a.handle(Command::events(vec![event("f/c/bob", "Stop", json!({}))]))
+            .await;
+        assert!(a.deliveries.idle("f/c/alice") && a.deliveries.idle("f/c/bob"));
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&[]),
+        })
+        .await;
+        assert!(!a.deliveries.idle("f/c/alice"));
+        assert!(a.deliveries.idle("f/c/bob"), "only the re-activated agent");
+    }
+
     /// An actor with one live thread; returns the room and its root.
     async fn with_thread() -> (FakeHost, FakePort, Actor<FakePort>, String, String) {
         let (fake, port, mut a) = actor().await;
@@ -1765,7 +1834,7 @@ mod tests {
             config: agent_config(&[]),
         })
         .await;
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
         let (room, root) = match port.calls().last() {
             Some(Call::Send { room, .. }) => (room.clone(), "$evt2:fake".to_string()),
@@ -1806,7 +1875,7 @@ mod tests {
             config: agent_config(&["Notification", "Stop"]),
         })
         .await;
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
         let room = match port.calls().last() {
             Some(Call::Send { room, .. }) => room.clone(),
@@ -1819,7 +1888,7 @@ mod tests {
     #[tokio::test]
     async fn a_question_is_posted_in_the_thread_and_the_permission_line_is_suppressed() {
         let (fake, port, mut a, _room, root) = with_question_thread().await;
-        a.handle(Command::Events(vec![
+        a.handle(Command::events(vec![
             asks("f/c/alice", "s1", &[color()]),
             during(
                 "f/c/alice",
@@ -1844,7 +1913,7 @@ mod tests {
         );
 
         // with no question open the same notification posts as before
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "f/c/alice",
             "s1",
             "Stop",
@@ -1852,7 +1921,7 @@ mod tests {
         )]))
         .await;
         port.take_calls();
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "f/c/alice",
             "s1",
             "Notification",
@@ -1884,14 +1953,14 @@ mod tests {
     #[tokio::test]
     async fn at_most_one_permission_prompt_is_suppressed_per_question() {
         let (_fake, port, mut a, _room, _root) = asked(&[color()]).await;
-        a.handle(Command::Events(vec![permission_prompt("f/c/alice", "s1")]))
+        a.handle(Command::events(vec![permission_prompt("f/c/alice", "s1")]))
             .await;
         assert!(
             sends(&port.take_calls()).is_empty(),
             "the question already said it"
         );
 
-        a.handle(Command::Events(vec![permission_prompt("f/c/alice", "s1")]))
+        a.handle(Command::events(vec![permission_prompt("f/c/alice", "s1")]))
             .await;
         let s = sends(&port.take_calls());
         assert_eq!(s.len(), 1, "a second prompt is another tool asking: {s:?}");
@@ -1911,7 +1980,7 @@ mod tests {
         ));
         port.take_calls();
 
-        a.handle(Command::Events(vec![permission_prompt("f/c/alice", "s1")]))
+        a.handle(Command::events(vec![permission_prompt("f/c/alice", "s1")]))
             .await;
         let s = sends(&port.calls());
         assert_eq!(s.len(), 1, "{s:?}");
@@ -1924,12 +1993,12 @@ mod tests {
     async fn a_permission_prompt_posts_when_the_question_message_never_landed() {
         let (_fake, port, mut a, _room, _root) = with_question_thread().await;
         port.fail_next(crate::matrix::MatrixError::Other("nope".into()));
-        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+        a.handle(Command::events(vec![asks("f/c/alice", "s1", &[color()])]))
             .await;
         assert!(sends(&port.take_calls()).is_empty(), "the question is lost");
         assert!(a.questions.is_open("f/c/alice"), "but still tracked");
 
-        a.handle(Command::Events(vec![permission_prompt("f/c/alice", "s1")]))
+        a.handle(Command::events(vec![permission_prompt("f/c/alice", "s1")]))
             .await;
         let s = sends(&port.calls());
         assert_eq!(s.len(), 1, "{s:?}");
@@ -1956,7 +2025,7 @@ mod tests {
         .await;
 
         port.fail_next(crate::matrix::MatrixError::Other("no rights".into()));
-        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+        a.handle(Command::events(vec![asks("f/c/alice", "s1", &[color()])]))
             .await;
         assert!(
             sends(&port.calls()).is_empty(),
@@ -1965,7 +2034,7 @@ mod tests {
         );
 
         // The notification that follows opens the thread the reply arrives in.
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "f/c/alice",
             "s1",
             "Notification",
@@ -1999,7 +2068,7 @@ mod tests {
             config: crate::config::parse_agent(&json!({ "enabled": false })).unwrap(),
         })
         .await;
-        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+        a.handle(Command::events(vec![asks("f/c/alice", "s1", &[color()])]))
             .await;
         assert!(port.calls().is_empty(), "{:?}", port.calls());
 
@@ -2024,7 +2093,7 @@ mod tests {
             config: agent_config(&["PreToolUse"]),
         })
         .await;
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "f/c/alice",
             "s1",
             "PreToolUse",
@@ -2042,7 +2111,7 @@ mod tests {
     #[tokio::test]
     async fn a_question_is_tracked_even_when_the_event_filter_hides_it() {
         let (fake, port, mut a, _room, _root) = with_thread().await; // events: []
-        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+        a.handle(Command::events(vec![asks("f/c/alice", "s1", &[color()])]))
             .await;
         assert!(sends(&port.calls()).is_empty(), "nothing posted");
         assert!(
@@ -2061,10 +2130,10 @@ mod tests {
             ("SessionStart", json!({ "source": "clear" })),
         ] {
             let (fake, _port, mut a, _room, _root) = with_question_thread().await;
-            a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+            a.handle(Command::events(vec![asks("f/c/alice", "s1", &[color()])]))
                 .await;
             assert!(a.questions.is_open("f/c/alice"));
-            a.handle(Command::Events(vec![during(
+            a.handle(Command::events(vec![during(
                 "f/c/alice",
                 "s1",
                 name,
@@ -2075,7 +2144,7 @@ mod tests {
             assert!(fake.kv_json("question/f/c/alice").is_none(), "{name}");
         }
         let (_fake, _port, mut a, _room, _root) = with_question_thread().await;
-        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+        a.handle(Command::events(vec![asks("f/c/alice", "s1", &[color()])]))
             .await;
         a.handle(deactivate("f/c/alice")).await;
         assert!(!a.questions.is_open("f/c/alice"), "deactivate");
@@ -2084,14 +2153,14 @@ mod tests {
     #[tokio::test]
     async fn an_answer_given_at_the_terminal_is_reported() {
         let (_fake, port, mut a, _room, _root) = with_question_thread().await;
-        a.handle(Command::Events(vec![asks(
+        a.handle(Command::events(vec![asks(
             "f/c/alice",
             "s1",
             &[color(), size()],
         )]))
         .await;
         port.take_calls();
-        a.handle(Command::Events(vec![answered(
+        a.handle(Command::events(vec![answered(
             "f/c/alice",
             "s1",
             json!({ "Which color?": "Blue", "Which size?": "Medium" }),
@@ -2117,11 +2186,11 @@ mod tests {
         };
 
         let (_fake, port, mut a, room, _root) = with_question_thread().await;
-        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+        a.handle(Command::events(vec![asks("f/c/alice", "s1", &[color()])]))
             .await;
         a.questions.set_stage("f/c/alice", sent("$echo:fake"));
         port.take_calls();
-        a.handle(Command::Events(vec![answered(
+        a.handle(Command::events(vec![answered(
             "f/c/alice",
             "s1",
             json!({ "Which color?": "Blue" }),
@@ -2138,11 +2207,11 @@ mod tests {
         );
 
         let (_fake, port, mut a, _room, _root) = with_question_thread().await;
-        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+        a.handle(Command::events(vec![asks("f/c/alice", "s1", &[color()])]))
             .await;
         a.questions.set_stage("f/c/alice", sent("$echo:fake"));
         port.take_calls();
-        a.handle(Command::Events(vec![answered(
+        a.handle(Command::events(vec![answered(
             "f/c/alice",
             "s1",
             json!({ "Which color?": "Red" }),
@@ -2160,7 +2229,7 @@ mod tests {
     #[tokio::test]
     async fn an_open_question_survives_an_actor_restart() {
         let (fake, _port, mut a, _room, _root) = with_question_thread().await;
-        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+        a.handle(Command::events(vec![asks("f/c/alice", "s1", &[color()])]))
             .await;
         drop(a);
         let host = Host::new(fake.env("matrix", std::path::Path::new("scratch"))).unwrap();
@@ -2197,7 +2266,7 @@ mod tests {
             "sent, not yet taken"
         );
 
-        a.handle(Command::Events(vec![submitted(
+        a.handle(Command::events(vec![submitted(
             "f/c/alice",
             "run\n the  tests ",
         )]))
@@ -2260,12 +2329,12 @@ mod tests {
             [enter.clone(), enter.clone()]
         );
 
-        a.handle(Command::Events(vec![submitted(
+        a.handle(Command::events(vec![submitted(
             "f/c/alice",
             "run the tests",
         )]))
         .await;
-        a.handle(Command::Events(vec![event("f/c/alice", "Stop", json!({}))]))
+        a.handle(Command::events(vec![event("f/c/alice", "Stop", json!({}))]))
             .await;
         tick_after(&mut a, Duration::from_secs(60)).await;
         assert_eq!(fake.actions_for("f/c/alice").len(), 3);
@@ -2356,7 +2425,7 @@ mod tests {
                     submit: true
                 }]
             );
-            a.handle(Command::Events(vec![submitted("f/c/alice", sent)]))
+            a.handle(Command::events(vec![submitted("f/c/alice", sent)]))
                 .await;
             assert_eq!(
                 reactions(&port.calls()),
@@ -2433,7 +2502,7 @@ mod tests {
     #[tokio::test]
     async fn the_window_waits_for_the_turn_to_end() {
         let (_fake, port, mut a, room, root) = with_thread().await;
-        a.handle(Command::Events(vec![submitted(
+        a.handle(Command::events(vec![submitted(
             "f/c/alice",
             "earlier work",
         )]))
@@ -2452,7 +2521,7 @@ mod tests {
             notices(&port.calls()).is_empty(),
             "mid-turn: queued, not swallowed"
         );
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "f/c/alice",
             "s1",
             "Stop",
@@ -2501,7 +2570,7 @@ mod tests {
             config: crate::config::parse_agent(&json!({ "confirmWindow": "0" })).unwrap(),
         })
         .await;
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+        a.handle(Command::events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
         let room = "!room1:fake".to_string();
         let root = minted_root(&port.take_calls(), 1);
@@ -2516,7 +2585,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(86_400)).await;
         a.handle(Command::Tick).await;
         assert!(notices(&port.calls()).is_empty());
-        a.handle(Command::Events(vec![submitted("f/c/alice", "x")]))
+        a.handle(Command::events(vec![submitted("f/c/alice", "x")]))
             .await;
         assert_eq!(
             reactions(&port.calls()),
@@ -2544,7 +2613,7 @@ mod tests {
             "$two:fake",
         )))
         .await;
-        a.handle(Command::Events(vec![submitted("f/c/alice", "second")]))
+        a.handle(Command::events(vec![submitted("f/c/alice", "second")]))
             .await;
         assert_eq!(
             notices(&port.calls()),
@@ -2687,7 +2756,7 @@ mod tests {
     #[tokio::test]
     async fn a_reply_for_an_agent_the_actor_does_not_track_is_not_delivered() {
         let (fake, _port, mut a, room, root) = with_question_thread().await;
-        a.handle(Command::Events(vec![asks("f/c/alice", "s1", &[color()])]))
+        a.handle(Command::events(vec![asks("f/c/alice", "s1", &[color()])]))
             .await;
         drop(a);
         let host = Host::new(fake.env("matrix", std::path::Path::new("scratch"))).unwrap();
@@ -2734,7 +2803,7 @@ mod tests {
     #[tokio::test]
     async fn a_reply_in_a_closed_thread_is_refused() {
         let (fake, port, mut a, room, root) = with_thread().await;
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "f/c/alice",
             "s1",
             "SessionEnd",
@@ -2820,7 +2889,7 @@ mod tests {
         questions: &[serde_json::Value],
     ) -> (FakeHost, FakePort, Actor<FakePort>, String, String) {
         let (fake, port, mut a, room, root) = with_question_thread().await;
-        a.handle(Command::Events(vec![asks("f/c/alice", "s1", questions)]))
+        a.handle(Command::events(vec![asks("f/c/alice", "s1", questions)]))
             .await;
         port.take_calls();
         (fake, port, a, room, root)
@@ -2880,7 +2949,7 @@ mod tests {
 
         // the recorded answer then lands as a ✅ on that echo
         port.take_calls();
-        a.handle(Command::Events(vec![answered(
+        a.handle(Command::events(vec![answered(
             "f/c/alice",
             "s1",
             json!({ "Which color?": "Blue" }),
@@ -3211,7 +3280,7 @@ mod tests {
             .unwrap(),
         })
         .await;
-        a.handle(Command::Events(vec![asks(
+        a.handle(Command::events(vec![asks(
             "f/c/alice",
             "s1",
             &[many_options(17)],

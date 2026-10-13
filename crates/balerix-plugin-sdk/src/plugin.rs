@@ -6,14 +6,14 @@ use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, header::CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use balerix_api::{
-    ActivateRequest, DeactivateRequest, ErrorBody, EventBatch, HookEvent, InterceptRequest,
-    InterceptResponse, PluginManifest,
+    ActivateRequest, DeactivateRequest, EVENTS_DROPPED_HEADER, ErrorBody, EventBatch, HookEvent,
+    InterceptRequest, InterceptResponse, PluginManifest,
 };
 use serde_json::{Value, json};
 
@@ -52,6 +52,18 @@ pub trait Plugin: Send + Sync + 'static {
     }
     fn observe(&self, events: Vec<HookEvent>) -> impl Future<Output = ()> + Send {
         let _ = events;
+        async {}
+    }
+    /// The plugin missed `n` hook events — observed or intercepted —
+    /// since a call last told it so (`EVENTS_DROPPED_HEADER`,
+    /// plugin-protocol §4, `events`). Called before `observe` or
+    /// `intercept` for the call that reports it; never with zero, and
+    /// with 1 for a count the SDK cannot read. The missed events came
+    /// before that call's own, so state tracked from the events may be
+    /// stale. The same count can arrive again if the call fails, so
+    /// handling it should be idempotent.
+    fn events_dropped(&self, n: u64) -> impl Future<Output = ()> + Send {
+        let _ = n;
         async {}
     }
     /// The verdict; default passes `response_so_far` through untouched.
@@ -187,26 +199,49 @@ async fn deactivate<P: Plugin>(
     Json(json!({})).into_response()
 }
 
+/// The `EVENTS_DROPPED_HEADER` count; absent or zero is none. A header
+/// present but unreadable still says something was lost: at least one.
+fn events_dropped(headers: &HeaderMap) -> Option<u64> {
+    let value = headers.get(EVENTS_DROPPED_HEADER)?;
+    match value
+        .to_str()
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(1),
+    }
+}
+
 async fn events<P: Plugin>(
     State(p): State<Arc<P>>,
+    headers: HeaderMap,
     body: Result<Json<EventBatch>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(batch) = match body {
         Ok(b) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
+    if let Some(n) = events_dropped(&headers) {
+        p.events_dropped(n).await;
+    }
     p.observe(batch.events).await;
     Json(json!({})).into_response()
 }
 
 async fn intercept<P: Plugin>(
     State(p): State<Arc<P>>,
+    headers: HeaderMap,
     body: Result<Json<InterceptRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(req) = match body {
         Ok(b) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
+    if let Some(n) = events_dropped(&headers) {
+        p.events_dropped(n).await;
+    }
     let verdict = p
         .intercept(req.event, req.response_so_far, req.deadline_ms)
         .await;
@@ -501,6 +536,88 @@ mod tests {
                 .await
                 .unwrap(),
             ""
+        );
+    }
+
+    /// Records, in order, each `events_dropped` count and each batch size.
+    #[derive(Default)]
+    struct Gaps(std::sync::Mutex<Vec<String>>);
+    impl Plugin for Gaps {
+        async fn events_dropped(&self, n: u64) {
+            self.0.lock().unwrap().push(format!("dropped {n}"));
+        }
+        async fn observe(&self, events: Vec<HookEvent>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("observe {}", events.len()));
+        }
+        async fn intercept(
+            &self,
+            event: HookEvent,
+            response_so_far: Value,
+            _deadline_ms: u64,
+        ) -> InterceptResponse {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("intercept {}", event.name));
+            InterceptResponse {
+                response: response_so_far,
+                actions: Vec::new(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_dropped_header_reaches_events_dropped_before_observe_or_intercept() {
+        let (listener, listen) = bind().await.unwrap();
+        let plugin = Arc::new(Gaps::default());
+        tokio::spawn(run(listener, plugin.clone(), "tok", None));
+        let url = format!("http://{listen}/v1/events");
+        let event = HookEvent::new("f/c/a", "Stop", Timestamp(1), json!({}));
+        let body = json!({ "events": [event] });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        for header in [None, Some("7"), Some("0"), Some("lots")] {
+            let mut req = c.post(&url).bearer_auth("tok").json(&body);
+            if let Some(h) = header {
+                req = req.header(EVENTS_DROPPED_HEADER, h);
+            }
+            assert_eq!(
+                req.send().await.unwrap().status().as_u16(),
+                200,
+                "{header:?}"
+            );
+        }
+        assert_eq!(
+            *plugin.0.lock().unwrap(),
+            [
+                "observe 1",
+                "dropped 7",
+                "observe 1",
+                "observe 1",
+                "dropped 1",
+                "observe 1"
+            ],
+            "no header or a zero: no call; an unreadable count is at least one"
+        );
+        plugin.0.lock().unwrap().clear();
+        let req = json!({ "event": event, "response_so_far": {}, "deadline_ms": 5 });
+        for header in [None, Some("4")] {
+            let mut r = c
+                .post(format!("http://{listen}/v1/intercept"))
+                .bearer_auth("tok")
+                .json(&req);
+            if let Some(h) = header {
+                r = r.header(EVENTS_DROPPED_HEADER, h);
+            }
+            assert_eq!(r.send().await.unwrap().status().as_u16(), 200);
+        }
+        assert_eq!(
+            *plugin.0.lock().unwrap(),
+            ["intercept Stop", "dropped 4", "intercept Stop"],
+            "reported before the intercept it rides on"
         );
     }
 

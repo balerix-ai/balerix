@@ -4,6 +4,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use balerix_api::HookEvent;
 use balerix_plugin_sdk::{Metrics, Plugin};
@@ -29,6 +30,8 @@ pub struct GitHubPlugin<L: Launcher> {
     health: Health,
     queue: Arc<Queue>,
     launcher: L,
+    /// Reported missed by `events_dropped`, taken by the next `observe`.
+    dropped: AtomicU64,
 }
 
 impl<L: Launcher> std::fmt::Debug for GitHubPlugin<L> {
@@ -50,6 +53,7 @@ impl<L: Launcher> GitHubPlugin<L> {
             health,
             queue,
             launcher,
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -97,8 +101,16 @@ impl<L: Launcher> Plugin for GitHubPlugin<L> {
     /// Enqueue and return: this is a daemon-to-plugin call and must never
     /// wait on GitHub (Spec M §3).
     async fn observe(&self, events: Vec<HookEvent>) {
-        // Never refused: a full bounded lane drops its oldest instead.
-        let _ = self.queue.push(Command::Events(events));
+        // Never refused: a full bounded lane drops its oldest instead, and
+        // the queue's gap mark then stands in for this batch's report.
+        let dropped = self.dropped.swap(0, Ordering::SeqCst);
+        let _ = self.queue.push(Command::Events { dropped, events });
+    }
+
+    /// Kept for the batch it came with (the SDK calls this just before
+    /// `observe`), so the report travels in that batch's command.
+    async fn events_dropped(&self, n: u64) {
+        self.dropped.fetch_add(n, Ordering::SeqCst);
     }
 
     async fn health(&self) -> Result<(), String> {
@@ -215,7 +227,7 @@ mod tests {
         let (p, queue, health) = plugin(FakeLauncher::default());
         p.observe(vec![event("f/c/issue-12", "Stop", json!({}))])
             .await;
-        assert!(matches!(queue.pop().await, Command::Events(e) if e.len() == 1));
+        assert!(matches!(queue.pop().await, Command::Events { events: e, .. } if e.len() == 1));
         p.deactivate("f/c/issue-12").await;
         assert!(matches!(queue.pop().await, Command::Deactivate { .. }));
 
@@ -251,7 +263,7 @@ mod tests {
         assert!(matches!(queue.pop().await, Command::Activate { .. }));
         assert!(matches!(queue.pop().await, Command::Webhook(_)));
         for _ in 0..crate::actor::QUEUE {
-            assert!(matches!(queue.pop().await, Command::Events(_)));
+            assert!(matches!(queue.pop().await, Command::Events { .. }));
         }
         assert!(matches!(queue.pop().await, Command::Deactivate { .. }));
         assert!(queue.is_empty());
@@ -285,7 +297,16 @@ mod tests {
         );
         h.observe(vec![event("f/c/issue-12", "Stop", json!({}))])
             .await;
-        assert!(matches!(queue.pop().await, Command::Events(_)));
+        assert!(matches!(
+            queue.pop().await,
+            Command::Events { dropped: 0, .. }
+        ));
+        h.observe_after_drop(3, vec![event("f/c/issue-12", "Stop", json!({}))])
+            .await;
+        assert!(
+            matches!(queue.pop().await, Command::Events { dropped: 3, events } if events.len() == 1),
+            "the report travels with its batch"
+        );
         assert!(h.health().await.is_ok());
         assert!(
             h.metrics().await.contains("balerix_plugin_github_"),

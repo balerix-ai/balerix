@@ -427,6 +427,17 @@ impl<M> Deliveries<M> {
         }
     }
 
+    /// `lose_track` for `agent` alone: its turn, if idle, is unknown again.
+    /// For an agent activated again (a restarted daemon re-sends
+    /// `activate`), whose events in between may never have arrived.
+    pub fn lose_track_agent(&mut self, agent: &str) {
+        if let Some(state) = self.agents.get_mut(agent)
+            && state.turn == Turn::Idle
+        {
+            state.turn = Turn::Unknown;
+        }
+    }
+
     /// Drops everything held for `agent`, answering the markers so the
     /// caller may report or ignore them.
     pub fn forget(&mut self, agent: &str) -> Vec<M> {
@@ -434,6 +445,12 @@ impl<M> Deliveries<M> {
             .remove(agent)
             .map(|s| s.pending.into_iter().map(|p| p.marker).collect())
             .unwrap_or_default()
+    }
+
+    /// Whether `agent`'s turn is known to be over: a `Stop` or a
+    /// `SessionStart` seen, nothing since, and no `lose_track` after it.
+    pub fn idle(&self, agent: &str) -> bool {
+        self.agents.get(agent).is_some_and(|s| s.turn == Turn::Idle)
     }
 
     /// How many prompts `agent` has pending.
@@ -942,6 +959,31 @@ mod tests {
         let stopped = now + Duration::from_secs(60);
         d.on_event(&stop(), stopped);
         assert_eq!(d.nudge(stopped + Duration::from_secs(5)), vec!["f/c/a"]);
+    }
+
+    #[test]
+    fn lose_track_turns_idle_into_unknown_until_the_next_stop() {
+        let now = Instant::now();
+        let mut d: Deliveries<()> = Deliveries::default();
+        assert!(!d.idle("f/c/a"), "never seen");
+        d.on_event(&stop(), now);
+        assert!(d.idle("f/c/a"));
+        d.lose_track();
+        assert!(!d.idle("f/c/a"));
+        d.on_event(&stop(), now);
+        assert!(d.idle("f/c/a"));
+    }
+
+    #[test]
+    fn lose_track_agent_touches_only_that_agent() {
+        let now = Instant::now();
+        let mut d: Deliveries<()> = Deliveries::default();
+        d.on_event(&stop(), now);
+        d.on_event(&event("f/c/b", "Stop", json!({})), now);
+        d.lose_track_agent("f/c/a");
+        d.lose_track_agent("f/c/nobody");
+        assert!(!d.idle("f/c/a"));
+        assert!(d.idle("f/c/b"));
     }
 
     #[test]

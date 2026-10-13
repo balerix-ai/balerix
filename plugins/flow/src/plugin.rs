@@ -127,6 +127,16 @@ impl Nudger {
     fn forget(&self, agent: &str) {
         self.deliveries().forget(agent);
     }
+
+    /// Events may have been lost: no agent's turn is known to be over.
+    fn lose_track(&self) {
+        self.deliveries().lose_track();
+    }
+
+    /// The same, for `agent` alone.
+    fn lose_track_agent(&self, agent: &str) {
+        self.deliveries().lose_track_agent(agent);
+    }
 }
 
 impl std::fmt::Debug for FlowPlugin {
@@ -292,6 +302,11 @@ impl Plugin for FlowPlugin {
                 )
                 .map(|a| a.state)
         };
+        if old.is_some() {
+            // Held already: a restarted daemon re-activating it, and what
+            // happened to the agent in between is unknown.
+            self.nudger.lose_track_agent(agent);
+        }
         self.set_state_gauge(agent, old.as_deref(), &state);
         eprintln!("flow: {agent} active in state {state:?}");
         Ok(())
@@ -384,6 +399,14 @@ impl Plugin for FlowPlugin {
     fn metrics(&self) -> Option<&Metrics> {
         Some(&self.metrics)
     }
+
+    /// The daemon reports the events flow missed — an intercept it was
+    /// not called for, or whose call failed — on the next intercept,
+    /// before it: flow stops trusting the turns it tracked before that
+    /// event is fed to the tracker.
+    async fn events_dropped(&self, _n: u64) {
+        self.nudger.lose_track();
+    }
 }
 
 #[cfg(test)]
@@ -391,7 +414,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use balerix_plugin_sdk::testing::{FakeHost, event, metric};
+    use balerix_plugin_sdk::testing::{FakeHost, Harness, event, metric};
     use serde_json::json;
     use tokio::sync::Notify;
 
@@ -465,5 +488,48 @@ mod tests {
             fake.kv_json(&FlowPlugin::state_key(ALICE)).unwrap()["state"],
             "working"
         );
+    }
+
+    async fn world() -> (FakeHost, Harness, Nudger) {
+        let fake = FakeHost::start("tok", json!({}), vec![]).await;
+        let env = fake.env("flow", std::path::Path::new("/s"));
+        let plugin = FlowPlugin::new(Host::new(env.clone()).unwrap()).unwrap();
+        let nudger = plugin.nudger();
+        let h = Harness::start(&env, plugin).await;
+        (fake, h, nudger)
+    }
+
+    /// An intercept reporting missed events: the tracker loses track
+    /// first, then reads the intercept's own event.
+    #[tokio::test]
+    async fn an_intercept_reporting_missed_events_loses_track_first() {
+        let (_fake, h, nudger) = world().await;
+        h.intercept(event("f/c/a", "Stop", json!({}))).await;
+        h.intercept(event("f/c/a", "Notification", json!({}))).await;
+        assert!(nudger.deliveries().idle("f/c/a"), "a Notification alone");
+        h.intercept_after_drop(1, event("f/c/a", "Notification", json!({})))
+            .await;
+        assert!(!nudger.deliveries().idle("f/c/a"));
+        h.intercept_after_drop(1, event("f/c/a", "Stop", json!({})))
+            .await;
+        assert!(
+            nudger.deliveries().idle("f/c/a"),
+            "the gap came before the Stop"
+        );
+        h.observe_after_drop(1, vec![]).await;
+        assert!(!nudger.deliveries().idle("f/c/a"), "on a batch too");
+    }
+
+    /// Re-activated (a restarted daemon re-sends `activate`), an agent's
+    /// turn tracking is reset; a first activation changes nothing.
+    #[tokio::test]
+    async fn a_reactivated_agent_has_its_turn_tracking_reset() {
+        let (_fake, h, nudger) = world().await;
+        let config = json!({ "initial": "a", "states": { "a": {} } });
+        h.activate("f/c/a", config.clone()).await.unwrap();
+        h.intercept(event("f/c/a", "Stop", json!({}))).await;
+        assert!(nudger.deliveries().idle("f/c/a"));
+        h.activate("f/c/a", config).await.unwrap();
+        assert!(!nudger.deliveries().idle("f/c/a"));
     }
 }

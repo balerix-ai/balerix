@@ -11,6 +11,16 @@ use balerix_api::{ActivationState, Capability, PluginActivation, PluginManifest}
 use balerix_core::{AgentId, AgentName, FleetName, FleetRecord, ResolvedPlugin};
 use serde_json::Value;
 
+/// The plugins subscribed to one event for one agent, split by
+/// readiness under one read of the registry (`intercepting`, `observing`).
+#[derive(Debug, Default, PartialEq)]
+pub struct Subscribed {
+    /// Ready: where to call each, in load-list order.
+    pub ready: Vec<(AgentName, PluginAddr)>,
+    /// Subscribed and active but not ready: each misses the event.
+    pub unready: Vec<AgentName>,
+}
+
 /// Where a ready plugin listens and the bearer the daemon presents to it
 /// (plugins spec §18.3): the plugin's own token, learned at `hello`.
 #[derive(Clone, PartialEq, Eq)]
@@ -391,35 +401,51 @@ impl PluginRegistry {
         .unwrap_or(u32::MAX)
     }
 
-    fn subscribed(
-        &self,
-        agent: &AgentId,
-        pick: impl Fn(&PluginManifest) -> bool,
-    ) -> Vec<(AgentName, PluginAddr)> {
+    /// Plugins active for `agent` whose manifest `pick`s the event, in
+    /// load-list order, read under one lock: those ready to be called,
+    /// with their addresses, and those that are not, which miss the event.
+    fn subscribed(&self, agent: &AgentId, pick: impl Fn(&PluginManifest) -> bool) -> Subscribed {
         let r = self.read();
-        r.order
-            .iter()
-            .filter_map(|name| {
-                let p = r.plugins.get(name)?;
-                let listen = p.listen.clone().filter(|_| p.ready)?;
-                let token = p.token.clone()?;
-                let active = r
-                    .rows
-                    .get(&(agent.clone(), name.clone()))
-                    .is_some_and(|row| row.activation.state == ActivationState::Active);
-                (active && pick(&p.manifest)).then(|| (name.clone(), PluginAddr { listen, token }))
-            })
-            .collect()
+        let mut out = Subscribed::default();
+        for name in &r.order {
+            let Some(p) = r.plugins.get(name) else {
+                continue;
+            };
+            let active = r
+                .rows
+                .get(&(agent.clone(), name.clone()))
+                .is_some_and(|row| row.activation.state == ActivationState::Active);
+            if !active || !pick(&p.manifest) {
+                continue;
+            }
+            match (p.listen.clone().filter(|_| p.ready), p.token.clone()) {
+                (Some(listen), Some(token)) => {
+                    out.ready.push((name.clone(), PluginAddr { listen, token }))
+                }
+                _ => out.unready.push(name.clone()),
+            }
+        }
+        out
+    }
+
+    /// Plugins intercepting `event` and active for `agent`.
+    pub fn intercepting(&self, agent: &AgentId, event: &str) -> Subscribed {
+        self.subscribed(agent, |m| m.hooks.intercept.contains(event))
+    }
+
+    /// Plugins observing `event` and active for `agent`.
+    pub fn observing(&self, agent: &AgentId, event: &str) -> Subscribed {
+        self.subscribed(agent, |m| m.hooks.observe.contains(event))
     }
 
     /// Ready plugins intercepting `event` and active for `agent`, in
     /// load-list order, with their listen addresses.
     pub fn interceptors(&self, agent: &AgentId, event: &str) -> Vec<(AgentName, PluginAddr)> {
-        self.subscribed(agent, |m| m.hooks.intercept.contains(event))
+        self.intercepting(agent, event).ready
     }
 
     pub fn observers(&self, agent: &AgentId, event: &str) -> Vec<(AgentName, PluginAddr)> {
-        self.subscribed(agent, |m| m.hooks.observe.contains(event))
+        self.observing(agent, event).ready
     }
 
     /// Copies the fleet's rows into `status.agents[*].plugins` (§16.3);
@@ -589,11 +615,29 @@ mod tests {
                 }
             )]
         );
+        assert!(r.observing(&a, "Stop").unready.is_empty());
         r.set_ready(&name("flow"), false);
         assert!(
             r.interceptors(&a, "PreToolUse").is_empty(),
             "not ready: skipped"
         );
+        assert!(r.observers(&a, "Stop").is_empty());
+        assert_eq!(r.observing(&a, "Stop").unready, vec![name("flow")]);
+        assert_eq!(
+            r.intercepting(&a, "PreToolUse").unready,
+            vec![name("flow")],
+            "one read, split by readiness"
+        );
+        assert!(
+            r.observing(&a, "Notification").unready.is_empty(),
+            "not subscribed"
+        );
+        r.set_ready(&name("web"), false);
+        assert!(
+            r.observing(&a, "SessionStart").unready.is_empty(),
+            "web is pending for a"
+        );
+        r.set_ready(&name("web"), true);
         r.set_ready(&name("flow"), true);
         assert!(r.is_active(&a, &name("flow")));
         assert!(!r.is_active(&a, &name("web")));

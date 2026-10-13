@@ -4,6 +4,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use balerix_api::HookEvent;
 use balerix_plugin_sdk::{Metrics, Plugin};
@@ -28,6 +29,8 @@ pub struct MatrixPlugin<L: Launcher> {
     health: Health,
     queue: Arc<Queue>,
     launcher: L,
+    /// Reported missed by `events_dropped`, taken by the next `observe`.
+    dropped: AtomicU64,
 }
 
 impl<L: Launcher> std::fmt::Debug for MatrixPlugin<L> {
@@ -49,6 +52,7 @@ impl<L: Launcher> MatrixPlugin<L> {
             health,
             queue,
             launcher,
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -96,8 +100,16 @@ impl<L: Launcher> Plugin for MatrixPlugin<L> {
     /// Enqueue and return: this is a daemon-to-plugin call and must never
     /// wait on a homeserver (Spec G-11).
     async fn observe(&self, events: Vec<HookEvent>) {
-        // Never refused: a full bounded lane drops its oldest instead.
-        let _ = self.queue.push(Command::Events(events));
+        // Never refused: a full bounded lane drops its oldest instead, and
+        // the queue's gap mark then stands in for this batch's report.
+        let dropped = self.dropped.swap(0, Ordering::SeqCst);
+        let _ = self.queue.push(Command::Events { dropped, events });
+    }
+
+    /// Kept for the batch it came with (the SDK calls this just before
+    /// `observe`), so the report travels in that batch's command.
+    async fn events_dropped(&self, n: u64) {
+        self.dropped.fetch_add(n, Ordering::SeqCst);
     }
 
     async fn health(&self) -> Result<(), String> {
@@ -206,7 +218,7 @@ mod tests {
     async fn observe_and_deactivate_enqueue_and_health_follows_the_cell() {
         let (p, queue, health) = plugin(FakeLauncher::default());
         p.observe(vec![event("f/c/alice", "Stop", json!({}))]).await;
-        assert!(matches!(queue.pop().await, Command::Events(e) if e.len() == 1));
+        assert!(matches!(queue.pop().await, Command::Events { events: e, .. } if e.len() == 1));
         p.deactivate("f/c/alice").await;
         assert!(matches!(queue.pop().await, Command::Deactivate { .. }));
 
@@ -248,7 +260,7 @@ mod tests {
         assert!(matches!(queue.pop().await, Command::Activate { .. }));
         assert!(matches!(queue.pop().await, Command::Inbound(_)));
         for _ in 0..crate::actor::QUEUE {
-            assert!(matches!(queue.pop().await, Command::Events(_)));
+            assert!(matches!(queue.pop().await, Command::Events { .. }));
         }
         assert_eq!(queue.pop().await, Command::Tick);
         assert!(queue.is_empty());
@@ -275,7 +287,16 @@ mod tests {
             "nope: unknown field `nope`"
         );
         h.observe(vec![event("f/c/alice", "Stop", json!({}))]).await;
-        assert!(matches!(queue.pop().await, Command::Events(_)));
+        assert!(matches!(
+            queue.pop().await,
+            Command::Events { dropped: 0, .. }
+        ));
+        h.observe_after_drop(3, vec![event("f/c/alice", "Stop", json!({}))])
+            .await;
+        assert!(
+            matches!(queue.pop().await, Command::Events { dropped: 3, events } if events.len() == 1),
+            "the report travels with its batch"
+        );
         assert!(h.health().await.is_ok());
         assert!(
             h.metrics().await.contains("balerix_plugin_matrix_"),

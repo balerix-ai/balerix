@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use balerix_api::{
-    ActivateRequest, DeactivateRequest, ErrorBody, EventBatch, InterceptRequest, InterceptResponse,
+    ActivateRequest, DeactivateRequest, EVENTS_DROPPED_HEADER, ErrorBody, EventBatch,
+    InterceptRequest, InterceptResponse,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -189,10 +190,38 @@ impl PluginClient {
             .map(|_| ())
     }
 
-    pub async fn events(&self, addr: &PluginAddr, batch: &EventBatch) -> Result<(), CallFailure> {
-        self.post(addr, "/v1/events", batch, CALL_TIMEOUT)
+    /// `dropped`, when not zero, rides along as `EVENTS_DROPPED_HEADER`.
+    pub async fn events(
+        &self,
+        addr: &PluginAddr,
+        batch: &EventBatch,
+        dropped: u64,
+    ) -> Result<(), CallFailure> {
+        self.post_reporting(addr, "/v1/events", batch, CALL_TIMEOUT, dropped)
             .await
             .map(|_| ())
+    }
+
+    /// `post`, with `dropped` as `EVENTS_DROPPED_HEADER` when not zero:
+    /// the events this plugin missed since a call last reported them.
+    async fn post_reporting<T: Serialize + ?Sized>(
+        &self,
+        addr: &PluginAddr,
+        path: &str,
+        body: &T,
+        timeout: Duration,
+        dropped: u64,
+    ) -> Result<Vec<u8>, CallFailure> {
+        let mut req = self
+            .http
+            .post(Self::url(addr, path))
+            .bearer_auth(&addr.token)
+            .timeout(timeout)
+            .json(body);
+        if dropped > 0 {
+            req = req.header(EVENTS_DROPPED_HEADER, dropped);
+        }
+        Self::body(req.send().await?).await
     }
 
     /// `timeout` is what remains of the chain's budget. A `response` that
@@ -202,8 +231,11 @@ impl PluginClient {
         addr: &PluginAddr,
         req: &InterceptRequest,
         timeout: Duration,
+        dropped: u64,
     ) -> Result<InterceptResponse, CallFailure> {
-        let bytes = self.post(addr, "/v1/intercept", req, timeout).await?;
+        let bytes = self
+            .post_reporting(addr, "/v1/intercept", req, timeout, dropped)
+            .await?;
         let verdict: InterceptResponse =
             serde_json::from_slice(&bytes).map_err(|e| CallFailure::Body(e.to_string()))?;
         if !matches!(verdict.response, Value::Object(_)) {
@@ -412,6 +444,7 @@ mod tests {
             &EventBatch {
                 events: vec![event("Notification")],
             },
+            0,
         )
         .await
         .unwrap();
@@ -425,6 +458,7 @@ mod tests {
                     deadline_ms: 1000,
                 },
                 Duration::from_secs(1),
+                0,
             )
             .await
             .unwrap();
@@ -440,6 +474,7 @@ mod tests {
                     deadline_ms: 1000,
                 },
                 Duration::from_secs(1),
+                0,
             )
             .await
             .unwrap_err();
@@ -454,6 +489,7 @@ mod tests {
                     deadline_ms: 100,
                 },
                 Duration::from_millis(100),
+                0,
             )
             .await
             .unwrap_err();

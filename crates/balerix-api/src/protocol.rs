@@ -10,6 +10,11 @@ use crate::HookEvent;
 pub const OBSERVER_BATCH: usize = 64;
 /// Per-plugin observer queue depth; the oldest event is dropped on overflow.
 pub const OBSERVER_QUEUE: usize = 1024;
+/// `POST /v1/events` and `POST /v1/intercept` request header: how many
+/// hook events the plugin missed since a call last told it so, as a
+/// decimal count. Sent only when that count is not zero; a plugin that
+/// does not know the header ignores it.
+pub const EVENTS_DROPPED_HEADER: &str = "x-balerix-events-dropped";
 /// The interceptor chain's shared budget inside Claude's 2 s hook timeout.
 pub const CHAIN_BUDGET_MS: u64 = 1500;
 /// `send_keys`: the pause after each step when the action names none.

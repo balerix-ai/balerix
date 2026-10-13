@@ -43,10 +43,11 @@ pub use plugin::{
     PluginsFile, SyncReport,
 };
 pub use protocol::{
-    ActivateRequest, CHAIN_BUDGET_MS, DEFAULT_KEY_DELAY_MS, DeactivateRequest, EventBatch,
-    InterceptRequest, InterceptResponse, Key, KeyStep, KvKeys, MAX_KEY_DELAY_MS,
-    MAX_KEY_SEQUENCE_MS, MAX_KEY_STEPS, MAX_KEY_TEXT, MAX_KV_KEY, MAX_SEND_TEXT, MIN_KEY_DELAY_MS,
-    OBSERVER_BATCH, OBSERVER_QUEUE, PluginAction, Resize, ResizeFrame, TextFrame, check_kv_key,
+    ActivateRequest, CHAIN_BUDGET_MS, DEFAULT_KEY_DELAY_MS, DeactivateRequest,
+    EVENTS_DROPPED_HEADER, EventBatch, InterceptRequest, InterceptResponse, Key, KeyStep, KvKeys,
+    MAX_KEY_DELAY_MS, MAX_KEY_SEQUENCE_MS, MAX_KEY_STEPS, MAX_KEY_TEXT, MAX_KV_KEY, MAX_SEND_TEXT,
+    MIN_KEY_DELAY_MS, OBSERVER_BATCH, OBSERVER_QUEUE, PluginAction, Resize, ResizeFrame, TextFrame,
+    check_kv_key,
 };
 pub use record::{Desired, FleetRecord, Keep};
 pub use request::{DownQuery, ErrorBody, FleetRequest, SessionRequest, SessionResponse};

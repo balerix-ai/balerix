@@ -184,12 +184,33 @@ pub fn phase_message(change: &PhaseChange) -> String {
 /// A `limit` passed to `split` must exceed it.
 pub const PART_OVERHEAD: usize = 64;
 
+/// The most of a fence's info string kept to reopen it (#254). A fence
+/// line can be one long line of text with no newline; repeating all of it
+/// on every continuation would leave no room for the content.
+const MAX_INFO: usize = 32;
+
 /// An open code fence: its marker (``` or ~~~, however many characters)
-/// and the info string to repeat when reopening it.
+/// and the info string to repeat when reopening it, at most `MAX_INFO`
+/// bytes.
 #[derive(Clone, PartialEq, Eq)]
 struct Fence {
     marker: String,
     info: String,
+}
+
+impl Fence {
+    /// The line that reopens this fence at the top of the next chunk. An
+    /// info string that starts with the marker's own character is set off
+    /// by a space, or the line would read as a longer marker, which the
+    /// closing line would not close.
+    fn reopen(&self) -> String {
+        let gap = if self.info.starts_with(&self.marker[..1]) {
+            " "
+        } else {
+            ""
+        };
+        format!("{}{gap}{}\n", self.marker, self.info)
+    }
 }
 
 /// The fence a line opens or closes, if it is a fence line at all.
@@ -198,65 +219,150 @@ fn fence_of(line: &str) -> Option<Fence> {
     let ch = t.chars().next().filter(|c| *c == '`' || *c == '~')?;
     let marker: String = t.chars().take_while(|c| *c == ch).collect();
     (marker.len() >= 3).then(|| Fence {
-        info: t[marker.len()..].trim().to_string(),
+        info: prefix(t[marker.len()..].trim(), MAX_INFO).to_string(),
         marker,
     })
 }
 
-/// `text` as chunks that each fit `budget`, broken at line boundaries
-/// where possible and at a character boundary otherwise. A chunk that
-/// ends inside a code fence closes it, and the next one reopens it.
-fn chunks(text: &str, budget: usize) -> Vec<String> {
+/// The longest prefix of `s` at most `max` bytes long that ends on a
+/// character boundary.
+fn prefix(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// The fence left open after `piece`, starting from `open`.
+fn track(mut open: Option<Fence>, piece: &str) -> Option<Fence> {
+    for line in piece.lines() {
+        match (&open, fence_of(line)) {
+            (None, Some(f)) => open = Some(f),
+            (Some(cur), Some(f)) if f.marker.starts_with(&cur.marker) && f.info.is_empty() => {
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    open
+}
+
+/// Where to end a piece of `rest` that holds at most `room` bytes: after
+/// the last line break within the room, or else at the last character
+/// boundary. Zero when not even one character fits.
+fn cut_within(rest: &str, room: usize) -> usize {
+    let head = prefix(rest, room);
+    match head.rfind('\n') {
+        // +1 keeps the newline with the chunk it ends.
+        Some(i) if i > 0 => i + 1,
+        _ => head.len(),
+    }
+}
+
+/// One chunk: a slice of the text, with the fence line that reopens a
+/// code block at its top and the one that closes it at its bottom.
+struct Piece<'a> {
+    reopen: String,
+    body: &'a str,
+    close: String,
+}
+
+impl Piece<'_> {
+    fn len(&self) -> usize {
+        self.reopen.len() + self.body.len() + self.close.len()
+    }
+}
+
+/// The largest piece of `rest` that fits `budget` after reopening `open`
+/// and closing whatever fence it leaves open, with that fence; `None`
+/// when no character fits.
+fn fit<'a>(
+    rest: &'a str,
+    budget: usize,
+    open: &Option<Fence>,
+) -> Option<(Piece<'a>, Option<Fence>)> {
+    let reopen = open.as_ref().map(Fence::reopen).unwrap_or_default();
+    let mut room = budget.checked_sub(reopen.len())?;
+    loop {
+        let cut = cut_within(rest, room);
+        if cut == 0 {
+            return None;
+        }
+        let body = &rest[..cut];
+        let after = track(open.clone(), body);
+        let close = after
+            .as_ref()
+            .map(|f| {
+                let nl = if body.ends_with('\n') { "" } else { "\n" };
+                format!("{nl}{}\n", f.marker)
+            })
+            .unwrap_or_default();
+        let piece = Piece {
+            reopen: reopen.clone(),
+            body,
+            close,
+        };
+        if piece.len() <= budget {
+            return Some((piece, after));
+        }
+        // The closing fence did not fit: try again with less, which
+        // always shrinks the room, so this ends.
+        room = (cut - 1).min(budget.saturating_sub(reopen.len() + piece.close.len()));
+    }
+}
+
+/// `text` as pieces that each fit `budget`, broken at line boundaries
+/// where possible and at a character boundary otherwise. A piece that
+/// ends inside a code fence closes it, and the next one reopens it. The
+/// bodies, in order, are `text`. Every piece advances by at least one
+/// character, so this ends for any budget (#254); with a budget of four
+/// bytes or more every piece fits it.
+fn pieces(text: &str, budget: usize) -> Vec<Piece<'_>> {
     let mut out = Vec::new();
     let mut open: Option<Fence> = None;
     let mut rest = text;
     while !rest.is_empty() {
-        // Reopening costs the fence line; closing costs one more.
-        let reopen = open
-            .as_ref()
-            .map(|f| format!("{}{}\n", f.marker, f.info))
-            .unwrap_or_default();
-        let room = budget.saturating_sub(reopen.len());
-        if rest.len() <= room && open.is_none() {
-            out.push(format!("{reopen}{rest}"));
+        if open.is_none() && rest.len() <= budget {
+            out.push(Piece {
+                reopen: String::new(),
+                body: rest,
+                close: String::new(),
+            });
             break;
         }
-        // Largest character boundary within the room, preferring the last
-        // line break so a chunk holds whole lines.
-        let mut end = room.min(rest.len());
-        while end > 0 && !rest.is_char_boundary(end) {
-            end -= 1;
-        }
-        let head = &rest[..end];
-        let cut = match head.rfind('\n') {
-            // +1 keeps the newline with the chunk it ends.
-            Some(i) if i > 0 => i + 1,
-            _ => end,
+        let (piece, after) = match fit(rest, budget, &open) {
+            Some(fitted) => fitted,
+            // Reopening the fence leaves no room (a long marker): drop it
+            // and go on as plain text. Should even the fence this piece
+            // opens not fit its close, send the piece with no fence work
+            // at all, and at least one character of it.
+            None => fit(rest, budget, &None).unwrap_or_else(|| {
+                let cut = match cut_within(rest, budget) {
+                    0 => rest.chars().next().map_or(rest.len(), char::len_utf8),
+                    cut => cut,
+                };
+                let piece = Piece {
+                    reopen: String::new(),
+                    body: &rest[..cut],
+                    close: String::new(),
+                };
+                (piece, None)
+            }),
         };
-        let (piece, tail) = rest.split_at(cut);
-        // Track the fence state this piece leaves behind.
-        for line in piece.lines() {
-            match (&open, fence_of(line)) {
-                (None, Some(f)) => open = Some(f),
-                (Some(cur), Some(f)) if f.marker.starts_with(&cur.marker) && f.info.is_empty() => {
-                    open = None;
-                }
-                _ => {}
-            }
-        }
-        let close = open
-            .as_ref()
-            .map(|f| {
-                let nl = if piece.ends_with('\n') { "" } else { "\n" };
-                format!("{nl}{}\n", f.marker)
-            })
-            .unwrap_or_default();
-        out.push(format!("{reopen}{piece}{close}"));
-        rest = tail;
-        if tail.is_empty() {
-            break;
-        }
+        rest = &rest[piece.body.len()..];
+        open = after;
+        out.push(piece);
     }
+    out
+}
+
+/// `text` as chunks that each fit `budget` (see `pieces`).
+fn chunks(text: &str, budget: usize) -> Vec<String> {
+    let mut out: Vec<String> = pieces(text, budget)
+        .into_iter()
+        .map(|p| format!("{}{}{}", p.reopen, p.body, p.close))
+        .collect();
     if out.is_empty() {
         out.push(String::new());
     }
@@ -477,6 +583,143 @@ mod tests {
         );
         for p in &parts {
             assert!(p.len() <= BODY_LIMIT, "part is {} bytes", p.len());
+        }
+    }
+
+    /// #254: a fence line longer than the budget was kept whole as the
+    /// info string, so the reopening line alone filled the next chunk and
+    /// `split` looped forever, allocating as it went.
+    #[test]
+    fn split_ends_on_a_fence_line_longer_than_the_limit() {
+        let body = format!("```{}\n", "a".repeat(5000));
+        let parts = split(&body, BODY_LIMIT, 10);
+        assert!(parts.len() > 1, "must split");
+        for p in &parts {
+            assert!(p.len() <= BODY_LIMIT, "part is {} bytes", p.len());
+        }
+        for p in parts.iter().skip(1) {
+            let first = p.lines().next().unwrap_or_default();
+            assert!(
+                first.len() <= 3 + MAX_INFO,
+                "the reopening line keeps at most {MAX_INFO} bytes of info: {first:?}"
+            );
+        }
+    }
+
+    /// #254: the same with multi-byte characters, where the info string
+    /// is cut at a character boundary and the room after the reopening
+    /// line can be narrower than the next character.
+    #[test]
+    fn split_ends_on_a_long_multi_byte_fence_line() {
+        let body = format!("~~~~{}\n", "é😀".repeat(2000));
+        let parts = split(&body, BODY_LIMIT, 10);
+        assert!(parts.len() > 1, "must split");
+        for p in &parts {
+            assert!(p.len() <= BODY_LIMIT, "part is {} bytes", p.len());
+        }
+        // Budgets barely wider than the reopening line, where the room it
+        // leaves can be narrower than a 😀: every piece still advances.
+        let text = format!("```{}\n{}", "é".repeat(MAX_INFO), "😀".repeat(40));
+        for budget in 4..3 + MAX_INFO + 1 + 8 {
+            let got = pieces(&text, budget);
+            assert_eq!(got.iter().map(|p| p.body).collect::<String>(), text);
+            for p in &got {
+                assert!(p.len() <= budget, "piece is {} bytes of {budget}", p.len());
+            }
+        }
+    }
+
+    /// Text that leans on what the chunker treats specially: fence
+    /// markers, newlines and characters of every UTF-8 width. Runs of
+    /// backticks reach `max_run`.
+    fn awkward_text(max_run: usize) -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        let atom = prop_oneof![
+            Just("```".to_string()),
+            Just("~~~~".to_string()),
+            Just("```rust".to_string()),
+            Just("\n".to_string()),
+            Just(" ".to_string()),
+            Just("é".to_string()),
+            Just("€".to_string()),
+            Just("😀".to_string()),
+            "[a-z ]{1,40}",
+            (1usize..300).prop_map(|n| "x".repeat(n)),
+            (1..=max_run).prop_map(|n| "`".repeat(n)),
+        ];
+        prop::collection::vec(atom, 0..120).prop_map(|atoms| atoms.concat())
+    }
+
+    /// The longest run of one fence character in `text`.
+    fn longest_run(text: &str) -> usize {
+        let (mut longest, mut run, mut last) = (0, 0, None);
+        for c in text.chars() {
+            run = if (c == '`' || c == '~') && Some(c) == last {
+                run + 1
+            } else {
+                usize::from(c == '`' || c == '~')
+            };
+            last = Some(c);
+            longest = longest.max(run);
+        }
+        longest
+    }
+
+    /// `pieces` gives back the text and fits every piece to a budget of
+    /// four bytes or more. Once the budget comfortably holds a reopening
+    /// and a closing line, every piece but the last leaves no fence open:
+    /// the last is the text's own tail, which may end inside one.
+    fn check_pieces(text: &str, budget: usize) -> Result<(), proptest::test_runner::TestCaseError> {
+        let got = pieces(text, budget);
+        proptest::prop_assert_eq!(got.iter().map(|p| p.body).collect::<String>(), text);
+        for p in &got {
+            proptest::prop_assert!(!p.body.is_empty());
+            if budget >= 4 {
+                proptest::prop_assert!(p.len() <= budget, "{} > {budget}", p.len());
+            }
+        }
+        if budget >= 2 * (longest_run(text) + MAX_INFO + 4) {
+            for p in got.iter().rev().skip(1) {
+                let chunk = format!("{}{}{}", p.reopen, p.body, p.close);
+                proptest::prop_assert!(
+                    track(None, &chunk).is_none(),
+                    "a fence is left open in {chunk:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    proptest::proptest! {
+        /// #254: `pieces` ends for any budget, and `check_pieces` holds.
+        #[test]
+        fn pieces_fit_and_keep_the_text(text in awkward_text(200), budget in 1usize..400) {
+            check_pieces(&text, budget)?;
+        }
+
+        /// Short fence runs, so the budget always holds them and every
+        /// case checks that the pieces are fence-balanced.
+        #[test]
+        fn pieces_are_fence_balanced(
+            text in awkward_text(8),
+            budget in 2 * (8 + MAX_INFO + 4)..400,
+        ) {
+            check_pieces(&text, budget)?;
+        }
+
+        /// #254: `split` ends and every part fits the limit, the
+        /// `(n/N)` marker and the truncation notice included.
+        #[test]
+        fn split_parts_fit_the_limit(
+            text in awkward_text(200),
+            limit in (PART_OVERHEAD + 4)..600,
+            max_parts in 1usize..=99,
+        ) {
+            let parts = split(&text, limit, max_parts);
+            proptest::prop_assert!(!parts.is_empty() && parts.len() <= max_parts);
+            for p in &parts {
+                proptest::prop_assert!(p.len() <= limit, "{} > {limit}", p.len());
+            }
         }
     }
 

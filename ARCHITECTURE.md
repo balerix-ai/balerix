@@ -336,10 +336,16 @@ makes an existing remote branch its clone's branch and start point
   installed into its own read-only mise data dir — the system table into the
   daemon pool, `defaults.tools` into the fleet pool, a crew's
   `defaults.tools` into the crew pool — and every agent runs with its own
-  writable data dir in `home/`, reaching the three pools through
+  writable data dir (`mise/data` in its root), reaching the three pools through
   `MISE_SHARED_INSTALL_DIRS` (crew, then fleet, then daemon). An agent can
   therefore `mise install` what its worktree declares without touching a
   binary any other agent executes.
+- **The daemon installs every tool under nono.** An agent's and a
+  plugin's installs, and each pool level's, run in a sandbox written per
+  call that writes only the directories that install fills: an agent's
+  four mise directories (`mise/` in its root, outside `home/`), a pool, or,
+  for a plugin, its `home/` for the trust record and the daemon pool for
+  the tools, in two separate calls.
 - **The daemon pool has one owner.** The system table is installed by a
   `SystemPool` actor at daemon start and re-checked each resync tick, not by
   whichever crew's pass reached it first. Its readiness is a live condition:

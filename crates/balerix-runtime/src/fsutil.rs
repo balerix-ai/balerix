@@ -28,6 +28,33 @@ pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
+/// `remove_dir_all`, after giving every directory in the tree its owner's
+/// `rwx` back: a sandboxed process that took the permissions off a
+/// directory it made cannot keep the daemon from removing it. Links are
+/// never followed (`symlink_metadata`); a missing `path` is not an error.
+pub(crate) fn remove_tree(path: &Path) -> io::Result<()> {
+    fn open_up(dir: &Path) {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                open_up(&entry.path());
+            }
+        }
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            open_up(path);
+            fs::remove_dir_all(path)
+        }
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Writes `contents` to `path` via a sibling temp file and rename, with
 /// `mode` (e.g. `0o600`) applied before the rename. The temp file is
 /// created with `mode` from the start (via `OpenOptionsExt::mode`), so a
@@ -378,5 +405,20 @@ mod tests {
         for bad in ["", "/abs", "a/../b", "./a"] {
             ensure_path_at(fd.as_fd(), Path::new(bad), DirMode::Default).unwrap_err();
         }
+    }
+
+    #[test]
+    fn remove_tree_removes_a_tree_whose_directories_lost_their_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("t");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/f"), "x").unwrap();
+        std::os::unix::fs::symlink(dir.path(), root.join("a/link")).unwrap();
+        fs::set_permissions(root.join("a/b"), fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(root.join("a"), fs::Permissions::from_mode(0o000)).unwrap();
+        remove_tree(&root).unwrap();
+        assert!(!root.exists());
+        assert!(dir.path().exists(), "the link's target stays");
+        remove_tree(&root).unwrap();
     }
 }

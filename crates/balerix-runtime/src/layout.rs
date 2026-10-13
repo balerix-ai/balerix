@@ -389,6 +389,13 @@ impl PluginPaths {
     pub fn installed_marker(&self) -> PathBuf {
         self.root.join(".installed")
     }
+    /// Where the daemon's `mise install` for this plugin keeps mise's
+    /// config, state and cache (`plugin::plugin_install_call`):
+    /// daemon-owned, and kept, so a half-made install a killed daemon left
+    /// is still known as one.
+    pub fn mise_install_state(&self) -> PathBuf {
+        self.root.join("mise-state")
+    }
     pub fn tmp_dir(&self) -> PathBuf {
         self.home.join("tmp")
     }
@@ -460,20 +467,37 @@ impl AgentPaths {
     pub fn gh_dir(&self) -> PathBuf {
         self.xdg_config().join("gh")
     }
+    /// The directory holding the agent's four mise directories: in the
+    /// agent root, and never granted itself, so neither the agent nor the
+    /// daemon's install can replace one of the four (`mise_dirs`).
+    pub fn mise_root(&self) -> PathBuf {
+        self.root.join("mise")
+    }
     pub fn mise_config_dir(&self) -> PathBuf {
-        self.xdg_config().join("mise")
+        self.mise_root().join("config")
     }
     pub fn mise_state_dir(&self) -> PathBuf {
-        self.xdg_state().join("mise")
+        self.mise_root().join("state")
     }
     pub fn mise_cache_dir(&self) -> PathBuf {
-        self.xdg_cache().join("mise")
+        self.mise_root().join("cache")
     }
-    /// The agent's own `MISE_DATA_DIR`: writable, inside `home/`, so an
-    /// agent can `mise install` a tool the fleet never declared without
-    /// touching any shared pool (Spec E, E-2).
+    /// The agent's own `MISE_DATA_DIR`: writable, so an agent can `mise
+    /// install` a tool the fleet never declared without touching any
+    /// shared pool (Spec E, E-2). Outside `home/`: the daemon's install
+    /// writes it, and must not see what `home/` holds.
     pub fn mise_data_dir(&self) -> PathBuf {
-        self.xdg_data().join("mise")
+        self.mise_root().join("data")
+    }
+    /// The four directories the agent's sandbox and the daemon's install
+    /// for it write: config, data, state, cache.
+    pub fn mise_dirs(&self) -> [PathBuf; 4] {
+        [
+            self.mise_config_dir(),
+            self.mise_data_dir(),
+            self.mise_state_dir(),
+            self.mise_cache_dir(),
+        ]
     }
 }
 
@@ -530,7 +554,7 @@ mod tests {
         );
         assert_eq!(
             a.mise_cache_dir(),
-            PathBuf::from(format!("{base}/home/.cache/mise"))
+            PathBuf::from(format!("{base}/mise/cache"))
         );
         assert_eq!(
             l.crew(&"payments/backend".parse().unwrap()).repo,
@@ -637,8 +661,8 @@ mod tests {
         let a = l.agent(&"payments/backend/alice".parse().unwrap());
         assert_eq!(
             a.mise_data_dir(),
-            PathBuf::from(format!("{base}/agents/alice/home/.local/share/mise")),
-            "the agent's own installs live inside its writable home"
+            PathBuf::from(format!("{base}/agents/alice/mise/data")),
+            "the agent's own installs live in its root, outside home/"
         );
         assert_eq!(
             l.system_installed_marker(),

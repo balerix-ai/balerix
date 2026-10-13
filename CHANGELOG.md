@@ -235,6 +235,12 @@
   know. A non-Rust plugin that rejects unknown fields must accept
   `truncated`. Rebuild a Rust plugin against `balerix-api` and
   `balerix-plugin-sdk` 0.3 to read it.
+- Agents' own tool directories moved to `<agent_root>/mise/`. On the
+  first start after upgrading, the daemon reinstalls each agent's tool
+  table there. Tools an agent installed itself, and its `mise trust`
+  records, don't carry over: run `mise install` / `mise trust` again
+  inside the agent. The old `home/.local/share/mise` is unused and can be
+  deleted.
 
 ## 0.2.4 - 2026-10-10
 

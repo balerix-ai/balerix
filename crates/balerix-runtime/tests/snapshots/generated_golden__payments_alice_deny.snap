@@ -21,13 +21,13 @@ expression: out
       "GH_CONFIG_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.config/gh",
       "HOME": "<root>/state/fleets/payments/crews/backend/agents/alice/home",
       "MISE_AUTO_INSTALL": "false",
-      "MISE_CACHE_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.cache/mise",
+      "MISE_CACHE_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/mise/cache",
       "MISE_CEILING_PATHS": "<root>/state/fleets/payments/crews/backend/agents/alice",
-      "MISE_CONFIG_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.config/mise",
-      "MISE_DATA_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.local/share/mise",
+      "MISE_CONFIG_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/mise/config",
+      "MISE_DATA_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/mise/data",
       "MISE_GLOBAL_CONFIG_FILE": "<root>/state/fleets/payments/crews/backend/agents/alice/mise.toml",
       "MISE_SHARED_INSTALL_DIRS": "<root>/state/fleets/payments/crews/backend/mise/installs:<root>/state/fleets/payments/mise/installs:<root>/data/mise/installs",
-      "MISE_STATE_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.local/state/mise",
+      "MISE_STATE_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/mise/state",
       "RUST_LOG": "info",
       "TERM": "tmux-256color",
       "TMPDIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/tmp",
@@ -40,7 +40,11 @@ expression: out
   "filesystem": {
     "allow": [
       "<root>/state/fleets/payments/crews/backend/agents/alice/home",
-      "<root>/state/fleets/payments/crews/backend/agents/alice/workspace"
+      "<root>/state/fleets/payments/crews/backend/agents/alice/workspace",
+      "<root>/state/fleets/payments/crews/backend/agents/alice/mise/config",
+      "<root>/state/fleets/payments/crews/backend/agents/alice/mise/data",
+      "<root>/state/fleets/payments/crews/backend/agents/alice/mise/state",
+      "<root>/state/fleets/payments/crews/backend/agents/alice/mise/cache"
     ],
     "read": [
       "/usr",

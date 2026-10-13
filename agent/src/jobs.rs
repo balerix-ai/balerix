@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use balerix_core::{AgentId, CrewRef, FleetName, RepoRef};
 use balerix_runtime::jobs::{self, BranchChange, PoolLevel};
 use balerix_runtime::layout::SharedSlice;
-use balerix_runtime::{ToolPaths, embedded_system_tools};
+use balerix_runtime::{InstallEnv, ToolPaths, embedded_system_tools};
 
 use crate::cli::{CrewRemoveArgs, CrewSyncArgs, HarvestArgs, Level, PoolSyncArgs};
 
@@ -17,6 +17,12 @@ fn tools() -> Result<ToolPaths> {
     let exe = std::env::current_exe().context("cannot name this binary")?;
     ToolPaths::discover_in(&std::env::var_os("PATH").unwrap_or_default(), &exe)
         .map_err(|e| anyhow!("{e} (a Job needs git, gh, mise, nono and tmux on PATH)"))
+}
+
+/// What the pool installs take from this Job's environment (proxies,
+/// certificates, a GitHub token).
+fn install_env() -> InstallEnv {
+    InstallEnv::from_env(|k| std::env::var_os(k))
 }
 
 pub fn crew_sync(args: &CrewSyncArgs) -> Result<String> {
@@ -44,6 +50,7 @@ pub fn crew_sync(args: &CrewSyncArgs) -> Result<String> {
         &args.git_ref,
         token.as_deref(),
         &table,
+        &install_env(),
     )?)
 }
 
@@ -69,6 +76,7 @@ pub fn pool_sync(args: &PoolSyncArgs) -> Result<String> {
         &args.dirs.scratch_dir,
         &level,
         &table,
+        &install_env(),
     )
     .map_err(|e| anyhow!("tools: {e}"))?;
     Ok("synced".to_string())

@@ -223,7 +223,8 @@ fn materialize_then_remove_round_trip() {
     assert_eq!(
         mise_log
             .lines()
-            .filter(|l| l.starts_with("$ mise install"))
+            // under nono: `$ nono … run … -- <mise> install`
+            .filter(|l| l.starts_with("$ nono ") && l.ends_with(" install"))
             .count(),
         1,
         "unchanged table → install skipped on the second pass"

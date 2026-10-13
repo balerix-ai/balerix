@@ -60,10 +60,11 @@ pub fn balerix_grants(
     // path under `repo/` is ever in `allow` — that is the isolation between
     // the agents of one crew (docs/THREAT-MODEL.md).
     read.push(crew.cache_objects());
-    Grants {
-        read,
-        allow: vec![paths.home.clone(), paths.workspace.clone()],
-    }
+    // the agent's own mise directories (`AgentPaths::mise_dirs`): outside
+    // `home/`, in a directory of the agent root no sandbox writes
+    let mut allow = vec![paths.home.clone(), paths.workspace.clone()];
+    allow.extend(paths.mise_dirs());
+    Grants { read, allow }
 }
 
 fn strs(paths: &[PathBuf]) -> Value {
@@ -181,6 +182,38 @@ pub fn render_git_profile(
                 "GIT_CEILING_DIRECTORIES": ceiling.display().to_string(),
             },
         },
+    })
+}
+
+/// The profile one of the daemon's own `mise trust`/`mise install` calls
+/// runs under (`install_sandbox`): an agent's, a plugin's, a pool
+/// level's. `grants.read` is read-only and `grants.allow` read-write;
+/// nothing else on the filesystem is reachable but what nono itself
+/// grants every process. `set_vars` is mise's environment; of nono's own
+/// environment only `allow_vars` pass, by name (the proxy and certificate
+/// variables, and a pool's token), so no value of theirs is ever written
+/// into a profile. `PATH` is nono's, which reserves it. Network stays at
+/// nono's default, open: an install downloads. Signals are isolated, as
+/// for an agent, so an installer cannot signal the daemon or its
+/// supervisors.
+///
+/// Every read-write entry must be a directory the sandboxed side cannot
+/// replace: nono grants what a path resolves to when the sandbox starts,
+/// so a grant named through a link someone planted would grant the link's
+/// target.
+pub fn render_mise_profile(
+    name: &str,
+    description: &str,
+    grants: &Grants,
+    set_vars: &BTreeMap<String, String>,
+    allow_vars: &[&str],
+) -> Value {
+    json!({
+        "meta": { "name": name, "description": description },
+        "filesystem": { "read": strs(&grants.read), "allow": strs(&grants.allow) },
+        "workdir": { "access": "none" },
+        "environment": { "allow_vars": allow_vars, "set_vars": set_vars },
+        "security": { "signal_mode": "isolated" },
     })
 }
 
@@ -918,6 +951,10 @@ mod tests {
             json!([
                 "/h/.local/state/balerix/fleets/f/crews/c/agents/a/home",
                 "/h/.local/state/balerix/fleets/f/crews/c/agents/a/workspace",
+                "/h/.local/state/balerix/fleets/f/crews/c/agents/a/mise/config",
+                "/h/.local/state/balerix/fleets/f/crews/c/agents/a/mise/data",
+                "/h/.local/state/balerix/fleets/f/crews/c/agents/a/mise/state",
+                "/h/.local/state/balerix/fleets/f/crews/c/agents/a/mise/cache",
             ]),
             "nothing under crews/c/repo is ever writable (Spec N §6)"
         );

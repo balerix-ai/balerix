@@ -486,21 +486,30 @@ fn sandboxed_cmd(
 /// global config either way.
 pub(crate) struct ScratchHome(PathBuf);
 
+/// The name prefixes of the `ScratchHome`s, one per kind of call: the
+/// git profile's and the mise install's (`toolchain::SandboxedMise`).
+const SCRATCH_PREFIXES: &[&str] = &[".nono-git-", ".nono-mise-"];
+
 impl ScratchHome {
     pub(crate) fn new(agent: &AgentPaths) -> std::io::Result<Self> {
+        Self::in_dir(
+            agent.nono_home.parent().unwrap_or(&agent.nono_home),
+            ".nono-git-",
+        )
+    }
+
+    /// A fresh directory named `<prefix><pid>-<n>-<nanos>` in `parent`;
+    /// `prefix` is one of `SCRATCH_PREFIXES`.
+    pub(crate) fn in_dir(parent: &Path, prefix: &str) -> std::io::Result<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let parent = agent
-            .nono_home
-            .parent()
-            .unwrap_or(&agent.nono_home)
-            .to_path_buf();
+        debug_assert!(SCRATCH_PREFIXES.contains(&prefix));
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or_default();
         let path = parent.join(format!(
-            ".nono-git-{}-{}-{nanos}",
+            "{prefix}{}-{}-{nanos}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -520,28 +529,37 @@ impl ScratchHome {
 /// Only one daemon runs against a state root, so a directory named for
 /// another pid is never in use; this process's own are left alone.
 pub(crate) fn sweep_stale_homes(agent: &AgentPaths) {
-    let Some(parent) = agent.nono_home.parent() else {
-        return;
-    };
+    if let Some(parent) = agent.nono_home.parent() {
+        sweep_stale_homes_in(parent);
+    }
+}
+
+/// `sweep_stale_homes` for any directory scratch homes are made in: an
+/// agent's or a plugin's root, a pool's parent.
+pub(crate) fn sweep_stale_homes_in(parent: &Path) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
     };
     let ours = std::process::id().to_string();
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(".nono-git-")) else {
+        let Some(rest) = name.to_str().and_then(|n| {
+            SCRATCH_PREFIXES
+                .iter()
+                .find_map(|prefix| n.strip_prefix(prefix))
+        }) else {
             continue;
         };
         let pid = rest.split('-').next().unwrap_or_default();
         if pid != ours && entry.file_type().is_ok_and(|t| t.is_dir()) {
-            let _ = std::fs::remove_dir_all(entry.path());
+            let _ = crate::fsutil::remove_tree(&entry.path());
         }
     }
 }
 
 impl Drop for ScratchHome {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = crate::fsutil::remove_tree(&self.0);
     }
 }
 
@@ -1794,7 +1812,10 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let other = root.join(".nono-git-4194304999-0-1");
         std::fs::create_dir_all(other.join(".local/state/nono/sessions")).unwrap();
+        let other_mise = root.join(".nono-mise-4194304999-0-1");
+        std::fs::create_dir_all(other_mise.join("home")).unwrap();
         let ours = ScratchHome::new(&agent).unwrap();
+        let ours_mise = ScratchHome::in_dir(&root, ".nono-mise-").unwrap();
         let unrelated = root.join(".nono-gitx");
         std::fs::create_dir_all(&unrelated).unwrap();
         let file = root.join(".nono-git-1-0-0");
@@ -1802,7 +1823,9 @@ mod tests {
 
         sweep_stale_homes(&agent);
         assert!(!other.exists(), "another pid's home is swept");
+        assert!(!other_mise.exists(), "an install's too");
         assert!(ours.path().exists(), "this process's own is in use");
+        assert!(ours_mise.path().exists());
         assert!(unrelated.exists() && file.exists(), "only our directories");
         let path = ours.path().to_path_buf();
         drop(ours);

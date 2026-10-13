@@ -140,6 +140,25 @@ fn io_err(id: &AgentId, path: &Path, e: std::io::Error) -> MaterializeError {
     }
 }
 
+/// Makes the agent's four mise directories (`AgentPaths::mise_dirs`) and
+/// the data dir's `installs/`. They sit in `mise/` in the agent root,
+/// which the daemon alone writes, so the four are made by path; the agent
+/// can write inside them, so `installs/` is reached by descriptor and a
+/// link or file found in its place is replaced by a real directory. The
+/// daemon's install (`Toolchain::install`) calls it just before mise
+/// runs; its sandbox is what holds if the agent replaces something after
+/// this.
+pub(crate) fn ensure_mise_dirs(id: &AgentId, paths: &AgentPaths) -> Result<(), MaterializeError> {
+    for d in paths.mise_dirs() {
+        ensure_dir(&d).map_err(|e| io_err(id, &d, e))?;
+    }
+    let data = paths.mise_data_dir();
+    let dir = open_dir_root(&data, DirMode::Default).map_err(|e| io_err(id, &data, e))?;
+    crate::fsutil::ensure_dir_at(dir.as_fd(), "installs", DirMode::Default)
+        .map(drop)
+        .map_err(|e| io_err(id, &data.join("installs"), e))
+}
+
 /// Writes the agent's home. `root`, `logs` and nono's home are balerix's
 /// own; everything under `home/` is written without following a link
 /// below `home/` itself: `home/` is opened once, each directory beneath it
@@ -175,6 +194,8 @@ pub fn write_home(
     for d in [paths.xdg_data(), paths.xdg_state(), paths.xdg_cache()] {
         sub(&d, DirMode::Default)?;
     }
+    // the agent's sandbox grants them, and nono grants only what exists
+    ensure_mise_dirs(id, paths)?;
     let pretty = |v: &Value| serde_json::to_vec_pretty(v).unwrap_or_default();
     let write = |dir: &OwnedFd, at: &Path, name: &str, contents: &[u8]| {
         write_atomic_at(dir.as_fd(), name, contents, 0o600)
@@ -541,6 +562,7 @@ mod tests {
             (paths.xdg_config(), 0o755),
             (paths.tmp_dir(), 0o700),
             (paths.xdg_cache(), 0o755),
+            (paths.mise_data_dir().join("installs"), 0o755),
         ]
         .into_iter()
         .enumerate()

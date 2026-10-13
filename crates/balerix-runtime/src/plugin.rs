@@ -3,11 +3,15 @@
 //! <start>` from the package root, and the daemon-side `mise install`.
 
 use std::collections::BTreeMap;
+use std::os::fd::AsFd;
 use std::path::Path;
 
 use balerix_core::{AgentName, HookTarget, LaunchPlan, MaterializeError, ResolvedPlugin};
 
-use crate::fsutil::{ensure_dir, ensure_private_dir, write_atomic};
+use crate::fsutil::{
+    DirMode, ensure_dir, ensure_path_at, ensure_private_dir, open_dir_root, relative_to,
+    write_atomic,
+};
 use crate::launch::{hooks_port, outer_path};
 use crate::layout::{PluginPaths, StateLayout};
 use crate::materializer::{RenderOutcome, Runtime};
@@ -186,11 +190,23 @@ fn io(name: &AgentName, path: &Path, e: std::io::Error) -> MaterializeError {
 }
 
 /// `home/` (0700) with its XDG tree and 0700 `tmp/`, `kv/` (0700),
-/// `scratch/`, `logs/`, nono's home. Idempotent.
+/// `scratch/`, `logs/`, nono's home. Idempotent. As for an agent's home
+/// (`home::write_home`), every directory under `home/` is reached by
+/// descriptor without following a link below `home/` itself.
 pub fn write_plugin_home(name: &AgentName, paths: &PluginPaths) -> Result<(), MaterializeError> {
-    for d in [&paths.home, &paths.tmp_dir(), &paths.kv] {
-        ensure_private_dir(d).map_err(|e| io(name, d, e))?;
+    ensure_private_dir(&paths.kv).map_err(|e| io(name, &paths.kv, e))?;
+    for d in [&paths.scratch, &paths.logs, &paths.nono_home] {
+        ensure_dir(d).map_err(|e| io(name, d, e))?;
     }
+    let home =
+        open_dir_root(&paths.home, DirMode::Private).map_err(|e| io(name, &paths.home, e))?;
+    let sub = |path: &Path, mode: DirMode| {
+        relative_to(&paths.home, path)
+            .and_then(|rel| ensure_path_at(home.as_fd(), rel, mode))
+            .map(drop)
+            .map_err(|e| io(name, path, e))
+    };
+    sub(&paths.tmp_dir(), DirMode::Private)?;
     for d in [
         paths.xdg_config(),
         paths.xdg_data(),
@@ -199,11 +215,8 @@ pub fn write_plugin_home(name: &AgentName, paths: &PluginPaths) -> Result<(), Ma
         paths.mise_config_dir(),
         paths.mise_state_dir(),
         paths.mise_cache_dir(),
-        paths.scratch.clone(),
-        paths.logs.clone(),
-        paths.nono_home.clone(),
     ] {
-        ensure_dir(&d).map_err(|e| io(name, &d, e))?;
+        sub(&d, DirMode::Default)?;
     }
     Ok(())
 }
@@ -542,5 +555,53 @@ mod tests {
             assert!(d.is_dir(), "{}", d.display());
         }
         write_plugin_home(&p.name, &paths).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn plugin_home_writes_never_follow_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StateLayout::from_env(dir.path(), |_| None);
+        let p = plugin();
+        let paths = layout.plugin(&p.name);
+        let mode = |q: &Path| std::fs::symlink_metadata(q).unwrap().permissions().mode() & 0o777;
+        for (i, planted) in [
+            paths.tmp_dir(),
+            paths.xdg_config(),
+            paths.mise_config_dir(),
+            paths.mise_state_dir(),
+            paths.xdg_cache(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write_plugin_home(&p.name, &paths).unwrap();
+            let outside = dir.path().join(format!("outside-{i}"));
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("sentinel"), "left alone").unwrap();
+            std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::remove_dir_all(&planted).unwrap();
+            std::os::unix::fs::symlink(&outside, &planted).unwrap();
+            write_plugin_home(&p.name, &paths).unwrap();
+            assert_eq!(mode(&outside), 0o755);
+            let names: Vec<_> = std::fs::read_dir(&outside)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, ["sentinel"]);
+            assert!(
+                std::fs::symlink_metadata(&planted).unwrap().is_dir(),
+                "{} is a real directory again",
+                planted.display()
+            );
+            assert_eq!(mode(&paths.tmp_dir()), 0o700);
+            for d in [
+                paths.mise_config_dir(),
+                paths.mise_state_dir(),
+                paths.mise_cache_dir(),
+            ] {
+                assert!(std::fs::symlink_metadata(&d).unwrap().is_dir());
+            }
+        }
     }
 }

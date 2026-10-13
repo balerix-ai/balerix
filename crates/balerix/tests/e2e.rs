@@ -1483,9 +1483,9 @@ fn raw_post(
     (status, headers, text)
 }
 
-fn body_index_has_review_link(mount: &str, cookie: &str) -> bool {
+fn body_index_has_review_link(mount: &str, prefix: &str, cookie: &str) -> bool {
     let (_, _, body) = raw_get(mount, &[("Cookie", cookie)]);
-    body.contains("/v1/plugins/web/agents/e2e/c/alice/review\">review</a>")
+    body.contains(&format!("{prefix}/agents/e2e/c/alice/review\">review</a>"))
 }
 
 /// Plugins spec §14 and §18.6, "done when": through a real daemon, nono
@@ -1593,19 +1593,40 @@ fn web_journey() {
     assert!(login.ends_with("?to=/v1/plugins/web/"), "{login}");
     let (status, headers, _) = raw_get(&login, &[]);
     assert_eq!(status, 303);
-    let cookie = headers
-        .iter()
-        .find(|(k, _)| k == "set-cookie")
-        .map(|(_, v)| v.split(';').next().unwrap().to_string())
-        .expect("a session cookie");
+    let found = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("a {name}: {headers:?}"))
+    };
+    // the session's own path, and the cookie scoped to it
+    let location = found("location");
+    assert!(
+        location.starts_with("/v1/s/") && location.ends_with("/plugins/web/"),
+        "{location}"
+    );
+    let set_cookie = found("set-cookie");
+    let scope_path = location.trim_end_matches("plugins/web/");
+    assert!(
+        set_cookie.ends_with(&format!("; Path={scope_path}")),
+        "{set_cookie}"
+    );
+    let cookie = set_cookie.split(';').next().unwrap().to_string();
     assert!(cookie.starts_with("balerix_session="), "{cookie}");
     let (status, _, _) = raw_get(&login, &[]);
     assert_eq!(status, 404, "single use");
 
     // the mount: cookie from the daemon's origin only; no cookie, no entry
-    let mount = format!("{url}/v1/plugins/web/");
+    let prefix = location.trim_end_matches('/').to_string();
+    let mount = format!("{url}{location}");
     let (status, _, _) = raw_get(&mount, &[]);
     assert_eq!(status, 401);
+    let (status, _, _) = raw_get(
+        &format!("{url}/v1/plugins/web/"),
+        &[("Cookie", &cookie), ("Sec-Fetch-Site", "same-origin")],
+    );
+    assert_eq!(status, 401, "the admin mount takes no session cookie");
     let (status, _, body) = raw_get(
         &mount,
         &[("Cookie", &cookie), ("Sec-Fetch-Site", "same-origin")],
@@ -1640,7 +1661,8 @@ fn web_journey() {
     );
     assert_eq!(status, 200);
     // assets are linked under a digest segment; the page says which
-    let marker = "/v1/plugins/web/assets/";
+    let marker = format!("{prefix}/assets/");
+    let marker = marker.as_str();
     let at = page
         .find(marker)
         .unwrap_or_else(|| panic!("an asset link: {page}"))
@@ -1681,7 +1703,7 @@ fn web_journey() {
         use tokio_tungstenite::tungstenite::Message;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let ws_url = format!(
-            "{}/v1/plugins/web/agents/e2e/c/alice/ws",
+            "{}{prefix}/agents/e2e/c/alice/ws",
             url.replacen("http://", "ws://", 1)
         );
         let mut req = ws_url.clone().into_client_request().unwrap();
@@ -1744,10 +1766,10 @@ fn web_journey() {
     );
     assert_eq!(status, 200);
     assert!(
-        page.contains(r#"const prefix = "/v1/plugins/web""#),
+        page.contains(&format!(r#"const prefix = "{prefix}""#)),
         "{page}"
     );
-    assert!(body_index_has_review_link(&mount, &cookie));
+    assert!(body_index_has_review_link(&mount, &prefix, &cookie));
     fs::write(
         w.agent_dir("alice").join("workspace/NOTES.md"),
         "agent notes\n",
@@ -1932,6 +1954,13 @@ fn web_journey() {
     let log = fs::read_to_string(w.state().join("server/server.log")).unwrap();
     assert!(!log.contains(token.trim()));
     assert!(!log.contains(cookie.trim_start_matches("balerix_session=")));
+    // nor the session's path: its scope stays out of the log
+    let scope = prefix
+        .trim_start_matches("/v1/s/")
+        .split('/')
+        .next()
+        .unwrap();
+    assert!(!log.contains(scope), "the session scope reached server.log");
     let profile = fs::read_to_string(w.state().join("plugins/web/nono-profile.json")).unwrap();
     let web_token = profile
         .split("\"BALERIX_PLUGIN_TOKEN\": \"")

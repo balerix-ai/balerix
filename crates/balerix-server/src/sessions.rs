@@ -2,13 +2,19 @@
 //! one-time login code minted for the admin, exchanged by the browser for
 //! an in-memory session cookie. The admin token never enters the browser;
 //! nothing here is persisted, so sessions die with the daemon.
+//!
+//! Each session has its own mount path, `/v1/s/<scope>/plugins/<name>/…`,
+//! with `<scope>` a random segment minted at login, and its cookie is
+//! scoped to `/v1/s/<scope>/`: a browser sends the cookie only below a
+//! session URL nobody else can guess, and the daemon accepts it only for
+//! the scope it was issued with.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Method};
 
 use crate::auth::constant_time_eq;
 use crate::vault::random_hex;
@@ -21,9 +27,13 @@ pub const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 /// visit to its URL is told what happened instead of "unknown".
 pub const TOMBSTONE_TTL: Duration = Duration::from_secs(10 * 60);
 pub const COOKIE: &str = "balerix_session";
-/// Every proxied path starts here; a login may only redirect below it, and
-/// the cookie is scoped to it.
+/// The admin's mount (bearer only) and the namespace a login's `to`
+/// names; a login redirects to the same path under its session's scope.
 pub const MOUNT_PREFIX: &str = "/v1/plugins/";
+/// Every session mount starts here: `/v1/s/<scope>/plugins/<name>/…`.
+pub const SCOPED_PREFIX: &str = "/v1/s/";
+/// A scope's random bytes: 128 bits, as 32 lowercase hex characters.
+const SCOPE_BYTES: usize = 16;
 
 /// Why a login code was refused. The page is for a human who pasted a
 /// stale URL; naming the reason tells them whether to hurry (expired)
@@ -65,8 +75,16 @@ struct Inner {
     codes: HashMap<String, Instant>,
     /// dead code → (when it died, how)
     dead: HashMap<String, (Instant, Fate)>,
-    /// session id → expiry
-    sessions: HashMap<String, Instant>,
+    /// session id → (its scope, expiry)
+    sessions: HashMap<String, (String, Instant)>,
+}
+
+/// A session minted at login: `id` goes in the cookie, `scope` in the
+/// path the cookie is scoped to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSession {
+    pub id: String,
+    pub scope: String,
 }
 
 #[derive(Default)]
@@ -97,7 +115,7 @@ impl Sessions {
             live
         });
         dead.retain(|_, (at, _)| *at + TOMBSTONE_TTL > now);
-        sessions.retain(|_, expiry| *expiry > now);
+        sessions.retain(|_, (_, expiry)| *expiry > now);
     }
 
     /// The entry whose key equals `code`, compared in constant time each:
@@ -120,12 +138,13 @@ impl Sessions {
         code
     }
 
-    /// Exchanges a live code for a session id; the code is gone either way.
-    pub fn redeem(&self, code: &str) -> Result<String, CodeRejected> {
+    /// Exchanges a live code for a session and its scope; the code is gone
+    /// either way.
+    pub fn redeem(&self, code: &str) -> Result<NewSession, CodeRejected> {
         self.redeem_at(code, Instant::now())
     }
 
-    pub fn redeem_at(&self, code: &str, now: Instant) -> Result<String, CodeRejected> {
+    pub fn redeem_at(&self, code: &str, now: Instant) -> Result<NewSession, CodeRejected> {
         let mut inner = self.lock();
         Self::prune(&mut inner, now);
         let Some((key, _)) = Self::find(&inner.codes, code) else {
@@ -143,58 +162,112 @@ impl Sessions {
         inner.codes.remove(&key);
         inner.dead.insert(key, (now, Fate::Used));
         let id = random_hex(32);
-        inner.sessions.insert(id.clone(), now + SESSION_TTL);
-        Ok(id)
-    }
-
-    pub fn is_valid(&self, id: &str) -> bool {
-        self.is_valid_at(id, Instant::now())
-    }
-
-    pub fn is_valid_at(&self, id: &str, now: Instant) -> bool {
-        let mut inner = self.lock();
-        Self::prune(&mut inner, now);
+        let scope = random_hex(SCOPE_BYTES);
         inner
             .sessions
-            .keys()
-            .any(|k| constant_time_eq(k.as_bytes(), id.as_bytes()))
+            .insert(id.clone(), (scope.clone(), now + SESSION_TTL));
+        Ok(NewSession { id, scope })
+    }
+
+    /// Whether `id` is a live session issued for `scope`. Both compared in
+    /// constant time; a live session under another scope is refused.
+    pub fn is_valid_for(&self, id: &str, scope: &str) -> bool {
+        self.is_valid_for_at(id, scope, Instant::now())
+    }
+
+    pub fn is_valid_for_at(&self, id: &str, scope: &str, now: Instant) -> bool {
+        let mut inner = self.lock();
+        Self::prune(&mut inner, now);
+        Self::find(&inner.sessions, id)
+            .is_some_and(|(_, (s, _))| constant_time_eq(s.as_bytes(), scope.as_bytes()))
+    }
+
+    /// Whether `id` is a live session under any scope; only to tell apart,
+    /// in a log line, a stale cookie from one shown under the wrong path.
+    pub fn is_live(&self, id: &str) -> bool {
+        let mut inner = self.lock();
+        Self::prune(&mut inner, Instant::now());
+        Self::find(&inner.sessions, id).is_some()
     }
 }
 
-/// The value of cookie `name` across every `Cookie` header, if any.
+/// Whether `scope` has the shape a minted scope has; anything else is
+/// refused before a lookup.
+pub fn scope_shape_ok(scope: &str) -> bool {
+    scope.len() == SCOPE_BYTES * 2
+        && scope
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The session's own path for a login target under `MOUNT_PREFIX`:
+/// `/v1/plugins/web/x` → `/v1/s/<scope>/plugins/web/x`.
+pub fn scoped_target(scope: &str, to: &str) -> String {
+    let below = to.strip_prefix("/v1/").unwrap_or(to);
+    format!("{SCOPED_PREFIX}{scope}/{below}")
+}
+
+/// The path a session's cookie is scoped to: `/v1/s/<scope>/`.
+pub fn scope_path(scope: &str) -> String {
+    format!("{SCOPED_PREFIX}{scope}/")
+}
+
+/// The first value of cookie `name` across every `Cookie` header, if any.
 pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    cookie_values(headers, name).into_iter().next()
+}
+
+/// Every value of cookie `name` across every `Cookie` header, in order: a
+/// browser may hold several under different paths and sends each whose
+/// path matches.
+pub fn cookie_values(headers: &HeaderMap, name: &str) -> Vec<String> {
     headers
         .get_all("cookie")
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|line| line.split(';'))
-        .find_map(|pair| {
+        .filter_map(|pair| {
             let (k, v) = pair.trim().split_once('=')?;
             (k.trim() == name).then(|| v.trim().to_string())
         })
+        .collect()
 }
 
-/// The `Set-Cookie` value: HttpOnly, never cross-site, scoped to the mount.
-pub fn set_cookie(id: &str) -> String {
-    format!("{COOKIE}={id}; HttpOnly; SameSite=Strict; Path={MOUNT_PREFIX}")
+/// The `Set-Cookie` value: HttpOnly, never cross-site, scoped to the
+/// session's own path.
+pub fn set_cookie(id: &str, scope: &str) -> String {
+    let path = scope_path(scope);
+    format!("{COOKIE}={id}; HttpOnly; SameSite=Strict; Path={path}")
 }
 
 /// Whether a cookie-authenticated request came from the daemon's own
 /// origin (§18.2): `Sec-Fetch-Site` when the browser sends it, else
-/// `Origin` — absent on a plain navigation; on a fetch or WebSocket from a
-/// page the daemon served, exactly `http://127.0.0.1:<port>` (`localhost`
-/// is another origin to a browser) or, through a reverse proxy, an origin
-/// whose authority is the request's own `Host`. A WebSocket handshake
-/// arrives without `Sec-Fetch-Site` through at least one proxy in the wild.
-pub fn same_origin(headers: &HeaderMap, origin: &str) -> bool {
+/// `Origin`: on a fetch or WebSocket from a page the daemon served,
+/// exactly `origin` (the login URL's; `localhost` is another origin to a
+/// browser) or, through a reverse proxy, an origin whose authority is the
+/// request's own (`authority`: its `Host`).
+/// A WebSocket handshake arrives without `Sec-Fetch-Site` through at
+/// least one proxy in the wild.
+///
+/// A request with neither header passes only as a plain navigation: a
+/// `GET` or `HEAD` that does not ask to upgrade (an older browser's
+/// top-level navigation sends neither). Anything else from a browser
+/// carries one of them.
+pub fn same_origin(
+    method: &Method,
+    upgrade: bool,
+    headers: &HeaderMap,
+    authority: Option<&str>,
+    origin: Option<&str>,
+) -> bool {
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         return matches!(site.trim(), "same-origin" | "none");
     }
     let Some(o) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
-        return true;
+        return (*method == Method::GET || *method == Method::HEAD) && !upgrade;
     };
     let o = o.trim().trim_end_matches('/');
-    if o == origin {
+    if origin.is_some_and(|origin| o == origin) {
         return true;
     }
     // Behind a TLS-terminating reverse proxy the browser never sees the
@@ -203,12 +276,18 @@ pub fn same_origin(headers: &HeaderMap, origin: &str) -> bool {
     // connected to and cannot forge `Origin`, so the two agree only for a
     // page that host served — the classic cross-site WebSocket hijacking
     // check. The scheme is ignored on purpose: the proxy rewrites it.
-    let host = headers
+    let authority = authority.map(str::trim);
+    let from = o.split_once("://").map(|(_, a)| a);
+    matches!((authority, from), (Some(h), Some(a)) if !a.is_empty() && a == h)
+}
+
+/// The request's authority: its `Host` header.
+pub fn request_authority(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .map(str::trim);
-    let authority = o.split_once("://").map(|(_, a)| a);
-    matches!((host, authority), (Some(h), Some(a)) if !a.is_empty() && a == h)
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
 }
 
 /// Where a login may send the browser: a path under the mount made of
@@ -250,9 +329,11 @@ mod tests {
         let code = s.issue_code_at(t0);
         assert_eq!(code.len(), 64);
         assert!(s.redeem_at("nope", t0).is_err());
-        let id = s.redeem_at(&code, t0 + Duration::from_secs(30)).unwrap();
+        let NewSession { id, scope } = s.redeem_at(&code, t0 + Duration::from_secs(30)).unwrap();
         assert_eq!(id.len(), 64);
         assert_ne!(id, code, "the session id is not the code");
+        assert!(scope_shape_ok(&scope), "{scope}");
+        assert_ne!(scope, id[..32], "the scope is not part of the id");
         assert!(s.redeem_at(&code, t0).is_err(), "single use");
         let late = s.issue_code_at(t0);
         assert!(
@@ -260,15 +341,52 @@ mod tests {
                 .is_err(),
             "expired"
         );
-        assert!(s.is_valid_at(&id, t0 + Duration::from_secs(3600)));
-        assert!(!s.is_valid_at("nope", t0));
+        assert!(s.is_valid_for_at(&id, &scope, t0 + Duration::from_secs(3600)));
+        assert!(!s.is_valid_for_at("nope", &scope, t0));
         assert!(
-            !s.is_valid_at(
+            !s.is_valid_for_at(
                 &id,
+                &scope,
                 t0 + Duration::from_secs(30) + SESSION_TTL + Duration::from_secs(1)
             ),
-            "sessions expire"
+            "sessions expire, and their scope with them"
         );
+    }
+
+    #[test]
+    fn a_session_is_valid_under_its_own_scope_only() {
+        let s = Sessions::new();
+        let t0 = Instant::now();
+        let a = s.redeem_at(&s.issue_code_at(t0), t0).unwrap();
+        let b = s.redeem_at(&s.issue_code_at(t0), t0).unwrap();
+        assert_ne!(a.scope, b.scope, "each session mints its own scope");
+        assert!(s.is_valid_for_at(&a.id, &a.scope, t0));
+        assert!(s.is_valid_for_at(&b.id, &b.scope, t0));
+        assert!(!s.is_valid_for_at(&a.id, &b.scope, t0), "another scope");
+        assert!(!s.is_valid_for_at(&b.id, &a.scope, t0), "another session");
+        assert!(!s.is_valid_for_at(&a.id, "", t0));
+        assert!(s.is_live(&a.id) && !s.is_live("nope"));
+    }
+
+    #[test]
+    fn a_scope_has_one_shape() {
+        assert!(scope_shape_ok("0123456789abcdef0123456789abcdef"));
+        for bad in [
+            "",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789abcdef",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef/123456789abcdef",
+        ] {
+            assert!(!scope_shape_ok(bad), "{bad:?}");
+        }
+        assert_eq!(
+            scoped_target("abc", "/v1/plugins/web/agents/f/c/a"),
+            "/v1/s/abc/plugins/web/agents/f/c/a"
+        );
+        assert_eq!(scoped_target("abc", "/v1/plugins/"), "/v1/s/abc/plugins/");
+        assert_eq!(scope_path("abc"), "/v1/s/abc/");
     }
 
     #[test]
@@ -325,9 +443,14 @@ mod tests {
         assert_eq!(cookie_value(&h, COOKIE).as_deref(), Some("abc"));
         h.insert("cookie", HeaderValue::from_static("balerix_session_x=zzz"));
         assert_eq!(cookie_value(&h, COOKIE), None, "prefix is not a match");
+        h.insert(
+            "cookie",
+            HeaderValue::from_static("balerix_session=one; x=1; balerix_session=two"),
+        );
+        assert_eq!(cookie_values(&h, COOKIE), vec!["one", "two"]);
         assert_eq!(
-            set_cookie("abc"),
-            "balerix_session=abc; HttpOnly; SameSite=Strict; Path=/v1/plugins/"
+            set_cookie("abc", "0123"),
+            "balerix_session=abc; HttpOnly; SameSite=Strict; Path=/v1/s/0123/"
         );
     }
 
@@ -340,6 +463,11 @@ mod tests {
                 h.insert(*k, HeaderValue::from_str(v).unwrap());
             }
             h
+        };
+        // a GET with the request's `Host` as its authority, as before
+        let same_origin = |h: &HeaderMap, origin: &str| {
+            let authority = h.get("host").and_then(|v| v.to_str().ok());
+            super::same_origin(&Method::GET, false, h, authority, Some(origin))
         };
         assert!(
             same_origin(&with(&[]), origin),
@@ -393,6 +521,11 @@ mod tests {
                 h.insert(*k, HeaderValue::from_str(v).unwrap());
             }
             h
+        };
+        // a GET with the request's `Host` as its authority, as before
+        let same_origin = |h: &HeaderMap, origin: &str| {
+            let authority = h.get("host").and_then(|v| v.to_str().ok());
+            super::same_origin(&Method::GET, false, h, authority, Some(origin))
         };
         let host = "balerix-7643.example.test";
         assert!(same_origin(
@@ -519,5 +652,31 @@ mod tests {
         ] {
             assert_eq!(login_target(Some(bad)), None, "{bad:?}");
         }
+    }
+
+    /// Only a plain navigation may carry neither `Sec-Fetch-Site` nor
+    /// `Origin`: any other method, or an upgrade, from a browser sends one.
+    #[test]
+    fn a_request_without_either_header_passes_only_as_a_navigation() {
+        let none = HeaderMap::new();
+        let origin = Some("http://127.0.0.1:7643");
+        let host = Some("127.0.0.1:7643");
+        assert!(same_origin(&Method::GET, false, &none, host, origin));
+        assert!(same_origin(&Method::HEAD, false, &none, host, origin));
+        for m in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            assert!(!same_origin(&m, false, &none, host, origin), "{m}");
+        }
+        assert!(
+            !same_origin(&Method::GET, true, &none, host, origin),
+            "a WebSocket handshake"
+        );
+        let mut site = HeaderMap::new();
+        site.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert!(same_origin(&Method::POST, false, &site, host, origin));
+        assert!(same_origin(&Method::GET, true, &site, host, origin));
+        let mut o = HeaderMap::new();
+        o.insert("origin", HeaderValue::from_static("http://127.0.0.1:7643"));
+        assert!(same_origin(&Method::POST, false, &o, host, origin));
+        assert!(same_origin(&Method::GET, true, &o, host, origin));
     }
 }

@@ -574,19 +574,30 @@ credentials, hook input, or sandbox rules.
 - The root of a plugin mount forwards to `/v1/routes` (no slash); axum's
   `nest` answers the nested `/` there and 404s `/v1/routes/`. A plugin's
   `routes()` router registers `/`, not `/index`.
+- A browser reaches a plugin at `/v1/s/<scope>/plugins/<name>/…`: the
+  login (`/v1/login/<code>?to=/v1/plugins/<name>/…`) mints a 128-bit
+  `<scope>` with the session and redirects to the same path under it; the
+  cookie is `Path=/v1/s/<scope>/` and is accepted only under the scope it
+  was issued with (`Sessions::is_valid_for`). `/v1/plugins/<name>/…` is
+  the admin bearer's mount and never reads the cookie. A plugin builds
+  every link and WebSocket URL from `X-Balerix-Forwarded-Prefix`; a fixed
+  `/v1/plugins/` in a page breaks it in the browser. Every mount answer
+  carries `Referrer-Policy: no-referrer`, and the scope must stay out of
+  logs (the web e2e checks server.log).
 - Cookie-authenticated proxy requests need `Sec-Fetch-Site: same-origin`,
   or an `Origin` equal to the exact `http://127.0.0.1:<port>` of the login
   URL (`localhost` is another origin) or whose authority is the request's
   `Host` (a WebSocket handshake through a reverse proxy: no
   `Sec-Fetch-Site`, `Origin` the proxy's hostname — found by
   `verify-claude` behind one, as `[disconnected]` on the terminal page). A
-  test client that sends none of them passes (a navigation sends none).
-- `/v1/plugins/<name>` without the trailing slash is the admin purge
-  route, so a browser there got 401 `missing or invalid admin token`
-  even with a good cookie; a GET there is now a 308 to the mount, and a
-  login `to` of a bare mount root gains its slash. Found by
-  `verify-claude` through a reverse proxy, where the URL's final `/`
-  went missing in the copy.
+  test client that sends none of them passes only on a `GET`/`HEAD` that
+  is not an upgrade (a navigation sends none); a POST or a WebSocket
+  handshake without either is a 403.
+- `/v1/plugins/<name>` (and `/v1/s/<scope>/plugins/<name>`) without the
+  trailing slash: the first is the admin purge route for DELETE; a GET
+  at either is a 308 to its mount, and a login `to` of a bare mount root
+  gains its slash. Found by `verify-claude` through a reverse proxy,
+  where the URL's final `/` went missing in the copy.
 - `balerix plugin open <name>` prints a URL valid for 60 s, once. Opening
   it twice is a 404 by design; the body says `already used Ns ago` or
   `expired Ns ago` (remembered 10 min), and server.log records every

@@ -114,7 +114,10 @@ asset is attested (`gh attestation verify <file> --repo balerix-ai/balerix`).
    — renders bob's generated files into a temp dir without launching anything.
 10. `mise x -- cargo run -q -p balerix -- plugin open web` — prints a
     single-use login URL (60 s); open it in a browser to reach the web
-    plugin's index and click an agent for a live terminal.
+    plugin's index and click an agent for a live terminal. The browser
+    lands on a per-session URL (`/v1/s/<scope>/plugins/web/`) that lasts
+    as long as the session (12 h, or until the daemon restarts); run
+    `plugin open` again for a new one.
 
 ## Where to look
 - `ARCHITECTURE.md` — the map: pieces, flow, non-obvious decisions.

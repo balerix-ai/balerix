@@ -226,6 +226,10 @@ cliff() {
 # The two charts (Spec O §14.1): one version and one appVersion between them.
 CHARTS=(balerix-operator balerix-daemon)
 DAEMON_VALUES=charts/balerix-daemon/values.yaml
+# The plugins check-charts.sh enables; a dry run loads only these plugins'
+# images into kind (kind-load-pins.sh).
+# shellcheck disable=SC2034
+CHARTS_CHECK_PLUGINS=(flow web)
 
 # A top-level `<field>: <value>` of a YAML file (`-` is stdin), quotes dropped.
 yaml_field() {

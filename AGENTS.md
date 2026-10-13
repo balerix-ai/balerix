@@ -106,7 +106,9 @@ credentials, hook input, or sandbox rules.
 - `release-test` — scenario tests for `scripts/release/` against throwaway
   clones under `target/tmp`; CI runs it when the scripts change. It covers
   the charts unit's gates (`appVersion`, plugin tags, a pin-only change,
-  a core minor), staging and the fork rewrite.
+  a core minor), staging, the fork rewrite, and a dry run's image
+  archives for kind (`save-images.sh`, `kind-load-pins.sh`, against stub
+  `docker` and `kind`).
 
 ## Conventions
 - Ports (`Materializer`, `AgentRunner`, `Clock`, `FleetStore`, `EventHandler`)

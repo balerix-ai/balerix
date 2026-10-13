@@ -79,6 +79,12 @@ runs:
         build-args: ${{ inputs.base-smoke != '' && format('BASE={0}', inputs.base-smoke) || '' }}
         load: true
         tags: ${{ steps.context.outputs.image }}:smoke
+        # This build never leaves the runner (the push build below carries
+        # the published provenance and SBOM). Without attestation manifests
+        # the image survives docker save, docker load and kind load on a
+        # containerd image store (a dry run's charts check, #167).
+        provenance: false
+        sbom: false
         secrets: |
           github_token=${{ inputs.github-token }}
     - name: Smoke test

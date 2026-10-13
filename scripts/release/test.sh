@@ -696,10 +696,11 @@ scenario_charts_pins_at_release() {
     fail "pins: github untagged but in the run: failed"
   fi
   # A dry run pushes no images: the pins this run moves are listed on
-  # stdout, so the charts job can skip the kind install (#150).
+  # stdout, so the charts job can load this run's images into kind under
+  # them (#150, #167).
   expect_eq "pins, dry run: lists the pin moved by the run" \
     "$("$dir/scripts/release/check-pins.sh" --dry-run charts github 2>>"$log")" \
-    "balerix-plugin-github-v$pin (plugins.github.image.tag)"
+    "github $pin plugins.github.image.tag"
   expect_eq "pins, not a dry run: lists nothing" \
     "$("$dir/scripts/release/check-pins.sh" charts github 2>>"$log")" ""
   set_chart_pin_of "$dir" github 9.9.9
@@ -856,6 +857,86 @@ scenario_plan_charts() {
   expect_eq "plan, merged charts PR: images" "$(field images "$out")" '[]'
 }
 
+# A dry run's images reach kind as archives (#167): save-images.sh saves a
+# unit's smoke tags in one archive; kind-load-pins.sh names the archives a
+# moved pin lacks, then re-tags each image under the reference the charts
+# pin and loads it. docker and kind are stubs that log their arguments; the
+# stub's `image inspect` answers the version label from <dir>/labels.
+scenario_kind_load_pins() {
+  local dir="$root/kind-load-pins" bin calls pins out
+  bin="$dir/bin"
+  calls="$dir/calls"
+  mkdir -p "$bin" "$dir/archives"
+  cat >"$bin/docker" <<EOF2
+#!/usr/bin/env bash
+echo "docker \$*" >>"$calls"
+case "\$1 \${2:-}" in
+  "save "*) echo "saved \${*:2}" ;;
+  "image inspect") awk -v ref="\${*: -1}" '\$1 == ref { print \$2 }' "$dir/labels" ;;
+esac
+EOF2
+  cat >"$bin/kind" <<EOF2
+#!/usr/bin/env bash
+echo "kind \$*" >>"$calls"
+EOF2
+  chmod +x "$bin/docker" "$bin/kind"
+  pins=$'core 1.2.3 appVersion\nflow 0.9.0 plugins.flow.image.tag\nmatrix 0.5.0 plugins.matrix.image.tag'
+
+  out=$(GITHUB_REPOSITORY_OWNER=Example PATH="$bin:$PATH" \
+    "$repo/scripts/release/save-images.sh" core "$dir/archives" 2>>"$log")
+  expect_eq "save images: one archive per unit" "$out" "$dir/archives/core.tar.gz"
+  expect_eq "save images: core's three smoke tags" "$(cat "$calls")" \
+    "docker save ghcr.io/example/balerix:smoke ghcr.io/example/balerix-agent:smoke ghcr.io/example/balerix-operator:smoke"
+  expect_eq "save images: gzipped" "$(gzip -dc "$dir/archives/core.tar.gz")" \
+    "saved ghcr.io/example/balerix:smoke ghcr.io/example/balerix-agent:smoke ghcr.io/example/balerix-operator:smoke"
+
+  # matrix is moved but the check does not enable it: never needed
+  expect_eq "kind load, check: names the missing archive, not matrix's" \
+    "$("$repo/scripts/release/kind-load-pins.sh" --check "$dir/archives" <<<"$pins" 2>>"$log")" \
+    "$dir/archives/flow.tar.gz"
+  expect_eq "kind load, check: no pins, nothing missing" \
+    "$("$repo/scripts/release/kind-load-pins.sh" --check "$dir/archives" </dev/null 2>>"$log")" ""
+  : >"$calls"
+  if GITHUB_REPOSITORY_OWNER=Example PATH="$bin:$PATH" \
+    "$repo/scripts/release/kind-load-pins.sh" "$dir/archives" <<<"$pins" 2>>"$log"; then
+    fail "kind load: an archive missing: passed"
+  else
+    pass "kind load: an archive missing: fails"
+  fi
+  expect_eq "kind load: an archive missing: loads nothing" "$(grep -c -e '^kind' -e '^docker load' "$calls" || true)" 0
+  expect_eq "kind load: an archive missing: deletes nothing" "$(ls "$dir/archives")" core.tar.gz
+
+  touch "$dir/archives/flow.tar.gz"
+  printf '%s\n' "ghcr.io/example/balerix:smoke 1.2.3" "ghcr.io/example/balerix-agent:smoke 1.2.3" \
+    "ghcr.io/example/balerix-operator:smoke 1.2.3" "ghcr.io/example/balerix-plugin-flow:smoke 0.9.0" >"$dir/labels"
+  : >"$calls"
+  if GITHUB_REPOSITORY_OWNER=Example PATH="$bin:$PATH" \
+    "$repo/scripts/release/kind-load-pins.sh" "$dir/archives" <<<"$pins" 2>>"$log"; then
+    pass "kind load: loads"
+  else
+    fail "kind load: failed"
+  fi
+  expect_grep "kind load: core's balerix under the pin" \
+    "docker tag ghcr.io/example/balerix:smoke ghcr.io/example/balerix:1.2.3" "$calls"
+  expect_grep "kind load: flow under its pin" \
+    "docker tag ghcr.io/example/balerix-plugin-flow:smoke ghcr.io/example/balerix-plugin-flow:0.9.0" "$calls"
+  expect_eq "kind load: every image into kind-up's cluster at once" "$(grep '^kind' "$calls")" \
+    "kind load docker-image --name balerix-e2e ghcr.io/example/balerix:1.2.3 ghcr.io/example/balerix-agent:1.2.3 ghcr.io/example/balerix-operator:1.2.3 ghcr.io/example/balerix-plugin-flow:0.9.0"
+  expect_eq "kind load: matrix, not enabled by the check, untouched" "$(grep -c matrix "$calls" || true)" 0
+  expect_eq "kind load: each archive deleted once loaded" "$(ls "$dir/archives")" ""
+
+  touch "$dir/archives/flow.tar.gz"
+  printf '%s\n' "ghcr.io/example/balerix-plugin-flow:smoke 0.8.0" >"$dir/labels"
+  : >"$calls"
+  if GITHUB_REPOSITORY_OWNER=Example PATH="$bin:$PATH" \
+    "$repo/scripts/release/kind-load-pins.sh" "$dir/archives" <<<"flow 0.9.0 plugins.flow.image.tag" 2>>"$log"; then
+    fail "kind load: an image of another version: passed"
+  else
+    pass "kind load: an image of another version: fails"
+  fi
+  expect_eq "kind load: another version: loads nothing into kind" "$(grep -c '^kind' "$calls" || true)" 0
+}
+
 scenario_initial
 scenario_bumps_0x
 scenario_bumps_1x
@@ -891,6 +972,7 @@ scenario_charts_core_minor
 scenario_plan_charts
 scenario_stage_charts
 scenario_stage_charts_fork
+scenario_kind_load_pins
 
 if ((failures)); then
   echo "$failures check(s) failed; fixtures and $log kept" >&2

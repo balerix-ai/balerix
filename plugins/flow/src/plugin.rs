@@ -6,7 +6,8 @@
 //! and `SessionStart` is the natural place to send the first one. Text
 //! that reaches the pane while Claude Code's TUI is still starting lands
 //! in the composer and loses its Enter (#100). So every submitted send is
-//! registered with common's delivery tracker (Spec M §8.7), the agent's
+//! registered with common's delivery tracker (Spec M §8.7), unless it
+//! is a slash command, which no `UserPromptSubmit` follows (#255); the agent's
 //! own `UserPromptSubmit` confirms it, and until then [`Nudger::tick`]
 //! presses Enter again on the tracker's cadence. Flow has nobody to
 //! report an expiry to, so a prompt's window is zero: confirmation and
@@ -17,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use balerix_api::{DEFAULT_KEY_DELAY_MS, HookEvent, InterceptResponse, Key, KeyStep, PluginAction};
-use balerix_plugin_common::delivery::Deliveries;
+use balerix_plugin_common::delivery::{self, Deliveries, Kind};
 use balerix_plugin_sdk::metrics::{IntCounterVec, IntGaugeVec};
 use balerix_plugin_sdk::{Host, Metrics, Plugin, SdkError};
 use serde::{Deserialize, Serialize};
@@ -302,7 +303,11 @@ impl Plugin for FlowPlugin {
             };
             let s = step(&flow.compiled, &flow.state, &event, so_far);
             for action in &s.actions {
-                if let PluginAction::SendText { text, submit: true } = action {
+                // A slash command gets no `UserPromptSubmit`, so it is never
+                // tracked: nothing could confirm it (#255).
+                if let PluginAction::SendText { text, submit: true } = action
+                    && delivery::classify(text) == Kind::Prompt
+                {
                     self.nudger.sent(&agent, text, now);
                 }
             }

@@ -420,3 +420,35 @@ async fn deactivate_forgets_what_was_pending() {
         "down: nothing to submit"
     );
 }
+
+/// #255: a slash command produces no `UserPromptSubmit`, so a tracked
+/// `/clear` could never be confirmed and took an Enter every 5 s for 90 s.
+/// Like github and matrix, flow never tracks a command.
+#[tokio::test]
+async fn a_slash_command_send_is_never_tracked_or_nudged() {
+    let (fake, h, nudger) = nudged_world().await;
+    let config = json!({
+        "initial": "working",
+        "states": { "working": { "on": [
+            { "event": "Stop", "send": { "text": "/clear", "submit": true } }
+        ] } }
+    });
+    h.activate(ALICE, config).await.unwrap();
+    let t0 = Instant::now();
+    let v = h.intercept(stop()).await; // the agent is idle: a nudge would fire
+    assert_eq!(
+        v.actions,
+        vec![PluginAction::SendText {
+            text: "/clear".into(),
+            submit: true
+        }]
+    );
+    for s in (6..=90).step_by(5) {
+        nudger.tick(t0 + Duration::from_secs(s)).await;
+    }
+    assert!(
+        fake.actions_for(ALICE).is_empty(),
+        "{:?}",
+        fake.actions_for(ALICE)
+    );
+}

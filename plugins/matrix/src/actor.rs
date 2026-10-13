@@ -228,6 +228,10 @@ impl<M: MatrixPort> Actor<M> {
         loop {
             let command = queue.pop().await;
             self.handle(command).await;
+            // A dropped command may have held hook events (Spec G-11).
+            if queue.take_gap() {
+                self.deliveries.lose_track();
+            }
         }
     }
 

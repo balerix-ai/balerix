@@ -358,7 +358,11 @@ A message is routed only when all of these hold. Each rejection increments
 ### 9.2 The send
 
 A routed message becomes `PluginAction::SendText { text, submit: true }` through
-`Host::action`. On success the plugin adds an acknowledgement reaction to the
+`Host::action`, after common's `delivery::as_prompt` (`balerix_api::prompt_text`,
+which the daemon applies to every plugin `send_text` as well): terminal controls
+and leading blanks go, and a body that then opens with `!`, `#` or `&` is sent
+with a backslash before it, so text from a channel never opens the input line
+in another input mode. On success the plugin adds an acknowledgement reaction to the
 Matrix message. On failure it posts the daemon's error into the thread and adds
 a failure reaction, so a nudge never disappears silently.
 

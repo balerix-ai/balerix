@@ -29,6 +29,7 @@
 //! exist, so the turn and the last `Stop` are recorded even before
 //! anything was ever sent to that agent. `forget` frees the entry.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
@@ -58,6 +59,19 @@ pub enum Kind {
     /// A slash command: most fire no hook, so "sent" is all a plugin can
     /// honestly say. Never tracked.
     Command,
+}
+
+pub use balerix_api::MODE_CHARS;
+
+/// A channel's text as prose for Claude's input line: the daemon's own
+/// rule ([`balerix_api::prompt_text`]), so the text tracked is the text
+/// typed. Terminal controls go, then leading blanks (whitespace, controls,
+/// format characters); a body that then opens with one of [`MODE_CHARS`]
+/// gains a backslash, Markdown's escape for a literal character, so text
+/// from a channel never opens the input line in another input mode.
+/// Slash commands pass through.
+pub fn as_prompt(text: &str) -> Cow<'_, str> {
+    balerix_api::prompt_text(text)
 }
 
 /// A body whose first non-blank character is `/` is a command.
@@ -825,6 +839,38 @@ mod tests {
         d.sent("f/c/a", "x", 1, now, Duration::ZERO);
         d.on_event(&event("f/c/a", "SessionEnd", json!({})), now);
         assert!(!any_nudge(&mut d, now, 60));
+    }
+
+    #[test]
+    fn a_leading_mode_character_is_escaped() {
+        assert_eq!(as_prompt("!ls"), "\\!ls");
+        assert_eq!(as_prompt("# notes\nmore"), "\\# notes\nmore");
+        assert_eq!(as_prompt("&x"), "\\&x");
+        assert_eq!(as_prompt("  \n\t!ls"), "\\!ls", "leading blanks go");
+        assert_eq!(as_prompt("\u{FEFF}\u{200B} !ls"), "\\!ls");
+        assert_eq!(
+            as_prompt("\u{7}!x"),
+            "\\!x",
+            "a control is not a first character"
+        );
+        assert_eq!(classify(&as_prompt("!ls")), Kind::Prompt);
+    }
+
+    #[test]
+    fn other_text_and_slash_commands_are_unchanged() {
+        for t in [
+            "run the tests",
+            "/compact",
+            "a!b",
+            "x\n!y",
+            "",
+            "@a hi",
+            "\\!x",
+        ] {
+            assert!(matches!(as_prompt(t), Cow::Borrowed(b) if b == t), "{t:?}");
+        }
+        assert_eq!(as_prompt("  /exit"), "/exit");
+        assert_eq!(classify(&as_prompt("  /exit")), Kind::Command);
     }
 
     #[test]

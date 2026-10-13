@@ -734,15 +734,17 @@ impl<M: MatrixPort> Actor<M> {
             return;
         }
 
+        // What the agent's input line takes as prose; tracked as sent.
+        let text = delivery::as_prompt(&message.body).into_owned();
         let action = PluginAction::SendText {
-            text: message.body.clone(),
+            text: text.clone(),
             submit: true,
         };
         match self.host.action(&agent, &action).await {
             Ok(()) => {
                 count("routed");
                 self.react(&message, SENT).await;
-                match delivery::classify(&message.body) {
+                match delivery::classify(&text) {
                     Kind::Command => {
                         self.counters
                             .deliveries
@@ -761,13 +763,10 @@ impl<M: MatrixPort> Actor<M> {
                             event_id: message.event_id.clone(),
                             agent: agent.clone(),
                         };
-                        if let Some(evicted) = self.deliveries.sent(
-                            &agent,
-                            &message.body,
-                            sent,
-                            Instant::now(),
-                            window,
-                        ) {
+                        if let Some(evicted) =
+                            self.deliveries
+                                .sent(&agent, &text, sent, Instant::now(), window)
+                        {
                             self.unconfirmed(evicted, Unconfirmed::Evicted).await;
                         }
                     }
@@ -2209,6 +2208,36 @@ mod tests {
             vec![SENT.to_string(), ACK.to_string()]
         );
         assert!(notices(&port.calls()).is_empty());
+    }
+
+    /// Text from a room never opens the input line with a mode character;
+    /// what was sent is what the confirmation matches.
+    #[tokio::test]
+    async fn a_reply_opening_with_a_mode_character_is_sent_escaped() {
+        for (body, sent) in [("!x", "\\!x"), (" # note\nmore", "\\# note\nmore")] {
+            let (fake, port, mut a, room, root) = with_thread().await;
+            a.handle(Command::Inbound(inbound(
+                &room,
+                Some(&root),
+                "@rahul:example.org",
+                body,
+            )))
+            .await;
+            assert_eq!(
+                fake.actions_for("f/c/alice"),
+                vec![PluginAction::SendText {
+                    text: sent.into(),
+                    submit: true
+                }]
+            );
+            a.handle(Command::Events(vec![submitted("f/c/alice", sent)]))
+                .await;
+            assert_eq!(
+                reactions(&port.calls()),
+                vec![SENT.to_string(), ACK.to_string()],
+                "{body:?}"
+            );
+        }
     }
 
     #[tokio::test]

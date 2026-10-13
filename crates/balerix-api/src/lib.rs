@@ -1,11 +1,11 @@
 //! Wire types shared by the balerix CLI and daemon (spec §3).
 //!
 //! This crate is a leaf: serde DTOs, with no logic beyond defaults,
-//! secret-redacting `Debug` impls and the pure validators both sides
-//! share (`branch::check_branch_name`, `workspace::check_path`,
-//! `protocol::check_kv_key`). The `axum` feature (off by default) adds
-//! `body_limit`, the over-limit body drain the daemon, the plugin SDK and
-//! the agent sidecar share.
+//! secret-redacting `Debug` impls and the pure validators and text rules
+//! both sides share (`branch::check_branch_name`, `workspace::check_path`,
+//! `protocol::check_kv_key`, `text::prompt_text`). The `axum` feature (off
+//! by default) adds `body_limit`, the over-limit body drain the daemon,
+//! the plugin SDK and the agent sidecar share.
 
 /// The `apiVersion` every fleet file and request declares.
 pub const API_VERSION: &str = "balerix/v1";
@@ -24,6 +24,7 @@ pub mod record;
 pub mod request;
 pub mod settings;
 pub mod status;
+pub mod text;
 pub mod workspace;
 
 pub use branch::check_branch_name;
@@ -54,6 +55,7 @@ pub use status::{
     ActivationState, AgentPhase, AgentStatus, FleetPhase, FleetStatus, FleetSummary,
     PluginActivation, SpecHash, Timestamp,
 };
+pub use text::{MODE_CHARS, prompt_text, strip_terminal_controls};
 pub use workspace::{
     EntryKind, FileDiff, FileStatus, TreeEntry, WORKSPACE_DIFF_LIMIT, WORKSPACE_FILE_COUNT_LIMIT,
     WORKSPACE_FILE_LIMIT, WORKSPACE_PATCH_LIMIT, WORKSPACE_TREE_ENTRY_LIMIT, WorkspaceDiff,

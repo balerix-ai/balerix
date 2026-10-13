@@ -407,6 +407,13 @@ took, and that is the proof (#85). Common gets `delivery.rs`, pure like
 - `classify(text)`: a body whose first non-blank character is `/` is a
   slash command and is never tracked; most commands fire no hook, so
   "sent" is all the plugin can honestly say.
+- `as_prompt(text)`, `balerix_api::prompt_text`, which the daemon also
+  applies to every plugin `send_text`: terminal controls and leading
+  blanks (whitespace, controls, format characters) go, and a body that
+  then opens with `!`, `#` or `&` (`MODE_CHARS`) gains a backslash, so
+  text from a channel never opens the input line in another input mode.
+  Matrix replies, live comments and `other:` answers go through it; what
+  it answers is what is sent and tracked. Slash commands are unchanged.
 - `sent(agent, text, marker, now)` registers a prompt.
 - `on_event(&HookEvent) -> Outcome`: a `UserPromptSubmit` whose `prompt`
   matches the oldest pending prompt with that text on that agent removes

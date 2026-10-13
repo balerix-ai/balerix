@@ -311,13 +311,21 @@ fn check_other(q: &Question, text: &str) -> Result<String, Refusal> {
             q.name()
         )));
     }
+    // Typed as prose: if the dialog has gone, it lands in the input line.
+    let text = balerix_api::prompt_text(text);
+    if text.is_empty() {
+        return Err(Refusal(format!(
+            "`other:` needs some text for **{}**.",
+            q.name()
+        )));
+    }
     if text.len() > MAX_KEY_TEXT {
         return Err(Refusal(format!(
             "`other:` for **{}** is limited to {MAX_KEY_TEXT} bytes.",
             q.name()
         )));
     }
-    Ok(text.to_string())
+    Ok(text.into_owned())
 }
 
 /// The ladder: number, whole label, unique prefix, unique word. The `bool`
@@ -694,6 +702,23 @@ mod tests {
         assert!(refusal(&q, "red, other: pink").contains("one answer"));
         assert!(refusal(&q, "other: two\nlines").contains("one line"));
         assert!(refusal(&q, &format!("other: {}", "x".repeat(1025))).contains("1024"));
+    }
+
+    /// Typed as prose like any channel text: never opens the input line
+    /// in another input mode, and what was typed is what is compared.
+    #[test]
+    fn other_text_opening_with_a_mode_character_is_typed_escaped() {
+        let q = parsed(&[color()]);
+        let (sel, _) = answers(&q, "other: !x");
+        assert_eq!(sel[0].other.as_deref(), Some("\\!x"));
+        let steps = plan(&q, &sel);
+        assert!(steps.contains(&KeyStep::Text("\\!x".into())), "{steps:?}");
+        assert!(!steps.contains(&KeyStep::Text("!x".into())));
+        let recorded = json!({ "Which color?": "\\!x" });
+        assert!(recorded_matches(&q, &sel, &recorded));
+        let (sel, _) = answers(&q, "other: \u{200B}#x");
+        assert_eq!(sel[0].other.as_deref(), Some("\\#x"));
+        assert!(refusal(&q, "other: \u{FEFF}").contains("needs some text"));
     }
 
     #[test]

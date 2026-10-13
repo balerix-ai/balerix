@@ -950,8 +950,10 @@ impl<G: GitHubPort> Actor<G> {
                 .await;
             return;
         }
+        // What the agent's input line takes as prose; tracked as sent.
+        let text = delivery::as_prompt(body).into_owned();
         let action = PluginAction::SendText {
-            text: body.to_string(),
+            text: text.clone(),
             submit: true,
         };
         match self.host.action(agent, &action).await {
@@ -966,7 +968,7 @@ impl<G: GitHubPort> Actor<G> {
                     number,
                     asker,
                     Target::Comment(comment_id),
-                    body,
+                    &text,
                     Duration::ZERO,
                 );
             }
@@ -2572,6 +2574,33 @@ mod tests {
                 (Target::Comment(9), PLUS_ONE.into())
             ]
         );
+    }
+
+    /// Text from a comment never opens the input line with a mode
+    /// character; what was sent is what the confirmation matches.
+    #[tokio::test]
+    async fn a_comment_opening_with_a_mode_character_is_sent_escaped() {
+        for (body, sent) in [("!x", "\\!x"), ("## Plan\nfix it", "\\## Plan\nfix it")] {
+            let (fake, port, mut a) = started().await;
+            a.handle(comment(12, "bob", 9, body)).await;
+            assert_eq!(
+                fake.actions_for(AGENT).last(),
+                Some(&PluginAction::SendText {
+                    text: sent.into(),
+                    submit: true
+                })
+            );
+            a.handle(Command::Events(vec![during(
+                "UserPromptSubmit",
+                json!({ "prompt": sent }),
+            )]))
+            .await;
+            assert_eq!(
+                reactions(&port.calls()).last(),
+                Some(&(Target::Comment(9), PLUS_ONE.into())),
+                "{body:?}"
+            );
+        }
     }
 
     /// #98: the daemon's action error can carry a socket path or a tmux

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use balerix_core::{AgentId, CrewRef, RepoRef};
+use balerix_runtime::InstallEnv;
 use balerix_runtime::jobs::{
     BranchChange, PoolLevel, SyncError, change_branch, harvest, sync_crew, sync_pool,
 };
@@ -142,6 +143,7 @@ fn crew_sync_makes_the_cache_fetches_the_ref_and_reports_its_commit() {
         "main",
         None,
         &none(),
+        &InstallEnv::default(),
     )
     .unwrap();
     assert_eq!(first, git(&work, &["rev-parse", "HEAD"]));
@@ -167,6 +169,7 @@ fn crew_sync_makes_the_cache_fetches_the_ref_and_reports_its_commit() {
         "main",
         None,
         &none(),
+        &InstallEnv::default(),
     )
     .unwrap();
     assert_eq!(second, git(&work, &["rev-parse", "HEAD"]));
@@ -195,6 +198,7 @@ fn a_gh_token_is_written_under_scratch_and_never_onto_the_volume() {
         "main",
         Some(token),
         &none(),
+        &InstallEnv::default(),
     )
     .unwrap();
     let hosts = std::fs::read_to_string(scratch.join("gh/hosts.yml")).unwrap();
@@ -226,6 +230,7 @@ fn a_ref_the_remote_lacks_is_a_cache_error_that_names_it() {
         "nope",
         None,
         &none(),
+        &InstallEnv::default(),
     )
     .unwrap_err();
     assert!(matches!(e, SyncError::Cache(_)), "{e:?}");
@@ -252,6 +257,7 @@ fn a_remote_that_is_not_there_is_a_cache_error_and_a_later_run_recovers() {
         "main",
         None,
         &none(),
+        &InstallEnv::default(),
     )
     .unwrap_err()
     .to_string();
@@ -266,6 +272,7 @@ fn a_remote_that_is_not_there_is_a_cache_error_and_a_later_run_recovers() {
         "main",
         None,
         &none(),
+        &InstallEnv::default(),
     )
     .unwrap();
 }
@@ -291,14 +298,36 @@ fn a_branch_deleted_on_the_remote_is_no_longer_synced() {
         "main",
         None,
         &none(),
+        &InstallEnv::default(),
     )
     .unwrap();
     git(&work, &["push", "-q", "up", "main:b"]);
-    sync_crew(&tools, &slice, &scratch, &crew(), &repo, "b", None, &none()).unwrap();
+    sync_crew(
+        &tools,
+        &slice,
+        &scratch,
+        &crew(),
+        &repo,
+        "b",
+        None,
+        &none(),
+        &InstallEnv::default(),
+    )
+    .unwrap();
     git(&work, &["push", "-q", "up", ":b"]);
-    let e = sync_crew(&tools, &slice, &scratch, &crew(), &repo, "b", None, &none())
-        .unwrap_err()
-        .to_string();
+    let e = sync_crew(
+        &tools,
+        &slice,
+        &scratch,
+        &crew(),
+        &repo,
+        "b",
+        None,
+        &none(),
+        &InstallEnv::default(),
+    )
+    .unwrap_err()
+    .to_string();
     assert_eq!(e, "cache: f/c: the remote has no branch b");
 }
 
@@ -312,17 +341,41 @@ fn pool_sync_with_an_empty_table_still_leaves_the_pool_and_its_marker() {
     let root = support::temp_root("jobs-pool-sync");
     let slice = slice(&root);
     let scratch = root.join("scratch");
-    sync_pool(&tools, &slice, &scratch, &PoolLevel::Daemon, &none()).unwrap();
+    sync_pool(
+        &tools,
+        &slice,
+        &scratch,
+        &PoolLevel::Daemon,
+        &none(),
+        &InstallEnv::default(),
+    )
+    .unwrap();
     assert!(slice.daemon_pool().is_dir());
     assert!(slice.daemon_root().join("mise.installed").is_file());
     let fleet = PoolLevel::Fleet("f".parse().unwrap());
-    sync_pool(&tools, &slice, &scratch, &fleet, &none()).unwrap();
+    sync_pool(
+        &tools,
+        &slice,
+        &scratch,
+        &fleet,
+        &none(),
+        &InstallEnv::default(),
+    )
+    .unwrap();
     assert!(slice.fleet().mise_pool().is_dir());
     assert!(slice.fleet().installed_marker().is_file());
     // a marker that outlived its pool must not short-circuit the install
     std::fs::remove_dir_all(slice.fleet().mise_pool()).unwrap();
     std::fs::remove_file(&slice.fleet().mise_toml).unwrap();
-    sync_pool(&tools, &slice, &scratch, &fleet, &none()).unwrap();
+    sync_pool(
+        &tools,
+        &slice,
+        &scratch,
+        &fleet,
+        &none(),
+        &InstallEnv::default(),
+    )
+    .unwrap();
     assert!(slice.fleet().mise_pool().is_dir());
     // the stale marker was dropped, so the install ran again and rewrote
     // the level file; a short-circuit would have left it missing
@@ -394,6 +447,7 @@ fn a_harvest_reads_a_claim_it_cannot_write_and_leaves_it_as_it_was() {
         "main",
         None,
         &none(),
+        &InstallEnv::default(),
     )
     .unwrap();
     let id: AgentId = "f/c/a".parse().unwrap();
@@ -441,6 +495,7 @@ fn a_claim_with_no_clone_has_nothing_to_harvest() {
         "main",
         None,
         &none(),
+        &InstallEnv::default(),
     )
     .unwrap();
     let claim = root.join("agent");
@@ -473,6 +528,7 @@ fn a_harvest_without_a_working_nono_fails() {
         "main",
         None,
         &none(),
+        &InstallEnv::default(),
     )
     .unwrap();
     let id: AgentId = "f/c/a".parse().unwrap();
@@ -523,6 +579,7 @@ fn branch_world(label: &str) -> Option<BranchWorld> {
         "main",
         None,
         &none(),
+        &InstallEnv::default(),
     )
     .unwrap();
     let id: AgentId = "f/c/a".parse().unwrap();

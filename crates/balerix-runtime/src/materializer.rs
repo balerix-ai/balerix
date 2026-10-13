@@ -12,6 +12,7 @@ use balerix_core::{
 
 use crate::env::agent_env;
 use crate::home::{HomeInputs, write_home};
+use crate::install_sandbox::InstallEnv;
 use crate::launch::{hooks_port, render_launch, wants_continue, write_launch};
 use crate::layout::StateLayout;
 use crate::sandbox::{
@@ -34,6 +35,9 @@ pub struct Runtime {
     /// The daemon's `TMUX_TMPDIR`, where its tmux server's socket lives
     /// (`socket_dirs`). None (`/tmp`) from `new`; `serve` sets it.
     pub tmux_tmpdir: Option<PathBuf>,
+    /// What the tool installs take from the daemon's environment. Empty
+    /// from `new`; `serve` and the pod sidecar set it.
+    pub install_env: InstallEnv,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -60,6 +64,7 @@ impl Runtime {
             git_read: Vec::new(),
             socket_policy: SocketPolicy::Open,
             tmux_tmpdir: None,
+            install_env: InstallEnv::default(),
         }
     }
 
@@ -96,6 +101,14 @@ impl Runtime {
     #[must_use]
     pub fn with_git_read(mut self, git_read: Vec<PathBuf>) -> Self {
         self.git_read = git_read;
+        self
+    }
+
+    /// What the tool installs take from the daemon's environment
+    /// (`InstallEnv::from_env`).
+    #[must_use]
+    pub fn with_install_env(mut self, env: InstallEnv) -> Self {
+        self.install_env = env;
         self
     }
 
@@ -139,6 +152,8 @@ impl Runtime {
         let tools_changed = Toolchain {
             tools: &self.tools,
             layout: &self.layout,
+            policy: self.socket_policy,
+            env: &self.install_env,
         }
         .write(id, &paths, &system, &agent.settings.tools, with_gh)?;
 
@@ -242,8 +257,10 @@ impl Runtime {
         Toolchain {
             tools: &self.tools,
             layout: &self.layout,
+            policy: self.socket_policy,
+            env: &self.install_env,
         }
-        .install(&agent.id, &paths, self.socket_policy)?;
+        .install(&agent.id, &paths)?;
         validate_profile(&self.tools, &agent.id, &paths)?;
         std::fs::write(paths.installed_marker(), b"").map_err(|e| MaterializeError::Io {
             id: agent.id.to_string(),
@@ -266,6 +283,8 @@ impl Runtime {
         let tc = Toolchain {
             tools: &self.tools,
             layout: &self.layout,
+            policy: self.socket_policy,
+            env: &self.install_env,
         };
         let fleet = self.layout.fleet(&crew.fleet);
         let crew_paths = self.layout.crew(crew);
@@ -305,6 +324,8 @@ impl SystemToolchain for Runtime {
         let tc = Toolchain {
             tools: &self.tools,
             layout: &self.layout,
+            policy: self.socket_policy,
+            env: &self.install_env,
         };
         let pool = self.layout.mise_data_dir();
         let marker = self.layout.system_installed_marker();

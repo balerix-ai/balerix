@@ -140,33 +140,23 @@ fn io_err(id: &AgentId, path: &Path, e: std::io::Error) -> MaterializeError {
     }
 }
 
-/// The directories mise makes under the agent's `home/` (`mise_env`):
-/// config, data and its `installs/`, state, cache.
-fn mise_dirs(paths: &AgentPaths) -> [std::path::PathBuf; 5] {
-    [
-        paths.mise_config_dir(),
-        paths.mise_data_dir(),
-        paths.mise_data_dir().join("installs"),
-        paths.mise_state_dir(),
-        paths.mise_cache_dir(),
-    ]
-}
-
-/// Makes `home/` and mise's directories under it as `write_home` does,
-/// without following a link below `home/`: a link or file found at any
-/// of them is replaced by a real directory. The daemon's install
-/// (`Toolchain::install`) calls it just before mise runs, so mise finds
-/// the directories it would otherwise make by path; the install's
-/// sandbox is what holds if the agent replaces one after this.
+/// Makes the agent's four mise directories (`AgentPaths::mise_dirs`) and
+/// the data dir's `installs/`. They sit in `mise/` in the agent root,
+/// which the daemon alone writes, so the four are made by path; the agent
+/// can write inside them, so `installs/` is reached by descriptor and a
+/// link or file found in its place is replaced by a real directory. The
+/// daemon's install (`Toolchain::install`) calls it just before mise
+/// runs; its sandbox is what holds if the agent replaces something after
+/// this.
 pub(crate) fn ensure_mise_dirs(id: &AgentId, paths: &AgentPaths) -> Result<(), MaterializeError> {
-    let home =
-        open_dir_root(&paths.home, DirMode::Private).map_err(|e| io_err(id, &paths.home, e))?;
-    for d in mise_dirs(paths) {
-        relative_to(&paths.home, &d)
-            .and_then(|rel| ensure_path_at(home.as_fd(), rel, DirMode::Default))
-            .map_err(|e| io_err(id, &d, e))?;
+    for d in paths.mise_dirs() {
+        ensure_dir(&d).map_err(|e| io_err(id, &d, e))?;
     }
-    Ok(())
+    let data = paths.mise_data_dir();
+    let dir = open_dir_root(&data, DirMode::Default).map_err(|e| io_err(id, &data, e))?;
+    crate::fsutil::ensure_dir_at(dir.as_fd(), "installs", DirMode::Default)
+        .map(drop)
+        .map_err(|e| io_err(id, &data.join("installs"), e))
 }
 
 /// Writes the agent's home. `root`, `logs` and nono's home are balerix's
@@ -204,9 +194,8 @@ pub fn write_home(
     for d in [paths.xdg_data(), paths.xdg_state(), paths.xdg_cache()] {
         sub(&d, DirMode::Default)?;
     }
-    for d in mise_dirs(paths) {
-        sub(&d, DirMode::Default)?;
-    }
+    // the agent's sandbox grants them, and nono grants only what exists
+    ensure_mise_dirs(id, paths)?;
     let pretty = |v: &Value| serde_json::to_vec_pretty(v).unwrap_or_default();
     let write = |dir: &OwnedFd, at: &Path, name: &str, contents: &[u8]| {
         write_atomic_at(dir.as_fd(), name, contents, 0o600)
@@ -573,11 +562,7 @@ mod tests {
             (paths.xdg_config(), 0o755),
             (paths.tmp_dir(), 0o700),
             (paths.xdg_cache(), 0o755),
-            (paths.mise_config_dir(), 0o755),
-            (paths.mise_data_dir(), 0o755),
             (paths.mise_data_dir().join("installs"), 0o755),
-            (paths.mise_state_dir(), 0o755),
-            (paths.mise_cache_dir(), 0o755),
         ]
         .into_iter()
         .enumerate()

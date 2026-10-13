@@ -47,8 +47,9 @@ pub fn agent_env(
         // resolving even when the worktree names a tool nobody installed.
         ("MISE_CEILING_PATHS".to_string(), s(&paths.root)),
         ("MISE_AUTO_INSTALL".to_string(), "false".to_string()),
-        // The agent's own installs, writable, inside `home/`; the pools are
-        // read-only fallbacks searched crew-first (Spec E §6).
+        // The agent's own installs, writable, in the agent root's `mise/`
+        // (`AgentPaths::mise_dirs`); the pools are read-only fallbacks
+        // searched crew-first (Spec E §6).
         ("MISE_DATA_DIR".to_string(), s(&paths.mise_data_dir())),
         (
             "MISE_SHARED_INSTALL_DIRS".to_string(),
@@ -114,8 +115,8 @@ mod tests {
         let base = "/h/.local/state/balerix/fleets/payments/crews/backend";
         assert_eq!(
             env["MISE_DATA_DIR"],
-            format!("{base}/agents/alice/home/.local/share/mise"),
-            "the agent installs into its own home, never a shared pool"
+            format!("{base}/agents/alice/mise/data"),
+            "the agent installs into its own directory, never a shared pool"
         );
         assert_eq!(
             env["MISE_SHARED_INSTALL_DIRS"],

@@ -420,7 +420,12 @@ fn run(
                 .with_git_read(config.git_read.clone())
                 .with_socket_policy(socket_policy)
                 // where the daemon's tmux server puts its socket (#187)
-                .with_tmux_tmpdir(std::env::var_os("TMUX_TMPDIR").map(PathBuf::from)),
+                .with_tmux_tmpdir(std::env::var_os("TMUX_TMPDIR").map(PathBuf::from))
+                // the proxy and certificate settings every tool install
+                // takes, and the token only the pool installs do
+                .with_install_env(balerix_runtime::InstallEnv::from_env(|k| {
+                    std::env::var_os(k)
+                })),
         );
         let ports = Ports {
             materializer: runtime.clone(),

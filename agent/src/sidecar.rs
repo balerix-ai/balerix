@@ -22,7 +22,9 @@ use balerix_core::{
 };
 use balerix_runtime::layout::{PodLayout, PodMounts};
 use balerix_runtime::sandbox::{SelfTestError, sandbox_self_test};
-use balerix_runtime::{Runtime, SocketPolicy, StateLayout, TmuxRunner, ToolPaths, UnixSockets};
+use balerix_runtime::{
+    InstallEnv, Runtime, SocketPolicy, StateLayout, TmuxRunner, ToolPaths, UnixSockets,
+};
 use std::path::Path;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
@@ -188,8 +190,11 @@ async fn sidecar(args: SidecarArgs) -> Result<()> {
     let tools = ToolPaths::discover_in(&std::env::var_os("PATH").unwrap_or_default(), &balerix)
         .map_err(|e| anyhow!("{e} (the sidecar needs git, gh, mise, nono and tmux on PATH)"))?;
     let socket_policy = resolve_socket_policy(&tools, &args.run_dir).await?;
-    let runtime =
-        Arc::new(Runtime::new(layout.clone(), tools.clone()).with_socket_policy(socket_policy));
+    let runtime = Arc::new(
+        Runtime::new(layout.clone(), tools.clone())
+            .with_socket_policy(socket_policy)
+            .with_install_env(InstallEnv::from_env(|k| std::env::var_os(k))),
+    );
     let runner = Arc::new(TmuxRunner::at_socket(tools.tmux.clone(), pod.tmux_socket()));
 
     // §7.1: the hook listener first; its port goes into the profile's

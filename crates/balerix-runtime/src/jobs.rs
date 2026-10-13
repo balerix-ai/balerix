@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use balerix_core::{AgentId, CrewRef, FleetName, MaterializeError, RepoRef};
 
+use crate::install_sandbox::InstallEnv;
 use crate::layout::{PodMounts, SharedSlice, StateLayout};
 use crate::socket_policy::SocketPolicy;
 use crate::toolchain::{Toolchain, drop_stale_marker};
@@ -46,6 +47,7 @@ pub fn sync_crew(
     git_ref: &str,
     gh_token: Option<&str>,
     table: &BTreeMap<String, String>,
+    env: &InstallEnv,
 ) -> Result<String, SyncError> {
     let id = crew.to_string();
     let paths = slice.crew();
@@ -77,6 +79,7 @@ pub fn sync_crew(
         &paths.installed_marker(),
         table,
         &paths.logs.join("mise.pools.log"),
+        env,
     )
     .map_err(SyncError::Tools)?;
     Ok(commit)
@@ -89,6 +92,7 @@ pub fn sync_pool(
     scratch: &Path,
     level: &PoolLevel,
     table: &BTreeMap<String, String>,
+    env: &InstallEnv,
 ) -> Result<(), MaterializeError> {
     match level {
         PoolLevel::Daemon => {
@@ -104,6 +108,7 @@ pub fn sync_pool(
                 &root.join("mise.installed"),
                 table,
                 &root.join("logs").join("mise.system.log"),
+                env,
             )
         }
         PoolLevel::Fleet(name) => {
@@ -119,6 +124,7 @@ pub fn sync_pool(
                 &fleet.installed_marker(),
                 table,
                 &fleet.logs().join("mise.pools.log"),
+                env,
             )
         }
     }
@@ -140,6 +146,7 @@ fn install(
     marker: &Path,
     table: &BTreeMap<String, String>,
     log: &Path,
+    env: &InstallEnv,
 ) -> Result<(), MaterializeError> {
     drop_stale_marker(id, pool, marker)?;
     std::fs::create_dir_all(pool).map_err(|e| MaterializeError::Io {
@@ -154,9 +161,13 @@ fn install(
         scratch.join("data"),
         scratch.join("config"),
     );
+    // the pod's Jobs run their sandboxed git under `Open` too: no tmux
+    // server, no agent sockets
     Toolchain {
         tools,
         layout: &layout,
+        policy: SocketPolicy::Open,
+        env,
     }
     .install_level(id, label, toml, pool, parents, marker, table, log, None)
 }

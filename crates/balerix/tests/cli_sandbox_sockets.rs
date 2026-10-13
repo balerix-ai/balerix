@@ -413,3 +413,55 @@ fn deny_policy_the_daemons_sandboxed_git_runs_behind_the_wrapper() {
         .count();
     assert_eq!(scripts, 3, "diff's two scripts and version's: {log}");
 }
+
+/// Under `deny` the daemon's tool installs run behind the wrapper too:
+/// a pool level's and an agent's, each `mise` call in a sandbox of its
+/// own with `balerix sandbox-exec` in front of mise.
+#[test]
+fn deny_policy_the_daemons_tool_installs_run_behind_the_wrapper() {
+    let Some(tools) = tools() else {
+        return;
+    };
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let root = dir.path();
+    let layout = balerix_runtime::StateLayout::xdg(
+        root.join("state"),
+        root.join("data"),
+        root.join("config"),
+    );
+    let env = balerix_runtime::InstallEnv::default();
+    let tc = balerix_runtime::Toolchain {
+        tools: &tools,
+        layout: &layout,
+        policy: SocketPolicy::Deny,
+        env: &env,
+    };
+    let log = root.join("logs").join("mise.system.log");
+    tc.install_level(
+        "system",
+        "system",
+        &layout.system_mise_toml_generated(),
+        &layout.mise_data_dir(),
+        &[],
+        &layout.system_installed_marker(),
+        &std::collections::BTreeMap::new(),
+        &log,
+        None,
+    )
+    .unwrap();
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let paths = layout.agent(&id);
+    std::fs::create_dir_all(&paths.home).unwrap();
+    std::fs::write(&paths.mise_toml, "[tools]\n").unwrap();
+    tc.install(&id, &paths).unwrap();
+    let wrapped = format!("{BALERIX} sandbox-exec -- ");
+    for log in [log, paths.logs.join("mise.toolchain.log")] {
+        let text = std::fs::read_to_string(&log).unwrap();
+        let calls: Vec<&str> = text.lines().filter(|l| l.starts_with("$ ")).collect();
+        assert_eq!(calls.len(), 2, "trust and install: {text}");
+        assert!(
+            calls.iter().all(|l| l.contains(&wrapped)),
+            "not behind the wrapper: {text}"
+        );
+    }
+}

@@ -270,5 +270,16 @@ fn a_package_tool_is_installed_into_the_daemon_pool_under_the_sandbox() {
         "the trust record is where the plugin's mise run looks"
     );
     assert!(!paths.xdg_data().join("mise").exists(), "nothing private");
-    assert!(!paths.mise_install_home().exists());
+    assert!(paths.mise_install_state().join("state").is_dir());
+    let scratch = fs::read_dir(&paths.root)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".nono-mise-")
+        })
+        .count();
+    assert_eq!(scratch, 0, "every call's scratch goes");
 }

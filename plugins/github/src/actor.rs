@@ -63,7 +63,14 @@ pub enum Command {
     Deactivate {
         agent: String,
     },
-    Events(Vec<HookEvent>),
+    /// A batch of hook events, and how many the daemon reported missed
+    /// before it: whatever was tracked from those may be stale. Carried
+    /// with its batch so nothing reorders the two; should the command be
+    /// dropped from a full queue, the queue's gap says the same.
+    Events {
+        dropped: u64,
+        events: Vec<HookEvent>,
+    },
     Phases(Vec<PhaseChange>),
     Webhook(WebhookEvent),
     Tick,
@@ -82,7 +89,7 @@ impl Laned for Command {
             | Command::Deactivate { .. }
             | Command::ListenerFailed(_) => Lane::Control,
             Command::Webhook(_) => Lane::Inbound,
-            Command::Events(_) | Command::Phases(_) => Lane::Lossy,
+            Command::Events { .. } | Command::Phases(_) => Lane::Lossy,
             Command::Tick => Lane::Latest,
         }
     }
@@ -92,6 +99,14 @@ impl Laned for Command {
             Command::Webhook(ev) => ev.bytes(),
             _ => 0,
         }
+    }
+}
+
+#[cfg(test)]
+impl Command {
+    /// A batch with nothing reported missed before it.
+    pub(crate) fn events(events: Vec<HookEvent>) -> Self {
+        Command::Events { dropped: 0, events }
     }
 }
 
@@ -373,7 +388,11 @@ impl<G: GitHubPort> Actor<G> {
                 }
                 self.publish_gauges();
             }
-            Command::Events(events) => {
+            Command::Events { dropped, events } => {
+                if dropped > 0 {
+                    tracing::info!("github: the daemon missed {dropped} events for this plugin");
+                    self.deliveries.lose_track();
+                }
                 for event in events {
                     self.on_event(event).await;
                 }
@@ -430,7 +449,11 @@ impl<G: GitHubPort> Actor<G> {
                 tracing::warn!("github: rebuilding row for {agent}: {e}");
             }
         }
-        self.agents.insert(agent, config);
+        // Held already: a restarted daemon re-activating it, and what
+        // happened to the agent in between is unknown.
+        if self.agents.insert(agent.clone(), config).is_some() {
+            self.deliveries.lose_track_agent(&agent);
+        }
         self.publish_gauges();
     }
 
@@ -2316,7 +2339,7 @@ mod tests {
             config: crate::config::parse_agent(&json!({ "kind": "issue", "number": 12 })).unwrap(),
         })
         .await;
-        a.handle(Command::Events(vec![event(
+        a.handle(Command::events(vec![event(
             BACKEND_AGENT,
             "SessionStart",
             json!({ "source": "startup" }),
@@ -2852,14 +2875,14 @@ mod tests {
         .await;
         let mut e = event(AGENT, "SessionStart", json!({ "source": "startup" }));
         e.session_id = Some("0199aa11-abcd".into());
-        a.handle(Command::Events(vec![e])).await;
+        a.handle(Command::events(vec![e])).await;
         let first = actions_text(&fake.actions_for(AGENT)[0]);
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "UserPromptSubmit",
             json!({ "prompt": first }),
         )]))
         .await;
-        a.handle(Command::Events(vec![during("Stop", json!({}))]))
+        a.handle(Command::events(vec![during("Stop", json!({}))]))
             .await;
         port.take_calls();
         (fake, port, a)
@@ -2892,13 +2915,13 @@ mod tests {
             config: crate::config::parse_agent(&json!({ "kind": "issue", "number": 12 })).unwrap(),
         })
         .await;
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "Notification",
             json!({ "message": "early" }),
         )]))
         .await;
         assert!(fake.actions_for(AGENT).is_empty());
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "SessionStart",
             json!({ "source": "startup" }),
         )]))
@@ -2931,7 +2954,7 @@ mod tests {
             e[0]
         );
         // the mention's 👍 arrives with the matching submit (§8.7)
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "UserPromptSubmit",
             json!({ "prompt": actions_text(&actions[0]) }),
         )]))
@@ -2952,6 +2975,58 @@ mod tests {
         a.handle(Command::Tick).await;
     }
 
+    /// An agent of issue 12, past its `SessionStart`, so its turn is idle.
+    async fn idle_agent() -> Actor<FakePort> {
+        let (_fake, _port, mut a) = actor().await;
+        a.handle(comment(12, "alice", 5, "@balerix please look"))
+            .await;
+        a.handle(Command::Activate {
+            agent: AGENT.into(),
+            config: crate::config::parse_agent(&json!({ "kind": "issue", "number": 12 })).unwrap(),
+        })
+        .await;
+        a.handle(Command::events(vec![during(
+            "SessionStart",
+            json!({ "source": "startup" }),
+        )]))
+        .await;
+        assert!(a.deliveries.idle(AGENT), "SessionStart");
+        a
+    }
+
+    /// A batch the daemon reports events missed before: the tracker loses
+    /// track of an idle turn before it reads the batch, whose `Stop`
+    /// then settles it again.
+    #[tokio::test]
+    async fn a_batch_reporting_missed_events_loses_track_first() {
+        let mut a = idle_agent().await;
+        a.handle(Command::Events {
+            dropped: 2,
+            events: Vec::new(),
+        })
+        .await;
+        assert!(!a.deliveries.idle(AGENT));
+        a.handle(Command::Events {
+            dropped: 1,
+            events: vec![during("Stop", json!({}))],
+        })
+        .await;
+        assert!(a.deliveries.idle(AGENT), "the gap came before the Stop");
+    }
+
+    /// Re-activated (a restarted daemon re-sends `activate`), an agent's
+    /// turn tracking is reset.
+    #[tokio::test]
+    async fn a_reactivated_agent_has_its_turn_tracking_reset() {
+        let mut a = idle_agent().await;
+        a.handle(Command::Activate {
+            agent: AGENT.into(),
+            config: crate::config::parse_agent(&json!({ "kind": "issue", "number": 12 })).unwrap(),
+        })
+        .await;
+        assert!(!a.deliveries.idle(AGENT));
+    }
+
     /// #99: a prompt sent on `SessionStart` reaches the composer while
     /// Claude's TUI is starting and loses its Enter.
     #[tokio::test]
@@ -2967,7 +3042,7 @@ mod tests {
             .unwrap(),
         })
         .await;
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "SessionStart",
             json!({ "source": "startup" }),
         )]))
@@ -2987,7 +3062,7 @@ mod tests {
         assert_eq!(fake.actions_for(AGENT)[1..], [enter.clone(), enter.clone()]);
 
         // Claude takes it: 👍, and the turn's end brings no further Enter
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "UserPromptSubmit",
             json!({ "prompt": actions_text(&first[0]) }),
         )]))
@@ -2996,7 +3071,7 @@ mod tests {
             reactions(&port.calls()).last(),
             Some(&(Target::Comment(5), PLUS_ONE.to_string()))
         );
-        a.handle(Command::Events(vec![during("Stop", json!({}))]))
+        a.handle(Command::events(vec![during("Stop", json!({}))]))
             .await;
         tick_after(&mut a, Duration::from_secs(60)).await;
         assert_eq!(fake.actions_for(AGENT).len(), 3);
@@ -3022,7 +3097,7 @@ mod tests {
             config: crate::config::parse_agent(&json!({ "kind": "issue", "number": 12 })).unwrap(),
         })
         .await;
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "SessionStart",
             json!({ "source": "startup" }),
         )]))
@@ -3091,7 +3166,7 @@ mod tests {
             reactions(&port.calls()),
             vec![(Target::Comment(9), EYES.into())]
         );
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "UserPromptSubmit",
             json!({ "prompt": "also  check the tests" }),
         )]))
@@ -3179,7 +3254,7 @@ mod tests {
                     submit: true
                 })
             );
-            a.handle(Command::Events(vec![during(
+            a.handle(Command::events(vec![during(
                 "UserPromptSubmit",
                 json!({ "prompt": sent }),
             )]))
@@ -3295,7 +3370,7 @@ mod tests {
         fake.fail_actions(Some("window gone"));
         a.handle(comment(12, "alice", 40, "@balerix continue"))
             .await;
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "SessionStart",
             json!({ "source": "startup" }),
         )]))
@@ -3349,7 +3424,7 @@ mod tests {
     #[tokio::test]
     async fn a_stop_posts_the_message_and_a_long_one_is_split_and_a_failed_part_stops_the_rest() {
         let (_fake, port, mut a) = started().await;
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "Stop",
             json!({ "last_assistant_message": "Done: I fixed the refund path." }),
         )]))
@@ -3360,7 +3435,7 @@ mod tests {
         );
         port.take_calls();
         let long = "abcd\n".repeat(30_000);
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "Stop",
             json!({ "last_assistant_message": long }),
         )]))
@@ -3370,7 +3445,7 @@ mod tests {
         assert!(c[0].1.ends_with(&format!("(1/{})", c.len())));
         port.take_calls();
         port.fail_next(GitHubError::Other("boom".into()));
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "Stop",
             json!({ "last_assistant_message": "abcd\n".repeat(30_000) }),
         )]))
@@ -3381,7 +3456,7 @@ mod tests {
         );
         // an empty message posts nothing and adds a status line
         port.take_calls();
-        a.handle(Command::Events(vec![during("Stop", json!({}))]))
+        a.handle(Command::events(vec![during("Stop", json!({}))]))
             .await;
         assert!(comments(&port.calls()).is_empty());
         assert!(a.statuses[AGENT].render().contains("turn finished"));
@@ -3391,8 +3466,8 @@ mod tests {
     async fn the_status_comment_is_edited_not_reposted_and_coalesced_and_reposted_when_deleted() {
         let (_fake, port, mut a) = started().await;
         tokio::time::pause();
-        a.handle(Command::Events(vec![during("Notification", json!({ "message": "Claude needs your permission to use Bash", "notification_type": "permission_prompt" }))])).await;
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during("Notification", json!({ "message": "Claude needs your permission to use Bash", "notification_type": "permission_prompt" }))])).await;
+        a.handle(Command::events(vec![during(
             "Notification",
             json!({ "message": "second" }),
         )]))
@@ -3409,7 +3484,7 @@ mod tests {
         assert!(comments(&port.calls()).is_empty());
         port.take_calls();
         port.delete_comment(1001);
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "Notification",
             json!({ "message": "third" }),
         )]))
@@ -3424,7 +3499,7 @@ mod tests {
     async fn a_question_round_trip_through_common() {
         use balerix_plugin_common::question::fixtures::{color, input};
         let (fake, port, mut a) = started().await;
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "PreToolUse",
             json!({ "tool_name": "AskUserQuestion", "tool_input": input(&[color()]) }),
         )]))
@@ -3452,7 +3527,7 @@ mod tests {
         let echo = c[0].0; // the echo's number; its id is the last minted
         let _ = echo;
         port.take_calls();
-        a.handle(Command::Events(vec![during("PostToolUse", json!({ "tool_name": "AskUserQuestion", "tool_response": { "answers": { "Which color?": "Blue" } } }))])).await;
+        a.handle(Command::events(vec![during("PostToolUse", json!({ "tool_name": "AskUserQuestion", "tool_response": { "answers": { "Which color?": "Blue" } } }))])).await;
         assert_eq!(
             reactions(&port.calls()),
             vec![(Target::Comment(1003), HOORAY.into())],
@@ -3468,7 +3543,7 @@ mod tests {
         use balerix_plugin_common::pending::Stage;
         use balerix_plugin_common::question::fixtures::{color, input};
         let (fake, port, mut a) = started().await;
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "PreToolUse",
             json!({ "tool_name": "AskUserQuestion", "tool_input": input(&[color()]) }),
         )]))
@@ -3518,7 +3593,7 @@ mod tests {
         .await;
         let mut e = event(PR_AGENT, "SessionStart", json!({ "source": "startup" }));
         e.session_id = Some("s".into());
-        a.handle(Command::Events(vec![e])).await;
+        a.handle(Command::events(vec![e])).await;
         port.set_review_comments(
             "acme/api",
             9,
@@ -3572,7 +3647,7 @@ mod tests {
             json!({ "tool_name": "AskUserQuestion", "tool_input": input(&[color()]) }),
         );
         q.session_id = Some("s".into());
-        a.handle(Command::Events(vec![q])).await;
+        a.handle(Command::events(vec![q])).await;
         let before = fake.actions_for(agent).len();
         // a second review: the same one again would be a redelivery (#259)
         port.set_review_comments("acme/api", 11, Vec::new());
@@ -3585,7 +3660,7 @@ mod tests {
             json!({ "tool_name": "AskUserQuestion", "tool_response": { "answers": {} } }),
         );
         done.session_id = Some("s".into());
-        a.handle(Command::Events(vec![done])).await;
+        a.handle(Command::events(vec![done])).await;
         assert_eq!(
             fake.actions_for(agent).len(),
             before + 1,
@@ -3638,13 +3713,13 @@ mod tests {
             json!({ "tool_name": "AskUserQuestion", "tool_input": input(&[color()]) }),
         );
         q.session_id = Some("s".into());
-        a.handle(Command::Events(vec![q])).await;
+        a.handle(Command::events(vec![q])).await;
         let before = fake.actions_for(agent).len();
         a.handle(review_by("bob", 9)).await;
         assert_eq!(fake.actions_for(agent).len(), before, "held");
         let mut restart = event(agent, "SessionStart", json!({ "source": "resume" }));
         restart.session_id = Some("s2".into());
-        a.handle(Command::Events(vec![restart])).await;
+        a.handle(Command::events(vec![restart])).await;
         a.handle(review_by("alice", 10)).await;
         let texts: Vec<String> = fake.actions_for(agent)[before..]
             .iter()
@@ -3739,7 +3814,7 @@ mod tests {
             .await;
         assert_eq!(fake.applied_fleets().len(), 3);
         assert!(!a.sessions.get(AGENT).unwrap().closed);
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "SessionStart",
             json!({ "source": "startup" }),
         )]))
@@ -4021,7 +4096,7 @@ mod tests {
         a.handle(comment(12, "bob", 9, "first thing")).await;
         a.handle(comment(12, "bob", 10, "second thing")).await;
         port.take_calls();
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "UserPromptSubmit",
             json!({ "prompt": "second thing" }),
         )]))
@@ -4081,7 +4156,7 @@ mod tests {
         assert_eq!(fake.applied_fleets().len(), 1, "no apply without the agent");
         // still open: a turn still posts
         port.take_calls();
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "Stop",
             json!({ "last_assistant_message": "still here" }),
         )]))
@@ -4100,7 +4175,7 @@ mod tests {
         }))
         .await;
         port.take_calls();
-        a.handle(Command::Events(vec![during(
+        a.handle(Command::events(vec![during(
             "Stop",
             json!({ "last_assistant_message": "late" }),
         )]))

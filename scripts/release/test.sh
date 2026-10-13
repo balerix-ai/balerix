@@ -262,6 +262,28 @@ scenario_core_projects() {
   expect_eq "agent change: core releases" "$(field status "$(prepare "$dir" core)")" release
 }
 
+# A unit's Dockerfiles ship in its images, so a fix there releases it:
+# docker/balerix (the balerix and balerix-agent images) is core's, and
+# docker/plugin every plugin's but not common's, which has no image.
+scenario_dockerfiles() {
+  local dir unit
+  dir=$(fixture dockerfiles)
+  for unit in core common flow web matrix github; do release "$dir" "$unit" 0.4.0; done
+  change "$dir" docker/plugin/release-test.txt "fix(deps): a plugin base image digest"
+  for unit in flow web matrix github; do
+    expect_eq "docker/plugin change: $unit releases" "$(field status "$(prepare "$dir" "$unit")")" release
+    discard "$dir"
+  done
+  expect_eq "docker/plugin change: common does not" "$(field status "$(prepare "$dir" common)")" none
+  discard "$dir"
+  expect_eq "docker/plugin change: core does not" "$(field status "$(prepare "$dir" core)")" none
+  discard "$dir"
+  change "$dir" docker/balerix/release-test.txt "fix(deps): a balerix base image digest"
+  expect_eq "docker/balerix change: core releases" "$(field status "$(prepare "$dir" core)")" release
+  discard "$dir"
+  expect_eq "docker/balerix change: common does not" "$(field status "$(prepare "$dir" common)")" none
+}
+
 scenario_in_progress() {
   local dir out
   dir=$(fixture in-progress)
@@ -670,6 +692,35 @@ scenario_charts_gate() {
   expect_grep "charts after all: changelog section" "## $(charts_field_of "$dir" version) - " "$dir/charts/CHANGELOG.md"
 }
 
+# The CRDs ship in the operator chart but are served by core's operator:
+# a change to them, or to operator/src/api they are generated from, since
+# the appVersion tag waits for the core release that ships it, even with
+# every pin tagged. A chart change elsewhere does not wait.
+scenario_charts_wait_for_core_crds() {
+  local dir out version app
+  dir=$(fixture charts-crds)
+  release_charts_deps "$dir"
+  version=$(charts_field_of "$dir" version)
+  app=$(charts_field_of "$dir" appVersion)
+  release "$dir" charts "$version"
+  change "$dir" charts/balerix-daemon/release-test.txt "fix(charts): a daemon chart fix"
+  out=$(prepare "$dir" charts)
+  expect_eq "charts, daemon chart fix: status" "$(field status "$out")" release
+  discard "$dir"
+  change "$dir" charts/balerix-operator/templates/crds/release-test.yaml "fix(operator): a CRD schema fix"
+  prepare_refused "$dir" charts "charts, CRDs changed" \
+    "changed since balerix-v$app (appVersion); release core first, then charts"
+  release "$dir" core "$(bumped "$app" patch)"
+  out=$(prepare "$dir" charts)
+  expect_eq "charts after the core release: status" "$(field status "$out")" release
+  expect_grep "charts after the core release: the image listed" \
+    "\`balerix\` $app → $(bumped "$app" patch)" "$dir/$(field notes "$out")"
+  discard "$dir"
+  change "$dir" operator/src/api/release-test.rs "feat(operator): a new Fleet field"
+  prepare_refused "$dir" charts "charts, operator api changed" \
+    "changed since balerix-v$(bumped "$app" patch) (appVersion); release core first, then charts"
+}
+
 # At release time every pin is tagged or released by this same run, at the
 # version the run releases: the charts job waits for merge-images, so the
 # run's image tags exist by then (Spec O §24.5).
@@ -945,6 +996,7 @@ scenario_sdk_change
 scenario_plugin_only
 scenario_core_bump
 scenario_core_projects
+scenario_dockerfiles
 scenario_in_progress
 scenario_plan
 scenario_plan_core_images
@@ -963,6 +1015,7 @@ scenario_core_bump_moves_common
 scenario_common_change_releases_dependents
 scenario_plan_crates
 scenario_charts_gate
+scenario_charts_wait_for_core_crds
 scenario_charts_pins_at_release
 scenario_plugin_moves_pin
 scenario_core_moves_app_version

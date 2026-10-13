@@ -137,16 +137,18 @@ image_description() {
 # The paths whose commits count toward the unit, one per line. The SDK and
 # the api are compiled into every plugin binary and into common, so they
 # count for all of them; common is compiled into every plugin whose
-# manifest names it, so it counts for those.
+# manifest names it, so it counts for those. A unit's Dockerfiles count
+# too: a base-image fix ships only in a release.
 unit_paths() {
   require_unit "$1"
   if [[ $1 == core ]]; then
     printf '%s\n' 'crates/**' Cargo.toml Cargo.lock mise.toml \
-      'operator/**' 'agent/**' 'docker/operator/**' 'docker/agent/**'
+      'operator/**' 'agent/**' 'docker/balerix/**' 'docker/operator/**' 'docker/agent/**'
   elif [[ $1 == charts ]]; then
     printf '%s\n' 'charts/**'
   else
     printf '%s\n' "plugins/$1/**" 'crates/balerix-api/**' 'crates/balerix-plugin-sdk/**'
+    if [[ $(unit_kind "$1") == plugin ]]; then printf '%s\n' 'docker/plugin/**'; fi
     if [[ $(unit_kind "$1") == plugin ]] && grep -q '^balerix-plugin-common ' "plugins/$1/Cargo.toml"; then
       printf '%s\n' 'plugins/common/**'
     fi
@@ -230,6 +232,11 @@ DAEMON_VALUES=charts/balerix-daemon/values.yaml
 # images into kind (kind-load-pins.sh).
 # shellcheck disable=SC2034
 CHARTS_CHECK_PLUGINS=(flow web)
+# What the charts ship that core's operator must serve: the CRDs and the
+# Rust types they are generated from. While either differs from the
+# appVersion tag, prepare.sh proposes no charts release.
+# shellcheck disable=SC2034
+CHARTS_CORE_PATHS=(operator/src/api charts/balerix-operator/templates/crds)
 
 # A top-level `<field>: <value>` of a YAML file (`-` is stdin), quotes dropped.
 yaml_field() {

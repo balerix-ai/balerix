@@ -70,8 +70,21 @@ charts_blocked() {
   while read -r pinned version field; do
     tag_exists "$(unit_tag "$pinned" "$version")" || missing+=("$(unit_tag "$pinned" "$version") ($field)")
   done <<<"$pins"
-  ((${#missing[@]})) || return 1
-  echo "charts: they name versions with no release tag yet: ${missing[*]}; release those first, then charts" >&2
+  if ((${#missing[@]})); then
+    echo "charts: they name versions with no release tag yet: ${missing[*]}; release those first, then charts" >&2
+    return 0
+  fi
+  # The operator chart's CRDs are generated from operator/src/api (`mise run
+  # crds`) and must match the operator that appVersion installs: a change
+  # there since core's tag would ship a schema, and the notes for it, ahead
+  # of the operator that serves it. Wait for core, as a library does.
+  version=$(charts_field appVersion)
+  if ! git diff --quiet "$(unit_tag core "$version")" HEAD -- "${CHARTS_CORE_PATHS[@]}"; then
+    echo "charts: ${CHARTS_CORE_PATHS[*]} changed since balerix-v$version (appVersion);" \
+      "release core first, then charts" >&2
+    return 0
+  fi
+  return 1
 }
 
 # The pins that moved since <tag>, one `<image> <old> <new>` line each: a

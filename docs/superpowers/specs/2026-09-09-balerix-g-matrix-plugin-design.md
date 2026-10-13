@@ -244,7 +244,11 @@ struct Session {
    configured `deviceId` and display name, seal the result into `auth`, and log
    at warn that the password source can now be removed.
 3. Prove the session with `whoami`. A failure here exits 1, so the daemon
-   reports the plugin as not ready and restarts it with backoff.
+   reports the plugin as not ready and restarts it with backoff. `whoami` is
+   also where an expired cached access token is refreshed, so the client is
+   subscribed to its session changes before it, and whatever pair it holds
+   after `whoami` is sealed before the plugin reports ready (#261): the
+   homeserver has spent the old refresh token.
 4. A 401 later triggers a refresh. If the refresh also fails and a password
    source is configured, log in again and log at warn that it happened. If none
    is configured, fail with a message naming the likely cause, a revoked

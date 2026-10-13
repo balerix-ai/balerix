@@ -31,6 +31,7 @@ use matrix_sdk::ruma::events::room::message::{
 use matrix_sdk::ruma::{EventId, RoomId, UserId, uint};
 use matrix_sdk::store::{RoomLoadSettings, StateStoreDataKey};
 use matrix_sdk::{Client, HttpError, RoomState, SessionChange, SessionMeta, SessionTokens};
+use tokio::sync::broadcast;
 
 use crate::actor::{Actor, Command, Counters, Health, Queue};
 use crate::config::{DaemonConfig, Secret};
@@ -542,8 +543,16 @@ async fn sync(client: &Client) -> Result<(), matrix_sdk::Error> {
 /// which makes the sealed record stale. Without this, a restart after a
 /// rotation logs in from the password again, or fails when the password has
 /// been taken out of `plugins.yaml`.
-async fn reseal_on_refresh(host: Host, client: Client, session: Session) {
-    let mut changes = client.subscribe_to_session_changes();
+///
+/// `changes` is subscribed by the caller before the client's first request,
+/// so a refresh during start-up is heard too: a broadcast receiver only
+/// sees what is sent after it exists.
+async fn reseal_on_refresh(
+    host: Host,
+    client: Client,
+    mut changes: broadcast::Receiver<SessionChange>,
+    session: Session,
+) {
     loop {
         match changes.recv().await {
             Ok(SessionChange::TokensRefreshed) => {
@@ -568,8 +577,8 @@ async fn reseal_on_refresh(host: Host, client: Client, session: Session) {
                      refreshed; configure a password so the next start can log in again"
                 );
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return,
         }
     }
 }
@@ -581,11 +590,85 @@ pub struct MatrixLauncher {
     pub health: Health,
 }
 
+/// `session` with the tokens `client` holds now, which differ from the
+/// ones it was given when a request on the way here spent the refresh
+/// token.
+fn with_current_tokens(client: &Client, session: &Session) -> Session {
+    let Some(tokens) = client.session_tokens() else {
+        return session.clone();
+    };
+    Session {
+        access_token: Secret::new(tokens.access_token),
+        refresh_token: tokens.refresh_token.map(Secret::new),
+        ..session.clone()
+    }
+}
+
+/// What start-up hands on once `whoami` has proven a session.
+pub struct Proven {
+    pub client: Client,
+    /// Subscribed before the client's first request, so it has heard every
+    /// session change since, including a refresh `whoami` itself caused.
+    pub changes: broadcast::Receiver<SessionChange>,
+    /// The session with the tokens the client holds after `whoami`.
+    pub session: Session,
+    /// The homeserver's spelling of our user id, from `whoami`.
+    pub user_id: String,
+}
+
+/// Restores `cached` into a fresh client and proves it with `whoami`
+/// (§5.2 steps 1 and 3). `whoami` is where an expired cached access token
+/// gets refreshed, so the client is subscribed to its session changes
+/// before that first request, and the returned session carries whatever
+/// tokens the client holds afterwards: when they differ from `cached`, the
+/// homeserver has spent the cached refresh token and the caller must seal
+/// the new pair before reporting ready (#261). `Auth` means the session was
+/// rejected outright.
+pub async fn restore_and_prove(
+    config: &DaemonConfig,
+    store_dir: &Path,
+    cached: &Session,
+) -> Result<Proven, MatrixError> {
+    let client = restore(config, store_dir, cached)
+        .await
+        .map_err(MatrixError::Other)?;
+    let changes = client.subscribe_to_session_changes();
+    let user_id = whoami(&client).await?;
+    let session = with_current_tokens(&client, cached);
+    Ok(Proven {
+        client,
+        changes,
+        session,
+        user_id,
+    })
+}
+
 impl MatrixLauncher {
     async fn remember(&self, session: &Session) -> Result<(), String> {
         session::store(&self.host, session)
             .await
             .map_err(|e| format!("kv: {e}"))
+    }
+
+    /// Password login, `whoami`, then seal the session with whatever tokens
+    /// the client holds after both.
+    async fn login_and_prove(
+        &self,
+        config: &DaemonConfig,
+        store_dir: &Path,
+        password: &Secret,
+    ) -> Result<Proven, String> {
+        let (client, session) = login(config, store_dir, password).await?;
+        let changes = client.subscribe_to_session_changes();
+        let user_id = whoami(&client).await.map_err(|e| e.to_string())?;
+        let session = with_current_tokens(&client, &session);
+        self.remember(&session).await?;
+        Ok(Proven {
+            client,
+            changes,
+            session,
+            user_id,
+        })
     }
 }
 
@@ -601,43 +684,48 @@ impl Launcher for MatrixLauncher {
         let plan = session::plan(cached, &config)?;
 
         // Restore or log in, then prove the credentials with `whoami`
-        // before the daemon is told the plugin is ready (G-14).
-        let (client, session, user_id) = match plan {
-            Plan::Restore(cached) => {
-                let client = restore(&config, &store_dir, &cached).await?;
-                match whoami(&client).await {
-                    Ok(user_id) => (client, *cached, user_id),
-                    Err(MatrixError::Auth(e)) => {
-                        // §5.2 step 4: the cached session was rejected, most
-                        // likely a revoked device. Drop it and log in once
-                        // more if there is a password to log in with.
-                        let Some(password) = config.password.clone() else {
-                            return Err(session::REVOKED.to_string());
-                        };
-                        tracing::warn!(
-                            "matrix: the cached session was rejected ({e}); logging in again"
-                        );
-                        drop(client);
-                        session::clear(&self.host)
-                            .await
-                            .map_err(|e| format!("kv: {e}"))?;
-                        let (client, session) = login(&config, &store_dir, &password).await?;
-                        let user_id = whoami(&client).await.map_err(|e| e.to_string())?;
-                        self.remember(&session).await?;
-                        (client, session, user_id)
+        // before the daemon is told the plugin is ready (G-14). Each client
+        // is subscribed to its session changes before its first request:
+        // `whoami` is where an expired cached token gets refreshed, and a
+        // rotation nobody hears about leaves sealed KV holding a refresh
+        // token the homeserver has already spent (#261).
+        let Proven {
+            client,
+            changes,
+            session,
+            user_id,
+        } = match plan {
+            Plan::Restore(cached) => match restore_and_prove(&config, &store_dir, &cached).await {
+                Ok(proven) => {
+                    if proven.session != *cached {
+                        self.remember(&proven.session).await?;
                     }
-                    Err(e) => return Err(e.to_string()),
+                    proven
                 }
-            }
+                Err(MatrixError::Auth(e)) => {
+                    // §5.2 step 4: the cached session was rejected, most
+                    // likely a revoked device. Drop it and log in once
+                    // more if there is a password to log in with.
+                    let Some(password) = config.password.clone() else {
+                        return Err(session::REVOKED.to_string());
+                    };
+                    tracing::warn!(
+                        "matrix: the cached session was rejected ({e}); logging in again"
+                    );
+                    session::clear(&self.host)
+                        .await
+                        .map_err(|e| format!("kv: {e}"))?;
+                    self.login_and_prove(&config, &store_dir, &password).await?
+                }
+                Err(e) => return Err(e.to_string()),
+            },
             Plan::Login { password } => {
-                let (client, session) = login(&config, &store_dir, &password).await?;
-                let user_id = whoami(&client).await.map_err(|e| e.to_string())?;
-                self.remember(&session).await?;
+                let proven = self.login_and_prove(&config, &store_dir, &password).await?;
                 tracing::warn!(
                     "matrix: logged in with the configured password and cached the session; \
                      the password can now be removed from plugins.yaml"
                 );
-                (client, session, user_id)
+                proven
             }
         };
 
@@ -656,6 +744,7 @@ impl Launcher for MatrixLauncher {
         tokio::spawn(reseal_on_refresh(
             self.host.clone(),
             client.clone(),
+            changes,
             session,
         ));
         tokio::spawn(start_inbound_pump(

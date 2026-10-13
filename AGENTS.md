@@ -591,6 +591,21 @@ credentials, hook input, or sandbox rules.
   the crew session and destroy it.
 - Enter on the attach PTY is `\r` (what a terminal and xterm.js send);
   tmux treats `\n` as `C-j`. The `tmux_it` attach test writes `\r`.
+- Drop an attach PTY's writer only after its stream: `portable-pty`'s
+  writer sends the terminal an EOF when dropped, and a tmux client still
+  attached hands it to the agent (the web e2e's `fake-claude` exits and
+  the review paste never arrives). Both attach bridges drop the stream
+  and then their `Input` on one blocking thread.
+- Both attach bridges write the viewer's input on a blocking thread, in
+  pieces of at most `ATTACH_MAX_MESSAGE`, and keep reading the socket
+  while one waits, up to a read-ahead of 1 MiB plus one message (on the
+  Daemon the plugin attach socket, `plugin_api.rs` `attach`, still takes
+  axum's default message size, so one message can be large). A viewer's
+  close is seen at once only while less than the read-ahead is queued
+  ahead of it; otherwise it is seen at the stall. A piece that waits
+  `WRITE_STALL` (30 s) ends the session with 1011 `the terminal took no
+  input for 30 s`; in Kubernetes mode the sidecar sends that close and
+  the Daemon relays it to the viewer (`attach::Ended`).
 - The vendored minified `xterm.js` trips gitleaks' `generic-api-key` rule
   on `…Key=void 0`; `.gitleaks.toml` keeps the default ruleset and
   allowlists exactly the three vendored files by anchored path. Anything

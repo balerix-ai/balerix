@@ -168,8 +168,15 @@ bytes both ways, a text frame must be a resize (`{ "resize": { "cols":
 120, "rows": 40 } }`) or the daemon closes with 1003; a resize with a
 zero dimension (what a hidden terminal's fit reports) is ignored, not
 refused. The daemon closes with 1000 when the window ends and 1011 on a
-runner failure. Both take the plugin's bearer on the handshake and answer
-the usual 401/403 before upgrading. Because `fleets/watch` sits beside
+runner failure, which includes a terminal that takes none of the
+plugin's input for 30 s (`the terminal took no input for 30 s`): input
+is written in pieces of at most 64 KiB, and the bound is per piece.
+While a piece waits the daemon reads ahead up to 1 MiB plus one message
+(this socket takes axum's default message size); a plugin's close is
+seen at once while less than that is queued ahead of it, otherwise at
+the 30 s bound.
+Both take the plugin's bearer on the handshake and answer the usual
+401/403 before upgrading. Because `fleets/watch` sits beside
 `fleets/{name}`, `watch` is not a fleet name: `up` refuses it.
 
 **Workspace** (Spec C §2.2). `diff` is the agent's worktree against the

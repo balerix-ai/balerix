@@ -32,8 +32,9 @@ pub use credentials::CredentialBundle;
 pub use fleet::{CrewSpec, FleetSpec, GitAuth, GitIdentity, GitSettings};
 pub use hook::{HOOK_EVENTS, HookEvent};
 pub use link::{
-    AgentTokens, FailureKind, LINK_MAX_MESSAGE, LINK_PROTOCOL, LINK_PROTOCOL_HEADER, LinkFailure,
-    LinkOp, LinkReply, LinkRequest, LinkResult, LinkStatus, SidecarFrame,
+    ATTACH_MAX_MESSAGE, AgentTokens, FailureKind, LINK_MAX_MESSAGE, LINK_PROTOCOL,
+    LINK_PROTOCOL_HEADER, LinkFailure, LinkOp, LinkReply, LinkRequest, LinkResult, LinkStatus,
+    SidecarFrame,
 };
 pub use plugin::{
     Capability, DeclaredPlugin, DeclaredPlugins, HelloRequest, HelloResponse, HookSubscriptions,

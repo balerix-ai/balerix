@@ -772,13 +772,10 @@ mod tests {
     }
 
     fn reported(phase: AgentPhase, message: &str, restarts: u32) -> balerix_api::AgentStatus {
-        balerix_api::AgentStatus {
-            phase,
-            message: message.into(),
-            restarts,
-            plugins: [("flow".to_string(), PluginActivation::active())].into(),
-            ..Default::default()
-        }
+        balerix_api::AgentStatus::new(phase)
+            .with_message(message)
+            .with_restarts(restarts)
+            .with_plugins([("flow".to_string(), PluginActivation::active())].into())
     }
 
     fn cond<'a>(status: &'a AgentStatus, type_: &str) -> (&'a str, &'a str, &'a str) {

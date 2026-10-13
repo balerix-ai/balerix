@@ -352,13 +352,7 @@ mod tests {
     }
 
     fn event(name: &str) -> HookEvent {
-        HookEvent {
-            agent: "f/c/a".into(),
-            name: name.into(),
-            session_id: None,
-            received_at: Timestamp(1),
-            payload: json!({}),
-        }
+        HookEvent::new("f/c/a", name, Timestamp(1), json!({}))
     }
 
     #[tokio::test]

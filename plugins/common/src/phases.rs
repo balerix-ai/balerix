@@ -109,11 +109,7 @@ mod tests {
         for (id, phase, message) in agents {
             record.status.agents.insert(
                 (*id).to_string(),
-                AgentStatus {
-                    phase: *phase,
-                    message: (*message).to_string(),
-                    ..Default::default()
-                },
+                AgentStatus::new(*phase).with_message((*message).to_string()),
             );
         }
         vec![record]

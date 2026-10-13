@@ -3,5 +3,5 @@
   "direction": "plugin-to-daemon",
   "request": null,
   "status": 200,
-  "response": { "path": "src", "entries": [ { "name": "lib.rs", "kind": "file", "size": 13 } ] }
+  "response": { "path": "src", "entries": [ { "name": "lib.rs", "kind": "file", "size": 13 } ], "truncated": false }
 }

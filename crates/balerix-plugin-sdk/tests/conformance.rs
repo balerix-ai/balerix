@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use balerix_api::{
-    DownQuery, FleetRecord, HookEvent, InterceptResponse, PluginAction, WorkspaceDiff,
+    DownQuery, FleetRecord, HookEvent, InterceptResponse, PluginAction, WORKSPACE_TREE_ENTRY_LIMIT,
+    WorkspaceDiff,
 };
 use balerix_plugin_sdk::testing::FakeHost;
 use balerix_plugin_sdk::{Host, Plugin, bind, run};
@@ -544,4 +545,30 @@ async fn the_host_streams_match_their_fixtures() {
         "GET /v1/plugin-host/agents/payments/backend/bob/attach"
     );
     assert_eq!(fake.attaches(), vec!["payments/backend/bob".to_string()]);
+}
+
+/// `FakeHost` cuts a tree at the daemon's entry cap and sets `truncated`,
+/// as the daemon does; a directory at the cap is whole. Built from outside
+/// `balerix-api`, as a plugin's test would.
+#[tokio::test]
+async fn the_fake_host_cuts_a_tree_at_the_entry_cap() {
+    let fake = FakeHost::start("tok", json!({}), vec![]).await;
+    let host = Host::new(fake.env("flow", Path::new("/s"))).unwrap();
+    let files = |n: usize| -> BTreeMap<String, Vec<u8>> {
+        (0..n).map(|i| (format!("d/f{i:05}"), Vec::new())).collect()
+    };
+    let diff = WorkspaceDiff::new("origin/main", "m", "h", vec![]);
+    fake.set_workspace("f/c/a", diff.clone(), files(WORKSPACE_TREE_ENTRY_LIMIT));
+    let whole = host.workspace_tree("f/c/a", "d").await.unwrap();
+    assert!(!whole.truncated);
+    assert_eq!(whole.entries.len(), WORKSPACE_TREE_ENTRY_LIMIT);
+    fake.set_workspace("f/c/a", diff, files(WORKSPACE_TREE_ENTRY_LIMIT + 2));
+    let cut = host.workspace_tree("f/c/a", "d").await.unwrap();
+    assert!(cut.truncated);
+    assert_eq!(cut.entries.len(), WORKSPACE_TREE_ENTRY_LIMIT);
+    assert_eq!(cut.entries[0].name, "f00000");
+    assert_eq!(
+        cut.entries.last().unwrap().name,
+        format!("f{:05}", WORKSPACE_TREE_ENTRY_LIMIT - 1)
+    );
 }

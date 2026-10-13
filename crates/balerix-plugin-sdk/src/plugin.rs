@@ -471,13 +471,7 @@ mod tests {
         )
         .await;
         assert_eq!(s, 200);
-        let event = HookEvent {
-            agent: "f/c/a".into(),
-            name: "Stop".into(),
-            session_id: None,
-            received_at: Timestamp(1),
-            payload: json!({}),
-        };
+        let event = HookEvent::new("f/c/a", "Stop", Timestamp(1), json!({}));
         let (s, v) = post(
             &format!("{base}/v1/intercept"),
             "tok",

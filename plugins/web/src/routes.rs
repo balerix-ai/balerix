@@ -1149,10 +1149,7 @@ mod tests {
         let never = std::future::pending::<Result<balerix_api::WorkspaceVersion, SdkError>>();
         assert_eq!(bounded_version("a", never, short, &failures).await, None);
         assert_eq!(failures.get(), 1);
-        let v = balerix_api::WorkspaceVersion {
-            head: "h".into(),
-            fingerprint: "f".into(),
-        };
+        let v = balerix_api::WorkspaceVersion::new("h", "f");
         let quick = std::future::ready(Ok(v.clone()));
         assert_eq!(bounded_version("a", quick, short, &failures).await, Some(v));
         let routine = std::future::ready(Err(SdkError::Status {

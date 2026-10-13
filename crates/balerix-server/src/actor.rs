@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use balerix_api::{AgentPhase, CredentialBundle, FleetSpec, Timestamp};
+use balerix_api::{AgentPhase, AgentStatus, CredentialBundle, FleetSpec, Timestamp};
 use balerix_core::reconcile::{
     ReconcileContext, agent_ready, finish_pass, reconcile_pass, set_desired,
 };
@@ -488,7 +488,13 @@ impl Actor {
     /// downed fleet records nothing (its view of the pods ended with the
     /// down) and stops an agent whose first frame reports otherwise: the
     /// down may have landed while that link was away.
-    async fn link_status(&mut self, agent: AgentId, status: balerix_api::LinkStatus, first: bool) {
+    async fn link_status(
+        &mut self,
+        agent: AgentId,
+        mut status: balerix_api::LinkStatus,
+        first: bool,
+    ) {
+        known_phase(&mut status.status);
         let reported_stopped = status.status.phase == AgentPhase::Stopped;
         if matches!(self.record.desired, Desired::Down { .. }) {
             if first && !reported_stopped {
@@ -668,8 +674,46 @@ impl Actor {
     }
 }
 
+/// The daemon never stores or serves `AgentPhase::Unknown`. A sidecar
+/// newer than the daemon may report a phase this build does not know (it
+/// reads as `Unknown`): it is mirrored as `Starting`, neither ready nor
+/// failed, with a message that says so.
+fn known_phase(status: &mut AgentStatus) {
+    if status.phase == AgentPhase::Unknown {
+        status.phase = AgentPhase::Starting;
+        if status.message.is_empty() {
+            status.message = "the sidecar reported a phase this daemon does not know".into();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_unknown_phase_from_a_sidecar_is_mirrored_as_starting() {
+        let mut st: AgentStatus = serde_json::from_value(serde_json::json!({
+            "phase": "hibernating", "restarts": 2
+        }))
+        .unwrap();
+        assert_eq!(st.phase, AgentPhase::Unknown);
+        known_phase(&mut st);
+        assert_eq!(st.phase, AgentPhase::Starting);
+        assert_eq!(
+            st.message,
+            "the sidecar reported a phase this daemon does not know"
+        );
+        assert_eq!(st.restarts, 2);
+        let mut said = AgentStatus::new(AgentPhase::Unknown).with_message("busy");
+        known_phase(&mut said);
+        assert_eq!(
+            (said.phase, said.message.as_str()),
+            (AgentPhase::Starting, "busy")
+        );
+        let mut ready = AgentStatus::new(AgentPhase::Ready);
+        known_phase(&mut ready);
+        assert_eq!(ready, AgentStatus::new(AgentPhase::Ready));
+    }
     use super::*;
     use crate::testing::Harness;
     use balerix_api::{AgentSettings, AgentStatus, CrewSpec, FleetPhase, GitSettings};
@@ -1033,11 +1077,10 @@ mod tests {
         record.status.generation = 1;
         record.status.agents.insert(
             "f/c/a".to_string(),
-            AgentStatus {
-                applied_hash: Some(hash),
-                next_restart_at: Some(Timestamp(500)), // already in FakeClock's past (1_000)
-                ..AgentStatus::default()
-            },
+            // already in FakeClock's past (1_000)
+            AgentStatus::default()
+                .with_applied_hash(Some(hash))
+                .with_next_restart_at(Some(Timestamp(500))),
         );
         let (shared, _purged, _pool) = ready_shared();
         let handle = spawn(

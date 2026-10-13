@@ -65,13 +65,12 @@ mod tests {
 
     #[test]
     fn pass_through_allows_everything_with_no_actions() {
-        let e = HookEvent {
-            agent: "f/c/a".into(),
-            name: "PreToolUse".into(),
-            session_id: None,
-            received_at: Timestamp(1),
-            payload: json!({ "tool_name": "Bash" }),
-        };
+        let e = HookEvent::new(
+            "f/c/a",
+            "PreToolUse",
+            Timestamp(1),
+            json!({ "tool_name": "Bash" }),
+        );
         let h: &dyn EventHandler = &PassThrough;
         let out = block_on(h.handle(&e));
         assert_eq!(out, Outcome::allow());

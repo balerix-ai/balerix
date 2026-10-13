@@ -280,15 +280,32 @@ async fn metrics(State(state): State<AppState>) -> Response {
         let handle = tokio::spawn(async move { client.metrics(&addr, SCRAPE_TIMEOUT).await });
         scrapes.push((name, handle));
     }
+    // Seeded with the daemon's own families: a scrape sharing a name
+    // with them or with an earlier plugin's is dropped whole (#224).
+    let mut merge = crate::plugin_api::MetricsMerge::new(state.daemon.metrics().families());
     for (name, handle) in scrapes {
         match handle.await {
-            Ok(Ok(text)) if crate::plugin_api::families_ok(&text, name.as_str()) => {
-                body.push_str(&text);
-                if !text.ends_with('\n') {
-                    body.push('\n');
+            Ok(Ok(text)) => match merge.admit(name.as_str(), &text) {
+                Ok(()) => {
+                    body.push_str(&text);
+                    if !text.ends_with('\n') {
+                        body.push('\n');
+                    }
                 }
-            }
-            Ok(Ok(_)) => state.daemon.metrics().scrape_failure(name.as_str()),
+                Err(crate::plugin_api::Dropped::Rule) => {
+                    state.daemon.metrics().scrape_failure(name.as_str());
+                }
+                Err(crate::plugin_api::Dropped::Collides {
+                    name: family,
+                    owner,
+                }) => {
+                    tracing::warn!(
+                        plugin = %name,
+                        "metrics scrape dropped: {family} is already {owner}'s"
+                    );
+                    state.daemon.metrics().scrape_failure(name.as_str());
+                }
+            },
             Ok(Err(e)) => {
                 tracing::debug!(plugin = %name, "metrics scrape failed: {e}");
                 state.daemon.metrics().scrape_failure(name.as_str());

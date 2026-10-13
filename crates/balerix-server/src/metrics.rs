@@ -33,6 +33,10 @@ struct Inner {
     plugin_actions: IntCounterVec,
     plugin_metrics_scrape_failures: IntCounterVec,
     proxy_requests: IntCounterVec,
+    /// Every family registered above, sampled yet or not: `encode` leaves
+    /// out a vector with no children, and a plugin must not claim one of
+    /// these names while it is empty either (#224).
+    families: Vec<String>,
 }
 
 /// Why observer events never reached their plugin: the
@@ -150,6 +154,7 @@ impl Metrics {
             ),
             &["plugin", "status"],
         )?;
+        let mut families = Vec::new();
         for c in [
             Box::new(fleets.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(agents.clone()),
@@ -167,6 +172,7 @@ impl Metrics {
             Box::new(plugin_metrics_scrape_failures.clone()),
             Box::new(proxy_requests.clone()),
         ] {
+            families.extend(c.desc().iter().map(|d| d.fq_name.clone()));
             registry.register(c)?;
         }
         Ok(Self {
@@ -187,8 +193,14 @@ impl Metrics {
                 plugin_actions,
                 plugin_metrics_scrape_failures,
                 proxy_requests,
+                families,
             }),
         })
+    }
+
+    /// The daemon's own family names, whether or not `encode` shows them.
+    pub fn families(&self) -> &[String] {
+        &self.inner.families
     }
 
     pub fn encode(&self) -> String {

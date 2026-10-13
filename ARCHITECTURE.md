@@ -398,9 +398,13 @@ makes an existing remote branch its clone's branch and start point
 - **Plugin metrics are registered through the SDK.** `Metrics` prefixes
   every family, so an SDK plugin cannot trip the daemon's prefix rule
   (§17.4).
-- **Plugin metrics are re-exported only under `balerix_plugin_<name>_`.** A
-  body with any other family is dropped whole, so a plugin cannot spoof the
-  daemon's own series.
+- **Plugin metrics are re-exported only under `balerix_plugin_<name>_`**
+  (`-` in the name written `_`). A body with any other family, with a
+  name outside Prometheus's grammar, or with a name the daemon or an
+  earlier plugin already exposes (the daemon's own `balerix_plugin_*`
+  families included, sampled or not), is dropped whole, so a plugin
+  cannot spoof the daemon's own series, another plugin's, or break the
+  exposition.
 - **The proxy is a byte-level passthrough.** hyper's legacy client
   forwards any method and streams responses; a 101 is upgraded on both
   sides and `copy_bidirectional` does the rest, so the daemon parses no

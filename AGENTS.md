@@ -506,8 +506,20 @@ credentials, hook input, or sandbox rules.
   `HTTP_PROXY` in the daemon's environment would otherwise capture loopback
   calls.
 - Plugin `/v1/metrics` bodies must carry only `balerix_plugin_<name>_`
-  families or the whole body is dropped (counted in
-  `balerix_plugin_metrics_scrape_failures_total`).
+  families (`-` in the name written `_`, #224), each a valid Prometheus
+  name, or the whole body is dropped (counted in
+  `balerix_plugin_metrics_scrape_failures_total`). The SDK's
+  `Metrics::family` and the daemon's `plugin_api::families_ok` each
+  apply that mapping (the daemon cannot depend on the SDK); change both.
+  `/metrics` also drops, whole, a scrape that shares a name with one
+  already merged (`plugin_api::MetricsMerge`): the daemon's own families
+  (`Metrics::families`, sampled or not; several sit under
+  `balerix_plugin_`) first, then the plugins in list order. A name and
+  its `_bucket`/`_sum`/`_count`/`_total`/`_created` forms count as one.
+  Each drop logs the name and its earlier owner and counts a scrape
+  failure. That is what stops `a`'s `b_x` and `a-b`'s `x` (both
+  `balerix_plugin_a_b_x`), or a plugin `events`'s `total`, reaching the
+  exposition twice.
 - The SDK's `Plugin` trait uses return-position `impl Future + Send`;
   implement methods as `async fn` in the impl block (the compiler accepts
   that), and keep `Send` state (`Mutex`, not `RefCell`).
@@ -526,7 +538,7 @@ credentials, hook input, or sandbox rules.
   place, with no `deactivate` before it, and resets through the hash check;
   a rejected `update` therefore changes nothing (§17.9).
 - `Plugin::metrics` returns `Option<&Metrics>`; register families through
-  `Metrics` (short names, the SDK adds `balerix_plugin_<name>_`). A plugin
+  `Metrics` (short names, the SDK adds `balerix_plugin_<name>_`, `-` as `_`). A plugin
   in another language must apply the prefix itself or its whole scrape is
   dropped.
 - Test a plugin through `balerix_plugin_sdk::testing::Harness`: it serves

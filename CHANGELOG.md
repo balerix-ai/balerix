@@ -114,6 +114,20 @@
   cleanup Jobs no longer have one either; they are deleted an hour after
   they finish (`ttlSecondsAfterFinished: 3600`). A harvest or cleanup
   still under way at the upgrade starts again once.
+- A plugin whose name contains `-` now has its metric families under
+  `balerix_plugin_<name>_`, with `-` in the name written as `_` (#224):
+  `my-plugin`'s are `balerix_plugin_my_plugin_…`. Registering any family
+  used to fail for such a plugin. Upgrade the daemon and the plugin's
+  SDK together, to this release: an older daemon expects the hyphenated
+  prefix and drops the whole scrape of a hyphenated plugin built on the
+  new SDK. A plugin that formats its own text must use the new prefix.
+  The daemon now also drops a plugin's whole scrape when a family name
+  is outside Prometheus's `[a-zA-Z_:][a-zA-Z0-9_:]*`, or when it shares
+  a name with one of the daemon's own families (several sit under
+  `balerix_plugin_`, such as `balerix_plugin_events_total`) or with an
+  earlier plugin's (`a`'s `b_x` and `a-b`'s `x` are both
+  `balerix_plugin_a_b_x`); the log names the clash and
+  `balerix_plugin_metrics_scrape_failures_total` counts it.
 
 ## 0.2.4 - 2026-10-10
 

@@ -873,3 +873,16 @@ credentials or the gh token (Spec L-3).
   fresh start (a new status comment, no branch line in the prompt) and a
   comment without one is ignored. §10's "row kept" holds for those seven
   days (#97).
+- The daemon deactivates an agent from inside the apply that drops it,
+  so `end`'s `Deactivate` is queued behind whatever the actor already
+  holds, a mention included. Per agent, the actor lists the calls its
+  own applies queue, in order: a `Deactivate` for each `end`, an
+  `Activate` for each `start`. An arriving call takes the list up to its
+  first match, so one that never came (the daemon's pairing is best
+  effort) is written off by the next call after it; a queue gap clears
+  every list. A `Deactivate` with an `Activate` still listed after it was
+  overtaken by a `start` and is ignored whole. Otherwise it deleted the
+  resumed row, and the `Activate` after it rebuilt the row with
+  `installation: 0` and no head, base or status comment (#257). A call
+  not listed is the daemon's own and acts as before. The lists are in
+  memory: a restart between the two loses them, the old behaviour.

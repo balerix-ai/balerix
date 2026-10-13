@@ -1,7 +1,7 @@
 //! The actor (Spec M §8): the one task that owns every piece of state
 //! and executes the command loop. Generic over `GitHubPort` (M-11).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -229,6 +229,9 @@ pub struct Actor<G: GitHubPort> {
     ended_notice: HashMap<String, ()>,
     /// What the first prompt needs, kept from `start` until `SessionStart`.
     first_prompts: HashMap<String, FirstPrompt>,
+    /// Per agent, the `Deactivate`s (`end`) and `Activate`s (`start`) our
+    /// own applies made the daemon queue, in apply order (#257).
+    expected: HashMap<String, VecDeque<Expect>>,
     /// Markers evicted inside a sync path, reported on the next tick.
     unconfirmed_queue: Vec<(Sent, Unconfirmed)>,
     /// Wall-clock seconds; a test pins it.
@@ -263,6 +266,7 @@ impl<G: GitHubPort> Actor<G> {
             held: HashMap::new(),
             ended_notice: HashMap::new(),
             first_prompts: HashMap::new(),
+            expected: HashMap::new(),
             unconfirmed_queue: Vec::new(),
             now_secs: unix_now,
         }
@@ -287,6 +291,8 @@ impl<G: GitHubPort> Actor<G> {
             // A dropped command may have held hook events (Spec G-11).
             if queue.take_gap() {
                 self.deliveries.lose_track();
+                // a dropped command may have been one of them
+                self.expected.clear();
             }
         }
     }
@@ -305,15 +311,24 @@ impl<G: GitHubPort> Actor<G> {
         }
         match command {
             Command::Configure(_) => unreachable!("handled above"),
-            Command::Activate { agent, config } => self.on_activate(agent, config).await,
+            Command::Activate { agent, config } => {
+                self.arrived(&agent, Expect::Activate);
+                self.on_activate(agent, config).await
+            }
             // The daemon deactivates every agent an apply drops, including
             // the one `end` just removed. Memory is forgotten either way;
             // the KV row goes only while it is still open (the daemon took
             // away an agent the plugin did not end). A closed row stays:
             // §10's "dropped on Deactivate" loses to its own "row kept with
             // closed = true … the resume case", which the ended reply and
-            // the resume need.
+            // the resume need. One that `end` caused and a `start` has
+            // since overtaken is ignored whole (#257): the row, status and
+            // config are the resumed session's.
             Command::Deactivate { agent } => {
+                if self.arrived(&agent, Expect::Deactivate) {
+                    tracing::debug!("github: a stale deactivate for {agent}, resumed since");
+                    return;
+                }
                 self.agents.remove(&agent);
                 self.questions.clear(&self.host, &agent).await;
                 self.deliveries.forget(&agent);
@@ -822,6 +837,9 @@ impl<G: GitHubPort> Actor<G> {
         }
         self.counters.applies.with_label_values(&["ok"]).inc();
         self.faults.ok(Fault::Apply);
+        // A `Deactivate` an earlier `end` caused may still be queued
+        // behind this command; the row it would drop is reopened below.
+        self.expect(&agent, Expect::Activate);
         if let Err(e) = session::set_repo_of_fleet(&self.host, &fleet, repo).await {
             tracing::warn!("github: writing repo/{fleet}: {e}");
         }
@@ -903,6 +921,33 @@ impl<G: GitHubPort> Actor<G> {
         self.post(installation, repo, number, message, "notice")
             .await;
         self.react(installation, repo, target, CONFUSED).await;
+    }
+
+    fn expect(&mut self, agent: &str, call: Expect) {
+        self.expected
+            .entry(agent.to_string())
+            .or_default()
+            .push_back(call);
+    }
+
+    /// `call` for `agent` arrived. The queue is FIFO, so whatever we
+    /// expected before the first matching entry never came (the daemon's
+    /// pairing is best effort) and goes with it. `true` for a stale
+    /// `Deactivate`: one a later `start` has overtaken. A call we did not
+    /// expect is the daemon's own and is never stale.
+    fn arrived(&mut self, agent: &str, call: Expect) -> bool {
+        let Some(list) = self.expected.get_mut(agent) else {
+            return false;
+        };
+        let Some(i) = list.iter().position(|c| *c == call) else {
+            return false;
+        };
+        list.drain(..=i);
+        let stale = call == Expect::Deactivate && list.contains(&Expect::Activate);
+        if list.is_empty() {
+            self.expected.remove(agent);
+        }
+        stale
     }
 
     /// A row rebuilt by `on_activate` carries `installation: 0`, and an App
@@ -1597,6 +1642,9 @@ impl<G: GitHubPort> Actor<G> {
         }
         self.counters.applies.with_label_values(&["ok"]).inc();
         self.faults.ok(Fault::Apply);
+        // The daemon deactivates the agent from inside that apply; the
+        // command lands behind whatever is already queued (#257).
+        self.expect(agent, Expect::Deactivate);
         self.line(agent, reason);
         // The apply makes the daemon deactivate the agent, which drops its
         // status: the final line goes out now, not on a later tick.
@@ -1903,6 +1951,13 @@ fn idle_wording(d: Duration) -> String {
 
 fn status_line(event: &HookEvent) -> String {
     render::event_message(event).replace("**", "")
+}
+
+/// A daemon call one of our own applies queued (#257).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    Activate,
+    Deactivate,
 }
 
 fn head_or_default(
@@ -2314,6 +2369,147 @@ mod tests {
             "a closed row stays for the resume"
         );
         assert!(!a.agents.contains_key(agent));
+    }
+
+    /// The daemon's pairing is best effort: an owed `Deactivate` that
+    /// never comes is written off by the `Activate` after it, so the
+    /// daemon's own later `Deactivate` is acted on.
+    #[tokio::test]
+    async fn a_lost_deactivate_does_not_swallow_a_later_real_one() {
+        let (fake, _port, mut a) = started().await;
+        a.handle(close()).await;
+        // its Deactivate is lost
+        a.handle(comment(12, "alice", 70, "@balerix go on")).await;
+        a.handle(Command::Activate {
+            agent: AGENT.into(),
+            config: AgentConfig::default(),
+        })
+        .await;
+        assert!(a.expected.is_empty());
+        a.handle(Command::Deactivate {
+            agent: AGENT.into(),
+        })
+        .await;
+        assert!(a.sessions.get(AGENT).is_none(), "the open row goes");
+        assert!(fake.kv_json(&format!("session/{AGENT}")).is_none());
+    }
+
+    fn pr_mention(id: u64, body: &str) -> Command {
+        Command::Webhook(WebhookEvent::Comment {
+            repo: "acme/api".into(),
+            installation: 7,
+            number: 34,
+            author: user("alice"),
+            comment_id: id,
+            body: body.into(),
+            is_pr: true,
+        })
+    }
+
+    /// #257: the daemon deactivates from inside `end`'s apply, so the
+    /// `Deactivate` lands behind a mention already queued; once that
+    /// mention has reopened the row, the late `Deactivate` leaves it be.
+    #[tokio::test]
+    async fn a_late_deactivate_leaves_a_resumed_row_intact() {
+        let (fake, port, mut a) = pr_session().await;
+        port.set_issue(
+            "acme/api",
+            34,
+            IssueInfo {
+                title: "t".into(),
+                body: "b".into(),
+                url: "u".into(),
+                pr: Some(("feature/x".into(), "acme/api".into(), "main".into())),
+            },
+        );
+        let before = a.sessions.get(PR_AGENT).cloned().unwrap();
+        assert_eq!(before.installation, 7);
+        assert_eq!(before.head.as_deref(), Some("feature/x"));
+        assert_eq!(before.status_comment, Some(1001));
+        a.handle(Command::Webhook(WebhookEvent::Closed {
+            repo: "acme/api".into(),
+            installation: 7,
+            number: 34,
+            merged: false,
+        }))
+        .await;
+        a.handle(pr_mention(70, "@balerix go on")).await;
+        a.handle(Command::Deactivate {
+            agent: PR_AGENT.into(),
+        })
+        .await;
+        a.handle(Command::Activate {
+            agent: PR_AGENT.into(),
+            config: crate::config::parse_agent(&json!({ "kind": "pr", "number": 34 })).unwrap(),
+        })
+        .await;
+        let row = a.sessions.get(PR_AGENT).cloned().unwrap();
+        assert!(!row.closed);
+        assert_eq!(row.installation, 7);
+        assert_eq!(row.head.as_deref(), Some("feature/x"));
+        assert_eq!(row.base.as_deref(), Some("main"));
+        assert_eq!(row.status_comment, Some(1001));
+        let stored = fake.kv_json(&format!("session/{PR_AGENT}")).unwrap();
+        assert_eq!(stored["status_comment"], 1001, "{stored}");
+        assert!(a.agents.contains_key(PR_AGENT));
+        assert!(
+            a.first_prompts.contains_key(PR_AGENT),
+            "the prompt still waits"
+        );
+        // the next apply still carries the branch
+        a.handle(Command::Webhook(WebhookEvent::Closed {
+            repo: "acme/api".into(),
+            installation: 7,
+            number: 34,
+            merged: true,
+        }))
+        .await;
+        let applied = fake.applied_fleets();
+        assert_eq!(
+            applied[applied.len() - 2].1["crews"]["repo"]["agents"]["pr-34"]["branch"],
+            "feature/x"
+        );
+        // an owed Deactivate with no resume in between drops memory as before
+        a.handle(Command::Deactivate {
+            agent: PR_AGENT.into(),
+        })
+        .await;
+        assert!(!a.agents.contains_key(PR_AGENT));
+        assert!(a.sessions.get(PR_AGENT).unwrap().closed, "closed row kept");
+        assert!(a.expected.is_empty());
+    }
+
+    /// Two end-and-resume rounds before the daemon's calls are handled:
+    /// they arrive as Deactivate, Activate, Deactivate, Activate, and both
+    /// Deactivates are stale (clearing on the first Activate would drop
+    /// the row at the second).
+    #[tokio::test]
+    async fn two_late_deactivates_after_two_resumes_are_both_ignored() {
+        let (_fake, _port, mut a) = started().await;
+        for id in [70, 71] {
+            a.handle(close()).await;
+            a.handle(comment(12, "alice", id, "@balerix go on")).await;
+        }
+        for _ in 0..2 {
+            a.handle(Command::Deactivate {
+                agent: AGENT.into(),
+            })
+            .await;
+            let row = a.sessions.get(AGENT).unwrap();
+            assert!(!row.closed && row.installation == 7 && row.status_comment.is_some());
+            a.handle(Command::Activate {
+                agent: AGENT.into(),
+                config: AgentConfig::default(),
+            })
+            .await;
+        }
+        assert!(a.expected.is_empty());
+        // and the daemon taking the agent away itself still drops the row
+        a.handle(Command::Deactivate {
+            agent: AGENT.into(),
+        })
+        .await;
+        assert!(a.sessions.get(AGENT).is_none());
     }
 
     #[tokio::test]

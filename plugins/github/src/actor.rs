@@ -32,6 +32,7 @@ use crate::status::Status;
 use crate::webhook::{Author, WebhookEvent};
 
 pub use balerix_plugin_common::queue::{Health, QUEUE};
+use balerix_plugin_common::queue::{Lane, Laned};
 pub type Queue = balerix_plugin_common::queue::Queue<Command>;
 
 /// `main` pushes `Tick` this often: delivery expiry, status flushes, the
@@ -68,6 +69,30 @@ pub enum Command {
     Tick,
     /// The webhook listener's `serve` returned: its error.
     ListenerFailed(String),
+}
+
+/// #260: only events and phases may be dropped under backpressure. A
+/// webhook is kept, or refused with a 503: GitHub marks the delivery
+/// failed but does not retry it, so it is lost unless redelivered.
+impl Laned for Command {
+    fn lane(&self) -> Lane {
+        match self {
+            Command::Configure(_)
+            | Command::Activate { .. }
+            | Command::Deactivate { .. }
+            | Command::ListenerFailed(_) => Lane::Control,
+            Command::Webhook(_) => Lane::Inbound,
+            Command::Events(_) | Command::Phases(_) => Lane::Lossy,
+            Command::Tick => Lane::Latest,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Command::Webhook(ev) => ev.bytes(),
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -290,13 +315,16 @@ impl<G: GitHubPort> Actor<G> {
     pub async fn run(mut self, queue: Arc<Queue>) {
         loop {
             let command = queue.pop().await;
-            self.handle(command).await;
-            // A dropped command may have held hook events (Spec G-11).
+            // Dropped events may have confirmed a prompt (Spec G-11).
+            // Asked before `handle`, so the command in hand — a webhook
+            // that arrived after the drop — meets the tracking already
+            // lost.
             if queue.take_gap() {
+                // Not `expected`: Activate and Deactivate are never
+                // dropped, so a gap loses none of what it lists.
                 self.deliveries.lose_track();
-                // a dropped command may have been one of them
-                self.expected.clear();
             }
+            self.handle(command).await;
         }
     }
 

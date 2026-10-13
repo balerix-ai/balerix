@@ -45,7 +45,7 @@ impl Launcher for TestLauncher {
         let q = queue.clone();
         let l = Listener::new(
             config.webhook_secret.clone(),
-            move |ev| q.push(Command::Webhook(ev)),
+            move |ev| q.push(Command::Webhook(ev)).is_ok(),
             self.counters.webhooks.clone(),
         );
         tokio::spawn(balerix_plugin_github::webhook::serve(listener, l.router()));

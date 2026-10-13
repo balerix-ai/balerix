@@ -564,7 +564,7 @@ impl crate::plugin::Launcher for GitHubLauncher {
         let sink_queue = queue.clone();
         let webhook = Listener::new(
             config.webhook_secret.clone(),
-            move |ev| sink_queue.push(Command::Webhook(ev)),
+            move |ev| sink_queue.push(Command::Webhook(ev)).is_ok(),
             self.counters.webhooks.clone(),
         );
         // §11: the listener is one of the actor's three health kinds, so
@@ -572,14 +572,16 @@ impl crate::plugin::Launcher for GitHubLauncher {
         let listener_queue = queue.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::webhook::serve(listener, webhook.router()).await {
-                listener_queue.push(Command::ListenerFailed(e.to_string()));
+                // A control command: never refused (#260).
+                let _ = listener_queue.push(Command::ListenerFailed(e.to_string()));
             }
         });
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(TICK);
             loop {
                 interval.tick().await;
-                queue.push(Command::Tick);
+                // Never refused; merged into a tick already waiting.
+                let _ = queue.push(Command::Tick);
             }
         });
         Ok(())

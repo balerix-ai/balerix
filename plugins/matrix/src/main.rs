@@ -40,14 +40,18 @@ fn run() -> anyhow::Result<()> {
         let queue = plugin.queue();
         let phase_watch = tokio::spawn(balerix_plugin_common::phases::run(
             host.clone(),
-            move |changes| queue.push(Command::Phases(changes)),
+            // Never refused: a full bounded lane drops its oldest instead.
+            move |changes| {
+                let _ = queue.push(Command::Phases(changes));
+            },
         ));
         let tick_queue = plugin.queue();
         let ticker = tokio::spawn(async move {
             let mut interval = tokio::time::interval(balerix_plugin_matrix::actor::TICK);
             loop {
                 interval.tick().await;
-                tick_queue.push(Command::Tick);
+                // Never refused; merged into a tick already waiting.
+                let _ = tick_queue.push(Command::Tick);
             }
         });
         eprintln!("matrix: starting");

@@ -70,23 +70,26 @@ impl<L: Launcher> Plugin for GitHubPlugin<L> {
         self.launcher
             .launch(config.clone(), self.queue.clone())
             .await?;
-        self.queue.push(Command::Configure(config));
-        Ok(())
+        self.queue
+            .push(Command::Configure(config))
+            .map_err(|e| e.to_string())
     }
 
     /// Validated here rather than in the actor, so a bad block fails the
     /// operator's `up` instead of failing silently later.
     async fn activate(&self, agent: &str, config: Value) -> Result<(), String> {
         let config = parse_agent(&config).map_err(|e| e.to_string())?;
-        self.queue.push(Command::Activate {
-            agent: agent.to_string(),
-            config,
-        });
-        Ok(())
+        self.queue
+            .push(Command::Activate {
+                agent: agent.to_string(),
+                config,
+            })
+            .map_err(|e| e.to_string())
     }
 
     async fn deactivate(&self, agent: &str) {
-        self.queue.push(Command::Deactivate {
+        // A control command: never refused, never dropped (#260).
+        let _ = self.queue.push(Command::Deactivate {
             agent: agent.to_string(),
         });
     }
@@ -94,7 +97,8 @@ impl<L: Launcher> Plugin for GitHubPlugin<L> {
     /// Enqueue and return: this is a daemon-to-plugin call and must never
     /// wait on GitHub (Spec M §3).
     async fn observe(&self, events: Vec<HookEvent>) {
-        self.queue.push(Command::Events(events));
+        // Never refused: a full bounded lane drops its oldest instead.
+        let _ = self.queue.push(Command::Events(events));
     }
 
     async fn health(&self) -> Result<(), String> {
@@ -221,6 +225,36 @@ mod tests {
             p.health().await,
             Err("webhook listener: address in use".into())
         );
+    }
+
+    /// #260: control commands and webhooks are kept through a flood of
+    /// events that pushes the oldest batches out, and leave in order.
+    #[tokio::test]
+    async fn control_and_a_webhook_survive_a_flood_of_events() {
+        let (p, queue, _health) = plugin(FakeLauncher::default());
+        p.activate("f/c/issue-12", json!({ "kind": "issue", "number": 12 }))
+            .await
+            .unwrap();
+        queue
+            .push(Command::Webhook(crate::webhook::WebhookEvent::Closed {
+                repo: "acme/api".into(),
+                installation: 1,
+                number: 12,
+                merged: false,
+            }))
+            .unwrap();
+        for _ in 0..2048 {
+            p.observe(vec![event("f/c/alice", "Stop", json!({}))]).await;
+        }
+        p.deactivate("f/c/alice").await;
+        assert!(queue.take_gap());
+        assert!(matches!(queue.pop().await, Command::Activate { .. }));
+        assert!(matches!(queue.pop().await, Command::Webhook(_)));
+        for _ in 0..crate::actor::QUEUE {
+            assert!(matches!(queue.pop().await, Command::Events(_)));
+        }
+        assert!(matches!(queue.pop().await, Command::Deactivate { .. }));
+        assert!(queue.is_empty());
     }
 
     /// The whole surface over the real §4.2 wire format.

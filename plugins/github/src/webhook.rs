@@ -82,6 +82,53 @@ pub enum WebhookEvent {
 }
 
 impl WebhookEvent {
+    /// Roughly the bytes this event holds: its strings. What the queue's
+    /// inbound bound counts (#260).
+    pub fn bytes(&self) -> usize {
+        match self {
+            Self::IssueOpened {
+                repo,
+                author,
+                title,
+                body,
+                url,
+                ..
+            } => repo.len() + author.login.len() + title.len() + body.len() + url.len(),
+            Self::PrOpened {
+                repo,
+                author,
+                title,
+                body,
+                url,
+                head,
+                head_repo,
+                base,
+                ..
+            } => {
+                repo.len()
+                    + author.login.len()
+                    + title.len()
+                    + body.len()
+                    + url.len()
+                    + head.len()
+                    + head_repo.len()
+                    + base.len()
+            }
+            Self::Comment {
+                repo, author, body, ..
+            } => repo.len() + author.login.len() + body.len(),
+            Self::Closed { repo, .. } => repo.len(),
+            Self::ReviewSubmitted {
+                repo,
+                author,
+                state,
+                body,
+                commit,
+                ..
+            } => repo.len() + author.login.len() + state.len() + body.len() + commit.len(),
+        }
+    }
+
     pub fn repo(&self) -> &str {
         match self {
             Self::IssueOpened { repo, .. }
@@ -217,7 +264,8 @@ pub fn parse(event: &str, p: &Value) -> Option<WebhookEvent> {
 /// The listener's state.
 pub struct Listener {
     secret: Secret,
-    sink: Box<dyn Fn(WebhookEvent) + Send + Sync>,
+    /// Takes a parsed event; `false` when the actor's queue refused it.
+    sink: Box<dyn Fn(WebhookEvent) -> bool + Send + Sync>,
     counters: IntCounterVec,
     seen: Mutex<(VecDeque<String>, HashSet<String>)>,
 }
@@ -225,7 +273,7 @@ pub struct Listener {
 impl Listener {
     pub fn new(
         secret: Secret,
-        sink: impl Fn(WebhookEvent) + Send + Sync + 'static,
+        sink: impl Fn(WebhookEvent) -> bool + Send + Sync + 'static,
         counters: IntCounterVec,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -262,6 +310,14 @@ impl Listener {
         }
         false
     }
+
+    /// Forgets `id`, so a redelivery of a refused delivery is taken.
+    fn forget(&self, id: &str) {
+        let mut g = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if g.1.remove(id) {
+            g.0.retain(|seen| seen != id);
+        }
+    }
 }
 
 /// The `event` label for a verified delivery: the names `parse` knows,
@@ -295,8 +351,9 @@ async fn deliver(State(l): State<Arc<Listener>>, headers: HeaderMap, body: Bytes
         l.count(label, "handled");
         return StatusCode::OK.into_response();
     }
-    if let Some(id) = header("x-github-delivery")
-        && l.replayed(&id)
+    let delivery = header("x-github-delivery");
+    if let Some(id) = &delivery
+        && l.replayed(id)
     {
         l.count(label, "duplicate");
         return StatusCode::ACCEPTED.into_response();
@@ -307,8 +364,22 @@ async fn deliver(State(l): State<Arc<Listener>>, headers: HeaderMap, body: Bytes
     };
     match parse(&event, &payload) {
         Some(ev) => {
+            if !(l.sink)(ev) {
+                // #260: the actor is too far behind (`queue::KEPT`). GitHub
+                // does not retry a failed delivery by itself: this event is
+                // lost unless someone redelivers it, from the App's
+                // delivery log or its API. The 503 marks it failed there,
+                // the warning and `webhooks_total{outcome="refused"}` show
+                // it here, and the id is forgotten so that a redelivery,
+                // which keeps it, is taken.
+                if let Some(id) = &delivery {
+                    l.forget(id);
+                }
+                l.count(label, "refused");
+                tracing::warn!("github: refused a {label} delivery: the queue is full");
+                return (StatusCode::SERVICE_UNAVAILABLE, "queue full").into_response();
+            }
             l.count(label, "handled");
-            (l.sink)(ev);
         }
         None => l.count(label, "ignored"),
     }
@@ -453,12 +524,63 @@ mod tests {
             .unwrap();
         let l = Listener::new(
             Secret::new(secret),
-            move |e| {
-                let _ = tx.send(e);
-            },
+            move |e| tx.send(e).is_ok(),
             counters.clone(),
         );
         (l, rx, counters)
+    }
+
+    /// #260: a delivery the actor's queue refuses is a 503, which GitHub
+    /// records as failed; its id is forgotten, so a redelivery is taken.
+    #[tokio::test]
+    async fn a_refused_delivery_is_a_503_and_its_redelivery_is_taken() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let open = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let metrics = balerix_plugin_sdk::Metrics::new("github");
+        let counters = metrics
+            .int_counter_vec("webhooks_total", "t", &["event", "outcome"])
+            .unwrap();
+        let gate = open.clone();
+        let l = Listener::new(
+            Secret::new("s3cret"),
+            move |e| gate.load(Ordering::SeqCst) && tx.send(e).is_ok(),
+            counters.clone(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, l.router()));
+        let mut p = base("acme/api");
+        p["action"] = json!("created");
+        p["issue"] = json!({ "number": 12 });
+        p["comment"] =
+            json!({ "id": 5, "body": "hi", "user": { "login": "alice", "type": "User" } });
+        let body = serde_json::to_vec(&p).unwrap();
+        let c = reqwest::Client::new();
+        let post = || {
+            c.post(format!("http://{addr}/webhook"))
+                .header("X-Hub-Signature-256", sign("s3cret", &body))
+                .header("X-GitHub-Delivery", "d1")
+                .header("X-GitHub-Event", "issue_comment")
+                .body(body.clone())
+                .send()
+        };
+        assert_eq!(post().await.unwrap().status(), 503);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            counters
+                .with_label_values(&["issue_comment", "refused"])
+                .get(),
+            1
+        );
+        open.store(true, Ordering::SeqCst);
+        assert_eq!(post().await.unwrap().status(), 202, "the redelivery");
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WebhookEvent::Comment { comment_id: 5, .. }
+        ));
+        assert_eq!(post().await.unwrap().status(), 202);
+        assert!(rx.try_recv().is_err(), "and now a replay");
     }
 
     #[tokio::test]

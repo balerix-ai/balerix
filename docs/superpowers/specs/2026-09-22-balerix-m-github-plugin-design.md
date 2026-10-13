@@ -880,8 +880,9 @@ credentials or the gh token (Spec L-3).
   own applies queue, in order: a `Deactivate` for each `end`, an
   `Activate` for each `start`. An arriving call takes the list up to its
   first match, so one that never came (the daemon's pairing is best
-  effort) is written off by the next call after it; a queue gap clears
-  every list. A `Deactivate` with an `Activate` still listed after it was
+  effort) is written off by the next call after it. A queue gap leaves
+  the lists alone: it drops only hook events, never an `Activate` or a
+  `Deactivate` (#260). A `Deactivate` with an `Activate` still listed after it was
   overtaken by a `start` and is ignored whole. Otherwise it deleted the
   resumed row, and the `Activate` after it rebuilt the row with
   `installation: 0` and no head, base or status comment (#257). A call

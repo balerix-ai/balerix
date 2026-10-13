@@ -34,6 +34,11 @@ asset is attested (`gh attestation verify <file> --repo balerix-ai/balerix`).
   [server]
   bind = "127.0.0.1:7643"   # loopback only
   log = "info"              # a tracing filter
+  # The origin browsers reach the daemon by, when it is not the bind
+  # address (a reverse proxy, say). `plugin open` prints login URLs on it,
+  # and an https one makes the session cookie Secure. Also `serve
+  # --public-url`.
+  public_url = "https://balerix.example.test"
 
   [sandbox]
   # Read-only prefixes the git profile (balerix's own git in an agent's
@@ -44,6 +49,15 @@ asset is attested (`gh attestation verify <file> --repo balerix-ai/balerix`).
   # Which Unix sockets a sandboxed process may use (Linux): auto | mediate | deny | open.
   unix_sockets = "auto"
   ```
+  `public_url` is an origin only (scheme, host, optional port), never an
+  unspecified address. Without it a login URL names the daemon's own
+  address, or, for a daemon bound to `0.0.0.0` (Kubernetes mode), the
+  host and port the `plugin open` request reached it by: run `plugin open`
+  through the same address your browser will use (a `kubectl
+  port-forward`, say). The Daemon resource has no field for it yet. The
+  daemon does not trust `X-Forwarded-Proto`; behind a TLS-terminating
+  proxy, set an https `public_url` to get a `Secure` cookie.
+
   Each `git_read` entry must be an absolute path to an existing
   directory, not `/`, and clear of balerix's state, data and config
   roots; `serve` refuses to start otherwise

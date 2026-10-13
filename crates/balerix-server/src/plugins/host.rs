@@ -145,6 +145,7 @@ impl PluginHost {
             credentials: agent_ports.credentials.clone(),
             policy: agent_ports.policy.clone(),
             hook_url: agent_ports.hook_url.clone(),
+            browser: agent_ports.browser.clone(),
             resync: agent_ports.resync,
             kube: agent_ports.kube.clone(),
         });

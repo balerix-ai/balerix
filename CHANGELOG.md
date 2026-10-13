@@ -180,6 +180,16 @@
   request other than a plain `GET`/`HEAD` navigation (a `POST`, a
   WebSocket handshake) must carry `Sec-Fetch-Site` or `Origin`, which
   every current browser sends.
+- A Kubernetes-mode daemon bound to `0.0.0.0` printed login URLs on
+  `https://0.0.0.0:<port>`, which no browser can open, and its origin
+  check fell back to a `Host` header that HTTP/2 requests need not send.
+  A login URL now uses the new `[server] public_url` (or `serve
+  --public-url`) when set, else the daemon's own address unless it is
+  unspecified, else the host and port the `plugin open` request named;
+  the origin check reads HTTP/2's `:authority` when `Host` is absent. The
+  session cookie is now `Secure` when the daemon serves TLS or
+  `public_url` is https. `X-Forwarded-Proto` is not trusted: behind a
+  TLS-terminating proxy, set an https `public_url`.
 
 ## 0.2.4 - 2026-10-10
 

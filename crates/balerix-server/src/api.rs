@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::{CONTENT_TYPE, LOCATION, SET_COOKIE};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post};
@@ -559,6 +559,8 @@ async fn purge_plugin(
 /// (plugins spec §18.2). The admin token itself never enters the browser.
 async fn create_session(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
     b: Result<Json<SessionRequest>, JsonRejection>,
 ) -> Result<Json<SessionResponse>, ApiError> {
     let req = b
@@ -570,9 +572,21 @@ async fn create_session(
             format!("to: must be a path under {MOUNT_PREFIX}"),
         )
     })?;
+    // A daemon bound to an unspecified address with no public URL has no
+    // origin of its own: the login URL takes the authority this request
+    // reached it by, which is how the admin's own machine reaches it.
+    let base = state
+        .daemon
+        .login_base(request_authority(&headers, &uri))
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "no origin for a login URL: the request named no reachable host; set [server] public_url (serve --public-url)",
+            )
+        })?;
     let code = state.daemon.sessions().issue_code();
     Ok(Json(SessionResponse {
-        login_url: format!("{}/v1/login/{code}?to={to}", state.daemon.origin()),
+        login_url: format!("{base}/v1/login/{code}?to={to}"),
     }))
 }
 
@@ -789,10 +803,10 @@ fn authenticate_session(state: &AppState, scope: &str, req: &Request) -> Result<
     let sessions = state.daemon.sessions();
     let ids = cookie_values(headers, COOKIE);
     if scope_shape_ok(scope) && ids.iter().any(|id| sessions.is_valid_for(id, scope)) {
-        let authority = request_authority(headers);
-        let origin = Some(state.daemon.origin());
+        let authority = request_authority(headers, req.uri());
+        let origin = state.daemon.browser_origin();
         let upgrade = proxy::is_upgrade(headers);
-        if same_origin(req.method(), upgrade, headers, authority, origin) {
+        if same_origin(req.method(), upgrade, headers, authority, origin.as_deref()) {
             return Ok(());
         }
         tracing::warn!(
@@ -896,7 +910,7 @@ async fn login(
             );
             // The session's own path, and a cookie scoped to it alone.
             let location = scoped_target(&session.scope, &to);
-            let cookie = set_cookie(&session.id, &session.scope);
+            let cookie = set_cookie(&session.id, &session.scope, state.daemon.secure_cookie());
             no_referrer(
                 (
                     StatusCode::SEE_OTHER,

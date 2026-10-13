@@ -587,7 +587,9 @@ credentials, hook input, or sandbox rules.
 - Cookie-authenticated proxy requests need `Sec-Fetch-Site: same-origin`,
   or an `Origin` equal to the exact `http://127.0.0.1:<port>` of the login
   URL (`localhost` is another origin) or whose authority is the request's
-  `Host` (a WebSocket handshake through a reverse proxy: no
+  `Host`, else its URI authority (HTTP/2's `:authority`: the Kubernetes
+  daemon's TLS listener offers h2, and an h2 request may carry no `Host`;
+  `sessions::request_authority`) (a WebSocket handshake through a reverse proxy: no
   `Sec-Fetch-Site`, `Origin` the proxy's hostname — found by
   `verify-claude` behind one, as `[disconnected]` on the terminal page). A
   test client that sends none of them passes only on a `GET`/`HEAD` that

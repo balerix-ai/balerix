@@ -13,6 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use balerix_core::{FleetStore, ReconcilePolicy};
 use balerix_runtime::{Runtime, SocketPolicy, StateLayout, TmuxRunner, UnixSockets};
 use balerix_server::kube::{self, LinkHub, NoFiles, NoPool, serve_tls};
+use balerix_server::sessions::{Browser, parse_public_url};
 use balerix_server::{
     Daemon, FileFleetStore, Metrics, PluginClient, PluginEventHandler, PluginHostConfig, PluginKv,
     PluginRegistry, PluginSetup, Ports, ServerPaths, Vault, load_or_create_token, read_endpoint,
@@ -31,6 +32,10 @@ const DETACH_WAIT: Duration = Duration::from_secs(10);
 pub struct ServerConfig {
     pub bind: String,
     pub log: String,
+    /// `[server] public_url`: the origin browsers reach the daemon by, for
+    /// login URLs, the origin check and the cookie's `Secure`; validated
+    /// and normalized to `scheme://authority`.
+    pub public_url: Option<String>,
     /// `[sandbox] git_read`: read-only prefixes the git profile grants
     /// beside the system ones (#111), canonical and validated.
     pub git_read: Vec<PathBuf>,
@@ -63,6 +68,7 @@ struct SandboxTable {
 struct ServerTable {
     bind: Option<String>,
     log: Option<String>,
+    public_url: Option<String>,
 }
 
 impl ServerConfig {
@@ -80,6 +86,13 @@ impl ServerConfig {
                 .bind
                 .unwrap_or_else(|| "127.0.0.1:7643".to_string()),
             log: file.server.log.unwrap_or_else(|| "info".to_string()),
+            public_url: file
+                .server
+                .public_url
+                .as_deref()
+                .map(parse_public_url)
+                .transpose()
+                .map_err(|e| anyhow!("config.toml: server.public_url: {e}"))?,
             unix_sockets: file.sandbox.unix_sockets,
             git_read: file
                 .sandbox
@@ -169,6 +182,10 @@ pub fn serve_command(args: &ServeArgs) -> Result<String> {
     let paths = server_paths(&layout);
     let config = ServerConfig::load_for(&layout.config_root.join("config.toml"), &layout)?;
     let bind = args.bind.clone().unwrap_or_else(|| config.bind.clone());
+    let public_url = match &args.public_url {
+        Some(url) => Some(parse_public_url(url).map_err(|e| anyhow!("--public-url: {e}"))?),
+        None => config.public_url.clone(),
+    };
     match args.mode {
         ServeMode::Tmux => {
             if args.tls_cert.is_some()
@@ -182,13 +199,14 @@ pub fn serve_command(args: &ServeArgs) -> Result<String> {
             }
             require_loopback(&bind)?;
             if args.detach {
-                return detach(&paths, &bind, &args.tmux_socket);
+                return detach(&paths, &bind, args.public_url.as_deref(), &args.tmux_socket);
             }
             run(
                 &layout,
                 &paths,
                 &bind,
                 &config,
+                public_url,
                 &args.tmux_socket,
                 args.detached_child,
             )
@@ -214,6 +232,7 @@ pub fn serve_command(args: &ServeArgs) -> Result<String> {
                 &paths,
                 addr,
                 &config.log,
+                public_url,
                 &KubeFiles {
                     cert,
                     key,
@@ -279,6 +298,7 @@ fn run_kubernetes(
     paths: &ServerPaths,
     addr: SocketAddr,
     log: &str,
+    public_url: Option<String>,
     files: &KubeFiles<'_>,
 ) -> Result<String> {
     let KubeFiles {
@@ -318,6 +338,12 @@ fn run_kubernetes(
             credentials: Arc::new(HostResolver),
             policy: ReconcilePolicy::default(),
             hook_url: format!("https://{addr}"),
+            // the daemon serves TLS itself; bound to `0.0.0.0` it has no
+            // origin of its own unless a public URL names one
+            browser: Browser {
+                public_url,
+                tls: true,
+            },
             resync: RESYNC,
             kube: Some(hub),
         };
@@ -367,6 +393,7 @@ fn run(
     paths: &ServerPaths,
     bind: &str,
     config: &ServerConfig,
+    public_url: Option<String>,
     tmux_socket: &str,
     detached_child: bool,
 ) -> Result<String> {
@@ -405,6 +432,10 @@ fn run(
             credentials: Arc::new(HostResolver),
             policy: ReconcilePolicy::default(),
             hook_url: url.clone(),
+            browser: Browser {
+                public_url,
+                tls: false,
+            },
             resync: RESYNC,
             kube: None,
         };
@@ -525,7 +556,12 @@ async fn shutdown_signal() {
     }
 }
 
-fn detach(paths: &ServerPaths, bind: &str, tmux_socket: &str) -> Result<String> {
+fn detach(
+    paths: &ServerPaths,
+    bind: &str,
+    public_url: Option<&str>,
+    tmux_socket: &str,
+) -> Result<String> {
     if let Some(url) = already_running(paths)? {
         bail!("a balerix daemon is already running at {url}");
     }
@@ -536,15 +572,19 @@ fn detach(paths: &ServerPaths, bind: &str, tmux_socket: &str) -> Result<String> 
         .append(true)
         .open(paths.log())?;
     let exe = std::env::current_exe().context("cannot determine balerix's own path")?;
-    let mut child = Command::new(exe)
-        .args([
-            "serve",
-            "--bind",
-            bind,
-            "--tmux-socket",
-            tmux_socket,
-            "--detached-child",
-        ])
+    let mut command = Command::new(exe);
+    command.args([
+        "serve",
+        "--bind",
+        bind,
+        "--tmux-socket",
+        tmux_socket,
+        "--detached-child",
+    ]);
+    if let Some(url) = public_url {
+        command.args(["--public-url", url]);
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -608,6 +648,7 @@ mod tests {
         let config = ServerConfig {
             bind: "127.0.0.1:0".into(),
             log: "info".into(),
+            public_url: None,
             git_read: Vec::new(),
             unix_sockets: UnixSockets::Deny,
         };
@@ -643,6 +684,31 @@ mod tests {
         std::fs::write(&path, "[server]\nport = 1\n").unwrap();
         let e = load(&path).unwrap_err().to_string();
         assert!(e.contains("config.toml") && e.contains("port"), "{e}");
+    }
+
+    #[test]
+    fn public_url_is_validated_and_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let layout = StateLayout::xdg(
+            dir.path().join("state"),
+            dir.path().join("data"),
+            dir.path().join("config"),
+        );
+        let load = |p: &Path| ServerConfig::load_for(p, &layout);
+        assert_eq!(load(&path).unwrap().public_url, None);
+        std::fs::write(
+            &path,
+            "[server]\npublic_url = \"https://balerix.example.test/\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load(&path).unwrap().public_url.as_deref(),
+            Some("https://balerix.example.test")
+        );
+        std::fs::write(&path, "[server]\npublic_url = \"https://0.0.0.0:7643\"\n").unwrap();
+        let e = load(&path).unwrap_err().to_string();
+        assert!(e.contains("config.toml: server.public_url"), "{e}");
     }
 
     #[test]

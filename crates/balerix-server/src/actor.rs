@@ -110,6 +110,9 @@ pub struct Ports {
     pub policy: ReconcilePolicy,
     /// `http://127.0.0.1:<port>`; every agent's hooks post here.
     pub hook_url: String,
+    /// How browsers reach the plugin mount: the login URLs' origin and
+    /// the cookie's `Secure`. Not used by the reconciler.
+    pub browser: crate::sessions::Browser,
     pub resync: Duration,
     /// Spec O §7: set, this daemon is in Kubernetes mode: actors mirror
     /// sidecar status frames and run no planner; the runner and the

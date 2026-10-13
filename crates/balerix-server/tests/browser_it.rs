@@ -39,7 +39,7 @@ async fn a_login_code_becomes_a_cookie_once() {
     let url = v["login_url"].as_str().unwrap().to_string();
     // the harness origin is a placeholder (the e2e checks the real one);
     // what is asserted here is the path: a login route with a code in it
-    let origin = w.daemon.origin().to_string();
+    let origin = w.daemon.browser_origin().unwrap();
     assert!(url.starts_with(&format!("{origin}/v1/login/")), "{url}");
     let path = url.trim_start_matches(&origin).to_string();
     let code = path
@@ -139,7 +139,7 @@ fn login(w: &World, to: &str) -> (String, String, String) {
         .api
         .admin("POST", "/v1/sessions", Some(&json!({ "to": to })));
     assert_eq!(s, 200, "{v}");
-    let origin = w.daemon.origin().to_string();
+    let origin = w.daemon.browser_origin().unwrap();
     let path = v["login_url"]
         .as_str()
         .unwrap()
@@ -641,7 +641,7 @@ async fn a_session_url_admits_its_own_session_only() {
         (403, "{\"error\":\"cross-origin request refused\"}"),
         "a POST with neither Sec-Fetch-Site nor Origin"
     );
-    let origin = w.daemon.origin().to_string();
+    let origin = w.daemon.browser_origin().unwrap();
     let (s, _, text) = w.api.raw(
         "POST",
         &format!("{mount}post"),
@@ -721,4 +721,36 @@ async fn a_session_url_admits_its_own_session_only() {
         matches!(e, tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status() == 403),
         "{e}"
     );
+}
+
+/// HTTP/2 names the authority in `:authority` and may send no `Host`;
+/// hyper puts it in the request URI. An absolute-form HTTP/1.1 request
+/// with no `Host` arrives the same way, so the origin check is shown
+/// reading the URI's authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_host_the_origin_check_reads_the_uri_authority() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let w = world().await;
+    web_routes_up(&w).await;
+    let (cookie, mount, _) = login(&w, "/v1/plugins/web/");
+    let authority = w.api.base.trim_start_matches("http://").to_string();
+    let send = |origin: &'static str| {
+        let (authority, cookie, mount) = (authority.clone(), cookie.clone(), mount.clone());
+        async move {
+            let mut sock = tokio::net::TcpStream::connect(&authority).await.unwrap();
+            let req = format!(
+                "POST https://balerix.example.test{mount}post HTTP/1.1\r\nCookie: {cookie}\r\nOrigin: {origin}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nxx"
+            );
+            sock.write_all(req.as_bytes()).await.unwrap();
+            let mut out = String::new();
+            sock.read_to_string(&mut out).await.unwrap();
+            out.split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<u16>()
+                .unwrap()
+        }
+    };
+    assert_eq!(send("https://balerix.example.test").await, 200);
+    assert_eq!(send("https://evil.example").await, 403);
 }

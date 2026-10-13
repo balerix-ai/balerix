@@ -19,8 +19,12 @@ on:
         type: boolean
         default: false
 permissions: {}
+# A dry run has a group of its own, per ref: a queued dry run must never
+# replace a queued real release, nor a dry run of another release/<unit>
+# branch (GitHub keeps one pending run per group). A push has no inputs,
+# so it lands in `release-real`, as does a dispatch that is not a dry run.
 concurrency:
-  group: release
+  group: release-${{ inputs.dry-run && format('dry-{0}', github.ref) || 'real' }}
   cancel-in-progress: false
 env:
   # Each job installs only the tools it uses.

@@ -9,7 +9,8 @@ use serde_json::{Map, Value};
 
 use crate::ConfigError;
 
-/// Keys lifted from `~/.claude.json` into the credential bundle.
+/// Keys lifted from `.claude.json` (`~/.claude.json`, or
+/// `$CLAUDE_CONFIG_DIR/.claude.json`) into the credential bundle.
 const ACCOUNT_KEYS: &[&str] = &["oauthAccount", "hasCompletedOnboarding"];
 
 /// Where the host keeps Claude and gh state.
@@ -32,17 +33,21 @@ impl HostPaths {
 
     /// Pure resolution: `CLAUDE_CONFIG_DIR`, `GH_CONFIG_DIR`, `XDG_CONFIG_HOME`
     /// are honoured in that order of specificity, then dotfiles under `home`.
+    /// With `CLAUDE_CONFIG_DIR` set, Claude Code keeps `.claude.json` in
+    /// that directory rather than in `home`, and so is it read here.
     pub fn from_env(home: &Path, env: impl Fn(&str) -> Option<OsString>) -> Self {
-        let claude_dir = env("CLAUDE_CONFIG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".claude"));
+        let config_dir = env("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+        let claude_json = config_dir
+            .as_ref()
+            .map_or_else(|| home.join(".claude.json"), |d| d.join(".claude.json"));
+        let claude_dir = config_dir.unwrap_or_else(|| home.join(".claude"));
         let gh_dir = env("GH_CONFIG_DIR")
             .map(PathBuf::from)
             .or_else(|| env("XDG_CONFIG_HOME").map(|x| PathBuf::from(x).join("gh")))
             .unwrap_or_else(|| home.join(".config").join("gh"));
         Self {
             claude_dir,
-            claude_json: home.join(".claude.json"),
+            claude_json,
             gh_hosts: gh_dir.join("hosts.yml"),
         }
     }
@@ -157,6 +162,11 @@ mod tests {
         };
         let p = HostPaths::from_env(Path::new("/h"), env);
         assert_eq!(p.claude_dir, PathBuf::from("/cc"));
+        assert_eq!(
+            p.claude_json,
+            PathBuf::from("/cc/.claude.json"),
+            "claude keeps .claude.json in CLAUDE_CONFIG_DIR when it is set"
+        );
         assert_eq!(p.gh_hosts, PathBuf::from("/ghc/hosts.yml"));
 
         let env = |k: &str| (k == "XDG_CONFIG_HOME").then(|| OsString::from("/xdg"));

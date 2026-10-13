@@ -6,7 +6,9 @@ use std::fs;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use support::{Kill, balerix, fake_tools, tls_files, tls_get, wait_for_file};
+use support::{
+    Kill, balerix, fake_tools, tls_call, tls_files, tls_get, tls_get_head, wait_for_file,
+};
 
 fn get(url: &str, token: Option<&str>) -> (u16, String) {
     let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -220,6 +222,74 @@ fn kubernetes_mode_serves_tls_with_the_mounted_token_and_reads_no_plugins_file()
     );
     // nothing under plugins/: the file was not read, no plugin launched
     assert!(!home.path().join(".local/share/balerix/plugins").exists());
+}
+
+/// A pod binds `0.0.0.0`, which no browser can reach: a login URL takes
+/// the public URL when one is set, else the authority the request named;
+/// never the bind address. The cookie is `Secure` over TLS.
+#[test]
+fn kubernetes_mode_on_an_unspecified_address_gives_a_reachable_login_url() {
+    let token = "0123456789abcdef0123456789abcdef";
+    for public_url in [Some("https://balerix.example.test/"), None] {
+        let home = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        fake_tools(tools.path());
+        let (ca, cert, key) = tls_files(home.path());
+        let token_file = home.path().join("admin-token");
+        fs::write(&token_file, format!("{token}\n")).unwrap();
+        let server_dir = home.path().join(".local/state/balerix/server");
+        let mut cmd = balerix(home.path(), tools.path());
+        cmd.args([
+            "serve",
+            "--mode",
+            "kubernetes",
+            "--bind",
+            "0.0.0.0:0",
+            "--tmux-socket",
+            "unused",
+        ])
+        .arg("--tls-cert")
+        .arg(&cert)
+        .arg("--tls-key")
+        .arg(&key)
+        .arg("--admin-token-file")
+        .arg(&token_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        if let Some(url) = public_url {
+            cmd.args(["--public-url", url]);
+        }
+        let _kill = Kill(cmd.spawn().unwrap());
+        let url = wait_for_file(&server_dir.join("endpoint"));
+        let port = url.rsplit(':').next().unwrap().to_string();
+        let addr = format!("127.0.0.1:{port}");
+        let (s, v) = tls_call(
+            &addr,
+            &ca,
+            "POST",
+            "/v1/sessions",
+            Some(token),
+            Some(&serde_json::json!({ "to": "/v1/plugins/web/" })),
+        );
+        assert_eq!(s, 200, "{v}");
+        let login = v["login_url"].as_str().unwrap().to_string();
+        assert!(!login.contains("0.0.0.0"), "{login}");
+        let expected = match public_url {
+            Some(_) => "https://balerix.example.test/v1/login/".to_string(),
+            // the authority the request named, port included
+            None => format!("https://{addr}/v1/login/"),
+        };
+        assert!(login.starts_with(&expected), "{login}");
+        let path = &login[login.find("/v1/login/").unwrap()..];
+        let (s, head, _) = tls_get_head(&addr, &ca, path);
+        assert_eq!(s, 303, "{head}");
+        let cookie = head
+            .lines()
+            .find_map(|l| l.strip_prefix("set-cookie: "))
+            .unwrap_or_else(|| panic!("a cookie: {head}"));
+        assert!(cookie.ends_with("; secure"), "{cookie}");
+        assert!(cookie.contains("; path=/v1/s/"), "{cookie}");
+    }
 }
 
 #[test]

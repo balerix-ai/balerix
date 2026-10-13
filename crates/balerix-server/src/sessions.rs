@@ -2,13 +2,19 @@
 //! one-time login code minted for the admin, exchanged by the browser for
 //! an in-memory session cookie. The admin token never enters the browser;
 //! nothing here is persisted, so sessions die with the daemon.
+//!
+//! Each session has its own mount path, `/v1/s/<scope>/plugins/<name>/…`,
+//! with `<scope>` a random segment minted at login, and its cookie is
+//! scoped to `/v1/s/<scope>/`: a browser sends the cookie only below a
+//! session URL nobody else can guess, and the daemon accepts it only for
+//! the scope it was issued with.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Method, Uri};
 
 use crate::auth::constant_time_eq;
 use crate::vault::random_hex;
@@ -21,9 +27,13 @@ pub const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 /// visit to its URL is told what happened instead of "unknown".
 pub const TOMBSTONE_TTL: Duration = Duration::from_secs(10 * 60);
 pub const COOKIE: &str = "balerix_session";
-/// Every proxied path starts here; a login may only redirect below it, and
-/// the cookie is scoped to it.
+/// The admin's mount (bearer only) and the namespace a login's `to`
+/// names; a login redirects to the same path under its session's scope.
 pub const MOUNT_PREFIX: &str = "/v1/plugins/";
+/// Every session mount starts here: `/v1/s/<scope>/plugins/<name>/…`.
+pub const SCOPED_PREFIX: &str = "/v1/s/";
+/// A scope's random bytes: 128 bits, as 32 lowercase hex characters.
+const SCOPE_BYTES: usize = 16;
 
 /// Why a login code was refused. The page is for a human who pasted a
 /// stale URL; naming the reason tells them whether to hurry (expired)
@@ -65,8 +75,16 @@ struct Inner {
     codes: HashMap<String, Instant>,
     /// dead code → (when it died, how)
     dead: HashMap<String, (Instant, Fate)>,
-    /// session id → expiry
-    sessions: HashMap<String, Instant>,
+    /// session id → (its scope, expiry)
+    sessions: HashMap<String, (String, Instant)>,
+}
+
+/// A session minted at login: `id` goes in the cookie, `scope` in the
+/// path the cookie is scoped to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSession {
+    pub id: String,
+    pub scope: String,
 }
 
 #[derive(Default)]
@@ -97,7 +115,7 @@ impl Sessions {
             live
         });
         dead.retain(|_, (at, _)| *at + TOMBSTONE_TTL > now);
-        sessions.retain(|_, expiry| *expiry > now);
+        sessions.retain(|_, (_, expiry)| *expiry > now);
     }
 
     /// The entry whose key equals `code`, compared in constant time each:
@@ -120,12 +138,13 @@ impl Sessions {
         code
     }
 
-    /// Exchanges a live code for a session id; the code is gone either way.
-    pub fn redeem(&self, code: &str) -> Result<String, CodeRejected> {
+    /// Exchanges a live code for a session and its scope; the code is gone
+    /// either way.
+    pub fn redeem(&self, code: &str) -> Result<NewSession, CodeRejected> {
         self.redeem_at(code, Instant::now())
     }
 
-    pub fn redeem_at(&self, code: &str, now: Instant) -> Result<String, CodeRejected> {
+    pub fn redeem_at(&self, code: &str, now: Instant) -> Result<NewSession, CodeRejected> {
         let mut inner = self.lock();
         Self::prune(&mut inner, now);
         let Some((key, _)) = Self::find(&inner.codes, code) else {
@@ -143,72 +162,229 @@ impl Sessions {
         inner.codes.remove(&key);
         inner.dead.insert(key, (now, Fate::Used));
         let id = random_hex(32);
-        inner.sessions.insert(id.clone(), now + SESSION_TTL);
-        Ok(id)
-    }
-
-    pub fn is_valid(&self, id: &str) -> bool {
-        self.is_valid_at(id, Instant::now())
-    }
-
-    pub fn is_valid_at(&self, id: &str, now: Instant) -> bool {
-        let mut inner = self.lock();
-        Self::prune(&mut inner, now);
+        let scope = random_hex(SCOPE_BYTES);
         inner
             .sessions
-            .keys()
-            .any(|k| constant_time_eq(k.as_bytes(), id.as_bytes()))
+            .insert(id.clone(), (scope.clone(), now + SESSION_TTL));
+        Ok(NewSession { id, scope })
+    }
+
+    /// Whether `id` is a live session issued for `scope`. Both compared in
+    /// constant time; a live session under another scope is refused.
+    pub fn is_valid_for(&self, id: &str, scope: &str) -> bool {
+        self.is_valid_for_at(id, scope, Instant::now())
+    }
+
+    pub fn is_valid_for_at(&self, id: &str, scope: &str, now: Instant) -> bool {
+        let mut inner = self.lock();
+        Self::prune(&mut inner, now);
+        Self::find(&inner.sessions, id)
+            .is_some_and(|(_, (s, _))| constant_time_eq(s.as_bytes(), scope.as_bytes()))
+    }
+
+    /// Whether `id` is a live session under any scope; only to tell apart,
+    /// in a log line, a stale cookie from one shown under the wrong path.
+    pub fn is_live(&self, id: &str) -> bool {
+        let mut inner = self.lock();
+        Self::prune(&mut inner, Instant::now());
+        Self::find(&inner.sessions, id).is_some()
     }
 }
 
-/// The value of cookie `name` across every `Cookie` header, if any.
+/// Whether `scope` has the shape a minted scope has; anything else is
+/// refused before a lookup.
+pub fn scope_shape_ok(scope: &str) -> bool {
+    scope.len() == SCOPE_BYTES * 2
+        && scope
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The session's own path for a login target under `MOUNT_PREFIX`:
+/// `/v1/plugins/web/x` → `/v1/s/<scope>/plugins/web/x`.
+pub fn scoped_target(scope: &str, to: &str) -> String {
+    let below = to.strip_prefix("/v1/").unwrap_or(to);
+    format!("{SCOPED_PREFIX}{scope}/{below}")
+}
+
+/// The path a session's cookie is scoped to: `/v1/s/<scope>/`.
+pub fn scope_path(scope: &str) -> String {
+    format!("{SCOPED_PREFIX}{scope}/")
+}
+
+/// The first value of cookie `name` across every `Cookie` header, if any.
 pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    cookie_values(headers, name).into_iter().next()
+}
+
+/// Every value of cookie `name` across every `Cookie` header, in order: a
+/// browser may hold several under different paths and sends each whose
+/// path matches.
+pub fn cookie_values(headers: &HeaderMap, name: &str) -> Vec<String> {
     headers
         .get_all("cookie")
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|line| line.split(';'))
-        .find_map(|pair| {
+        .filter_map(|pair| {
             let (k, v) = pair.trim().split_once('=')?;
             (k.trim() == name).then(|| v.trim().to_string())
         })
+        .collect()
 }
 
-/// The `Set-Cookie` value: HttpOnly, never cross-site, scoped to the mount.
-pub fn set_cookie(id: &str) -> String {
-    format!("{COOKIE}={id}; HttpOnly; SameSite=Strict; Path={MOUNT_PREFIX}")
+/// The `Set-Cookie` value: HttpOnly, never cross-site, scoped to the
+/// session's own path, and `Secure` when the browser reached the daemon
+/// over https.
+pub fn set_cookie(id: &str, scope: &str, secure: bool) -> String {
+    let path = scope_path(scope);
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{COOKIE}={id}; HttpOnly; SameSite=Strict; Path={path}{secure}")
 }
 
 /// Whether a cookie-authenticated request came from the daemon's own
 /// origin (§18.2): `Sec-Fetch-Site` when the browser sends it, else
-/// `Origin` — absent on a plain navigation; on a fetch or WebSocket from a
-/// page the daemon served, exactly `http://127.0.0.1:<port>` (`localhost`
-/// is another origin to a browser) or, through a reverse proxy, an origin
-/// whose authority is the request's own `Host`. A WebSocket handshake
-/// arrives without `Sec-Fetch-Site` through at least one proxy in the wild.
-pub fn same_origin(headers: &HeaderMap, origin: &str) -> bool {
+/// `Origin`: on a fetch or WebSocket from a page the daemon served,
+/// exactly `origin` (the login URL's; `localhost` is another origin to a
+/// browser, and `None` when the daemon has no fixed one) or, through a
+/// reverse proxy or over HTTP/2, an origin whose authority is the
+/// request's own (`authority`: its `Host`, else the URI's `:authority`).
+/// A WebSocket handshake arrives without `Sec-Fetch-Site` through at
+/// least one proxy in the wild.
+///
+/// A request with neither header passes only as a plain navigation: a
+/// `GET` or `HEAD` that does not ask to upgrade (an older browser's
+/// top-level navigation sends neither). Anything else from a browser
+/// carries one of them.
+pub fn same_origin(
+    method: &Method,
+    upgrade: bool,
+    headers: &HeaderMap,
+    authority: Option<&str>,
+    origin: Option<&str>,
+) -> bool {
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         return matches!(site.trim(), "same-origin" | "none");
     }
     let Some(o) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
-        return true;
+        return (*method == Method::GET || *method == Method::HEAD) && !upgrade;
     };
     let o = o.trim().trim_end_matches('/');
-    if o == origin {
+    if origin.is_some_and(|origin| o == origin) {
         return true;
     }
     // Behind a TLS-terminating reverse proxy the browser never sees the
     // daemon's loopback origin: its `Origin` is the proxy's hostname and
-    // its scheme https. A browser fills `Host` from the URL the page itself
-    // connected to and cannot forge `Origin`, so the two agree only for a
-    // page that host served — the classic cross-site WebSocket hijacking
-    // check. The scheme is ignored on purpose: the proxy rewrites it.
-    let host = headers
+    // its scheme https. A browser fills `Host` (`:authority` over HTTP/2)
+    // from the URL the page itself connected to and cannot forge
+    // `Origin`, so the two agree only for a page that host served — the
+    // classic cross-site WebSocket hijacking check. The scheme is ignored
+    // on purpose: the proxy rewrites it.
+    let authority = authority.map(str::trim);
+    let from = o.split_once("://").map(|(_, a)| a);
+    matches!((authority, from), (Some(h), Some(a)) if !a.is_empty() && a == h)
+}
+
+/// The request's authority: its `Host` header, else the URI's authority
+/// (HTTP/2 carries `:authority` there and may send no `Host`).
+pub fn request_authority<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
+    headers
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .map(str::trim);
-    let authority = o.split_once("://").map(|(_, a)| a);
-    matches!((host, authority), (Some(h), Some(a)) if !a.is_empty() && a == h)
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .or_else(|| uri.authority().map(|a| a.as_str()))
+}
+
+/// How browsers reach the daemon: the origin its login URLs name and
+/// whether its cookie is `Secure`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Browser {
+    /// `[server] public_url` (or `serve --public-url`), normalized to
+    /// `scheme://authority` by `parse_public_url`.
+    pub public_url: Option<String>,
+    /// The daemon serves TLS itself (Kubernetes mode).
+    pub tls: bool,
+}
+
+impl Browser {
+    /// The origin a login URL names and an `Origin` may equal: the public
+    /// URL, else `listen_url` (the daemon's own `scheme://host:port`)
+    /// unless its host is an unspecified address, which no browser can
+    /// reach. `None` then: login URLs and the origin check use the
+    /// request's own authority instead.
+    pub fn origin(&self, listen_url: &str) -> Option<String> {
+        if let Some(public) = &self.public_url {
+            return Some(public.clone());
+        }
+        let uri: Uri = listen_url.parse().ok()?;
+        let host = uri.host()?;
+        (!is_unspecified(host)).then(|| listen_url.trim_end_matches('/').to_string())
+    }
+
+    /// Whether the session cookie gets `Secure`: the daemon serves TLS, or
+    /// browsers reach it through an https public URL. A TLS-terminating
+    /// proxy's `X-Forwarded-Proto` is not trusted; set `public_url` there.
+    pub fn secure(&self) -> bool {
+        self.tls
+            || self
+                .public_url
+                .as_deref()
+                .is_some_and(|u| u.starts_with("https://"))
+    }
+
+    /// The base of a login URL: `origin`, else the scheme the daemon
+    /// serves and the authority the request named. `None` when neither
+    /// is known.
+    pub fn login_base(&self, listen_url: &str, authority: Option<&str>) -> Option<String> {
+        if let Some(origin) = self.origin(listen_url) {
+            return Some(origin);
+        }
+        let scheme = if self.tls { "https" } else { "http" };
+        let authority = authority?;
+        let host = authority.parse::<axum::http::uri::Authority>().ok()?;
+        (!is_unspecified(host.host())).then(|| format!("{scheme}://{authority}"))
+    }
+}
+
+fn is_unspecified(host: &str) -> bool {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified())
+}
+
+/// A public URL for browsers: `http` or `https`, a host that is not an
+/// unspecified address, and nothing after the authority but an optional
+/// `/`. Returned as `scheme://authority`, lowercased as a browser
+/// serializes an `Origin`.
+pub fn parse_public_url(url: &str) -> Result<String, String> {
+    let uri: Uri = url
+        .trim()
+        .parse()
+        .map_err(|e| format!("{url:?} is not a URL: {e}"))?;
+    let scheme = uri.scheme_str().unwrap_or_default();
+    if !matches!(scheme, "http" | "https") {
+        return Err(format!("{url:?}: the scheme is http or https"));
+    }
+    let Some(authority) = uri.authority() else {
+        return Err(format!("{url:?}: no host"));
+    };
+    if authority.as_str().contains('@') {
+        return Err(format!("{url:?}: no user information"));
+    }
+    if authority.host().is_empty() || is_unspecified(authority.host()) {
+        return Err(format!("{url:?}: the host must be one a browser can reach"));
+    }
+    if !matches!(uri.path(), "" | "/") || uri.query().is_some() {
+        return Err(format!(
+            "{url:?}: an origin only (scheme, host and port); the daemon's paths are absolute"
+        ));
+    }
+    Ok(format!(
+        "{scheme}://{}",
+        authority.as_str().to_ascii_lowercase()
+    ))
 }
 
 /// Where a login may send the browser: a path under the mount made of
@@ -250,9 +426,11 @@ mod tests {
         let code = s.issue_code_at(t0);
         assert_eq!(code.len(), 64);
         assert!(s.redeem_at("nope", t0).is_err());
-        let id = s.redeem_at(&code, t0 + Duration::from_secs(30)).unwrap();
+        let NewSession { id, scope } = s.redeem_at(&code, t0 + Duration::from_secs(30)).unwrap();
         assert_eq!(id.len(), 64);
         assert_ne!(id, code, "the session id is not the code");
+        assert!(scope_shape_ok(&scope), "{scope}");
+        assert_ne!(scope, id[..32], "the scope is not part of the id");
         assert!(s.redeem_at(&code, t0).is_err(), "single use");
         let late = s.issue_code_at(t0);
         assert!(
@@ -260,15 +438,52 @@ mod tests {
                 .is_err(),
             "expired"
         );
-        assert!(s.is_valid_at(&id, t0 + Duration::from_secs(3600)));
-        assert!(!s.is_valid_at("nope", t0));
+        assert!(s.is_valid_for_at(&id, &scope, t0 + Duration::from_secs(3600)));
+        assert!(!s.is_valid_for_at("nope", &scope, t0));
         assert!(
-            !s.is_valid_at(
+            !s.is_valid_for_at(
                 &id,
+                &scope,
                 t0 + Duration::from_secs(30) + SESSION_TTL + Duration::from_secs(1)
             ),
-            "sessions expire"
+            "sessions expire, and their scope with them"
         );
+    }
+
+    #[test]
+    fn a_session_is_valid_under_its_own_scope_only() {
+        let s = Sessions::new();
+        let t0 = Instant::now();
+        let a = s.redeem_at(&s.issue_code_at(t0), t0).unwrap();
+        let b = s.redeem_at(&s.issue_code_at(t0), t0).unwrap();
+        assert_ne!(a.scope, b.scope, "each session mints its own scope");
+        assert!(s.is_valid_for_at(&a.id, &a.scope, t0));
+        assert!(s.is_valid_for_at(&b.id, &b.scope, t0));
+        assert!(!s.is_valid_for_at(&a.id, &b.scope, t0), "another scope");
+        assert!(!s.is_valid_for_at(&b.id, &a.scope, t0), "another session");
+        assert!(!s.is_valid_for_at(&a.id, "", t0));
+        assert!(s.is_live(&a.id) && !s.is_live("nope"));
+    }
+
+    #[test]
+    fn a_scope_has_one_shape() {
+        assert!(scope_shape_ok("0123456789abcdef0123456789abcdef"));
+        for bad in [
+            "",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789abcdef",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef/123456789abcdef",
+        ] {
+            assert!(!scope_shape_ok(bad), "{bad:?}");
+        }
+        assert_eq!(
+            scoped_target("abc", "/v1/plugins/web/agents/f/c/a"),
+            "/v1/s/abc/plugins/web/agents/f/c/a"
+        );
+        assert_eq!(scoped_target("abc", "/v1/plugins/"), "/v1/s/abc/plugins/");
+        assert_eq!(scope_path("abc"), "/v1/s/abc/");
     }
 
     #[test]
@@ -325,9 +540,18 @@ mod tests {
         assert_eq!(cookie_value(&h, COOKIE).as_deref(), Some("abc"));
         h.insert("cookie", HeaderValue::from_static("balerix_session_x=zzz"));
         assert_eq!(cookie_value(&h, COOKIE), None, "prefix is not a match");
+        h.insert(
+            "cookie",
+            HeaderValue::from_static("balerix_session=one; x=1; balerix_session=two"),
+        );
+        assert_eq!(cookie_values(&h, COOKIE), vec!["one", "two"]);
         assert_eq!(
-            set_cookie("abc"),
-            "balerix_session=abc; HttpOnly; SameSite=Strict; Path=/v1/plugins/"
+            set_cookie("abc", "0123", false),
+            "balerix_session=abc; HttpOnly; SameSite=Strict; Path=/v1/s/0123/"
+        );
+        assert_eq!(
+            set_cookie("abc", "0123", true),
+            "balerix_session=abc; HttpOnly; SameSite=Strict; Path=/v1/s/0123/; Secure"
         );
     }
 
@@ -340,6 +564,11 @@ mod tests {
                 h.insert(*k, HeaderValue::from_str(v).unwrap());
             }
             h
+        };
+        // a GET with the request's `Host` as its authority, as before
+        let same_origin = |h: &HeaderMap, origin: &str| {
+            let authority = h.get("host").and_then(|v| v.to_str().ok());
+            super::same_origin(&Method::GET, false, h, authority, Some(origin))
         };
         assert!(
             same_origin(&with(&[]), origin),
@@ -393,6 +622,11 @@ mod tests {
                 h.insert(*k, HeaderValue::from_str(v).unwrap());
             }
             h
+        };
+        // a GET with the request's `Host` as its authority, as before
+        let same_origin = |h: &HeaderMap, origin: &str| {
+            let authority = h.get("host").and_then(|v| v.to_str().ok());
+            super::same_origin(&Method::GET, false, h, authority, Some(origin))
         };
         let host = "balerix-7643.example.test";
         assert!(same_origin(
@@ -518,6 +752,138 @@ mod tests {
             "/v1/plugins/./web/",
         ] {
             assert_eq!(login_target(Some(bad)), None, "{bad:?}");
+        }
+    }
+
+    /// Only a plain navigation may carry neither `Sec-Fetch-Site` nor
+    /// `Origin`: any other method, or an upgrade, from a browser sends one.
+    #[test]
+    fn a_request_without_either_header_passes_only_as_a_navigation() {
+        let none = HeaderMap::new();
+        let origin = Some("http://127.0.0.1:7643");
+        let host = Some("127.0.0.1:7643");
+        assert!(same_origin(&Method::GET, false, &none, host, origin));
+        assert!(same_origin(&Method::HEAD, false, &none, host, origin));
+        for m in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            assert!(!same_origin(&m, false, &none, host, origin), "{m}");
+        }
+        assert!(
+            !same_origin(&Method::GET, true, &none, host, origin),
+            "a WebSocket handshake"
+        );
+        let mut site = HeaderMap::new();
+        site.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert!(same_origin(&Method::POST, false, &site, host, origin));
+        assert!(same_origin(&Method::GET, true, &site, host, origin));
+        let mut o = HeaderMap::new();
+        o.insert("origin", HeaderValue::from_static("http://127.0.0.1:7643"));
+        assert!(same_origin(&Method::POST, false, &o, host, origin));
+        assert!(same_origin(&Method::GET, true, &o, host, origin));
+    }
+
+    /// HTTP/2 carries the authority as `:authority`, which hyper puts in
+    /// the URI; a request may then have no `Host` at all.
+    #[test]
+    fn without_a_host_header_the_uri_authority_is_the_request_authority() {
+        let uri: Uri = "https://balerix.example.test:8443/v1/s/x/plugins/web/"
+            .parse()
+            .unwrap();
+        let mut h = HeaderMap::new();
+        assert_eq!(
+            request_authority(&h, &uri),
+            Some("balerix.example.test:8443")
+        );
+        h.insert(
+            "origin",
+            HeaderValue::from_static("https://balerix.example.test:8443"),
+        );
+        assert!(same_origin(
+            &Method::GET,
+            true,
+            &h,
+            request_authority(&h, &uri),
+            None
+        ));
+        h.insert("host", HeaderValue::from_static("other.example.test"));
+        assert_eq!(request_authority(&h, &uri), Some("other.example.test"));
+        let path_only: Uri = "/v1/s/x/plugins/web/".parse().unwrap();
+        assert_eq!(request_authority(&HeaderMap::new(), &path_only), None);
+        assert!(
+            !same_origin(&Method::GET, true, &h, None, None),
+            "no authority and no fixed origin: nothing to agree with"
+        );
+    }
+
+    #[test]
+    fn the_browser_origin_is_the_public_url_or_a_reachable_listen_address() {
+        let plain = Browser::default();
+        assert_eq!(
+            plain.origin("http://127.0.0.1:7643").as_deref(),
+            Some("http://127.0.0.1:7643")
+        );
+        assert!(!plain.secure());
+        let pod = Browser {
+            public_url: None,
+            tls: true,
+        };
+        assert_eq!(pod.origin("https://0.0.0.0:7643"), None);
+        assert_eq!(pod.origin("https://[::]:7643"), None);
+        assert!(pod.secure(), "the daemon serves TLS");
+        assert_eq!(
+            pod.login_base("https://0.0.0.0:7643", Some("127.0.0.1:18443"))
+                .as_deref(),
+            Some("https://127.0.0.1:18443"),
+            "the authority the request reached the daemon by"
+        );
+        assert_eq!(pod.login_base("https://0.0.0.0:7643", None), None);
+        assert_eq!(
+            pod.login_base("https://0.0.0.0:7643", Some("0.0.0.0:7643")),
+            None,
+            "never an unspecified address in a URL"
+        );
+        let public = Browser {
+            public_url: Some("https://balerix.example.test".into()),
+            tls: false,
+        };
+        assert_eq!(
+            public.origin("http://127.0.0.1:7643").as_deref(),
+            Some("https://balerix.example.test")
+        );
+        assert_eq!(
+            public
+                .login_base("https://0.0.0.0:7643", Some("10.0.0.5:7643"))
+                .as_deref(),
+            Some("https://balerix.example.test")
+        );
+        assert!(public.secure(), "an https public URL");
+    }
+
+    #[test]
+    fn a_public_url_is_an_origin_a_browser_can_reach() {
+        assert_eq!(
+            parse_public_url("https://balerix.example.test/").as_deref(),
+            Ok("https://balerix.example.test")
+        );
+        assert_eq!(
+            parse_public_url("http://127.0.0.1:7643").as_deref(),
+            Ok("http://127.0.0.1:7643")
+        );
+        assert_eq!(
+            parse_public_url("HTTPS://Balerix.Example.TEST:8443").as_deref(),
+            Ok("https://balerix.example.test:8443"),
+            "as a browser writes the Origin"
+        );
+        for bad in [
+            "balerix.example.test",
+            "ftp://balerix.example.test",
+            "https://0.0.0.0:7643",
+            "https://[::]:7643",
+            "https://balerix.example.test/balerix",
+            "https://balerix.example.test/?x=1",
+            "https://user@balerix.example.test",
+            "",
+        ] {
+            assert!(parse_public_url(bad).is_err(), "{bad:?}");
         }
     }
 }

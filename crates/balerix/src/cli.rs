@@ -216,6 +216,13 @@ pub struct ServeArgs {
     /// Re-exec detached; log to server/server.log; print the endpoint.
     #[arg(short = 'd', long)]
     pub detach: bool,
+    /// The origin browsers reach the daemon by, e.g.
+    /// `https://balerix.example.test` behind a reverse proxy (default:
+    /// config.toml `[server] public_url`, else the daemon's own address,
+    /// or, bound to an unspecified address, the one each request named).
+    /// Login URLs use it; an https one makes the session cookie `Secure`.
+    #[arg(long)]
+    pub public_url: Option<String>,
     /// tmux server socket name (tests use a private one).
     #[arg(long, hide = true, default_value = "balerix")]
     pub tmux_socket: String,

@@ -166,6 +166,37 @@
   Kubernetes each pod's sidecar clones its own agent, so each pod's start
   is about a second longer. A failed refresh only warns in the crew's
   `git.log`.
+- Plugin pages opened in a browser now live under a per-session path:
+  `balerix plugin open <name>` still prints `/v1/login/<code>?to=/v1/plugins/<name>/`,
+  and the login now sends the browser to `/v1/s/<scope>/plugins/<name>/`,
+  where `<scope>` is a random segment minted with the session. The
+  session cookie is scoped to that path and accepted only there.
+  `/v1/plugins/<name>/…` takes the admin bearer only, so a bookmark to it
+  answers 401: run `plugin open` again for a fresh URL. A plugin that
+  builds its links from `X-Balerix-Forwarded-Prefix` (web, and any SDK
+  plugin that follows the protocol) needs no change; one that writes
+  `/v1/plugins/<name>` into its pages must use the header instead. Mount
+  responses now carry `Referrer-Policy: no-referrer`, and a cookie
+  request other than a plain `GET`/`HEAD` navigation (a `POST`, a
+  WebSocket handshake) must carry `Sec-Fetch-Site` or `Origin`, which
+  every current browser sends.
+- A Kubernetes-mode daemon bound to `0.0.0.0` printed login URLs on
+  `https://0.0.0.0:<port>`, which no browser can open, and its origin
+  check fell back to a `Host` header that HTTP/2 requests need not send.
+  A login URL now uses the new `[server] public_url` (or `serve
+  --public-url`) when set, else the daemon's own address unless it is
+  unspecified, else the host and port the `plugin open` request named;
+  the origin check reads HTTP/2's `:authority` when `Host` is absent. The
+  session cookie is now `Secure` when the daemon serves TLS or
+  `public_url` is https. `X-Forwarded-Proto` is not trusted: behind a
+  TLS-terminating proxy, set an https `public_url`.
+- With `CLAUDE_CONFIG_DIR` set, the client now reads the Claude account
+  (`oauthAccount`, `hasCompletedOnboarding`) from
+  `$CLAUDE_CONFIG_DIR/.claude.json`, where Claude Code keeps it, instead
+  of `~/.claude.json`.
+- `plugin install --sha256` compares the digest case-insensitively, and a
+  huge `--timeout` (`down --purge`, `plugin remove --purge`) waits
+  instead of panicking on overflow.
 
 ## 0.2.4 - 2026-10-10
 

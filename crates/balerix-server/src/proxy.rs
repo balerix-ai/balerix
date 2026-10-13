@@ -1,5 +1,6 @@
 //! The reverse-proxied plugin mount (plugins spec §6, §18.1, §18.2):
-//! `/v1/plugins/<name>/…` → `http://<listen>/v1/routes/…` on hyper's
+//! `/v1/s/<scope>/plugins/<name>/…` (a browser session) and
+//! `/v1/plugins/<name>/…` (the admin bearer) → `http://<listen>/v1/routes/…` on hyper's
 //! legacy client. Bodies in are capped, bodies out stream, the daemon's
 //! own credentials and the hop-by-hop headers never cross, and a 101 is
 //! upgraded on both sides and copied byte for byte — the proxy never
@@ -17,7 +18,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 
 use crate::api::ApiError;
 use crate::plugins::PluginAddr;
-use crate::sessions::MOUNT_PREFIX;
+use crate::sessions::{MOUNT_PREFIX, SCOPED_PREFIX};
 use balerix_api::body_limit::{self, DRAIN_FACTOR, DRAIN_TIME, Read};
 use std::time::Duration;
 
@@ -27,6 +28,10 @@ pub type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 pub const MAX_BODY: usize = 1 << 20;
 /// Tells a plugin where it is mounted, so it can build links.
 pub const FORWARDED_PREFIX: &str = "x-balerix-forwarded-prefix";
+
+/// Set on every mount response: a session's path carries its scope, which
+/// must never reach another site through a `Referer`.
+pub const REFERRER_POLICY: &str = "no-referrer";
 
 /// Never forwarded on a request: the daemon's own credentials, the host
 /// (hyper sets it from the upstream URI), and the hop-by-hop set of RFC
@@ -186,14 +191,21 @@ async fn read_body_within(body: Body, time: Duration) -> Result<Bytes, BodyError
     }
 }
 
-/// The `<rest>` of `/v1/plugins/<name>/<rest>`, taken from the request's
+/// The `<rest>` of `/v1/plugins/<name>/<rest>` or
+/// `/v1/s/<scope>/plugins/<name>/<rest>`, taken from the request's
 /// raw path and left percent-encoded. axum's `Path` extractor decodes
 /// what it captures, and a decoded segment spliced back into a URI means
 /// something else: `%3F` would start a query, `%2F` would split a
 /// segment, `%20` would not parse at all. The mount therefore takes the
 /// path apart itself and forwards the bytes the client actually sent.
 pub fn forwarded_rest(path: &str) -> &str {
-    path.strip_prefix(MOUNT_PREFIX)
+    let below = match path.strip_prefix(SCOPED_PREFIX) {
+        Some(scoped) => scoped
+            .split_once('/')
+            .and_then(|(_scope, rest)| rest.strip_prefix("plugins/")),
+        None => path.strip_prefix(MOUNT_PREFIX),
+    };
+    below
         .and_then(|s| s.split_once('/'))
         .map_or("", |(_name, rest)| rest)
 }
@@ -231,10 +243,13 @@ pub fn upstream_uri(base: &str, rest: &str, query: Option<&str>) -> Result<Uri, 
 /// Forwards one request to the plugin and answers with its response. On a
 /// 101 both sides are upgraded and copied until either closes; the copy
 /// runs on its own task, the 101 goes back to the client at once.
+/// `prefix` is the mount the request came through, sent to the plugin as
+/// `X-Balerix-Forwarded-Prefix` for its links.
 pub async fn forward(
     client: &HttpClient,
     addr: &PluginAddr,
     name: &str,
+    prefix: &str,
     mut req: Request,
 ) -> Response {
     // Taken before the request is consumed: hyper stores the client
@@ -265,9 +280,8 @@ pub async fn forward(
         Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, e).into_response(),
     };
     let mut headers = forwarded_headers(&parts.headers);
-    let prefix = format!("/v1/plugins/{name}");
     let (Ok(prefix), Ok(bearer)) = (
-        HeaderValue::from_str(&prefix),
+        HeaderValue::from_str(prefix),
         HeaderValue::from_str(&format!("Bearer {}", addr.token)),
     ) else {
         return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "proxy: bad header value")
@@ -436,7 +450,7 @@ mod tests {
                         listen: base,
                         token: "t".into(),
                     };
-                    forward(&proxy, &addr, "stub", req).await
+                    forward(&proxy, &addr, "stub", "/v1/plugins/stub", req).await
                 }
             }),
         );
@@ -519,6 +533,14 @@ mod tests {
         // never reached through the mount's routes, but never a panic
         assert_eq!(forwarded_rest("/v1/plugins/web"), "");
         assert_eq!(forwarded_rest("/v1/fleets"), "");
+        assert_eq!(forwarded_rest("/v1/s/0123abcd/plugins/web/"), "");
+        assert_eq!(forwarded_rest("/v1/s/0123abcd/plugins/web/a/b"), "a/b");
+        assert_eq!(forwarded_rest("/v1/s/0123abcd/plugins/web"), "");
+        assert_eq!(
+            forwarded_rest("/v1/s/0123abcd/plugins/web/a%2Fb?x"),
+            "a%2Fb?x"
+        );
+        assert_eq!(forwarded_rest("/v1/s/0123abcd/fleets/x/y"), "");
     }
 
     #[test]

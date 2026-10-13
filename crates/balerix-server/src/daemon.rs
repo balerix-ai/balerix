@@ -444,10 +444,25 @@ impl Daemon {
         &self.sessions
     }
 
-    /// The daemon's own origin, `http://127.0.0.1:<port>`: the login URL's
-    /// host and the only `Origin` a cookie request may carry (§18.2).
-    pub fn origin(&self) -> &str {
-        &self.ports.hook_url
+    /// The origin browsers use, when fixed: the public URL, else the
+    /// daemon's own `http://127.0.0.1:<port>`; the login URL's host and
+    /// the `Origin` a cookie request may carry besides its own authority
+    /// (§18.2). `None` for a daemon bound to an unspecified address with
+    /// no public URL: the request's authority stands in.
+    pub fn browser_origin(&self) -> Option<String> {
+        self.ports.browser.origin(&self.ports.hook_url)
+    }
+
+    /// The base of a login URL for a request that named `authority`.
+    pub fn login_base(&self, authority: Option<&str>) -> Option<String> {
+        self.ports
+            .browser
+            .login_base(&self.ports.hook_url, authority)
+    }
+
+    /// Whether the session cookie is `Secure`.
+    pub fn secure_cookie(&self) -> bool {
+        self.ports.browser.secure()
     }
 
     /// Activation state is a read-time overlay (§16.3): the actor never

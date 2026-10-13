@@ -348,11 +348,16 @@ language formats the text itself and must apply the prefix.
 
 ### 4.1 Routes
 
-A manifest with `routes: true` mounts the plugin's own HTTP surface at
-`/v1/plugins/<name>/…` on the daemon's listener, authenticated by the
-admin bearer or a browser session cookie (plugins spec §18.2). The daemon
-forwards `/v1/plugins/<name>/` to `GET|POST|… http://<listen>/v1/routes` (`https://<url>` in Kubernetes mode)
-and `/v1/plugins/<name>/<rest>?<query>` to `/v1/routes/<rest>?<query>`
+A manifest with `routes: true` mounts the plugin's own HTTP surface on
+the daemon's listener twice: at `/v1/plugins/<name>/…`, authenticated by
+the admin bearer alone, and, for a browser, at
+`/v1/s/<scope>/plugins/<name>/…`, where `<scope>` is a random segment
+(128 bits, 32 hex characters) minted when the browser redeems its login
+code (plugins spec §18.2). The session's cookie is scoped to
+`/v1/s/<scope>/`, and the daemon accepts it only under the scope it was
+issued with. The daemon
+forwards `<mount>/` to `GET|POST|… http://<listen>/v1/routes` (`https://<url>` in Kubernetes mode)
+and `<mount>/<rest>?<query>` to `/v1/routes/<rest>?<query>`
 — `<rest>` crosses percent-encoded exactly as the client wrote it, and a
 `.` or `..` segment (its `%2e` spellings included) is refused with 400
 rather than forwarded — with the method, the body (1 MiB cap, 413 beyond), and the request
@@ -360,14 +365,24 @@ headers minus `Authorization`, `Cookie`, `Host`, the hop-by-hop set and
 whatever `Connection:` names (on an upgrade request `Upgrade` is kept and
 `Connection` is sent as exactly `Upgrade`). Two headers
 are added: `Authorization: Bearer <BALERIX_PLUGIN_TOKEN>` (§2) and
-`X-Balerix-Forwarded-Prefix: /v1/plugins/<name>`, the mount to build links
-from. The response streams back with its hop-by-hop headers removed; a
+`X-Balerix-Forwarded-Prefix`, the mount the request came through
+(`/v1/plugins/<name>` or `/v1/s/<scope>/plugins/<name>`), to build links
+from: a plugin must build every link and WebSocket URL from it, never
+from a fixed `/v1/plugins/`. The response streams back with its hop-by-hop
+headers removed and `Referrer-Policy: no-referrer` set; a
 101 is upgraded on both sides and the two byte streams copied until either
 closes, so a WebSocket route works unchanged behind the mount. 404
 `plugin "x" has no routes` without `routes: true`, 503 `plugin "x" is not
 ready` before `hello`. The Rust SDK nests `Plugin::routes` under
 `/v1/routes` behind the same bearer check as every other route
 (`routes.json`, Task 6).
+
+A plugin's `GET` (and `HEAD`) routes must have no side effects: a
+browser's plain navigation may reach the mount without `Sec-Fetch-Site`
+or `Origin`, so a cookie `GET` is admitted without an origin check.
+Anything that changes state belongs behind `POST` (or another method),
+which the daemon admits only with one of those headers, from the
+session's own origin.
 
 ## 5. Activation lifecycle
 

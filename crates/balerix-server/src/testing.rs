@@ -100,6 +100,7 @@ impl Harness {
             credentials: credentials.clone(),
             policy,
             hook_url: "http://127.0.0.1:1".to_string(),
+            browser: Default::default(),
             resync,
             kube: None,
         });

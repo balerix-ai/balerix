@@ -188,7 +188,9 @@ to `<listen>/v1/routes[/<rest>]` with the plugin's own token and
 `X-Balerix-Forwarded-Prefix`, strips credentials and hop-by-hop headers,
 and passes a 101 through as raw bytes. A browser gets in through `balerix
 plugin open <name>`: a 60 s single-use code becomes a 12 h in-memory
-session cookie, accepted on the mount from the daemon's origin only.
+session with its own random path, `/v1/s/<scope>/plugins/<name>/`, and a
+cookie scoped to that path, accepted there from the daemon's origin only;
+`/v1/plugins/<name>/` itself takes the admin bearer alone.
 Every daemon → plugin call now carries the plugin's own token and the SDK
 router checks it. `GET /v1/plugin-host/agents/{fleet}/{crew}/{agent}/attach`
 bridges a WebSocket to `AgentRunner::attach` — on tmux a throwaway session grouped
@@ -412,8 +414,11 @@ makes an existing remote branch its clone's branch and start point
   (§18.1). The root of a mount forwards to `/v1/routes` without a slash:
   axum answers a nested router's `/` there.
 - **The admin token never enters the browser.** A single-use login code,
-  an in-memory session, an `HttpOnly; SameSite=Strict` cookie scoped to
-  `/v1/plugins/`, and a same-origin check on every cookie request (§18.2).
+  an in-memory session with a per-session mount path (`/v1/s/<scope>/…`,
+  a 128-bit random scope minted at login), an `HttpOnly; SameSite=Strict`
+  cookie scoped to that path and accepted only for that scope,
+  `Referrer-Policy: no-referrer` on every mount response, and a
+  same-origin check on every cookie request (§18.2).
 - **The daemon presents the plugin's own token.** A plugin's listener is
   a loopback port any local process can reach; the token it already holds
   is what tells the daemon apart (§18.3). Still protocol 1.

@@ -114,6 +114,24 @@ fn tls_request(
     token: Option<&str>,
     body: Option<&[u8]>,
 ) -> (u16, String) {
+    let (status, _, body) = tls_exchange(addr, ca, method, path, token, body);
+    (status, body)
+}
+
+/// `tls_get` answering the response head too (lowercased), for the
+/// headers a test asserts on.
+pub fn tls_get_head(addr: &str, ca: &Path, path: &str) -> (u16, String, String) {
+    tls_exchange(addr, ca, "GET", path, None, None)
+}
+
+fn tls_exchange(
+    addr: &str,
+    ca: &Path,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&[u8]>,
+) -> (u16, String, String) {
     use rustls_pki_types::pem::PemObject;
     use std::io::{Read, Write};
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -141,7 +159,7 @@ fn tls_request(
         )
     });
     let mut request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{auth}{content}\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{auth}{content}\r\n"
     )
     .into_bytes();
     request.extend_from_slice(body.unwrap_or_default());
@@ -165,7 +183,7 @@ fn tls_request(
     } else {
         body
     };
-    (status, body)
+    (status, head, body)
 }
 
 /// A chunked body joined: `<hex size>\r\n<data>\r\n` until a size of 0.

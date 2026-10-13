@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::{CONTENT_TYPE, LOCATION, SET_COOKIE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, post};
@@ -27,7 +27,8 @@ use crate::hooks;
 use crate::plugins::{PluginAddr, PluginError};
 use crate::proxy;
 use crate::sessions::{
-    COOKIE, CodeRejected, MOUNT_PREFIX, cookie_value, login_target, same_origin, set_cookie,
+    COOKIE, CodeRejected, MOUNT_PREFIX, SCOPED_PREFIX, cookie_values, login_target,
+    request_authority, same_origin, scope_shape_ok, scoped_target, set_cookie,
 };
 use crate::system_pool::SystemPoolState;
 use balerix_api::body_limit::{Drain, drain_over_limit, limited, refuse};
@@ -198,14 +199,19 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
     let plugin_host = limited(crate::plugin_api::router(), Drain::new(1 << 20)).route_layer(
         middleware::from_fn_with_state(state.clone(), require_plugin),
     );
-    // The plugin mount authenticates itself (bearer or session cookie),
-    // so it sits outside the admin middleware. `/v1/plugins/{name}` with
-    // no slash stays the purge route for DELETE; a GET there is a browser
-    // whose URL lost its final `/`, sent on to the mount.
+    // The plugin mounts authenticate themselves, so they sit outside the
+    // admin middleware: `/v1/plugins/{name}/…` takes the admin bearer, and
+    // `/v1/s/{scope}/plugins/{name}/…` a browser session issued for that
+    // scope. `/v1/plugins/{name}` with no slash stays the purge route for
+    // DELETE; a GET at either slash-less root is a URL that lost its
+    // final `/`, sent on to the mount.
     let mount = Router::new()
         .route("/v1/plugins/{name}", get(mount_root_redirect))
         .route("/v1/plugins/{name}/", any(proxy_root))
-        .route("/v1/plugins/{name}/{*rest}", any(proxy_rest));
+        .route("/v1/plugins/{name}/{*rest}", any(proxy_rest))
+        .route("/v1/s/{scope}/plugins/{name}", get(session_root_redirect))
+        .route("/v1/s/{scope}/plugins/{name}/", any(session_root))
+        .route("/v1/s/{scope}/plugins/{name}/{*rest}", any(session_rest));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
@@ -553,6 +559,8 @@ async fn purge_plugin(
 /// (plugins spec §18.2). The admin token itself never enters the browser.
 async fn create_session(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
     b: Result<Json<SessionRequest>, JsonRejection>,
 ) -> Result<Json<SessionResponse>, ApiError> {
     let req = b
@@ -564,9 +572,21 @@ async fn create_session(
             format!("to: must be a path under {MOUNT_PREFIX}"),
         )
     })?;
+    // A daemon bound to an unspecified address with no public URL has no
+    // origin of its own: the login URL takes the authority this request
+    // reached it by, which is how the admin's own machine reaches it.
+    let base = state
+        .daemon
+        .login_base(request_authority(&headers, &uri))
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "no origin for a login URL: the request named no reachable host; set [server] public_url (serve --public-url)",
+            )
+        })?;
     let code = state.daemon.sessions().issue_code();
     Ok(Json(SessionResponse {
-        login_url: format!("{}/v1/login/{code}?to={to}", state.daemon.origin()),
+        login_url: format!("{base}/v1/login/{code}?to={to}"),
     }))
 }
 
@@ -575,18 +595,85 @@ async fn proxy_root(
     Path(name): Path<String>,
     req: Request,
 ) -> Response {
-    proxied(&state, &name, req).await
+    proxied(&state, Via::Admin, &name, req).await
+}
+
+/// `GET /v1/s/{scope}/plugins/{name}`: a 308 to that session's mount root.
+/// Nothing is checked or revealed; the mount authenticates the follow-up.
+async fn session_root_redirect(Path((scope, name)): Path<(String, String)>) -> Response {
+    match name.parse::<AgentName>() {
+        Ok(name) if scope_shape_ok(&scope) => no_referrer(
+            (
+                StatusCode::PERMANENT_REDIRECT,
+                [(LOCATION, format!("{SCOPED_PREFIX}{scope}/plugins/{name}/"))],
+            )
+                .into_response(),
+        ),
+        _ => ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("plugin {name:?} has no routes"),
+        )
+        .into_response(),
+    }
+}
+
+async fn session_root(
+    State(state): State<AppState>,
+    Path((scope, name)): Path<(String, String)>,
+    req: Request,
+) -> Response {
+    proxied(&state, Via::Session(scope), &name, req).await
+}
+
+/// `rest` is captured only so the route matches; see `proxy_rest`.
+async fn session_rest(
+    State(state): State<AppState>,
+    Path((scope, name, _rest)): Path<(String, String, String)>,
+    req: Request,
+) -> Response {
+    proxied(&state, Via::Session(scope), &name, req).await
+}
+
+/// `Referrer-Policy: no-referrer` on a mount response: a session's path
+/// carries its scope, which never leaves through a `Referer`.
+fn no_referrer(mut resp: Response) -> Response {
+    resp.headers_mut().insert(
+        axum::http::header::REFERRER_POLICY,
+        HeaderValue::from_static(proxy::REFERRER_POLICY),
+    );
+    resp
+}
+
+/// Which mount a request came through.
+enum Via {
+    /// `/v1/plugins/{name}/…`: the admin bearer only.
+    Admin,
+    /// `/v1/s/{scope}/plugins/{name}/…`: a session cookie issued for
+    /// `scope`, on a same-origin request.
+    Session(String),
+}
+
+impl Via {
+    /// The mount's prefix for `name`, as the plugin builds links from it.
+    fn prefix(&self, name: &str) -> String {
+        match self {
+            Via::Admin => format!("{MOUNT_PREFIX}{name}"),
+            Via::Session(scope) => format!("{SCOPED_PREFIX}{scope}/plugins/{name}"),
+        }
+    }
 }
 
 /// `GET /v1/plugins/{name}`: a 308 to the mount root proper. Nothing is
 /// checked or revealed; the mount authenticates the follow-up itself.
 async fn mount_root_redirect(Path(name): Path<String>) -> Response {
     match name.parse::<AgentName>() {
-        Ok(name) => (
-            StatusCode::PERMANENT_REDIRECT,
-            [(LOCATION, format!("{MOUNT_PREFIX}{name}/"))],
-        )
-            .into_response(),
+        Ok(name) => no_referrer(
+            (
+                StatusCode::PERMANENT_REDIRECT,
+                [(LOCATION, format!("{MOUNT_PREFIX}{name}/"))],
+            )
+                .into_response(),
+        ),
         Err(_) => ApiError::new(
             StatusCode::NOT_FOUND,
             format!("plugin {name:?} has no routes"),
@@ -602,10 +689,10 @@ async fn proxy_rest(
     Path((name, _rest)): Path<(String, String)>,
     req: Request,
 ) -> Response {
-    proxied(&state, &name, req).await
+    proxied(&state, Via::Admin, &name, req).await
 }
 
-/// What `/v1/plugins/{name}/…` resolved to. Only the two named variants
+/// What a mount request resolved to. Only the two named variants
 /// may appear in the proxy counter's `plugin` label: the label is minted
 /// from the registry, never from the path, so an anonymous caller cannot
 /// fill the series with one entry per guessed name.
@@ -619,12 +706,19 @@ enum Mount {
 }
 
 /// The mount (plugins spec §6, §18.2): authenticate, resolve the plugin,
-/// forward, count.
-async fn proxied(state: &AppState, name: &str, req: Request) -> Response {
-    let (label, resp) = match resolve_mount(state, name, req.headers()) {
+/// forward, count. Every answer carries `Referrer-Policy: no-referrer`.
+async fn proxied(state: &AppState, via: Via, name: &str, req: Request) -> Response {
+    let (label, resp) = match resolve_mount(state, &via, name, &req) {
         Mount::Ready(plugin, addr) => {
-            let resp =
-                proxy::forward(state.daemon.proxy_client(), &addr, plugin.as_str(), req).await;
+            let prefix = via.prefix(plugin.as_str());
+            let resp = proxy::forward(
+                state.daemon.proxy_client(),
+                &addr,
+                plugin.as_str(),
+                &prefix,
+                req,
+            )
+            .await;
             (plugin.to_string(), resp)
         }
         // Both answered without the body: at most `REFUSAL_READ` of it
@@ -642,11 +736,15 @@ async fn proxied(state: &AppState, name: &str, req: Request) -> Response {
         .daemon
         .metrics()
         .proxy_request(&label, resp.status().as_u16());
-    resp
+    no_referrer(resp)
 }
 
-fn resolve_mount(state: &AppState, name: &str, headers: &HeaderMap) -> Mount {
-    if let Err(e) = authenticate_browser_or_admin(state, headers) {
+fn resolve_mount(state: &AppState, via: &Via, name: &str, req: &Request) -> Mount {
+    let auth = match via {
+        Via::Admin => authenticate_admin(state, req.headers()),
+        Via::Session(scope) => authenticate_session(state, scope, req),
+    };
+    if let Err(e) = auth {
         return Mount::Refused(e);
     }
     let no_routes = || {
@@ -668,18 +766,33 @@ fn resolve_mount(state: &AppState, name: &str, headers: &HeaderMap) -> Mount {
     }
 }
 
-/// The admin bearer, or a live session cookie on a same-origin request
-/// (§18.2). A bearer that is present but wrong is refused outright; the
-/// cookie is never consulted then.
-fn authenticate_browser_or_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let unauthorized = || ApiError::new(StatusCode::UNAUTHORIZED, "missing or invalid admin token");
-    if let Some(t) = bearer(headers) {
-        return if constant_time_eq(t.as_bytes(), state.daemon.token().as_bytes()) {
-            Ok(())
-        } else {
-            Err(unauthorized())
-        };
+/// The admin mount: the admin bearer, nothing else. A browser session's
+/// cookie is never scoped here and is not consulted.
+fn authenticate_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    match bearer(headers) {
+        Some(t) if constant_time_eq(t.as_bytes(), state.daemon.token().as_bytes()) => Ok(()),
+        Some(_) => Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid admin token",
+        )),
+        None => Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid admin token (a browser opens a plugin through the URL `balerix plugin open` prints)",
+        )),
     }
+}
+
+/// A session mount: a live session cookie issued for `scope`, on a
+/// same-origin request (§18.2). The scope is looked up server-side; a
+/// session shown under another session's scope is refused.
+fn authenticate_session(state: &AppState, scope: &str, req: &Request) -> Result<(), ApiError> {
+    let headers = req.headers();
+    let unauthorized = || {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "no live browser session for this URL; run `balerix plugin open` again",
+        )
+    };
     let hdr = |name: &str| {
         headers
             .get(name)
@@ -687,40 +800,46 @@ fn authenticate_browser_or_admin(state: &AppState, headers: &HeaderMap) -> Resul
             .unwrap_or("-")
             .to_string()
     };
-    match cookie_value(headers, COOKIE) {
-        Some(id) if state.daemon.sessions().is_valid(&id) => {
-            if same_origin(headers, state.daemon.origin()) {
-                Ok(())
-            } else {
-                tracing::warn!(
-                    host = hdr("host"),
-                    sec_fetch_site = hdr("sec-fetch-site"),
-                    origin = hdr("origin"),
-                    "proxy: session cookie refused as cross-origin"
-                );
-                Err(ApiError::new(
-                    StatusCode::FORBIDDEN,
-                    "cross-origin request refused",
-                ))
-            }
+    let sessions = state.daemon.sessions();
+    let ids = cookie_values(headers, COOKIE);
+    if scope_shape_ok(scope) && ids.iter().any(|id| sessions.is_valid_for(id, scope)) {
+        let authority = request_authority(headers, req.uri());
+        let origin = state.daemon.browser_origin();
+        let upgrade = proxy::is_upgrade(headers);
+        if same_origin(req.method(), upgrade, headers, authority, origin.as_deref()) {
+            return Ok(());
         }
-        found => {
-            // Names only: a value is a credential. Tells apart a browser that
-            // withheld the cookie from a proxy that stripped the header and
-            // from a session this daemon never issued (a restart, say).
-            tracing::warn!(
-                host = hdr("host"),
-                sec_fetch_site = hdr("sec-fetch-site"),
-                cookies = cookie_names(headers),
-                session_cookie = match found {
-                    Some(_) => "present but not a live session",
-                    None => "absent",
-                },
-                "proxy: no bearer and no live session cookie"
-            );
-            Err(unauthorized())
-        }
+        tracing::warn!(
+            method = %req.method(),
+            host = authority.unwrap_or("-"),
+            sec_fetch_site = hdr("sec-fetch-site"),
+            origin = hdr("origin"),
+            upgrade,
+            "proxy: session cookie refused as cross-origin"
+        );
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "cross-origin request refused",
+        ));
     }
+    // Names only: a value is a credential, and the path holds the scope.
+    // Tells apart a browser that withheld the cookie from a proxy that
+    // stripped the header, from a session shown under another URL and
+    // from one this daemon never issued (a restart, say).
+    tracing::warn!(
+        host = hdr("host"),
+        sec_fetch_site = hdr("sec-fetch-site"),
+        cookies = cookie_names(headers),
+        session_cookie = if ids.is_empty() {
+            "absent"
+        } else if ids.iter().any(|id| sessions.is_live(id)) {
+            "a live session, issued for another URL"
+        } else {
+            "present but not a live session"
+        },
+        "proxy: no live session cookie for this session URL"
+    );
+    Err(unauthorized())
 }
 
 /// The names of every cookie sent, for the log; values stay out of it.
@@ -782,18 +901,23 @@ async fn login(
         return (StatusCode::NOT_FOUND, CodeRejected::Unknown.to_string()).into_response();
     };
     match state.daemon.sessions().redeem(&code) {
-        Ok(id) => {
+        Ok(session) => {
             tracing::info!(
                 host,
                 sec_fetch_site = site,
                 user_agent = agent,
                 "login: code redeemed, session cookie set"
             );
-            (
-                StatusCode::SEE_OTHER,
-                [(LOCATION, to), (SET_COOKIE, set_cookie(&id))],
+            // The session's own path, and a cookie scoped to it alone.
+            let location = scoped_target(&session.scope, &to);
+            let cookie = set_cookie(&session.id, &session.scope, state.daemon.secure_cookie());
+            no_referrer(
+                (
+                    StatusCode::SEE_OTHER,
+                    [(LOCATION, location), (SET_COOKIE, cookie)],
+                )
+                    .into_response(),
             )
-                .into_response()
         }
         Err(why) => {
             tracing::warn!(

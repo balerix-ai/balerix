@@ -705,6 +705,7 @@ async fn purge_of_a_window_the_record_never_held_stops_it_before_deleting() {
         credentials: h.credentials.clone(),
         policy: Default::default(),
         hook_url: "http://127.0.0.1:1".into(),
+        browser: Default::default(),
         resync: Duration::from_secs(3600),
         kube: None,
     };
@@ -904,6 +905,7 @@ async fn a_stored_fleet_under_the_reserved_name_is_ignored() {
         credentials: h.credentials.clone(),
         policy: Default::default(),
         hook_url: "http://127.0.0.1:1".into(),
+        browser: Default::default(),
         resync: Duration::from_secs(3600),
         kube: None,
     };

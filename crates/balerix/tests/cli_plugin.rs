@@ -58,8 +58,15 @@ fn package_install_and_remove_edit_plugins_yaml_offline() {
         .failure()
         .stderr(predicate::str::contains("digest mismatch"));
 
+    // the digest compares case-insensitively and is recorded lowercase
     balerix(&home)
-        .args(["plugin", "install", &tarball.display().to_string()])
+        .args([
+            "plugin",
+            "install",
+            &tarball.display().to_string(),
+            "--sha256",
+            &digest.to_uppercase(),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("declared hello 0.1.0"))

@@ -33,7 +33,18 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
         "h" => 3600,
         _ => bail!("invalid duration {s:?} (use 90s, 5m or 1h)"),
     };
-    Ok(Duration::from_secs(n * mult))
+    // a huge value means "as long as it takes", never an overflow
+    Ok(Duration::from_secs(n.saturating_mul(mult)))
+}
+
+/// `timeout` from now, or far in the future when the sum would overflow
+/// `Instant`: a huge `--timeout` waits, it does not panic.
+pub fn deadline_after(timeout: Duration) -> Instant {
+    const FAR: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .or_else(|| now.checked_add(FAR))
+        .unwrap_or(now)
 }
 
 /// The wire name of a serializable enum value, for a table cell. A value
@@ -267,7 +278,7 @@ pub fn down_command(args: &DownArgs) -> Result<String> {
     let client = Client::connect(args.api_url.as_deref())?;
     client.down(&args.fleet, &q)?;
     if args.purge {
-        wait_purged(&client, &args.fleet, Instant::now() + timeout)?;
+        wait_purged(&client, &args.fleet, deadline_after(timeout))?;
         return Ok(format!("{}: purged\n", args.fleet));
     }
     wait_until(&client, &args.fleet, timeout, "down", |r| {
@@ -323,7 +334,21 @@ mod tests {
         assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
         assert!(parse_duration("5x").is_err());
+        assert_eq!(
+            parse_duration(&format!("{}h", u64::MAX)).unwrap(),
+            Duration::from_secs(u64::MAX),
+            "saturates rather than overflowing"
+        );
         assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn a_huge_timeout_is_a_far_deadline_not_a_panic() {
+        let now = Instant::now();
+        let far = deadline_after(Duration::MAX);
+        assert!(far > now + Duration::from_secs(365 * 24 * 3600), "{far:?}");
+        let near = deadline_after(Duration::from_secs(5));
+        assert!(near > now && near <= Instant::now() + Duration::from_secs(5));
     }
 
     #[test]

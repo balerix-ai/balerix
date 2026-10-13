@@ -140,18 +140,35 @@ job fails and the summary says to re-run the whole workflow.
 
 ## Recovery
 
+A real run makes things public in this order, each step only after every
+step before it succeeded for every unit in the run:
+
+1. images are pushed by digest only, untagged, as each leg builds and
+   scans them;
+2. `merge-images`: each image's `<ver>` tag, signed and attested;
+3. charts, when planned: the check on kind, then the OCI push
+   (`charts-publish`);
+4. `publish-crates`: crates.io, which cannot be undone, so it waits for
+   every gate above;
+5. `github-release`: the GitHub Release and its tag, per unit;
+6. after the tag: the charts index, `verify-package`, then
+   `promote-images` moves `latest` and the other moving tags.
+
+A failure in any one leg (one image's scan, say) stops the whole run at
+that step: no unit in it publishes crates or is tagged.
+
 Every job is idempotent and the tag is created last, so re-running
 `release.yml` (Re-run failed jobs, or `workflow_dispatch`) finishes a partial
 release.
 
 | Fails at | State left | Do |
 |---|---|---|
-| audit, build, smoke test, image build or scan | nothing public | Fix on `main` through a normal PR; the version is still untagged, so that merge releases it. |
+| audit, build, smoke test, image build or scan | nothing public but untagged image digests, for every unit in the run | Fix on `main` through a normal PR; the version is still untagged, so that merge releases it. |
 | after `publish-crates` | crates live, no tag | Re-run; publishing skips versions crates.io already has. |
 | after an image push | an unannounced `<ver>` image tag | Re-run; the tag is overwritten and `latest` has not moved. |
 | one unit's GitHub Release, after other units in the same run published | those units are tagged, but their packages are not verified and their images not promoted | Use *Re-run failed jobs* on that run: it retries the failed release, then runs `verify-package` and `promote-images` for every unit. A new run or push skips units that already have tags, so their `latest` stays on the previous release until they release again. |
 | `verify-package` | the release is published and flagged as a prerelease; no image's moving tags move in that run | Fix it; the next patch release follows the normal flow. |
-| charts check (pins, lint, kind) | no chart published and no unit tagged; when the run also releases core or a plugin, their unannounced `<ver>` image tags may exist | Re-run if the failure was transient (the kind install); otherwise fix through a normal PR, whose merge releases every unit still untagged. A pin neither tagged nor in the run needs its unit released first. |
+| charts check (pins, lint, kind) | no chart or crate published and no unit tagged; when the run also releases core or a plugin, their unannounced `<ver>` image tags may exist | Re-run if the failure was transient (the kind install); otherwise fix through a normal PR, whose merge releases every unit still untagged. A pin neither tagged nor in the run needs its unit released first. |
 | after `charts-publish` | the OCI charts exist, no tag | Re-run. |
 | `charts-index` | tagged, not indexed | Re-run; it skips an index that already lists the version. |
 | `charts-verify` | the release is flagged as a prerelease | Fix the index or Pages; the next release follows the normal flow. |

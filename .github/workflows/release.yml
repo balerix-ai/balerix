@@ -438,12 +438,23 @@ jobs:
           mapfile -t units < <(jq -r '.[]' <<<"$CRATES")
           mise x -- scripts/release/publish-crates.sh --dry-run "${units[@]}"
 
+  # crates.io cannot be undone, so this runs after every gate that can still
+  # stop the release: build, every image leg, the merged and signed images,
+  # the packages and the charts check and push. Each planned gate must have
+  # succeeded; an unplanned one is skipped. A failed images leg skips
+  # merge-images by its implicit success(), which on its own reads like a
+  # run with no images, hence needs.images.
   publish-crates:
-    needs: [plan, build]
+    needs: [plan, build, images, merge-images, package, charts, charts-publish]
     if: >-
       ${{ !cancelled() && needs.plan.result == 'success'
-      && (needs.build.result == 'success' || needs.build.result == 'skipped')
-      && needs.plan.outputs.crates != '[]' && !inputs.dry-run && github.repository == 'balerix-ai/balerix' }}
+      && needs.plan.outputs.crates != '[]' && !inputs.dry-run && github.repository == 'balerix-ai/balerix'
+      && (needs.plan.outputs.binaries == '[]' || (needs.build.result == 'success'
+        && needs.images.result == 'success' && needs.merge-images.result == 'success'))
+      && (needs.plan.outputs.plugins == '[]' || needs.package.result == 'success')
+      && (needs.plan.outputs.charts != 'true' || (needs.charts.result == 'success'
+        && needs.charts-publish.result == 'success'))
+      && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -469,14 +480,21 @@ jobs:
           mise x -- scripts/release/publish-crates.sh "${units[@]}"
 
   github-release:
-    # A fork's real (non-dry-run) run never runs publish-crates (repository
-    # check), only publish-crates-dry-run; gate on both so that still holds
-    # this job back the way the combined job used to.
-    needs: [plan, build, merge-images, package, charts, charts-publish, publish-crates-dry-run, publish-crates]
+    # The tag, last: every planned gate succeeded, as for publish-crates,
+    # and so did the crates. A fork's real (non-dry-run) run never runs
+    # publish-crates (repository check), only publish-crates-dry-run; either
+    # one counts. needs.*.result covers direct needs only, so images is
+    # named here even though merge-images follows it.
+    needs: [plan, build, images, merge-images, package, charts, charts-publish, publish-crates-dry-run, publish-crates]
     if: >-
       ${{ !cancelled() && !inputs.dry-run && needs.plan.result == 'success' && needs.plan.outputs.units != '[]'
-      && (needs.build.result == 'success' || needs.build.result == 'skipped')
-      && (needs.merge-images.result == 'success' || needs.merge-images.result == 'skipped')
+      && (needs.plan.outputs.binaries == '[]' || (needs.build.result == 'success'
+        && needs.images.result == 'success' && needs.merge-images.result == 'success'))
+      && (needs.plan.outputs.plugins == '[]' || needs.package.result == 'success')
+      && (needs.plan.outputs.charts != 'true' || (needs.charts.result == 'success'
+        && needs.charts-publish.result == 'success'))
+      && (needs.plan.outputs.crates == '[]' || needs.publish-crates.result == 'success'
+        || needs.publish-crates-dry-run.result == 'success')
       && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-24.04
     permissions:

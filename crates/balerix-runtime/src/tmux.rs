@@ -43,25 +43,10 @@ const ATTACH_TERM: &str = "xterm-256color";
 static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
 static SEND_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Strips terminal control characters from text sent to an agent: every
-/// C0 control but `\n` and `\t`, DEL, and every C1 control are removed;
-/// `\r\n` becomes `\n` and a lone `\r` is dropped. The text is otherwise
-/// unchanged. Stripping, not refusing, so a review or a reply that happens
-/// to carry one still arrives. Every `send_text` goes through here
-/// (`TmuxRunner::send_text`, which the Kubernetes sidecar runs as well).
-pub fn strip_terminal_controls(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text
-        .chars()
-        .any(|c| c.is_control() && c != '\n' && c != '\t')
-    {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    std::borrow::Cow::Owned(
-        text.chars()
-            .filter(|&c| !c.is_control() || c == '\n' || c == '\t')
-            .collect(),
-    )
-}
+/// What every `send_text` strips (`TmuxRunner::send_text`, which the
+/// Kubernetes sidecar runs as well): one implementation, `balerix-api`'s.
+pub use balerix_api::strip_terminal_controls;
+
 /// Above this many bytes a single line is pasted through a buffer like a
 /// multi-line text: tmux refuses a command whose argv exceeds ~16 KiB
 /// (`command too long`), and `send-keys -l` carries the text as argv.
@@ -1013,25 +998,13 @@ pub fn tmux_socket_dir(tmux_tmpdir: Option<&Path>) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The runner types what it is given, controls aside: the escape
+    /// for an input mode is the daemon's, for plugins' text only.
     #[test]
-    fn terminal_controls_are_stripped_from_sent_text() {
-        assert!(matches!(
-            strip_terminal_controls("plain\ttext\nok"),
-            std::borrow::Cow::Borrowed("plain\ttext\nok")
-        ));
-        assert_eq!(
-            strip_terminal_controls("a\u{1b}[31mb\u{7}c\u{85}d\u{9b}e\u{7f}f\u{0}g"),
-            "a[31mbcdefg"
-        );
-        assert_eq!(
-            strip_terminal_controls("one\r\ntwo\rthree\n"),
-            "one\ntwothree\n"
-        );
-        assert_eq!(
-            strip_terminal_controls("ä € \u{a0}"),
-            "ä € \u{a0}",
-            "not controls"
-        );
+    fn the_runner_strips_controls_and_escapes_nothing() {
+        assert_eq!(strip_terminal_controls("a\u{7}b"), "ab");
+        assert_eq!(strip_terminal_controls("!x"), "!x");
+        assert_eq!(strip_terminal_controls("# x"), "# x");
     }
 
     /// `cmd()` and `attach` build every client's leading argv from

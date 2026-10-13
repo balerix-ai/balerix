@@ -2,7 +2,7 @@
 //! §4.2 step 1 before it).
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use balerix_core::{MaterializeError, RepoRef};
 
@@ -391,6 +391,18 @@ fn system_prefixes() -> String {
 /// `sandbox::render_git_profile`; `write_git_profile` must have run with
 /// the same policy.
 fn sandbox_args(agent: &AgentPaths, policy: SocketPolicy, balerix: &Path) -> Vec<String> {
+    sandbox_args_writing(agent, policy, balerix, None)
+}
+
+/// `sandbox_args`, with `writable` granted read-write (`--allow`) on top
+/// of the read-only profile: only the clone step's index refresh
+/// (`Workspace::refresh_index`) passes one, its fresh clone's `.git`.
+fn sandbox_args_writing(
+    agent: &AgentPaths,
+    policy: SocketPolicy,
+    balerix: &Path,
+    writable: Option<&Path>,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-s".into(),
         "--log-file".into(),
@@ -399,8 +411,11 @@ fn sandbox_args(agent: &AgentPaths, policy: SocketPolicy, balerix: &Path) -> Vec
         "--no-audit".into(),
         "--profile".into(),
         agent.git_profile.display().to_string(),
-        "--".into(),
     ];
+    if let Some(dir) = writable {
+        args.extend(["--allow".into(), dir.display().to_string()]);
+    }
+    args.push("--".into());
     args.extend(wrap_command(policy, balerix, Vec::new()));
     args
 }
@@ -423,13 +438,15 @@ fn git_command(tools: &ToolPaths, crew: &CrewPaths, agent: &AgentPaths) -> Vec<S
 }
 
 /// The nono command for one call under the git profile, from an empty
-/// environment with a fresh `ScratchHome`, logged to the crew's `git.log`.
+/// environment with a fresh `ScratchHome`, logged to the crew's `git.log`;
+/// `writable` as `sandbox_args_writing`'s.
 fn sandboxed_cmd(
     tools: &ToolPaths,
     policy: SocketPolicy,
     crew: &CrewPaths,
     agent: &AgentPaths,
     log: GitLog,
+    writable: Option<&Path>,
 ) -> Result<(Cmd, ScratchHome), GitFailure> {
     let log_file = crew.logs.join("git.log");
     let home = ScratchHome::new(agent).map_err(|e| GitFailure {
@@ -449,7 +466,12 @@ fn sandboxed_cmd(
         GitLog::Full => cmd.log(&log_file),
         GitLog::ArgvOnly => cmd.log_argv_only(&log_file),
     }
-    .args(sandbox_args(agent, policy, &tools.balerix));
+    .args(sandbox_args_writing(
+        agent,
+        policy,
+        &tools.balerix,
+        writable,
+    ));
     Ok((cmd, home))
 }
 
@@ -523,6 +545,38 @@ impl Drop for ScratchHome {
     }
 }
 
+/// How far past the second of `written` a file's mtime must be for git
+/// to take entries written up to then as clean (`Workspace::refresh_index`).
+/// The kernel stamps files from a coarse clock that can trail the system
+/// clock by a tick (10 ms at `HZ=100`); twice that keeps a write made just
+/// after the boundary from landing in the old second.
+const PAST_SECOND_MARGIN: Duration = Duration::from_millis(20);
+
+/// The most `wait_past_second` waits: one second and the margin, whatever
+/// `written` says (a clock that moved backwards, an mtime in the future).
+const PAST_SECOND_MAX: Duration = Duration::from_millis(1100);
+
+/// How long to wait, from `now`, until a file written then gets an mtime
+/// in a later whole second than `written` (plus `PAST_SECOND_MARGIN`):
+/// git's racy-clean check compares whole seconds unless it was built with
+/// `USE_NSEC`, so the next second is enough for either build.
+pub(crate) fn wait_past_second(written: SystemTime, now: SystemTime) -> Duration {
+    let second = written
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let target = UNIX_EPOCH + Duration::from_secs(second + 1) + PAST_SECOND_MARGIN;
+    target
+        .duration_since(now)
+        .unwrap_or_default()
+        .min(PAST_SECOND_MAX)
+}
+
+/// The most the clone step's index refresh may take
+/// (`Workspace::refresh_index`): far more than re-hashing a large
+/// checkout needs, so a hung start cannot hold the clone step.
+const INDEX_REFRESH_DEADLINE: Duration = Duration::from_secs(60);
+
 /// What `sandboxed_git` writes to the crew's `git.log`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GitLog {
@@ -579,7 +633,7 @@ pub(crate) fn sandboxed_git(
     log: GitLog,
     deadline: Option<Duration>,
 ) -> Result<CmdOutput, GitFailure> {
-    let (cmd, _home) = sandboxed_cmd(tools, policy, crew, agent, log)?;
+    let (cmd, _home) = sandboxed_cmd(tools, policy, crew, agent, log, None)?;
     let mut cmd = cmd
         .args(git_command(tools, crew, agent))
         .args(args.iter().copied());
@@ -643,7 +697,7 @@ pub(crate) fn sandboxed_git_script(
     sink: Option<StdoutSink<'_>>,
     deadline: Duration,
 ) -> Result<CmdOutput, GitFailure> {
-    let (cmd, _home) = sandboxed_cmd(tools, policy, crew, agent, GitLog::ArgvOnly)?;
+    let (cmd, _home) = sandboxed_cmd(tools, policy, crew, agent, GitLog::ArgvOnly, None)?;
     let cmd = cmd
         .args(["/bin/sh", "-c", script, "sh"])
         .args(leading.iter().copied())
@@ -1137,7 +1191,94 @@ impl Workspace<'_> {
         }
         self.create_clone(id, crew, agent, repo, branch, start_ref)
             .map_err(|e| discard_half_made(id, &agent.workspace, e))?;
+        self.refresh_index(id, crew, agent);
         Self::record_branch(id, agent, branch)
+    }
+
+    /// A new clone's index, rewritten once the clock has left the second
+    /// its checkout wrote it in (#253). The checkout writes the files and
+    /// then the index within the same second, and git's racy-clean rule
+    /// treats an entry whose file mtime is not older than the index's own
+    /// (compared in whole seconds, or in nanoseconds when git is built
+    /// with `USE_NSEC`) as possibly modified: every `status` re-reads
+    /// those files. The workspace reader runs with `GIT_OPTIONAL_LOCKS=0`
+    /// and never writes the result back, so every poll paid that until the
+    /// agent's own git wrote the index. `update-index --refresh` re-hashes
+    /// them once, here, and writes an index younger than every file it
+    /// checked; the reader's `status` then trusts the stat data.
+    ///
+    /// Under the git profile like every call in the clone, with the
+    /// clone's `.git` granted read-write for this one start: the profile
+    /// is read-only, and `index.lock` and its rename need the directory.
+    /// The profile and the command are made before the wait, which they
+    /// overlap. No canary (`prepare_sandbox`): nothing here is a yes/no
+    /// answer a nono failure could be mistaken for, and every failure is
+    /// the same. No filter probe (the reader's `FILTER_KEYS`) before the
+    /// re-hash either: its answer is always "no" in a fresh clone, whose
+    /// only config is the one `git clone` wrote and whose git reads no
+    /// system or global config. It is an optimisation, so a failure, or a
+    /// start still running at `INDEX_REFRESH_DEADLINE`, is a warning in
+    /// the crew's `git.log` and the clone stands; the reads are slower,
+    /// not wrong. Nothing else runs in the clone yet, so an `index.lock`
+    /// a failed start left is removed: the agent's own git would refuse
+    /// to run beside it.
+    fn refresh_index(&self, id: &str, crew: &CrewPaths, agent: &AgentPaths) {
+        let dot_git = agent.workspace.join(".git");
+        let refreshed = std::fs::symlink_metadata(dot_git.join("index"))
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("cannot read the index's mtime: {e}"))
+            .and_then(|written| {
+                write_git_profile(
+                    self.tools,
+                    id,
+                    agent,
+                    crew,
+                    self.git_read,
+                    self.socket_policy,
+                )
+                .map_err(|e| e.to_string())?;
+                let (cmd, _home) = sandboxed_cmd(
+                    self.tools,
+                    self.socket_policy,
+                    crew,
+                    agent,
+                    GitLog::Full,
+                    Some(&dot_git),
+                )
+                .map_err(|f| f.stderr)?;
+                let cmd = cmd
+                    .args(git_command(self.tools, crew, agent))
+                    .args(["update-index", "-q", "--refresh"])
+                    .timeout(INDEX_REFRESH_DEADLINE);
+                std::thread::sleep(wait_past_second(written, SystemTime::now()));
+                cmd.run().map(|_| ()).map_err(|f| match f.timed_out {
+                    Some(d) => format!("timed out after {}s: {}", d.as_secs(), f.stderr),
+                    None => f.stderr,
+                })
+            });
+        if let Err(error) = refreshed {
+            let lock = dot_git.join("index.lock");
+            let removed = match std::fs::remove_file(&lock) {
+                Ok(()) => format!(" (removed the {} it left)", lock.display()),
+                Err(_) => String::new(),
+            };
+            let error = error.trim();
+            tracing::warn!(agent = id, error, "index refresh after the clone failed");
+            let log = crew.logs.join("git.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)
+            {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    f,
+                    "# warning: {id}: index refresh after the clone failed, so reads \
+                     re-hash the files the checkout wrote until the index is next \
+                     written{removed}: {error}"
+                );
+            }
+        }
     }
 
     /// `ensure_clone`'s judgement of an existing clone for `branch`
@@ -1547,9 +1688,52 @@ mod tests {
     use crate::tools::{Cmd, CmdOutput};
     use crate::workspace::{
         CloneDecision, ScratchHome, decide_clone, file_url, first_symlink_with, is_gits_answer,
-        sandbox_args, scrub_git_env, sweep_stale_homes,
+        sandbox_args, sandbox_args_writing, scrub_git_env, sweep_stale_homes, wait_past_second,
     };
     use std::path::Path;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    /// #253: the wait ends 20 ms into the second after the index's, and
+    /// is never more than 1.1 s.
+    #[test]
+    fn the_index_refresh_waits_just_past_the_checkouts_second() {
+        let at = |ms: u64| UNIX_EPOCH + Duration::from_millis(ms);
+        // written at 100.300 s, now 100.400 s: until 101.020 s
+        assert_eq!(
+            wait_past_second(at(100_300), at(100_400)),
+            Duration::from_millis(620)
+        );
+        assert_eq!(
+            wait_past_second(at(100_000), at(100_000)),
+            Duration::from_millis(1020)
+        );
+        // already past: no wait
+        assert_eq!(wait_past_second(at(100_300), at(101_020)), Duration::ZERO);
+        assert_eq!(wait_past_second(at(100_300), at(105_000)), Duration::ZERO);
+        // an mtime ahead of the clock waits no more than the cap
+        assert_eq!(
+            wait_past_second(at(200_000), at(100_000)),
+            Duration::from_millis(1100)
+        );
+    }
+
+    /// The write grant goes before nono's `--`, after the profile.
+    #[test]
+    fn the_write_grant_precedes_the_separator() {
+        let layout = StateLayout::from_env(Path::new("/h"), |_| None);
+        let agent = layout.agent(&"f/c/a".parse().unwrap());
+        let plain = sandbox_args(&agent, SocketPolicy::Open, Path::new("/b"));
+        assert!(!plain.iter().any(|a| a == "--allow"));
+        let args = sandbox_args_writing(
+            &agent,
+            SocketPolicy::Open,
+            Path::new("/b"),
+            Some(Path::new("/w/.git")),
+        );
+        let n = args.len();
+        assert_eq!(args[n - 3..], ["--allow", "/w/.git", "--"]);
+        assert_eq!(args[..n - 3], plain[..plain.len() - 1]);
+    }
 
     #[test]
     fn deny_puts_sandbox_exec_after_nonos_separator() {

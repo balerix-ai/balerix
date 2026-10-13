@@ -285,7 +285,12 @@ credentials, hook input, or sandbox rules.
   `.nono-git-*` directory beside the agent's `nono/`, removed when the
   call ends (`workspace::ScratchHome`): nono writes a session record per
   `run` under `$HOME`, and the agent's own `nono/` holds its live
-  session's, so those could never be swept there. Each call is a sandbox start (about 55 ms idle, far
+  session's, so those could never be swept there. The profile is
+  read-only; the one call that writes is a new clone's index refresh
+  (`Workspace::refresh_index`, #253: `update-index --refresh` once the
+  clock has left the checkout's second, so the reader finds no racily
+  clean entries), which adds `--allow <clone>/.git` for its one start and
+  only warns in `git.log` when it fails. Each call is a sandbox start (about 55 ms idle, far
   more on a loaded host), so the reader's `version` is one call (#174: its
   four git commands run in one `/bin/sh` under the profile,
   `workspace::sandboxed_git_script`; the script is a constant and every

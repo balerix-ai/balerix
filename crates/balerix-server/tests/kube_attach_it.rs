@@ -9,10 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use balerix_api::link::ATTACH_MAX_MESSAGE;
 use balerix_api::{
-    AgentSettings, CrewSpec, FleetSpec, LINK_PROTOCOL_HEADER, LinkOp, LinkReply, LinkRequest,
-    LinkResult, SidecarFrame,
+    ATTACH_MAX_MESSAGE, AgentSettings, CrewSpec, FleetSpec, LINK_PROTOCOL_HEADER, LinkOp,
+    LinkReply, LinkRequest, LinkResult, SidecarFrame,
 };
 use balerix_core::{AgentId, AgentRunner, PassThrough, PtyStream, RunnerError};
 use balerix_server::testing::Harness;
@@ -572,6 +571,77 @@ async fn a_paste_while_the_viewer_is_not_reading_does_not_hang_the_session() {
         .expect("the paste was taken")
         .unwrap();
     assert_eq!(pasted, bytes);
+    tokio::task::spawn_blocking(move || drop(stream))
+        .await
+        .unwrap();
+}
+
+/// A viewer's paste waits on a sidecar that is not reading; when the
+/// viewer is done (the stream is dropped), the write still waiting gives
+/// up at once instead of holding its thread until the sidecar reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_waiting_on_the_sidecar_gives_up_when_the_stream_is_dropped() {
+    let w = world().await;
+    let (stream, _pty_ws, _link) = attached(&w).await; // never read
+    let mut writer = stream.writer().unwrap();
+    let taken = Arc::new(AtomicUsize::new(0));
+    let paste = tokio::task::spawn_blocking({
+        let taken = taken.clone();
+        move || {
+            let piece = vec![b'p'; CHUNK];
+            for _ in 0..OFFERED / CHUNK {
+                writer.write_all(&piece)?;
+                taken.fetch_add(CHUNK, Ordering::SeqCst);
+            }
+            Ok::<(), std::io::Error>(())
+        }
+    });
+    until_stalled(&taken, BOUND).await;
+    tokio::task::spawn_blocking(move || drop(stream))
+        .await
+        .unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(5), paste)
+        .await
+        .expect("the blocked write gave up once the stream was dropped")
+        .unwrap();
+    assert!(ended.is_err(), "the paste cannot have been taken whole");
+}
+
+/// The sidecar ends a session whose terminal took no input with 1011 and
+/// a reason; the stream's reader fails with that close (the bridge passes
+/// it on to the viewer) after what was sent before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sidecar_s_stall_close_reaches_the_reader() {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    let w = world().await;
+    let (stream, mut pty_ws, _link) = attached(&w).await;
+    let mut reader = stream.reader().unwrap();
+    pty_ws
+        .send(Message::Binary(b"last output".to_vec().into()))
+        .await
+        .unwrap();
+    pty_ws
+        .send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Error,
+            reason: "the terminal took no input for 30 s".into(),
+        })))
+        .await
+        .unwrap();
+    let (got, end) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || {
+            let mut got = Vec::new();
+            let end = reader.read_to_end(&mut got);
+            (got, end)
+        }),
+    )
+    .await
+    .expect("the session ended")
+    .unwrap();
+    assert_eq!(got, b"last output");
+    let e = end.expect_err("the close, not EOF");
+    assert_eq!(e.to_string(), "1011 the terminal took no input for 30 s");
     tokio::task::spawn_blocking(move || drop(stream))
         .await
         .unwrap();

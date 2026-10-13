@@ -245,7 +245,9 @@ credentials, hook input, or sandbox rules.
   Enter varies from 1 s to over 20 s between cold starts, so github
   reports its first prompt only after `confirmWindow` plus 60 s
   (`START_UP_ALLOWANCE`).
-  Flow tracks nothing, so a flow `send` on `SessionStart` is still lost.
+  Flow tracks its submitted sends the same way (#100), with no window.
+  None of the three tracks a slash command: no `UserPromptSubmit`
+  follows one, so it would take Enters for 90 s (#255).
   `dev fake-claude` reads stdin from the start and cannot show any of
   this; `mise run verify-claude` section H does.
 - nono's state root follows nono's own `$HOME`; never point that at the agent's

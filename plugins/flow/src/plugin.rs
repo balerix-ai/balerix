@@ -6,18 +6,25 @@
 //! and `SessionStart` is the natural place to send the first one. Text
 //! that reaches the pane while Claude Code's TUI is still starting lands
 //! in the composer and loses its Enter (#100). So every submitted send is
-//! registered with common's delivery tracker (Spec M §8.7), the agent's
+//! registered with common's delivery tracker (Spec M §8.7), unless it
+//! is a slash command, which no `UserPromptSubmit` follows (#255); the agent's
 //! own `UserPromptSubmit` confirms it, and until then [`Nudger::tick`]
 //! presses Enter again on the tracker's cadence. Flow has nobody to
 //! report an expiry to, so a prompt's window is zero: confirmation and
 //! the tracker's own nudge bound are all that settle it.
+//!
+//! A state change and its KV write happen under the agent's gate, an
+//! async lock `activate` and `deactivate` take too, so a `deactivate`
+//! never lands between an intercept's transition and its store: the
+//! write cannot bring a dropped agent's state back, nor its gauge
+//! series (#256).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use balerix_api::{DEFAULT_KEY_DELAY_MS, HookEvent, InterceptResponse, Key, KeyStep, PluginAction};
-use balerix_plugin_common::delivery::Deliveries;
+use balerix_plugin_common::delivery::{self, Deliveries, Kind};
 use balerix_plugin_sdk::metrics::{IntCounterVec, IntGaugeVec};
 use balerix_plugin_sdk::{Host, Metrics, Plugin, SdkError};
 use serde::{Deserialize, Serialize};
@@ -43,10 +50,18 @@ struct AgentFlow {
 pub struct FlowPlugin {
     host: Host,
     agents: Mutex<HashMap<String, AgentFlow>>,
+    /// Per agent, held across a state change and its KV write (#256).
+    /// Made by the first `activate` and kept: a gate dropped on
+    /// `deactivate` while an intercept still waited on it would let a
+    /// later `activate` take a fresh one alongside. One entry per agent
+    /// ever activated.
+    gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     metrics: Metrics,
     state_gauge: IntGaugeVec,
     transitions: IntCounterVec,
     nudger: Nudger,
+    #[cfg(test)]
+    pause: Mutex<Option<Arc<tests::Pause>>>,
 }
 
 /// The half of the plugin that runs on a timer: the submitted sends not
@@ -156,10 +171,27 @@ impl FlowPlugin {
             },
             host,
             agents: Mutex::new(HashMap::new()),
+            gates: Mutex::new(HashMap::new()),
             metrics,
             state_gauge,
             transitions,
+            #[cfg(test)]
+            pause: Mutex::new(None),
         })
+    }
+
+    fn gates(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+        self.gates.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `agent`'s gate, made if it has none yet.
+    fn gate(&self, agent: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.gates().entry(agent.to_string()).or_default().clone()
+    }
+
+    /// `agent`'s gate, if it was ever activated.
+    fn existing_gate(&self, agent: &str) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        self.gates().get(agent).cloned()
     }
 
     /// The timer half; see [`Nudger`].
@@ -200,6 +232,8 @@ impl FlowPlugin {
     async fn store(&self, agent: &str, stored: &Stored) -> Result<(), SdkError> {
         let bytes = serde_json::to_vec(stored)
             .map_err(|e| SdkError::Transport(format!("encode state: {e}")))?;
+        #[cfg(test)]
+        tests::Pause::at_store(&self.pause).await;
         self.host
             .kv_put(&Self::state_key(agent), &bytes, false)
             .await
@@ -217,6 +251,8 @@ impl Plugin for FlowPlugin {
     /// loudly on a daemon-side error (§17.3).
     async fn activate(&self, agent: &str, config: Value) -> Result<(), String> {
         let compiled = Arc::new(compile(&config).map_err(|e| e.to_string())?);
+        let gate = self.gate(agent);
+        let _held = gate.lock().await;
         let key = Self::state_key(agent);
         let previous = self
             .host
@@ -264,6 +300,11 @@ impl Plugin for FlowPlugin {
     /// Forget the agent and its stored state: `down`, a dropped block and
     /// a config change all reset to `initial` on the next `activate`.
     async fn deactivate(&self, agent: &str) {
+        let gate = self.existing_gate(agent);
+        let _held = match &gate {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        };
         self.nudger.forget(agent);
         let old = self
             .agents
@@ -281,8 +322,9 @@ impl Plugin for FlowPlugin {
     }
 
     /// One step; the transition is applied in memory first, then written
-    /// to KV before the verdict returns. A KV failure is logged and the
-    /// in-memory state stands — a hook never fails on it (§17.3).
+    /// to KV before the verdict returns, both under the agent's gate. A
+    /// KV failure is logged and the in-memory state stands — a hook never
+    /// fails on it (§17.3).
     async fn intercept(
         &self,
         event: HookEvent,
@@ -292,17 +334,26 @@ impl Plugin for FlowPlugin {
         let agent = event.agent.clone();
         let now = Instant::now();
         self.nudger.on_event(&event, now);
+        let pass = |so_far| InterceptResponse {
+            response: so_far,
+            actions: Vec::new(),
+        };
+        let Some(gate) = self.existing_gate(&agent) else {
+            return pass(so_far);
+        };
+        let _held = gate.lock().await;
         let (outcome, transition) = {
             let mut agents = self.agents.lock().unwrap_or_else(|e| e.into_inner());
             let Some(flow) = agents.get_mut(&agent) else {
-                return InterceptResponse {
-                    response: so_far,
-                    actions: Vec::new(),
-                };
+                return pass(so_far);
             };
             let s = step(&flow.compiled, &flow.state, &event, so_far);
             for action in &s.actions {
-                if let PluginAction::SendText { text, submit: true } = action {
+                // A slash command gets no `UserPromptSubmit`, so it is never
+                // tracked: nothing could confirm it (#255).
+                if let PluginAction::SendText { text, submit: true } = action
+                    && delivery::classify(text) == Kind::Prompt
+                {
                     self.nudger.sent(&agent, text, now);
                 }
             }
@@ -332,5 +383,87 @@ impl Plugin for FlowPlugin {
 
     fn metrics(&self) -> Option<&Metrics> {
         Some(&self.metrics)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use balerix_plugin_sdk::testing::{FakeHost, event, metric};
+    use serde_json::json;
+    use tokio::sync::Notify;
+
+    const ALICE: &str = "e2e/c/alice";
+
+    /// Holds the next `store` open: says when it is reached, waits to be
+    /// released.
+    #[derive(Default)]
+    pub(super) struct Pause {
+        reached: Notify,
+        release: Notify,
+    }
+
+    impl Pause {
+        pub(super) async fn at_store(slot: &Mutex<Option<Arc<Pause>>>) {
+            let pause = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.release.notified().await;
+            }
+        }
+    }
+
+    fn config() -> Value {
+        json!({
+            "initial": "working",
+            "states": {
+                "working": { "on": [ { "event": "Stop", "goto": "review" } ] },
+                "review": {}
+            }
+        })
+    }
+
+    /// #256: a `deactivate` that arrives while an intercept is storing
+    /// its transition waits for it, then deletes: no state is left
+    /// behind, no gauge series, and the next `activate` starts at
+    /// `initial`.
+    #[tokio::test]
+    async fn deactivate_during_a_store_leaves_no_state_behind() {
+        let fake = FakeHost::start("tok", json!({}), vec![]).await;
+        let env = fake.env("flow", std::path::Path::new("/s"));
+        let plugin = FlowPlugin::new(Host::new(env).unwrap()).unwrap();
+        plugin.activate(ALICE, config()).await.unwrap();
+
+        let pause = Arc::new(Pause::default());
+        *plugin.pause.lock().unwrap() = Some(pause.clone());
+        let stop = event(ALICE, "Stop", json!({}));
+        let (verdict, waited) = tokio::join!(plugin.intercept(stop, json!({}), 900), async {
+            pause.reached.notified().await; // working -> review, not yet stored
+            let deactivate = plugin.deactivate(ALICE);
+            tokio::pin!(deactivate);
+            let early = tokio::time::timeout(Duration::from_millis(200), &mut deactivate).await;
+            pause.release.notify_one();
+            if early.is_err() {
+                deactivate.await;
+            }
+            early.is_err()
+        });
+        assert!(verdict.actions.is_empty());
+        assert!(waited, "deactivate waited for the store");
+        assert_eq!(fake.kv_json(&FlowPlugin::state_key(ALICE)), None);
+        let m = plugin.metrics.render().unwrap();
+        assert_eq!(
+            metric(&m, "balerix_plugin_flow_state", &[("agent", "alice")]),
+            None,
+            "{m}"
+        );
+
+        plugin.activate(ALICE, config()).await.unwrap();
+        assert_eq!(
+            fake.kv_json(&FlowPlugin::state_key(ALICE)).unwrap()["state"],
+            "working"
+        );
     }
 }

@@ -6,14 +6,14 @@ use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, header::CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use balerix_api::{
-    ActivateRequest, DeactivateRequest, ErrorBody, EventBatch, HookEvent, InterceptRequest,
-    InterceptResponse, PluginManifest,
+    ActivateRequest, DeactivateRequest, EVENTS_DROPPED_HEADER, ErrorBody, EventBatch, HookEvent,
+    InterceptRequest, InterceptResponse, PluginManifest,
 };
 use serde_json::{Value, json};
 
@@ -52,6 +52,17 @@ pub trait Plugin: Send + Sync + 'static {
     }
     fn observe(&self, events: Vec<HookEvent>) -> impl Future<Output = ()> + Send {
         let _ = events;
+        async {}
+    }
+    /// The daemon lost `n` observer events for this plugin since the last
+    /// batch the plugin acknowledged (`EVENTS_DROPPED_HEADER`,
+    /// plugin-protocol §4, `events`). Called before `observe` for the
+    /// batch that reports it; never with zero. The lost events came
+    /// before that batch's first one, so state tracked from the events
+    /// may be stale. The same count can arrive again if the batch is not
+    /// acknowledged, so handling it should be idempotent.
+    fn events_dropped(&self, n: u64) -> impl Future<Output = ()> + Send {
+        let _ = n;
         async {}
     }
     /// The verdict; default passes `response_so_far` through untouched.
@@ -187,14 +198,30 @@ async fn deactivate<P: Plugin>(
     Json(json!({})).into_response()
 }
 
+/// The `EVENTS_DROPPED_HEADER` count; absent, zero or unreadable is none.
+fn events_dropped(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(EVENTS_DROPPED_HEADER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+}
+
 async fn events<P: Plugin>(
     State(p): State<Arc<P>>,
+    headers: HeaderMap,
     body: Result<Json<EventBatch>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(batch) = match body {
         Ok(b) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
+    if let Some(n) = events_dropped(&headers) {
+        p.events_dropped(n).await;
+    }
     p.observe(batch.events).await;
     Json(json!({})).into_response()
 }
@@ -501,6 +528,55 @@ mod tests {
                 .await
                 .unwrap(),
             ""
+        );
+    }
+
+    /// Records, in order, each `events_dropped` count and each batch size.
+    #[derive(Default)]
+    struct Gaps(std::sync::Mutex<Vec<String>>);
+    impl Plugin for Gaps {
+        async fn events_dropped(&self, n: u64) {
+            self.0.lock().unwrap().push(format!("dropped {n}"));
+        }
+        async fn observe(&self, events: Vec<HookEvent>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("observe {}", events.len()));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_dropped_header_reaches_events_dropped_before_observe() {
+        let (listener, listen) = bind().await.unwrap();
+        let plugin = Arc::new(Gaps::default());
+        tokio::spawn(run(listener, plugin.clone(), "tok", None));
+        let url = format!("http://{listen}/v1/events");
+        let event = HookEvent::new("f/c/a", "Stop", Timestamp(1), json!({}));
+        let body = json!({ "events": [event] });
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        for header in [None, Some("7"), Some("0"), Some("lots")] {
+            let mut req = c.post(&url).bearer_auth("tok").json(&body);
+            if let Some(h) = header {
+                req = req.header(EVENTS_DROPPED_HEADER, h);
+            }
+            assert_eq!(
+                req.send().await.unwrap().status().as_u16(),
+                200,
+                "{header:?}"
+            );
+        }
+        assert_eq!(
+            *plugin.0.lock().unwrap(),
+            [
+                "observe 1",
+                "dropped 7",
+                "observe 1",
+                "observe 1",
+                "observe 1"
+            ],
+            "no header, a zero or an unreadable count: no call"
         );
     }
 

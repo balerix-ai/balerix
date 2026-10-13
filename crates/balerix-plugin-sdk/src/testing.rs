@@ -1164,6 +1164,23 @@ impl Harness {
         assert_eq!(status, 200, "events: {body}");
     }
 
+    /// `observe`, the batch reporting `dropped` events lost before it
+    /// (`EVENTS_DROPPED_HEADER`), as the daemon sends it after a loss.
+    pub async fn observe_after_drop(&self, dropped: u64, events: Vec<HookEvent>) {
+        let resp = self
+            .http
+            .post(self.url("/v1/events"))
+            .bearer_auth(&self.token)
+            .header(balerix_api::EVENTS_DROPPED_HEADER, dropped)
+            .json(&json!({ "events": events }))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("Harness POST /v1/events: {e}"));
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 200, "events: {body}");
+    }
+
     /// `intercept` with `response_so_far` `{}` and the full chain budget.
     pub async fn intercept(&self, event: HookEvent) -> InterceptResponse {
         self.intercept_with(event, json!({}), CHAIN_BUDGET_MS).await

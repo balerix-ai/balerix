@@ -45,7 +45,8 @@ struct Inner {
 pub enum DropReason {
     /// The queue was full; the oldest event went.
     Overflow,
-    /// The batch was ready to send while the plugin was not.
+    /// The event arrived, or its batch was ready to send, while the
+    /// plugin was not ready; or it was queued when the plugin said hello.
     NotReady,
     /// The plugin did not acknowledge the batch.
     Unacknowledged,

@@ -82,7 +82,7 @@ async fn the_client_sends_the_documented_bodies() {
 
     let f = fixture("events");
     let batch: EventBatch = serde_json::from_value(f["request"].clone()).unwrap();
-    c.events(&addr, &batch).await.unwrap();
+    c.events(&addr, &batch, 0).await.unwrap();
     assert_eq!(stub.calls_named("events")[0], f["request"]);
 
     let f = fixture("intercept");

@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use balerix_api::{
-    ActivateRequest, DeactivateRequest, ErrorBody, EventBatch, InterceptRequest, InterceptResponse,
+    ActivateRequest, DeactivateRequest, EVENTS_DROPPED_HEADER, ErrorBody, EventBatch,
+    InterceptRequest, InterceptResponse,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -189,10 +190,24 @@ impl PluginClient {
             .map(|_| ())
     }
 
-    pub async fn events(&self, addr: &PluginAddr, batch: &EventBatch) -> Result<(), CallFailure> {
-        self.post(addr, "/v1/events", batch, CALL_TIMEOUT)
-            .await
-            .map(|_| ())
+    /// `dropped`, when not zero, rides along as `EVENTS_DROPPED_HEADER`:
+    /// the events this plugin lost since its last acknowledged batch.
+    pub async fn events(
+        &self,
+        addr: &PluginAddr,
+        batch: &EventBatch,
+        dropped: u64,
+    ) -> Result<(), CallFailure> {
+        let mut req = self
+            .http
+            .post(Self::url(addr, "/v1/events"))
+            .bearer_auth(&addr.token)
+            .timeout(CALL_TIMEOUT)
+            .json(batch);
+        if dropped > 0 {
+            req = req.header(EVENTS_DROPPED_HEADER, dropped);
+        }
+        Self::body(req.send().await?).await.map(|_| ())
     }
 
     /// `timeout` is what remains of the chain's budget. A `response` that
@@ -412,6 +427,7 @@ mod tests {
             &EventBatch {
                 events: vec![event("Notification")],
             },
+            0,
         )
         .await
         .unwrap();

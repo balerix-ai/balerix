@@ -422,6 +422,25 @@ impl PluginRegistry {
         self.subscribed(agent, |m| m.hooks.observe.contains(event))
     }
 
+    /// Plugins observing `event`, active for `agent`, but not ready: they
+    /// miss it, and the observer queue counts that (§4.3).
+    pub fn unready_observers(&self, agent: &AgentId, event: &str) -> Vec<AgentName> {
+        let r = self.read();
+        r.order
+            .iter()
+            .filter(|name| {
+                r.plugins.get(*name).is_some_and(|p| {
+                    !p.ready
+                        && p.manifest.hooks.observe.contains(event)
+                        && r.rows
+                            .get(&(agent.clone(), (*name).clone()))
+                            .is_some_and(|row| row.activation.state == ActivationState::Active)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Copies the fleet's rows into `status.agents[*].plugins` (§16.3);
     /// agents the record does not know yet are skipped.
     pub fn overlay(&self, record: &mut FleetRecord) {
@@ -589,11 +608,24 @@ mod tests {
                 }
             )]
         );
+        assert!(r.unready_observers(&a, "Stop").is_empty());
         r.set_ready(&name("flow"), false);
         assert!(
             r.interceptors(&a, "PreToolUse").is_empty(),
             "not ready: skipped"
         );
+        assert!(r.observers(&a, "Stop").is_empty());
+        assert_eq!(r.unready_observers(&a, "Stop"), vec![name("flow")]);
+        assert!(
+            r.unready_observers(&a, "Notification").is_empty(),
+            "not subscribed"
+        );
+        r.set_ready(&name("web"), false);
+        assert!(
+            r.unready_observers(&a, "SessionStart").is_empty(),
+            "web is pending for a"
+        );
+        r.set_ready(&name("web"), true);
         r.set_ready(&name("flow"), true);
         assert!(r.is_active(&a, &name("flow")));
         assert!(!r.is_active(&a, &name("web")));

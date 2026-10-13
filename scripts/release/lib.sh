@@ -230,6 +230,11 @@ DAEMON_VALUES=charts/balerix-daemon/values.yaml
 # images into kind (kind-load-pins.sh).
 # shellcheck disable=SC2034
 CHARTS_CHECK_PLUGINS=(flow web)
+# What the charts ship that core's operator must serve: the CRDs and the
+# Rust types they are generated from. While either differs from the
+# appVersion tag, prepare.sh proposes no charts release.
+# shellcheck disable=SC2034
+CHARTS_CORE_PATHS=(operator/src/api charts/balerix-operator/templates/crds)
 
 # A top-level `<field>: <value>` of a YAML file (`-` is stdin), quotes dropped.
 yaml_field() {

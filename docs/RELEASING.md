@@ -46,7 +46,17 @@ tagged, and names the missing tag. While refused, an open charts release
 PR is closed like any unit with nothing to release, and opened again only
 on the first push to `main` after the blocking tag exists (`release-pr.yml`
 runs on push, not on a tag); dispatching `release-pr` with unit `charts`
-is the shortcut. A moved pin counts as a change even with no commit under
+is the shortcut. The operator chart's CRDs are served by core's operator,
+so, like common, the charts also wait for core: while
+`operator/src/api` or `charts/balerix-operator/templates/crds` has changed
+since the `balerix-v<appVersion>` tag, `prepare.sh charts` answers
+`status=none`, saying to release core first. Core's release PR moves
+`appVersion`, and its tag lifts the refusal. The CRDs' descriptions come
+from the doc comments in `operator/src/api`, so a `docs`, `test` or
+`chore` commit there blocks the charts too while core has nothing
+releasable to propose; to unblock them, dispatch `release-pr` with unit
+`core` and an explicit patch version (see *Forcing a version*), and
+release core. A moved pin counts as a change even with no commit under
 `charts/`, and the larger bump wins (a core minor is a chart minor). The
 changelog lists the moved images under `### Images`.
 

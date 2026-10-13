@@ -3,6 +3,7 @@
 //! `Plugin::health` reads.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use balerix_api::OBSERVER_QUEUE;
@@ -18,6 +19,8 @@ pub struct Queue<C> {
     inner: Mutex<VecDeque<C>>,
     notify: Notify,
     dropped: IntCounter,
+    /// Set on every drop, cleared by `take_gap`.
+    gap: AtomicBool,
 }
 
 impl<C> Queue<C> {
@@ -27,6 +30,7 @@ impl<C> Queue<C> {
             inner: Mutex::new(VecDeque::with_capacity(QUEUE)),
             notify: Notify::new(),
             dropped,
+            gap: AtomicBool::new(false),
         })
     }
 
@@ -42,6 +46,7 @@ impl<C> Queue<C> {
             if q.len() >= QUEUE {
                 q.pop_front();
                 self.dropped.inc();
+                self.gap.store(true, Ordering::SeqCst);
             }
             q.push_back(command);
         }
@@ -58,6 +63,14 @@ impl<C> Queue<C> {
             }
             self.notify.notified().await;
         }
+    }
+
+    /// Whether an entry was dropped since the last call, clearing the
+    /// mark. An actor asks after each command it handles: what it was
+    /// tracking from the commands may have missed some of them (common's
+    /// `Deliveries::lose_track`).
+    pub fn take_gap(&self) -> bool {
+        self.gap.swap(false, Ordering::SeqCst)
     }
 
     /// The number of entries currently queued.
@@ -137,6 +150,19 @@ mod tests {
         assert_eq!(q.len(), QUEUE);
         assert_eq!(counter.get(), 1);
         assert_eq!(q.pop().await, 1, "entry 0 was dropped");
+    }
+
+    #[tokio::test]
+    async fn a_drop_marks_a_gap_until_it_is_taken() {
+        let q: Arc<Queue<usize>> = Queue::new(dropped());
+        for i in 0..QUEUE {
+            q.push(i);
+        }
+        assert!(!q.take_gap(), "full is not a gap");
+        q.push(QUEUE);
+        q.pop().await;
+        assert!(q.take_gap());
+        assert!(!q.take_gap(), "taken once");
     }
 
     #[test]

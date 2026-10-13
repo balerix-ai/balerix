@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use balerix_api::{HookEvent, Key, KeyStep, PluginAction};
-use balerix_plugin_common::delivery::{self, Deliveries, Kind as BodyKind};
+use balerix_plugin_common::delivery::{
+    self, Allowlist, COMMAND_REFUSED, Deliveries, Kind as BodyKind,
+};
 use balerix_plugin_common::metrics::Shared;
 use balerix_plugin_common::pending::{OpenQuestion, Questions};
 use balerix_plugin_common::phases::PhaseChange;
@@ -282,6 +284,10 @@ impl<G: GitHubPort> Actor<G> {
         loop {
             let command = queue.pop().await;
             self.handle(command).await;
+            // A dropped command may have held hook events (Spec G-11).
+            if queue.take_gap() {
+                self.deliveries.lose_track();
+            }
         }
     }
 
@@ -946,8 +952,30 @@ impl<G: GitHubPort> Actor<G> {
                 .await;
             return;
         }
+        // What the agent's input line takes as prose; tracked as sent.
+        let text = delivery::as_prompt(body).into_owned();
+        if delivery::classify(&text) == BodyKind::Command
+            && !Allowlist::with(&self.cfg().slash_commands).allows(&text)
+        {
+            self.counters
+                .inbound
+                .with_label_values(&["command_refused"])
+                .inc();
+            tracing::info!("github: a command for {agent} is not on the allowlist");
+            self.post(
+                installation,
+                repo,
+                number,
+                &format!("not sent to {agent}: {COMMAND_REFUSED}"),
+                "notice",
+            )
+            .await;
+            self.react(installation, repo, Target::Comment(comment_id), CONFUSED)
+                .await;
+            return;
+        }
         let action = PluginAction::SendText {
-            text: body.to_string(),
+            text: text.clone(),
             submit: true,
         };
         match self.host.action(agent, &action).await {
@@ -962,7 +990,7 @@ impl<G: GitHubPort> Actor<G> {
                     number,
                     asker,
                     Target::Comment(comment_id),
-                    body,
+                    &text,
                     Duration::ZERO,
                 );
             }
@@ -1101,7 +1129,13 @@ impl<G: GitHubPort> Actor<G> {
             .agents
             .get(agent)
             .map_or(balerix_api::DEFAULT_KEY_DELAY_MS, |c| c.key_delay_ms);
-        let d = answer::on_reply(&open, body, delay_ms, Instant::now());
+        let d = answer::on_reply(
+            &open,
+            body,
+            delay_ms,
+            Instant::now(),
+            &Allowlist::with(&self.cfg().slash_commands),
+        );
         // The executor contract of `Decision` (Spec K §4), with comments as
         // posts and reactions on the operator's comment.
         let mut echo = None;
@@ -2568,6 +2602,93 @@ mod tests {
                 (Target::Comment(9), PLUS_ONE.into())
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_default_command_comment_is_sent() {
+        let (fake, _port, mut a) = started().await;
+        a.handle(comment(12, "bob", 9, "/compact keep the plan"))
+            .await;
+        assert_eq!(
+            fake.actions_for(AGENT).last(),
+            Some(&PluginAction::SendText {
+                text: "/compact keep the plan".into(),
+                submit: true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_comment_off_the_allowlist_is_refused_and_not_sent() {
+        for body in ["/foo", "/config x", "/clearx"] {
+            let (fake, port, mut a) = started().await;
+            let before = fake.actions_for(AGENT).len();
+            a.handle(comment(12, "bob", 9, body)).await;
+            assert_eq!(fake.actions_for(AGENT).len(), before, "{body:?}");
+            assert_eq!(
+                comments(&port.calls()).last(),
+                Some(&(12, format!("not sent to {AGENT}: {COMMAND_REFUSED}"))),
+                "{body:?}"
+            );
+            assert_eq!(
+                reactions(&port.calls()).last(),
+                Some(&(Target::Comment(9), CONFUSED.into()))
+            );
+            assert_eq!(
+                a.counters
+                    .inbound
+                    .with_label_values(&["command_refused"])
+                    .get(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operator_command_comment_is_sent() {
+        let (fake, _port, mut a) = started().await;
+        a.config = Some(
+            crate::config::parse_daemon(&json!({
+                "appId": 1, "privateKey": "k", "webhookSecret": "s",
+                "slashCommands": ["/review"]
+            }))
+            .unwrap(),
+        );
+        a.handle(comment(12, "bob", 9, "/review src")).await;
+        assert_eq!(
+            fake.actions_for(AGENT).last(),
+            Some(&PluginAction::SendText {
+                text: "/review src".into(),
+                submit: true
+            })
+        );
+    }
+
+    /// Text from a comment never opens the input line with a mode
+    /// character; what was sent is what the confirmation matches.
+    #[tokio::test]
+    async fn a_comment_opening_with_a_mode_character_is_sent_escaped() {
+        for (body, sent) in [("!x", "\\!x"), ("## Plan\nfix it", "\\## Plan\nfix it")] {
+            let (fake, port, mut a) = started().await;
+            a.handle(comment(12, "bob", 9, body)).await;
+            assert_eq!(
+                fake.actions_for(AGENT).last(),
+                Some(&PluginAction::SendText {
+                    text: sent.into(),
+                    submit: true
+                })
+            );
+            a.handle(Command::Events(vec![during(
+                "UserPromptSubmit",
+                json!({ "prompt": sent }),
+            )]))
+            .await;
+            assert_eq!(
+                reactions(&port.calls()).last(),
+                Some(&(Target::Comment(9), PLUS_ONE.into())),
+                "{body:?}"
+            );
+        }
     }
 
     /// #98: the daemon's action error can carry a socket path or a tmux

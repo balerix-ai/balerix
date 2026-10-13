@@ -1571,7 +1571,12 @@ impl Daemon {
     }
 
     /// One action from a verdict or from the `actions` route. `plugin` is
-    /// the metrics label when a plugin asked for it.
+    /// the metrics label when a plugin asked for it. Every caller is a
+    /// plugin's (a verdict's actions come from interceptors), so a
+    /// `send_text` goes through `balerix_api::prompt_text` first: the
+    /// text never opens the input line in another input mode, whatever
+    /// the plugin sent. The plugins apply the same function, so for them
+    /// this changes nothing. The runner's own `send_text` stays raw.
     pub async fn execute_action(
         &self,
         agent: &AgentId,
@@ -1586,7 +1591,8 @@ impl Daemon {
         match action {
             PluginAction::SendText { text, submit } => {
                 let runner = self.ports.runner.clone();
-                let (id, text, submit) = (agent.clone(), text.clone(), *submit);
+                let text = balerix_api::prompt_text(text).into_owned();
+                let (id, submit) = (agent.clone(), *submit);
                 tokio::task::spawn_blocking(move || runner.send_text(&id, &text, submit))
                     .await
                     .map_err(|e| DaemonError::Internal(e.to_string()))?
@@ -2472,6 +2478,63 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(w.h.runner.calls().len(), before, "never reached the runner");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_send_text_reaches_the_runner_as_prose() {
+        let w = world().await;
+        let stub = stub_plugin(StubScript {
+            health_ok: true,
+            ..StubScript::default()
+        })
+        .await;
+        hello(&w, &stub.listen).await;
+        let name: FleetName = "f".parse().unwrap();
+        w.daemon
+            .apply(
+                &name,
+                spec(&[("a", &[("flow", json!({}))])]),
+                Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        wait_gen(&w.daemon, 1).await;
+        let agent: AgentId = "f/c/a".parse().unwrap();
+        for (sent, typed) in [
+            ("\u{7}!x", "\\!x"),
+            ("!x", "\\!x"),
+            ("\\!x", "\\!x"),
+            ("  # x", "\\# x"),
+            ("/exit", "/exit"),
+            ("run the tests", "run the tests"),
+        ] {
+            let action = PluginAction::SendText {
+                text: sent.into(),
+                submit: true,
+            };
+            w.daemon
+                .execute_action(&agent, &action, Some("matrix"))
+                .await
+                .unwrap();
+            let want = format!("send_text f/c/a {typed:?} submit=true");
+            assert_eq!(w.h.runner.calls().last(), Some(&want), "{sent:?}");
+        }
+        // A verdict's actions are a plugin's too.
+        w.daemon
+            .clone()
+            .run_actions(
+                agent.clone(),
+                vec![PluginAction::SendText {
+                    text: "&y".into(),
+                    submit: false,
+                }],
+            )
+            .await;
+        assert_eq!(
+            w.h.runner.calls().last(),
+            Some(&"send_text f/c/a \"\\\\&y\" submit=false".to_string())
+        );
     }
 
     /// A refused apply must not have told a plugin anything: the 409 and

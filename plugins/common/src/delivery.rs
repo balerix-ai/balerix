@@ -14,20 +14,28 @@
 //! on `SessionStart`) lands in the composer and loses its Enter (#99).
 //! `nudge` answers the agents whose prompt has sat unconfirmed for
 //! `NUDGE_AFTER`, and the plugin presses Enter there once more, again
-//! every `NUDGE_AFTER` for up to `NUDGE_FOR`. It obeys the same clock as
-//! expiry: never mid-turn, where an Enter would answer whatever dialog is
-//! open.
+//! every `NUDGE_AFTER` for up to `NUDGE_FOR`. It is stricter than
+//! expiry: an Enter goes only to an agent known to be idle, with no
+//! prompt or question open. Known idle means a `Stop` or a `SessionStart`
+//! (not a compaction's) seen since the tracker started, and no sign of a
+//! turn since; a tracker that has seen neither (a plugin restarted while
+//! the agent works, a lost `UserPromptSubmit`) treats the agent as
+//! mid-turn. A `Notification` other than an idle or sign-in notice, or an
+//! open `AskUserQuestion`, holds the nudge until the turn ends. Any event
+//! holds it for `NUDGE_AFTER`, and a gap in the plugin's own queue
+//! (`lose_track`) makes every idle agent's turn unknown again.
 //!
-//! `UserPromptSubmit`, `Stop` and `SessionEnd` create an agent's state on
-//! arrival if it did not already exist, so the mid-turn bit and the last
-//! `Stop` are recorded even before anything was ever sent to that agent;
-//! every other event name leaves the agent state untouched. `forget`
-//! frees the entry.
+//! Every event creates an agent's state on arrival if it did not already
+//! exist, so the turn and the last `Stop` are recorded even before
+//! anything was ever sent to that agent. `forget` frees the entry.
 
-use std::collections::{HashMap, VecDeque};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
 use balerix_api::HookEvent;
+
+use crate::config::ConfigError;
 use serde_json::Value;
 use tokio::time::Instant;
 
@@ -55,12 +63,81 @@ pub enum Kind {
     Command,
 }
 
+pub use balerix_api::MODE_CHARS;
+
+/// A channel's text as prose for Claude's input line: the daemon's own
+/// rule ([`balerix_api::prompt_text`]), so the text tracked is the text
+/// typed. Terminal controls go, then leading blanks (whitespace, controls,
+/// format characters); a body that then opens with one of [`MODE_CHARS`]
+/// gains a backslash, Markdown's escape for a literal character, so text
+/// from a channel never opens the input line in another input mode.
+/// Slash commands pass through.
+pub fn as_prompt(text: &str) -> Cow<'_, str> {
+    balerix_api::prompt_text(text)
+}
+
 /// A body whose first non-blank character is `/` is a command.
 pub fn classify(text: &str) -> Kind {
     if text.trim_start().starts_with('/') {
         Kind::Command
     } else {
         Kind::Prompt
+    }
+}
+
+/// What a channel hears when a slash command is not on its allowlist.
+pub const COMMAND_REFUSED: &str = "this command isn't enabled for this channel";
+
+/// The slash commands a channel may send when the operator adds none.
+pub const DEFAULT_COMMANDS: [&str; 6] = [
+    "/compact", "/clear", "/context", "/usage", "/status", "/help",
+];
+
+/// The slash commands a channel may send (Spec G §9.2, Spec M §8.7): the
+/// defaults plus the operator's `slashCommands`. A command is allowed
+/// when its name, the first token after `/` up to whitespace, equals an
+/// entry exactly, case included; anything after the name is its
+/// arguments and is not checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Allowlist(BTreeSet<String>);
+
+impl Default for Allowlist {
+    fn default() -> Self {
+        Self(DEFAULT_COMMANDS.iter().map(|c| (*c).to_string()).collect())
+    }
+}
+
+impl Allowlist {
+    /// The defaults plus `extra`, which [`Allowlist::validate`] has checked.
+    pub fn with(extra: &[String]) -> Self {
+        let mut list = Self::default();
+        list.0.extend(extra.iter().cloned());
+        list
+    }
+
+    /// Checks the operator's entries under the config key `path`: each is
+    /// `/` and a name, with no whitespace or control character.
+    pub fn validate(path: &str, entries: &[String]) -> Result<(), ConfigError> {
+        for (i, entry) in entries.iter().enumerate() {
+            let name = entry.strip_prefix('/').unwrap_or("");
+            if name.is_empty()
+                || name.starts_with('/')
+                || entry.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                return Err(ConfigError {
+                    path: format!("{path}[{i}]"),
+                    message: format!("expected /name with no whitespace, got {entry:?}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a body that [`classify`] calls a command may be sent: its
+    /// `/name` is on the list.
+    pub fn allows(&self, text: &str) -> bool {
+        let name = text.split_whitespace().next().unwrap_or("");
+        name.len() > 1 && self.0.contains(name)
     }
 }
 
@@ -97,24 +174,73 @@ struct Pending<M> {
     window: Duration,
 }
 
+/// What the tracker knows of an agent's turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Turn {
+    /// Nothing seen yet that says, or since a `SessionEnd`. Expiry runs;
+    /// a nudge does not.
+    #[default]
+    Unknown,
+    /// A `Stop` or a `SessionStart` seen, and no sign of a turn since.
+    Idle,
+    /// A `UserPromptSubmit`, a tool event or any other event seen since.
+    Busy,
+}
+
 #[derive(Debug)]
 struct AgentState<M> {
     pending: VecDeque<Pending<M>>,
-    in_turn: bool,
+    turn: Turn,
+    /// A `Notification` that may be a dialog, until the turn ends.
+    prompt_open: bool,
+    /// An `AskUserQuestion` between its `PreToolUse` and `PostToolUse`.
+    question_open: bool,
     last_stop: Option<Instant>,
     last_nudge: Option<Instant>,
+    /// The last event of any name: a nudge waits for `NUDGE_AFTER` of quiet.
+    last_event: Option<Instant>,
 }
 
 impl<M> Default for AgentState<M> {
     fn default() -> Self {
         Self {
             pending: VecDeque::new(),
-            in_turn: false,
+            turn: Turn::Unknown,
+            prompt_open: false,
+            question_open: false,
             last_stop: None,
             last_nudge: None,
+            last_event: None,
         }
     }
 }
+
+impl<M> AgentState<M> {
+    /// The turn is over: no dialog of it can still be open.
+    fn settle(&mut self, turn: Turn) {
+        self.turn = turn;
+        self.prompt_open = false;
+        self.question_open = false;
+    }
+
+    /// Only an agent known to be idle, with nothing open and no event
+    /// for `NUDGE_AFTER`, takes an Enter.
+    fn takes_enter(&self, now: Instant) -> bool {
+        self.turn == Turn::Idle
+            && !self.prompt_open
+            && !self.question_open
+            && self
+                .last_event
+                .is_none_or(|e| now.duration_since(e) >= NUDGE_AFTER)
+    }
+}
+
+/// The tool whose dialog is a question (Spec J).
+const QUESTION_TOOL: &str = "AskUserQuestion";
+
+/// `Notification` kinds that never mean a dialog is open; any other kind,
+/// or none, holds the nudge.
+const QUIET_NOTIFICATIONS: [&str; 2] = ["idle_prompt", "auth_success"];
 
 /// The prompts sent and not yet confirmed, per agent. `M` is the
 /// plugin's marker for a sent prompt (a message id, a comment id).
@@ -164,16 +290,22 @@ impl<M> Deliveries<M> {
 
     /// One hook event. `UserPromptSubmit` starts a turn and, when its
     /// `prompt` matches a pending prompt, confirms the oldest such and
-    /// skips everything older. `Stop` and `SessionEnd` end the turn.
-    /// These three events create the agent's state if it did not already
-    /// exist (Spec M §8.7: the mid-turn bit and the last `Stop` are
-    /// tracked unconditionally); every other event name is a no-op that
-    /// never creates state.
+    /// skips everything older. `Stop` ends the turn and marks the agent
+    /// idle; so does a `SessionStart` other than a compaction's, which
+    /// leaves the turn as it was. `SessionEnd` ends the turn with the
+    /// agent's state unknown. A `Notification` that may be a dialog holds
+    /// the nudge until one of those three; an `AskUserQuestion`'s
+    /// `PreToolUse` holds it until its `PostToolUse`. Every other event
+    /// is a sign of a turn. Every event creates the agent's state if it
+    /// did not already exist (Spec M §8.7: the turn and the last `Stop`
+    /// are tracked unconditionally).
     pub fn on_event(&mut self, event: &HookEvent, now: Instant) -> Outcome<M> {
+        let state = self.agents.entry(event.agent.clone()).or_default();
+        state.last_event = Some(now);
+        let field = |key: &str| event.payload.get(key).and_then(Value::as_str);
         match event.name.as_str() {
             "UserPromptSubmit" => {
-                let state = self.agents.entry(event.agent.clone()).or_default();
-                state.in_turn = true;
+                state.turn = Turn::Busy;
                 let prompt = normalize(
                     event
                         .payload
@@ -190,23 +322,49 @@ impl<M> Deliveries<M> {
                     skipped,
                 }
             }
-            "Stop" | "SessionEnd" => {
-                let state = self.agents.entry(event.agent.clone()).or_default();
-                state.in_turn = false;
+            "Stop" => {
+                state.settle(Turn::Idle);
                 state.last_stop = Some(now);
                 Outcome::default()
             }
-            _ => Outcome::default(),
+            "SessionEnd" => {
+                state.settle(Turn::Unknown);
+                state.last_stop = Some(now);
+                Outcome::default()
+            }
+            "SessionStart" => {
+                if field("source") != Some("compact") {
+                    state.settle(Turn::Idle);
+                }
+                Outcome::default()
+            }
+            "Notification" => {
+                if !field("notification_type").is_some_and(|k| QUIET_NOTIFICATIONS.contains(&k)) {
+                    state.prompt_open = true;
+                }
+                Outcome::default()
+            }
+            name => {
+                state.turn = Turn::Busy;
+                if field("tool_name") == Some(QUESTION_TOOL) {
+                    match name {
+                        "PreToolUse" => state.question_open = true,
+                        "PostToolUse" => state.question_open = false,
+                        _ => {}
+                    }
+                }
+                Outcome::default()
+            }
         }
     }
 
     /// Every pending prompt whose window has passed since the later of
-    /// its send and the agent's last `Stop`, on agents not mid-turn.
-    /// Removed as they are answered.
+    /// its send and the agent's last `Stop`, on agents not known to be
+    /// mid-turn. Removed as they are answered.
     pub fn expire(&mut self, now: Instant) -> Vec<M> {
         let mut out = Vec::new();
         for state in self.agents.values_mut() {
-            if state.in_turn {
+            if state.turn == Turn::Busy {
                 continue;
             }
             let last_stop = state.last_stop;
@@ -224,9 +382,10 @@ impl<M> Deliveries<M> {
         out
     }
 
-    /// The agents, in name order, to press Enter on once more: those not
-    /// mid-turn holding a prompt whose clock (the later of its send and
-    /// the agent's last `Stop`) started less than `NUDGE_FOR` ago and
+    /// The agents, in name order, to press Enter on once more: those
+    /// known to be idle, with no prompt or question open and no event for
+    /// `NUDGE_AFTER`, holding a prompt whose clock (the later of its send
+    /// and the agent's last `Stop`) started less than `NUDGE_FOR` ago and
     /// less than its window ago, `NUDGE_AFTER` after the later of that
     /// start and the agent's last nudge. One Enter submits the composer
     /// whatever it holds, so an agent is answered once however many of
@@ -235,7 +394,7 @@ impl<M> Deliveries<M> {
     pub fn nudge(&mut self, now: Instant) -> Vec<String> {
         let mut out = Vec::new();
         for (agent, state) in &mut self.agents {
-            if state.in_turn {
+            if !state.takes_enter(now) {
                 continue;
             }
             let (last_stop, last_nudge) = (state.last_stop, state.last_nudge);
@@ -254,6 +413,18 @@ impl<M> Deliveries<M> {
         }
         out.sort();
         out
+    }
+
+    /// Events may have been lost (the plugin's queue dropped some): every
+    /// idle agent's turn is unknown again, so none is nudged before its
+    /// next `Stop` or `SessionStart`; a busy one stays busy. Pending
+    /// prompts and their clocks stay.
+    pub fn lose_track(&mut self) {
+        for state in self.agents.values_mut() {
+            if state.turn == Turn::Idle {
+                state.turn = Turn::Unknown;
+            }
+        }
     }
 
     /// Drops everything held for `agent`, answering the markers so the
@@ -285,6 +456,14 @@ mod tests {
 
     fn stop() -> HookEvent {
         event("f/c/a", "Stop", json!({}))
+    }
+
+    /// A fresh session on `agent`: what makes a new tracker's agent idle.
+    fn start<M>(d: &mut Deliveries<M>, agent: &str, now: Instant) {
+        d.on_event(
+            &event(agent, "SessionStart", json!({ "source": "startup" })),
+            now,
+        );
     }
 
     #[test]
@@ -418,6 +597,7 @@ mod tests {
     fn an_idle_agent_is_nudged_once_its_prompt_is_five_seconds_unconfirmed() {
         let now = Instant::now();
         let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
         d.sent("f/c/a", "x", 1, now, W);
         assert!(d.nudge(now + Duration::from_secs(4)).is_empty());
         assert_eq!(d.nudge(now + Duration::from_secs(5)), vec!["f/c/a"]);
@@ -428,6 +608,7 @@ mod tests {
     fn the_next_nudge_waits_five_seconds_from_the_last() {
         let now = Instant::now();
         let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
         d.sent("f/c/a", "x", 1, now, W);
         assert_eq!(d.nudge(now + Duration::from_secs(7)), vec!["f/c/a"]);
         assert!(d.nudge(now + Duration::from_secs(11)).is_empty());
@@ -462,6 +643,7 @@ mod tests {
     fn a_prompt_past_its_window_is_not_nudged() {
         let now = Instant::now();
         let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
         d.sent("f/c/a", "x", 1, now, W);
         assert!(d.nudge(now + W).is_empty(), "expiry's, not a nudge's");
         assert_eq!(d.expire(now + W), vec![1]);
@@ -471,6 +653,7 @@ mod tests {
     fn several_pending_prompts_are_one_enter() {
         let now = Instant::now();
         let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
         d.sent("f/c/a", "first", 1, now, W);
         d.sent("f/c/a", "second", 2, now + Duration::from_secs(1), W);
         assert_eq!(d.nudge(now + Duration::from_secs(6)), vec!["f/c/a"]);
@@ -481,6 +664,7 @@ mod tests {
     fn a_prompt_that_never_expires_is_nudged_for_ninety_seconds_and_no_longer() {
         let now = Instant::now();
         let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
         d.sent("f/c/a", "x", 1, now, Duration::ZERO);
         let nudged: Vec<u64> = (1..=100)
             .map(|i| 5 * i)
@@ -497,6 +681,7 @@ mod tests {
         // a cold start under nono swallowed an Enter 20 s after `SessionStart`
         let now = Instant::now();
         let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
         d.sent("f/c/a", "x", 1, now, Duration::from_secs(90));
         for s in [5, 10, 15, 20, 25, 30, 35] {
             assert_eq!(
@@ -511,6 +696,9 @@ mod tests {
     fn every_idle_agent_with_a_stale_prompt_is_nudged_in_name_order() {
         let now = Instant::now();
         let mut d = Deliveries::default();
+        for agent in ["f/c/a", "f/c/b", "f/c/late"] {
+            start(&mut d, agent, now);
+        }
         d.sent("f/c/b", "y", 2, now, W);
         d.sent("f/c/a", "x", 1, now, W);
         d.sent("f/c/late", "z", 3, now + Duration::from_secs(3), W);
@@ -553,5 +741,327 @@ mod tests {
             d.on_event(&event("f/c/a", "Stop", json!({})), now),
             Outcome::default()
         );
+    }
+    fn notification(kind: &str) -> HookEvent {
+        event(
+            "f/c/a",
+            "Notification",
+            json!({ "message": "Claude is waiting", "notification_type": kind }),
+        )
+    }
+
+    fn question(name: &str) -> HookEvent {
+        event(
+            "f/c/a",
+            name,
+            json!({ "tool_name": "AskUserQuestion", "tool_input": {} }),
+        )
+    }
+
+    /// Every five seconds for `secs`, whether an Enter was answered.
+    fn any_nudge<M>(d: &mut Deliveries<M>, from: Instant, secs: u64) -> bool {
+        (1..=secs / 5).any(|i| !d.nudge(from + Duration::from_secs(5 * i)).is_empty())
+    }
+
+    #[test]
+    fn a_new_tracker_never_nudges_before_it_has_seen_the_agent_idle() {
+        // The tracker starts with the agent's turn unknown: it may be
+        // mid-turn, so no Enter goes to it. Expiry still runs.
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", "x", 1, now, Duration::ZERO);
+        assert!(!any_nudge(&mut d, now, 200));
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", "x", 1, now, W);
+        assert_eq!(d.expire(now + W), vec![1]);
+    }
+
+    #[test]
+    fn a_new_tracker_with_a_reply_and_a_notification_never_nudges() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", "check the logs", 1, now, Duration::ZERO);
+        d.on_event(
+            &notification("elicitation_dialog"),
+            now + Duration::from_secs(1),
+        );
+        assert!(!any_nudge(&mut d, now, 200));
+        // nor once a tool event says the agent is working
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", "check the logs", 1, now, Duration::ZERO);
+        d.on_event(
+            &event("f/c/a", "PreToolUse", json!({ "tool_name": "Read" })),
+            now,
+        );
+        d.on_event(&notification("elicitation_dialog"), now);
+        assert!(!any_nudge(&mut d, now, 200));
+    }
+
+    #[test]
+    fn nudging_starts_after_a_stop() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", "x", 1, now, Duration::ZERO);
+        assert!(d.nudge(now + Duration::from_secs(5)).is_empty());
+        let stopped = now + Duration::from_secs(10);
+        d.on_event(&stop(), stopped);
+        assert!(d.nudge(stopped + Duration::from_secs(4)).is_empty());
+        assert_eq!(d.nudge(stopped + Duration::from_secs(5)), vec!["f/c/a"]);
+    }
+
+    #[test]
+    fn a_notification_holds_the_nudge_until_the_turn_ends() {
+        // An idle agent by the tracker's account, then a notification: the
+        // events between were lost, and the notification wins.
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
+        d.sent("f/c/a", "x", 1, now, Duration::ZERO);
+        d.on_event(&notification("elicitation_dialog"), now);
+        assert!(!any_nudge(&mut d, now, 60));
+        let stopped = now + Duration::from_secs(60);
+        d.on_event(&stop(), stopped);
+        assert_eq!(d.nudge(stopped + Duration::from_secs(5)), vec!["f/c/a"]);
+    }
+
+    #[test]
+    fn a_notification_of_no_known_kind_holds_the_nudge() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
+        d.sent("f/c/a", "x", 1, now, Duration::ZERO);
+        d.on_event(
+            &event("f/c/a", "Notification", json!({ "message": "?" })),
+            now,
+        );
+        assert!(!any_nudge(&mut d, now, 60));
+    }
+
+    #[test]
+    fn an_idle_notice_does_not_hold_the_nudge() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
+        d.sent("f/c/a", "x", 1, now, Duration::ZERO);
+        d.on_event(&notification("idle_prompt"), now);
+        assert_eq!(d.nudge(now + Duration::from_secs(5)), vec!["f/c/a"]);
+    }
+
+    #[test]
+    fn an_open_question_holds_the_nudge_until_the_turn_ends() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
+        d.sent("f/c/a", "x", 1, now, Duration::ZERO);
+        d.on_event(&question("PreToolUse"), now);
+        assert!(!any_nudge(&mut d, now, 60));
+        // answered, but the turn goes on
+        d.on_event(&question("PostToolUse"), now + Duration::from_secs(60));
+        assert!(!any_nudge(&mut d, now + Duration::from_secs(60), 60));
+        let stopped = now + Duration::from_secs(120);
+        d.on_event(&stop(), stopped);
+        assert_eq!(d.nudge(stopped + Duration::from_secs(5)), vec!["f/c/a"]);
+    }
+
+    #[test]
+    fn any_tool_event_is_a_turn() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
+        d.sent("f/c/a", "x", 1, now, W);
+        d.on_event(
+            &event("f/c/a", "PostToolUse", json!({ "tool_name": "Read" })),
+            now,
+        );
+        assert!(!any_nudge(&mut d, now, 60));
+        assert!(
+            d.expire(now + Duration::from_secs(600)).is_empty(),
+            "mid-turn"
+        );
+    }
+
+    #[test]
+    fn a_compaction_start_is_not_idle_and_a_session_end_is_unknown() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.on_event(&submit("earlier"), now);
+        d.on_event(
+            &event("f/c/a", "SessionStart", json!({ "source": "compact" })),
+            now,
+        );
+        d.sent("f/c/a", "x", 1, now, Duration::ZERO);
+        assert!(!any_nudge(&mut d, now, 60));
+
+        let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
+        d.sent("f/c/a", "x", 1, now, Duration::ZERO);
+        d.on_event(&event("f/c/a", "SessionEnd", json!({})), now);
+        assert!(!any_nudge(&mut d, now, 60));
+    }
+
+    #[test]
+    fn a_leading_mode_character_is_escaped() {
+        assert_eq!(as_prompt("!ls"), "\\!ls");
+        assert_eq!(as_prompt("# notes\nmore"), "\\# notes\nmore");
+        assert_eq!(as_prompt("&x"), "\\&x");
+        assert_eq!(as_prompt("  \n\t!ls"), "\\!ls", "leading blanks go");
+        assert_eq!(as_prompt("\u{FEFF}\u{200B} !ls"), "\\!ls");
+        assert_eq!(
+            as_prompt("\u{7}!x"),
+            "\\!x",
+            "a control is not a first character"
+        );
+        assert_eq!(classify(&as_prompt("!ls")), Kind::Prompt);
+    }
+
+    #[test]
+    fn other_text_and_slash_commands_are_unchanged() {
+        for t in [
+            "run the tests",
+            "/compact",
+            "a!b",
+            "x\n!y",
+            "",
+            "@a hi",
+            "\\!x",
+        ] {
+            assert!(matches!(as_prompt(t), Cow::Borrowed(b) if b == t), "{t:?}");
+        }
+        assert_eq!(as_prompt("  /exit"), "/exit");
+        assert_eq!(classify(&as_prompt("  /exit")), Kind::Command);
+    }
+
+    #[test]
+    fn a_gap_in_the_events_makes_an_idle_agent_unknown() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
+        d.sent("f/c/a", "x", 1, now, Duration::ZERO);
+        d.lose_track();
+        assert!(!any_nudge(&mut d, now, 60));
+        let stopped = now + Duration::from_secs(60);
+        d.on_event(&stop(), stopped);
+        assert_eq!(d.nudge(stopped + Duration::from_secs(5)), vec!["f/c/a"]);
+    }
+
+    #[test]
+    fn a_gap_leaves_a_busy_agent_busy() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        d.on_event(&submit("earlier"), now);
+        d.sent("f/c/a", "x", 1, now, W);
+        d.lose_track();
+        assert!(
+            d.expire(now + Duration::from_secs(600)).is_empty(),
+            "mid-turn"
+        );
+    }
+
+    #[test]
+    fn any_event_holds_the_nudge_for_five_seconds() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        start(&mut d, "f/c/a", now);
+        d.sent("f/c/a", "x", 1, now, Duration::ZERO);
+        let late = now + Duration::from_secs(8);
+        d.on_event(&notification("idle_prompt"), late);
+        assert!(d.nudge(now + Duration::from_secs(9)).is_empty());
+        assert!(d.nudge(late + Duration::from_secs(4)).is_empty());
+        assert_eq!(d.nudge(late + Duration::from_secs(5)), vec!["f/c/a"]);
+    }
+
+    #[test]
+    fn the_default_commands_are_allowed_with_their_arguments() {
+        let list = Allowlist::default();
+        for t in [
+            "/compact", "/clear", "/context", "/usage", "/status", "/help",
+        ] {
+            assert!(list.allows(t), "{t}");
+        }
+        assert!(list.allows("/compact keep the test plan"));
+        assert!(list.allows("  /clear\n"));
+    }
+
+    #[test]
+    fn a_command_off_the_list_is_not_allowed() {
+        let list = Allowlist::default();
+        for t in [
+            "/foo",
+            "/config x=y",
+            "/clearx",
+            "/Clear",
+            "/compact/x",
+            "/",
+            "/ clear",
+            "",
+        ] {
+            assert!(!list.allows(t), "{t:?}");
+        }
+    }
+
+    /// An invisible lead never hides a command from the allowlist, nor a
+    /// mode character from the escape: one character from each range the
+    /// input line drops.
+    #[test]
+    fn an_invisible_lead_hides_neither_a_command_nor_a_mode_character() {
+        let list = Allowlist::default();
+        for c in [
+            '\u{7}',
+            '\u{85}',
+            '\u{AD}',
+            '\u{600}',
+            '\u{180E}',
+            '\u{34F}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{17B4}',
+            '\u{17B5}',
+            '\u{180C}',
+            '\u{180F}',
+            '\u{200B}',
+            '\u{202A}',
+            '\u{2065}',
+            '\u{3164}',
+            '\u{FE0F}',
+            '\u{FEFF}',
+            '\u{FFA0}',
+            '\u{FFF0}',
+            '\u{1107F}',
+            '\u{16FE4}',
+            '\u{E0000}',
+            '\u{E0001}',
+            '\u{E0002}',
+            '\u{E0041}',
+            '\u{E0080}',
+            '\u{E0FFF}',
+        ] {
+            let at = format!("U+{:04X}", c as u32);
+            let command = as_prompt(&format!("{c}/config x")).into_owned();
+            assert_eq!(classify(&command), Kind::Command, "{at}");
+            assert!(!list.allows(&command), "{at}");
+            assert!(list.allows(&as_prompt(&format!("{c}/compact"))), "{at}");
+            let mode = as_prompt(&format!("{c}!x")).into_owned();
+            assert_eq!(mode, "\\!x", "{at}");
+            assert_eq!(classify(&mode), Kind::Prompt, "{at}");
+        }
+    }
+
+    #[test]
+    fn an_operator_entry_extends_the_defaults() {
+        let list = Allowlist::with(&["/review".to_string()]);
+        assert!(list.allows("/review src/lib.rs"));
+        assert!(list.allows("/clear"));
+        assert!(!list.allows("/reviewx"));
+    }
+
+    #[test]
+    fn operator_entries_are_validated() {
+        let ok = ["/review".to_string(), "/my-cmd:sub".to_string()];
+        assert_eq!(Allowlist::validate("slashCommands", &ok), Ok(()));
+        for bad in ["review", "/", "//x", "/a b", "/a\tb", "/a\u{7}", ""] {
+            let err =
+                Allowlist::validate("slashCommands", &["/ok".into(), bad.into()]).unwrap_err();
+            assert_eq!(err.path, "slashCommands[1]", "{bad:?}");
+        }
     }
 }

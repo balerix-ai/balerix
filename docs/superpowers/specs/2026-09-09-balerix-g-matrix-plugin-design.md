@@ -145,6 +145,7 @@ plugins:
         - "@rahul:example.org"
       rooms:                       # optional pins, keyed fleet/crew
         payments/backend: "!abcdef:example.org"
+      slashCommands: [/review]     # optional; extends the default allowlist (§9.2)
 ```
 
 `homeserver` and `userId` are required. Exactly one source of the password must
@@ -358,9 +359,24 @@ A message is routed only when all of these hold. Each rejection increments
 ### 9.2 The send
 
 A routed message becomes `PluginAction::SendText { text, submit: true }` through
-`Host::action`. On success the plugin adds an acknowledgement reaction to the
+`Host::action`, after common's `delivery::as_prompt` (`balerix_api::prompt_text`,
+which the daemon applies to every plugin `send_text` as well): terminal controls
+and leading blanks go, and a body that then opens with `!`, `#` or `&` is sent
+with a backslash before it, so text from a channel never opens the input line
+in another input mode. On success the plugin adds an acknowledgement reaction to the
 Matrix message. On failure it posts the daemon's error into the thread and adds
 a failure reaction, so a nudge never disappears silently.
+
+Slash commands from a channel are limited to an allowlist (default `/compact`,
+`/clear`, `/context`, `/usage`, `/status`, `/help`; common's
+`delivery::Allowlist`); an operator can extend it with `slashCommands`. A
+command matches when its name, the first token after `/`, equals an entry
+exactly; its arguments are not checked. Anything else is not sent: the plugin
+answers in the channel that the command isn't enabled for this channel, and
+counts it as `command_refused`. An `other:` answer to a question that reads as a
+command off the list is refused like any other answer the plugin cannot send.
+Entries that change the agent's settings or environment give that ability to
+everyone who can post in the channel.
 
 ### 9.3 History is never replayed
 

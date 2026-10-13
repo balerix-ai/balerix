@@ -239,8 +239,9 @@ credentials, hook input, or sandbox rules.
   `SessionStart` lands in the composer and its Enter is lost (#99).
   `send_text` does not wait; the plugins that track deliveries (github,
   matrix) press Enter again every 5 s, for up to 90 s, while a prompt is
-  unconfirmed and the agent is not mid-turn
-  (`plugins/common/src/delivery.rs::nudge`). How long Claude swallows
+  unconfirmed and the agent is known to be idle (a `Stop` or `SessionStart`
+  seen since the plugin started, no turn since) with no prompt or question
+  open (`plugins/common/src/delivery.rs::nudge`). How long Claude swallows
   Enter varies from 1 s to over 20 s between cold starts, so github
   reports its first prompt only after `confirmWindow` plus 60 s
   (`START_UP_ALLOWANCE`).

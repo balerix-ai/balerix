@@ -50,4 +50,4 @@ pub use toolchain::{
     system_tools,
 };
 pub use tools::{MissingTool, ToolPaths};
-pub use workspace::{CloneDecision, Workspace, decide_clone};
+pub use workspace::{CloneDecision, Settled, Workspace, decide_clone};

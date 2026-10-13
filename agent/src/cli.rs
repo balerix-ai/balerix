@@ -27,7 +27,8 @@ pub enum Command {
     CrewSync(CrewSyncArgs),
     /// A pool Job: the daemon pool or a fleet's pool (§20.3).
     PoolSync(PoolSyncArgs),
-    /// The harvest Job: the agent's branch into the crew cache (§8.4).
+    /// The harvest Job: the agent's branch into the crew cache (§8.4);
+    /// with `--branch`, the branch-change Job (§8.5).
     Harvest(HarvestArgs),
     /// The cleanup Job: empty a crew's cache and pool after its Fleet is
     /// deleted with `retain: None` (§5.2, §8.5).
@@ -149,9 +150,18 @@ pub struct HarvestArgs {
     /// `<fleet>/<crew>/<agent>`.
     #[arg(long)]
     pub agent: String,
-    /// The agent claim, mounted read-only.
+    /// The agent claim, mounted read-only (with `--branch`, all but its
+    /// `workspace/`, which is emptied).
     #[arg(long, default_value = "/balerix/agent")]
     pub agent_dir: PathBuf,
+    /// The agent's new branch (Spec O §8.5): settle the clone as the
+    /// pod's `ensure_clone` would, harvesting its old branch and removing
+    /// it, so the next pod clones this branch. A dirty clone fails.
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// With `--branch`: remove the clone without a check or a harvest.
+    #[arg(long, requires = "branch")]
+    pub purge: bool,
     #[command(flatten)]
     pub dirs: JobDirs,
 }

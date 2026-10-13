@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use balerix_core::{AgentId, CrewRef, RepoRef};
-use balerix_runtime::jobs::{PoolLevel, SyncError, harvest, sync_crew, sync_pool};
+use balerix_runtime::jobs::{
+    BranchChange, PoolLevel, SyncError, change_branch, harvest, sync_crew, sync_pool,
+};
 use balerix_runtime::layout::{PodMounts, SharedSlice};
 use balerix_runtime::{SocketPolicy, StateLayout, Workspace};
 
@@ -484,6 +486,276 @@ fn a_harvest_without_a_working_nono_fails() {
         .to_string();
     assert!(e.starts_with("f/c/a: "), "{e}");
     assert!(e.contains("no-such-nono"), "{e}");
+}
+
+/// A synced crew and a pod clone with one unpushed commit, for the
+/// branch-change Job's tests.
+struct BranchWorld {
+    tools: balerix_runtime::ToolPaths,
+    root: balerix_runtime::testing::TempRoot,
+    repo: RepoRef,
+    slice: SharedSlice,
+    scratch: PathBuf,
+    id: AgentId,
+    claim: PathBuf,
+    sha: String,
+}
+
+/// `None` when a tool or Landlock is missing (and that is allowed).
+fn branch_world(label: &str) -> Option<BranchWorld> {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git+mise+nono", false));
+        return None;
+    };
+    let root = support::temp_root(label);
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return None;
+    }
+    let (repo, _) = upstream(&root);
+    let slice = slice(&root);
+    let scratch = root.join("scratch");
+    sync_crew(
+        &tools,
+        &slice,
+        &scratch,
+        &crew(),
+        &repo,
+        "main",
+        None,
+        &none(),
+    )
+    .unwrap();
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let (claim, sha) = pod_clone(&tools, &root, &slice, &repo, &id);
+    Some(BranchWorld {
+        tools,
+        root,
+        repo,
+        slice,
+        scratch,
+        id,
+        claim,
+        sha,
+    })
+}
+
+impl BranchWorld {
+    fn change(&self, branch: &str, purge: bool) -> Result<BranchChange, String> {
+        change_branch(
+            &self.tools,
+            &self.slice,
+            &self.scratch,
+            &self.id,
+            &self.claim,
+            branch,
+            purge,
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
+impl BranchWorld {
+    /// The claim read-only but its `workspace/`, as the Job mounts it.
+    fn narrow(&self) {
+        chmod_tree(&self.claim, false);
+        std::fs::set_permissions(&self.claim, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let ws = self.claim.join("workspace");
+        std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o755)).unwrap();
+        chmod_tree(&ws, true);
+    }
+    /// Writable again, for `TempRoot` and the next pod.
+    fn widen(&self) {
+        std::fs::set_permissions(&self.claim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        chmod_tree(&self.claim, true);
+    }
+}
+
+fn is_empty_dir(dir: &Path) -> bool {
+    std::fs::read_dir(dir).unwrap().next().is_none()
+}
+
+/// Spec O §27: the old branch into the cache and the clone emptied out of
+/// a claim only its `workspace/` of which is writable, so the pod's
+/// `ensure_clone` (cache read-only) makes the new branch's clone.
+#[test]
+fn a_branch_change_harvests_the_old_branch_and_removes_the_clone() {
+    let Some(w) = branch_world("jobs-branch-change") else {
+        return;
+    };
+    w.narrow();
+    let ws = w.claim.join("workspace");
+    let outside = |l: BTreeMap<String, Entry>| -> BTreeMap<String, Entry> {
+        l.into_iter()
+            .filter(|(k, _)| !k.starts_with(&ws.display().to_string()))
+            .collect()
+    };
+    let before = outside(listing(&w.claim));
+    let got = w.change("feature/x", false);
+    let after = outside(listing(&w.claim));
+    w.widen();
+    assert_eq!(
+        got.unwrap(),
+        BranchChange::Removed {
+            old: "balerix/f/c/a".into(),
+            harvested: true
+        }
+    );
+    assert_eq!(after, before, "the Job wrote outside the clone");
+    assert_eq!(
+        git(
+            &w.slice.crew().repo,
+            &["rev-parse", "refs/heads/balerix/f/c/a"]
+        ),
+        w.sha
+    );
+    assert!(
+        is_empty_dir(&ws),
+        "the clone is emptied, the mount point kept"
+    );
+
+    // the next pod clones the new branch, from the crew's ref
+    let layout = StateLayout::pod(
+        PodMounts {
+            agent: w.claim.clone(),
+            shared: w.slice.root.clone(),
+            run: w.root.join("run"),
+        },
+        &w.id,
+    );
+    let paths = layout.agent(&w.id);
+    Workspace {
+        tools: &w.tools,
+        gh_config_dir: None,
+        cache_is_read_only: true,
+        git_read: &[],
+        socket_policy: SocketPolicy::Open,
+    }
+    .ensure_clone(
+        &w.id.to_string(),
+        &layout.crew(&w.id.crew_ref()),
+        &paths,
+        &w.repo,
+        "feature/x",
+        "main",
+    )
+    .unwrap();
+    assert_eq!(
+        git(&paths.workspace, &["symbolic-ref", "--short", "HEAD"]),
+        "feature/x"
+    );
+    assert_eq!(
+        std::fs::read_to_string(paths.branch_marker()).unwrap(),
+        "feature/x"
+    );
+}
+
+/// Spec N §4's `Dirty`, on the Job's path: the clone is kept, and the
+/// error names both branches.
+#[test]
+fn a_branch_change_refuses_a_dirty_clone_and_keeps_it() {
+    let Some(w) = branch_world("jobs-branch-dirty") else {
+        return;
+    };
+    std::fs::write(w.claim.join("workspace/draft.txt"), "uncommitted\n").unwrap();
+    let e = w.change("feature/x", false).unwrap_err();
+    assert!(e.starts_with("f/c/a: "), "{e}");
+    assert!(e.contains("\"balerix/f/c/a\""), "{e}");
+    assert!(e.contains("\"feature/x\""), "{e}");
+    assert!(e.contains("local changes"), "{e}");
+    // the remedy is the operator's to give: none of the host's here
+    assert!(!e.contains("commit or discard"), "{e}");
+    assert!(w.claim.join("workspace/draft.txt").is_file());
+    assert!(w.claim.join("workspace/.git").is_dir());
+}
+
+/// A clone already on the branch (the marker says so) is kept, with no
+/// harvest.
+#[test]
+fn a_branch_change_to_the_clones_own_branch_keeps_it() {
+    let Some(w) = branch_world("jobs-branch-same") else {
+        return;
+    };
+    let got = w.change("balerix/f/c/a", false).unwrap();
+    assert_eq!(got, BranchChange::Kept);
+    assert!(w.claim.join("workspace/work.txt").is_file());
+}
+
+/// `--purge`: removed unread, and nothing reaches the cache.
+#[test]
+fn a_purged_branch_change_removes_the_clone_without_a_harvest() {
+    let Some(w) = branch_world("jobs-branch-purge") else {
+        return;
+    };
+    std::fs::write(w.claim.join("workspace/draft.txt"), "uncommitted\n").unwrap();
+    assert_eq!(w.change("feature/x", true).unwrap(), BranchChange::Purged);
+    assert!(is_empty_dir(&w.claim.join("workspace")));
+    let out = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/balerix/f/c/a",
+        ])
+        .current_dir(&w.slice.crew().repo)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a purge harvests nothing");
+    // and a claim with no clone is a purge too
+    assert_eq!(w.change("feature/x", true).unwrap(), BranchChange::Purged);
+}
+
+/// The removal follows no link the agent planted in its clone: one to
+/// the claim's state and one to the crew cache are removed, their
+/// targets kept, with and without `purge`.
+#[test]
+fn a_branch_change_removes_planted_links_and_never_their_targets() {
+    for purge in [false, true] {
+        let Some(w) = branch_world(&format!("jobs-branch-links-{purge}")) else {
+            return;
+        };
+        let state = w.claim.join(".balerix/state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("keep"), "state\n").unwrap();
+        let repo = w.slice.crew().repo.clone();
+        let ws = w.claim.join("workspace");
+        std::os::unix::fs::symlink(&state, ws.join("l1")).unwrap();
+        std::os::unix::fs::symlink(&repo, ws.join("l2")).unwrap();
+        // ignored, so the clone is clean and the removal is reached
+        std::fs::write(ws.join(".git/info/exclude"), "l1\nl2\n").unwrap();
+        let cache_before = listing(&repo);
+        let got = w.change("feature/x", purge).unwrap();
+        assert!(
+            matches!(got, BranchChange::Removed { .. } | BranchChange::Purged),
+            "{got:?}"
+        );
+        assert!(is_empty_dir(&ws), "purge {purge}");
+        assert_eq!(
+            std::fs::read_to_string(state.join("keep")).unwrap(),
+            "state\n"
+        );
+        let cache_after = listing(&repo);
+        // the harvest adds its ref and objects; nothing that was there goes
+        for path in cache_before.keys() {
+            assert!(
+                cache_after.contains_key(path),
+                "{path} went (purge {purge})"
+            );
+        }
+        assert!(repo.join(".git/HEAD").is_file());
+    }
+}
+
+/// A Job stopped after `.git` was renamed aside leaves no clone: the
+/// next run finds none and removes the leftovers.
+#[test]
+fn a_branch_change_stopped_part_way_leaves_leftovers_the_next_run_removes() {
+    let Some(w) = branch_world("jobs-branch-leftovers") else {
+        return;
+    };
+    let ws = w.claim.join("workspace");
+    std::fs::rename(ws.join(".git"), ws.join(".git.removing")).unwrap();
+    assert_eq!(w.change("feature/x", false).unwrap(), BranchChange::NoClone);
+    assert!(is_empty_dir(&ws));
 }
 
 #[test]

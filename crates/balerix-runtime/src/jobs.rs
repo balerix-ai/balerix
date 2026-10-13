@@ -12,7 +12,7 @@ use crate::layout::{PodMounts, SharedSlice, StateLayout};
 use crate::socket_policy::SocketPolicy;
 use crate::toolchain::{Toolchain, drop_stale_marker};
 use crate::tools::ToolPaths;
-use crate::workspace::Workspace;
+use crate::workspace::{Settled, Workspace, dirty_clone};
 
 /// Which half of a crew sync failed: the operator sets `CacheReady` or
 /// `ToolsReady` from the prefix (§5.3).
@@ -184,16 +184,129 @@ pub fn remove_crew(slice: &SharedSlice) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The agent's branch into the crew cache, from a claim mounted read-only
-/// at `claim`: the checks and the fetch of `harvest_and_remove`, with the
-/// git profile, nono's home and its logs under `scratch`. Removes nothing.
-pub fn harvest(
+/// What the branch-change Job did to the clone on the claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchChange {
+    /// The clone was on `old`: `old` into the cache when the clone had
+    /// it (`harvested`), and the clone removed.
+    Removed { old: String, harvested: bool },
+    /// The clone stays: its marker or HEAD is the branch, or HEAD is
+    /// detached. The pod's `ensure_clone` writes the marker if needed.
+    Kept,
+    /// No clone; whatever a half-made one left is removed.
+    NoClone,
+    /// `purge`: the clone removed without a check or a harvest.
+    Purged,
+}
+
+/// The branch-change Job (Spec O §27): an agent's branch changed while
+/// its claim holds a clone. `Workspace::settle_clone`, the host's own
+/// judgement, with the crew cache writable: a clean clone on the old
+/// branch has that branch harvested into the cache and is removed, so
+/// the next pod clones `branch` afresh; a dirty one, or a 0.1
+/// worktree, is refused and kept; one already on `branch`, or with a
+/// detached HEAD, is kept. With `purge`, the clone is removed unread, as
+/// `--purge` removes one.
+///
+/// Only `workspace/` under `claim` is written, and it is emptied, not
+/// removed: in the Job it is the one read-write mount of the claim.
+/// The git profile, nono's home and its logs are under `scratch`.
+pub fn change_branch(
     tools: &ToolPaths,
     slice: &SharedSlice,
     scratch: &Path,
     id: &AgentId,
     claim: &Path,
-) -> Result<Option<String>, MaterializeError> {
+    branch: &str,
+    purge: bool,
+) -> Result<BranchChange, MaterializeError> {
+    let agent = job_agent_paths(slice, scratch, id, claim);
+    let ws = &agent.workspace;
+    if purge {
+        empty_workspace(id, ws)?;
+        return Ok(BranchChange::Purged);
+    }
+    let settled = Workspace {
+        tools,
+        gh_config_dir: None,
+        cache_is_read_only: false,
+        git_read: &[],
+        socket_policy: SocketPolicy::Open,
+    }
+    .settle_clone(&id.to_string(), &slice.crew(), &agent, branch)?;
+    let refuse = |message: String| MaterializeError::Invalid {
+        id: id.to_string(),
+        message,
+    };
+    match settled {
+        Settled::Kept | Settled::Record => Ok(BranchChange::Kept),
+        Settled::NoClone => {
+            empty_workspace(id, ws)?;
+            Ok(BranchChange::NoClone)
+        }
+        Settled::Remove { old, harvested } => {
+            empty_workspace(id, ws)?;
+            Ok(BranchChange::Removed { old, harvested })
+        }
+        Settled::Dirty { old } => Err(refuse(dirty_clone(&old, branch))),
+        Settled::Worktree => Err(refuse(format!(
+            "{}: created by balerix 0.1 as a worktree, which cannot be harvested; \
+             annotate the Agent balerix.ai/purge=true to remove it (push unpushed work first)",
+            ws.display()
+        ))),
+    }
+}
+
+/// Empties `workspace/` (a mount point in the Job, so never removed).
+/// `.git` is renamed aside first, so a Job stopped part-way leaves no
+/// half-deleted clone to be judged: what is left has no `.git`, and the
+/// next run, or the pod's `ensure_clone`, removes it. Entries are
+/// removed by their own type: `remove_dir_all` and `remove_file` remove
+/// a symlink, never what it points at.
+fn empty_workspace(id: &AgentId, ws: &Path) -> Result<(), MaterializeError> {
+    let io = |path: &Path, e: std::io::Error| MaterializeError::Io {
+        id: id.to_string(),
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    };
+    let remove = |path: &Path| -> Result<(), MaterializeError> {
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io(path, e)),
+        };
+        if meta.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        }
+        .map_err(|e| io(path, e))
+    };
+    let entries = match std::fs::read_dir(ws) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io(ws, e)),
+    };
+    let aside = ws.join(".git.removing");
+    remove(&aside)?;
+    let dot_git = ws.join(".git");
+    if std::fs::symlink_metadata(&dot_git).is_ok() {
+        std::fs::rename(&dot_git, &aside).map_err(|e| io(&dot_git, e))?;
+    }
+    for entry in entries {
+        remove(&entry.map_err(|e| io(ws, e))?.path())?;
+    }
+    remove(&aside)
+}
+
+/// The agent's paths on a claim mounted at `claim`, as the agent pod has
+/// them, with the git profile, nono's home and the logs under `scratch`.
+fn job_agent_paths(
+    slice: &SharedSlice,
+    scratch: &Path,
+    id: &AgentId,
+    claim: &Path,
+) -> crate::layout::AgentPaths {
     let layout = StateLayout::pod(
         PodMounts {
             agent: claim.to_path_buf(),
@@ -206,6 +319,20 @@ pub fn harvest(
     agent.nono_home = scratch.join("nono");
     agent.logs = scratch.join("logs");
     agent.git_profile = scratch.join("nono-git-profile.json");
+    agent
+}
+
+/// The agent's branch into the crew cache, from a claim mounted read-only
+/// at `claim`: the checks and the fetch of `harvest_and_remove`, with the
+/// git profile, nono's home and its logs under `scratch`. Removes nothing.
+pub fn harvest(
+    tools: &ToolPaths,
+    slice: &SharedSlice,
+    scratch: &Path,
+    id: &AgentId,
+    claim: &Path,
+) -> Result<Option<String>, MaterializeError> {
+    let agent = job_agent_paths(slice, scratch, id, claim);
     Workspace {
         tools,
         gh_config_dir: None,

@@ -129,8 +129,14 @@ builds and scans images, and runs `cargo publish --dry-run`, then uploads
 every artifact to the run. Nothing is pushed, published or tagged. For the
 charts unit, that is packaging, the check on kind and uploading the
 archives. A mixed dry run, one that also releases core or a plugin the
-charts pin, skips the kind install: those pins' images are never pushed on
-a dry run. The job summary lists the pins moved by the run.
+charts pin, never pushes those pins' images, so the `images` job saves the
+amd64 images it built (`image-<unit>-amd64`, kept one day) and the charts
+job loads them into kind under the tags the charts pin
+(`scripts/release/kind-load-pins.sh`); pins the run does not move pull
+from ghcr, and a moved matrix or github pin is not loaded (the check
+enables flow and web only). The job summary lists the pins loaded. If an
+archive is missing (a `charts` job re-run alone after the day is up), the
+job fails and the summary says to re-run the whole workflow.
 
 ## Recovery
 

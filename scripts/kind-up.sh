@@ -11,7 +11,8 @@
 # path, not a network filesystem.
 #
 # `cluster` makes the cluster and the shared class only, with no images: the
-# charts release check installs the published ones (Spec O §24.5).
+# charts release check installs the published ones (Spec O §24.5), or, for
+# the pins a dry run moves, the run's own (release/kind-load-pins.sh, #167).
 #
 # usage: kind-up.sh [up|cluster|down]
 set -euo pipefail

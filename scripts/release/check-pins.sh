@@ -10,8 +10,10 @@
 # usage: check-pins.sh [--dry-run] <unit>...     the units this run releases
 #
 # With --dry-run, prints the pins this run moves on stdout, one
-# `<tag> (<field>)` line each: a dry run pushes no images, so those tags do
-# not exist and the charts cannot be installed with them (#150).
+# `<unit> <version> <field>` line each (charts_pins' form): a dry run pushes
+# no images, so those tags do not exist on ghcr (#150); the charts job loads
+# this run's own images into kind under them instead (kind-load-pins.sh,
+# #167).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 # shellcheck source=scripts/release/lib.sh
@@ -31,7 +33,7 @@ while read -r unit version field; do
     echo "charts: $field $version is released ($tag)" >&2
   elif [[ $running == *" $unit "* && $(unit_version "$unit") == "$version" ]]; then
     echo "charts: $field $version is released by this run" >&2
-    [[ -z $dry_run ]] || echo "$tag ($field)"
+    [[ -z $dry_run ]] || echo "$unit $version $field"
   else
     missing+=("$tag ($field)")
   fi

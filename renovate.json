@@ -2,5 +2,14 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", ":semanticCommits", "helpers:pinGitHubActionDigests"],
   "lockFileMaintenance": { "enabled": true, "schedule": ["before 6am on monday"] },
-  "rangeStrategy": "pin"
+  "rangeStrategy": "pin",
+  "packageRules": [
+    {
+      "description": "A unit's base image ships only in a release, so its updates take a releasable type (docs/RELEASING.md)",
+      "matchManagers": ["dockerfile"],
+      "matchFileNames": ["docker/**"],
+      "semanticCommitType": "fix",
+      "semanticCommitScope": "deps"
+    }
+  ]
 }

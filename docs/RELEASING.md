@@ -285,7 +285,10 @@ The first charts release is rehearsed before it is real (Spec O §24.6).
 - `docker/balerix/Dockerfile` pins mise by version and by the two sha256s
   from that release's `SHASUMS256.txt`; update all three at once.
 - Base images are pinned by digest and action references by commit SHA;
-  Renovate proposes both.
+  Renovate proposes both. A base-image update under `docker/` comes as
+  `fix(deps)`, so it releases the units that ship it: `docker/balerix`,
+  `docker/agent` and `docker/operator` are core's, `docker/plugin` every
+  plugin's.
 - `.trivyignore.yaml` holds the image scan's reviewed exceptions, each scoped
   to one binary and carrying an `expired_at`. An expired entry fails
   `images.yml` and the release image jobs again: renew it only with a fresh

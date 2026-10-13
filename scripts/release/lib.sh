@@ -137,16 +137,18 @@ image_description() {
 # The paths whose commits count toward the unit, one per line. The SDK and
 # the api are compiled into every plugin binary and into common, so they
 # count for all of them; common is compiled into every plugin whose
-# manifest names it, so it counts for those.
+# manifest names it, so it counts for those. A unit's Dockerfiles count
+# too: a base-image fix ships only in a release.
 unit_paths() {
   require_unit "$1"
   if [[ $1 == core ]]; then
     printf '%s\n' 'crates/**' Cargo.toml Cargo.lock mise.toml \
-      'operator/**' 'agent/**' 'docker/operator/**' 'docker/agent/**'
+      'operator/**' 'agent/**' 'docker/balerix/**' 'docker/operator/**' 'docker/agent/**'
   elif [[ $1 == charts ]]; then
     printf '%s\n' 'charts/**'
   else
     printf '%s\n' "plugins/$1/**" 'crates/balerix-api/**' 'crates/balerix-plugin-sdk/**'
+    if [[ $(unit_kind "$1") == plugin ]]; then printf '%s\n' 'docker/plugin/**'; fi
     if [[ $(unit_kind "$1") == plugin ]] && grep -q '^balerix-plugin-common ' "plugins/$1/Cargo.toml"; then
       printf '%s\n' 'plugins/common/**'
     fi

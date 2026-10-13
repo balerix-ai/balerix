@@ -262,6 +262,28 @@ scenario_core_projects() {
   expect_eq "agent change: core releases" "$(field status "$(prepare "$dir" core)")" release
 }
 
+# A unit's Dockerfiles ship in its images, so a fix there releases it:
+# docker/balerix (the balerix and balerix-agent images) is core's, and
+# docker/plugin every plugin's but not common's, which has no image.
+scenario_dockerfiles() {
+  local dir unit
+  dir=$(fixture dockerfiles)
+  for unit in core common flow web matrix github; do release "$dir" "$unit" 0.4.0; done
+  change "$dir" docker/plugin/release-test.txt "fix(deps): a plugin base image digest"
+  for unit in flow web matrix github; do
+    expect_eq "docker/plugin change: $unit releases" "$(field status "$(prepare "$dir" "$unit")")" release
+    discard "$dir"
+  done
+  expect_eq "docker/plugin change: common does not" "$(field status "$(prepare "$dir" common)")" none
+  discard "$dir"
+  expect_eq "docker/plugin change: core does not" "$(field status "$(prepare "$dir" core)")" none
+  discard "$dir"
+  change "$dir" docker/balerix/release-test.txt "fix(deps): a balerix base image digest"
+  expect_eq "docker/balerix change: core releases" "$(field status "$(prepare "$dir" core)")" release
+  discard "$dir"
+  expect_eq "docker/balerix change: common does not" "$(field status "$(prepare "$dir" common)")" none
+}
+
 scenario_in_progress() {
   local dir out
   dir=$(fixture in-progress)
@@ -974,6 +996,7 @@ scenario_sdk_change
 scenario_plugin_only
 scenario_core_bump
 scenario_core_projects
+scenario_dockerfiles
 scenario_in_progress
 scenario_plan
 scenario_plan_core_images

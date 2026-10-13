@@ -8,6 +8,7 @@ use balerix_api::{KeyStep, PluginAction};
 use serde_json::Value;
 use tokio::time::Instant;
 
+use crate::delivery::{Allowlist, COMMAND_REFUSED, Kind, classify};
 use crate::pending::{OpenQuestion, Stage};
 use crate::question::{self, Matched, Refusal, Selection};
 
@@ -105,8 +106,16 @@ fn plan_action(
 }
 
 /// Spec J §7.2 for one reply, arriving at `now`, while `open` is the
-/// agent's question.
-pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64, now: Instant) -> Decision {
+/// agent's question. `commands` is the channel's slash-command
+/// allowlist: free text that reads as a command off it is refused, as a
+/// message would be.
+pub fn on_reply(
+    open: &OpenQuestion,
+    reply: &str,
+    key_delay_ms: u64,
+    now: Instant,
+    commands: &Allowlist,
+) -> Decision {
     let questions = &open.questions;
     match &open.stage {
         Stage::Sent { since, .. } if now.saturating_duration_since(*since) < SENT_GRACE => {
@@ -195,6 +204,15 @@ pub fn on_reply(open: &OpenQuestion, reply: &str, key_delay_ms: u64, now: Instan
             },
             Err(message) => refused(Stage::Open, message),
         },
+        Ok(Matched::Answers { selections, .. })
+            if selections.iter().any(|s| {
+                s.other
+                    .as_deref()
+                    .is_some_and(|t| classify(t) == Kind::Command && !commands.allows(t))
+            }) =>
+        {
+            refused(Stage::Open, format!("`other:` {COMMAND_REFUSED}"))
+        }
         Ok(Matched::Answers { selections, exact }) => {
             let chosen = question::describe(questions, &selections);
             if exact {
@@ -289,6 +307,39 @@ mod tests {
     use super::*;
     use crate::question::fixtures::{color, colors_multi, input, size};
     use balerix_api::Key;
+
+    fn reply_to(open: &OpenQuestion, reply: &str, delay: u64, now: Instant) -> Decision {
+        on_reply(open, reply, delay, now, &Allowlist::default())
+    }
+
+    #[test]
+    fn an_other_answer_reading_as_a_command_off_the_allowlist_is_refused() {
+        for reply in ["other: /config x", "other: \u{FEFF}/foo", "other: /clearx"] {
+            let d = reply_to(&open(&[color()]), reply, 100, Instant::now());
+            assert_eq!(d.send, None, "{reply:?}");
+            assert_eq!(d.stage, Stage::Open);
+            assert_eq!(d.react, Some(Reaction::Refused));
+            assert_eq!(d.outcome, Some("answer_refused"));
+            assert_eq!(
+                d.post.as_deref(),
+                Some("`other:` this command isn't enabled for this channel")
+            );
+        }
+        // allowed, and plain text, go on to be confirmed as before
+        for reply in ["other: /compact", "other: teal"] {
+            let d = reply_to(&open(&[color()]), reply, 100, Instant::now());
+            assert_eq!(d.outcome, Some("confirm_asked"), "{reply:?}");
+        }
+        let extended = Allowlist::with(&["/review".to_string()]);
+        let d = on_reply(
+            &open(&[color()]),
+            "other: /review",
+            100,
+            Instant::now(),
+            &extended,
+        );
+        assert_eq!(d.outcome, Some("confirm_asked"));
+    }
     use serde_json::json;
     use std::time::Duration;
     use tokio::time::Instant;
@@ -316,7 +367,7 @@ mod tests {
 
     #[test]
     fn an_exact_reply_echoes_and_plans_the_keys() {
-        let d = on_reply(&open(&[color()]), "3", 100, Instant::now());
+        let d = reply_to(&open(&[color()]), "3", 100, Instant::now());
         assert_eq!(d.post.as_deref(), Some("**answering** Color → Blue"));
         assert_eq!(
             keys(&d),
@@ -345,7 +396,7 @@ mod tests {
 
     #[test]
     fn the_agents_key_delay_is_used() {
-        let d = on_reply(&open(&[color()]), "1", 250, Instant::now());
+        let d = reply_to(&open(&[color()]), "1", 250, Instant::now());
         assert!(matches!(
             d.send,
             Some(PluginAction::SendKeys { delay_ms: 250, .. })
@@ -354,7 +405,7 @@ mod tests {
 
     #[test]
     fn an_inexact_reply_asks_first() {
-        let d = on_reply(&open(&[color()]), "gre", 100, Instant::now());
+        let d = reply_to(&open(&[color()]), "gre", 100, Instant::now());
         assert_eq!(
             d.post.as_deref(),
             Some("**I read that as** Color → Green. Reply **yes** to send.")
@@ -369,9 +420,9 @@ mod tests {
     #[test]
     fn yes_sends_the_held_selection_without_a_second_echo() {
         let mut o = open(&[color()]);
-        let asked = on_reply(&o, "gre", 100, Instant::now());
+        let asked = reply_to(&o, "gre", 100, Instant::now());
         o.stage = asked.stage.with_echo(Some("$echo".into()));
-        let d = on_reply(&o, "YES", 100, Instant::now());
+        let d = reply_to(&o, "YES", 100, Instant::now());
         assert!(d.post.is_none());
         assert_eq!(
             keys(&d),
@@ -385,19 +436,19 @@ mod tests {
     #[test]
     fn no_drops_the_confirmation_and_another_reply_is_matched_fresh() {
         let mut o = open(&[color()]);
-        o.stage = on_reply(&o, "gre", 100, Instant::now()).stage;
-        let d = on_reply(&o, "n", 100, Instant::now());
+        o.stage = reply_to(&o, "gre", 100, Instant::now()).stage;
+        let d = reply_to(&o, "n", 100, Instant::now());
         assert!(d.post.is_none() && d.send.is_none());
         assert_eq!(d.stage, Stage::Open);
         assert_eq!(d.react, Some(Reaction::Ack));
         assert_eq!(d.outcome, None);
-        let d = on_reply(&o, "2", 100, Instant::now());
+        let d = reply_to(&o, "2", 100, Instant::now());
         assert_eq!(d.post.as_deref(), Some("**answering** Color → Green"));
     }
 
     #[test]
     fn prose_is_refused_with_the_option_list() {
-        let d = on_reply(&open(&[color()]), "purple please", 100, Instant::now());
+        let d = reply_to(&open(&[color()]), "purple please", 100, Instant::now());
         let post = d.post.clone().unwrap();
         assert!(post.contains("Red") && post.contains("Blue"), "{post}");
         assert!(d.send.is_none());
@@ -412,7 +463,7 @@ mod tests {
 
     #[test]
     fn skip_declines_with_one_escape() {
-        let d = on_reply(&open(&[color()]), "skip", 100, Instant::now());
+        let d = reply_to(&open(&[color()]), "skip", 100, Instant::now());
         assert_eq!(d.post.as_deref(), Some("**declining the question**"));
         assert_eq!(keys(&d), vec![KeyStep::Key(Key::Escape)]);
         assert!(matches!(
@@ -436,7 +487,7 @@ mod tests {
             since,
         };
         for reply in ["2", "skip", "skip!"] {
-            let d = on_reply(&o, reply, 100, at(since, 29));
+            let d = reply_to(&o, reply, 100, at(since, 29));
             assert_eq!(
                 d.post.as_deref(),
                 Some("an answer is already on its way; wait for the agent."),
@@ -467,7 +518,7 @@ mod tests {
             since,
         };
         for reply in ["2", "blue", "other: teal"] {
-            let d = on_reply(&o, reply, 100, at(since, 30));
+            let d = reply_to(&o, reply, 100, at(since, 30));
             assert_eq!(
                 d.post.as_deref(),
                 Some(
@@ -482,7 +533,7 @@ mod tests {
         }
         for reply in [" Skip ", "SKIP!"] {
             let now = at(since, 45);
-            let d = on_reply(&o, reply, 100, now);
+            let d = reply_to(&o, reply, 100, now);
             assert_eq!(d.post.as_deref(), Some("**declining the question**"));
             assert_eq!(keys(&d), vec![KeyStep::Key(Key::Escape)]);
             assert_eq!(
@@ -508,7 +559,7 @@ mod tests {
         let o = open(&[color()]);
         for reply in ["3", "gre", "skip", "purple please"] {
             assert_eq!(
-                on_reply(&o, reply, 100, Instant::now()).fallback,
+                reply_to(&o, reply, 100, Instant::now()).fallback,
                 Stage::Open
             );
         }
@@ -516,7 +567,7 @@ mod tests {
 
     #[test]
     fn one_reply_answers_several_questions() {
-        let d = on_reply(
+        let d = reply_to(
             &open(&[colors_multi(), size()]),
             "1, 3\n2",
             100,
@@ -535,7 +586,7 @@ mod tests {
             .map(|i| json!({ "label": format!("o{i}"), "description": "" }))
             .collect();
         let q = json!({ "question": "Which?", "header": "H", "multiSelect": false, "options": options });
-        let d = on_reply(&open(&[q]), "70", 500, Instant::now());
+        let d = reply_to(&open(&[q]), "70", 500, Instant::now());
         assert!(
             d.post
                 .unwrap()
@@ -550,7 +601,7 @@ mod tests {
     #[test]
     fn a_sent_answer_is_confirmed_or_reported_when_it_differs() {
         let mut o = open(&[color()]);
-        o.stage = on_reply(&o, "3", 100, Instant::now())
+        o.stage = reply_to(&o, "3", 100, Instant::now())
             .stage
             .with_echo(Some("$echo".into()));
         assert_eq!(

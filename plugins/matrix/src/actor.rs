@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use balerix_api::{HookEvent, Key, KeyStep, PluginAction};
 use balerix_plugin_common::answer::{self, Decision, Reaction, Verdict};
-use balerix_plugin_common::delivery::{self, Deliveries, Kind};
+use balerix_plugin_common::delivery::{self, Allowlist, COMMAND_REFUSED, Deliveries, Kind};
 use balerix_plugin_common::metrics::Shared;
 use balerix_plugin_sdk::metrics::{IntCounter, IntCounterVec, IntGauge};
 use balerix_plugin_sdk::{Host, Metrics, SdkError};
@@ -736,6 +736,14 @@ impl<M: MatrixPort> Actor<M> {
 
         // What the agent's input line takes as prose; tracked as sent.
         let text = delivery::as_prompt(&message.body).into_owned();
+        if delivery::classify(&text) == Kind::Command && !self.allowlist().allows(&text) {
+            count("command_refused");
+            tracing::info!("matrix: a command for {agent} is not on the allowlist");
+            let body = format!("**not sent to {agent}:** {COMMAND_REFUSED}");
+            self.send(&message.room, Some(&root), &body, "notice").await;
+            self.react(&message, REFUSED).await;
+            return;
+        }
         let action = PluginAction::SendText {
             text: text.clone(),
             submit: true,
@@ -782,6 +790,13 @@ impl<M: MatrixPort> Actor<M> {
         }
     }
 
+    /// The slash commands a thread reply may send (Spec G §9.2).
+    fn allowlist(&self) -> Allowlist {
+        self.config
+            .as_ref()
+            .map_or_else(Allowlist::default, |c| Allowlist::with(&c.slash_commands))
+    }
+
     /// A thread reply while `agent` has a question open (Spec J §7.2):
     /// decide in common, execute here under `Decision`'s contract.
     async fn on_answer(&mut self, agent: &str, root: &str, message: &Inbound) {
@@ -793,7 +808,13 @@ impl<M: MatrixPort> Actor<M> {
             .get(agent)
             .map(|c| c.key_delay_ms)
             .unwrap_or(balerix_api::DEFAULT_KEY_DELAY_MS);
-        let decision = answer::on_reply(&open, &message.body, delay_ms, Instant::now());
+        let decision = answer::on_reply(
+            &open,
+            &message.body,
+            delay_ms,
+            Instant::now(),
+            &self.allowlist(),
+        );
         self.execute(agent, root, message, decision).await;
     }
 
@@ -2210,6 +2231,66 @@ mod tests {
         assert!(notices(&port.calls()).is_empty());
     }
 
+    #[tokio::test]
+    async fn a_default_command_is_sent() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        reply(&mut a, &room, &root, "/compact keep the plan").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendText {
+                text: "/compact keep the plan".into(),
+                submit: true
+            }]
+        );
+        assert_eq!(reactions(&port.calls()), vec![SENT.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_command_off_the_allowlist_is_refused_in_the_thread_and_not_sent() {
+        for body in ["/foo", "/config x", "/clearx", " /Help"] {
+            let (fake, port, mut a, room, root) = with_thread().await;
+            reply(&mut a, &room, &root, body).await;
+            assert!(fake.actions_for("f/c/alice").is_empty(), "{body:?}");
+            assert_eq!(
+                sends(&port.calls()),
+                vec![(
+                    Some(root.clone()),
+                    format!("**not sent to f/c/alice:** {COMMAND_REFUSED}")
+                )],
+                "{body:?}"
+            );
+            assert_eq!(reactions(&port.calls()), vec![REFUSED.to_string()]);
+            assert_eq!(
+                a.counters
+                    .inbound
+                    .with_label_values(&["command_refused"])
+                    .get(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operator_command_is_sent() {
+        let (fake, _port, mut a, room, root) = with_thread().await;
+        let config = crate::config::parse_daemon(&json!({
+            "homeserver": "https://h",
+            "userId": "@balerix:example.org",
+            "slashCommands": ["/review"]
+        }))
+        .unwrap();
+        a.handle(Command::Configure(config)).await;
+        reply(&mut a, &room, &root, "/review src").await;
+        reply(&mut a, &room, &root, "/reviews").await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendText {
+                text: "/review src".into(),
+                submit: true
+            }]
+        );
+    }
+
     /// Text from a room never opens the input line with a mode character;
     /// what was sent is what the confirmation matches.
     #[tokio::test]
@@ -2813,6 +2894,20 @@ mod tests {
         assert!(
             body.contains("matches nothing") && body.contains("1. Red"),
             "{body}"
+        );
+        assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);
+    }
+
+    #[tokio::test]
+    async fn an_other_answer_off_the_allowlist_is_refused_and_nothing_reaches_the_agent() {
+        let (fake, port, mut a, room, root) = asked(&[color()]).await;
+        reply(&mut a, &room, &root, "other: /config x").await;
+        reply(&mut a, &room, &root, "yes").await;
+        assert!(fake.actions_for("f/c/alice").is_empty());
+        assert_eq!(reactions(&port.calls())[0], REFUSED.to_string());
+        assert_eq!(
+            sends(&port.calls())[0].1,
+            format!("`other:` {COMMAND_REFUSED}")
         );
         assert_eq!(a.questions.get("f/c/alice").unwrap().stage, Stage::Open);
     }

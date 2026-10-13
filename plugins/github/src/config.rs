@@ -41,6 +41,10 @@ pub struct DaemonConfig {
     pub idle_timeout: Duration,
     #[serde(default = "default_max_parts")]
     pub max_parts: usize,
+    /// Slash commands a channel may send beyond common's defaults
+    /// (`delivery::DEFAULT_COMMANDS`).
+    #[serde(default)]
+    pub slash_commands: Vec<String>,
 }
 
 impl std::fmt::Debug for DaemonConfig {
@@ -53,6 +57,7 @@ impl std::fmt::Debug for DaemonConfig {
             .field("config_path", &self.config_path)
             .field("idle_timeout", &self.idle_timeout)
             .field("max_parts", &self.max_parts)
+            .field("slash_commands", &self.slash_commands)
             .finish()
     }
 }
@@ -80,6 +85,7 @@ pub fn parse_daemon(config: &Value) -> Result<DaemonConfig, ConfigError> {
         path: path.into(),
         message: message.into(),
     };
+    balerix_plugin_common::delivery::Allowlist::validate("slashCommands", &c.slash_commands)?;
     if c.max_parts == 0 {
         return Err(invalid("maxParts", "must be at least 1"));
     }
@@ -191,6 +197,23 @@ mod tests {
             m.extend(e.clone());
         }
         v
+    }
+
+    #[test]
+    fn slash_commands_default_to_none_and_are_validated() {
+        assert!(
+            parse_daemon(&daemon(json!({})))
+                .unwrap()
+                .slash_commands
+                .is_empty()
+        );
+        let c = parse_daemon(&daemon(json!({ "slashCommands": ["/review"] }))).unwrap();
+        assert_eq!(c.slash_commands, vec!["/review".to_string()]);
+        assert!(format!("{c:?}").contains("/review"));
+        for bad in [json!(["review"]), json!(["/ok", "/a b"]), json!(["//x"])] {
+            let err = parse_daemon(&daemon(json!({ "slashCommands": bad.clone() }))).unwrap_err();
+            assert!(err.path.starts_with("slashCommands["), "{bad}: {err}");
+        }
     }
 
     #[test]

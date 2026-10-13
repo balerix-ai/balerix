@@ -46,6 +46,10 @@ pub struct DaemonConfig {
     /// Most messages one body may be split across.
     #[serde(default = "default_max_parts")]
     pub max_parts: usize,
+    /// Slash commands a channel may send beyond common's defaults
+    /// (`delivery::DEFAULT_COMMANDS`).
+    #[serde(default)]
+    pub slash_commands: Vec<String>,
 }
 
 fn default_max_parts() -> usize {
@@ -106,6 +110,7 @@ pub fn parse_daemon(config: &Value) -> Result<DaemonConfig, ConfigError> {
             message: "must be a full Matrix id starting with @".into(),
         });
     }
+    balerix_plugin_common::delivery::Allowlist::validate("slashCommands", &c.slash_commands)?;
     if c.max_parts == 0 {
         return Err(ConfigError {
             path: "maxParts".into(),
@@ -182,6 +187,26 @@ mod tests {
         assert_eq!(parse_daemon(&v).unwrap().max_parts, DEFAULT_MAX_PARTS);
         v["maxParts"] = json!(3);
         assert_eq!(parse_daemon(&v).unwrap().max_parts, 3);
+    }
+
+    #[test]
+    fn slash_commands_default_to_none_and_are_validated() {
+        assert!(parse_daemon(&daemon()).unwrap().slash_commands.is_empty());
+        let mut v = daemon();
+        v["slashCommands"] = json!(["/review", "/my-cmd"]);
+        assert_eq!(
+            parse_daemon(&v).unwrap().slash_commands,
+            vec!["/review".to_string(), "/my-cmd".to_string()]
+        );
+        for bad in [json!(["review"]), json!(["/ok", "/a b"]), json!(["/"])] {
+            let mut v = daemon();
+            v["slashCommands"] = bad.clone();
+            let err = parse_daemon(&v).unwrap_err();
+            assert!(err.path.starts_with("slashCommands["), "{bad}: {err}");
+        }
+        let mut v = daemon();
+        v["slashCommands"] = json!("/review");
+        assert_eq!(parse_daemon(&v).unwrap_err().path, "slashCommands");
     }
 
     #[test]

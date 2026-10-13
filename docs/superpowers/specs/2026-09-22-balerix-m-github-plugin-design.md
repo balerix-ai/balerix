@@ -122,6 +122,7 @@ plugins:
       configPath: .balerix.yaml    # default; path in the repo, default branch
       idleTimeout: 2h              # default; 0 disables
       maxParts: 10                 # default; most comments one turn may become
+      slashCommands: [/review]     # optional; extends the default allowlist (§8.7)
 ```
 
 `appId`, `privateKey` and `webhookSecret` are required; the two secrets
@@ -414,6 +415,17 @@ took, and that is the proof (#85). Common gets `delivery.rs`, pure like
   text from a channel never opens the input line in another input mode.
   Matrix replies, live comments and `other:` answers go through it; what
   it answers is what is sent and tracked. Slash commands are unchanged.
+- `Allowlist`: slash commands from a channel are limited to an allowlist
+  (default `/compact`, `/clear`, `/context`, `/usage`, `/status`,
+  `/help`); an operator can extend it with `slashCommands`. A command
+  matches when its name, the first token after `/`, equals an entry
+  exactly; its arguments are not checked. Anything else is not sent: the
+  plugin answers in the channel that the command isn't enabled for this
+  channel, and counts it as `command_refused`. An `other:` answer to a
+  question that reads as a command off the list is refused like any other
+  answer the plugin cannot send. Entries that change the agent's settings
+  or environment give that ability to everyone who can post in the
+  channel.
 - `sent(agent, text, marker, now)` registers a prompt.
 - `on_event(&HookEvent) -> Outcome`: a `UserPromptSubmit` whose `prompt`
   matches the oldest pending prompt with that text on that agent removes

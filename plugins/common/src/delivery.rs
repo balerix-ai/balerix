@@ -30,10 +30,12 @@
 //! anything was ever sent to that agent. `forget` frees the entry.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
 use balerix_api::HookEvent;
+
+use crate::config::ConfigError;
 use serde_json::Value;
 use tokio::time::Instant;
 
@@ -80,6 +82,62 @@ pub fn classify(text: &str) -> Kind {
         Kind::Command
     } else {
         Kind::Prompt
+    }
+}
+
+/// What a channel hears when a slash command is not on its allowlist.
+pub const COMMAND_REFUSED: &str = "this command isn't enabled for this channel";
+
+/// The slash commands a channel may send when the operator adds none.
+pub const DEFAULT_COMMANDS: [&str; 6] = [
+    "/compact", "/clear", "/context", "/usage", "/status", "/help",
+];
+
+/// The slash commands a channel may send (Spec G §9.2, Spec M §8.7): the
+/// defaults plus the operator's `slashCommands`. A command is allowed
+/// when its name, the first token after `/` up to whitespace, equals an
+/// entry exactly, case included; anything after the name is its
+/// arguments and is not checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Allowlist(BTreeSet<String>);
+
+impl Default for Allowlist {
+    fn default() -> Self {
+        Self(DEFAULT_COMMANDS.iter().map(|c| (*c).to_string()).collect())
+    }
+}
+
+impl Allowlist {
+    /// The defaults plus `extra`, which [`Allowlist::validate`] has checked.
+    pub fn with(extra: &[String]) -> Self {
+        let mut list = Self::default();
+        list.0.extend(extra.iter().cloned());
+        list
+    }
+
+    /// Checks the operator's entries under the config key `path`: each is
+    /// `/` and a name, with no whitespace or control character.
+    pub fn validate(path: &str, entries: &[String]) -> Result<(), ConfigError> {
+        for (i, entry) in entries.iter().enumerate() {
+            let name = entry.strip_prefix('/').unwrap_or("");
+            if name.is_empty()
+                || name.starts_with('/')
+                || entry.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                return Err(ConfigError {
+                    path: format!("{path}[{i}]"),
+                    message: format!("expected /name with no whitespace, got {entry:?}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a body that [`classify`] calls a command may be sent: its
+    /// `/name` is on the list.
+    pub fn allows(&self, text: &str) -> bool {
+        let name = text.split_whitespace().next().unwrap_or("");
+        name.len() > 1 && self.0.contains(name)
     }
 }
 
@@ -910,5 +968,100 @@ mod tests {
         assert!(d.nudge(now + Duration::from_secs(9)).is_empty());
         assert!(d.nudge(late + Duration::from_secs(4)).is_empty());
         assert_eq!(d.nudge(late + Duration::from_secs(5)), vec!["f/c/a"]);
+    }
+
+    #[test]
+    fn the_default_commands_are_allowed_with_their_arguments() {
+        let list = Allowlist::default();
+        for t in [
+            "/compact", "/clear", "/context", "/usage", "/status", "/help",
+        ] {
+            assert!(list.allows(t), "{t}");
+        }
+        assert!(list.allows("/compact keep the test plan"));
+        assert!(list.allows("  /clear\n"));
+    }
+
+    #[test]
+    fn a_command_off_the_list_is_not_allowed() {
+        let list = Allowlist::default();
+        for t in [
+            "/foo",
+            "/config x=y",
+            "/clearx",
+            "/Clear",
+            "/compact/x",
+            "/",
+            "/ clear",
+            "",
+        ] {
+            assert!(!list.allows(t), "{t:?}");
+        }
+    }
+
+    /// An invisible lead never hides a command from the allowlist, nor a
+    /// mode character from the escape: one character from each range the
+    /// input line drops.
+    #[test]
+    fn an_invisible_lead_hides_neither_a_command_nor_a_mode_character() {
+        let list = Allowlist::default();
+        for c in [
+            '\u{7}',
+            '\u{85}',
+            '\u{AD}',
+            '\u{600}',
+            '\u{180E}',
+            '\u{34F}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{17B4}',
+            '\u{17B5}',
+            '\u{180C}',
+            '\u{180F}',
+            '\u{200B}',
+            '\u{202A}',
+            '\u{2065}',
+            '\u{3164}',
+            '\u{FE0F}',
+            '\u{FEFF}',
+            '\u{FFA0}',
+            '\u{FFF0}',
+            '\u{1107F}',
+            '\u{16FE4}',
+            '\u{E0000}',
+            '\u{E0001}',
+            '\u{E0002}',
+            '\u{E0041}',
+            '\u{E0080}',
+            '\u{E0FFF}',
+        ] {
+            let at = format!("U+{:04X}", c as u32);
+            let command = as_prompt(&format!("{c}/config x")).into_owned();
+            assert_eq!(classify(&command), Kind::Command, "{at}");
+            assert!(!list.allows(&command), "{at}");
+            assert!(list.allows(&as_prompt(&format!("{c}/compact"))), "{at}");
+            let mode = as_prompt(&format!("{c}!x")).into_owned();
+            assert_eq!(mode, "\\!x", "{at}");
+            assert_eq!(classify(&mode), Kind::Prompt, "{at}");
+        }
+    }
+
+    #[test]
+    fn an_operator_entry_extends_the_defaults() {
+        let list = Allowlist::with(&["/review".to_string()]);
+        assert!(list.allows("/review src/lib.rs"));
+        assert!(list.allows("/clear"));
+        assert!(!list.allows("/reviewx"));
+    }
+
+    #[test]
+    fn operator_entries_are_validated() {
+        let ok = ["/review".to_string(), "/my-cmd:sub".to_string()];
+        assert_eq!(Allowlist::validate("slashCommands", &ok), Ok(()));
+        for bad in ["review", "/", "//x", "/a b", "/a\tb", "/a\u{7}", ""] {
+            let err =
+                Allowlist::validate("slashCommands", &["/ok".into(), bad.into()]).unwrap_err();
+            assert_eq!(err.path, "slashCommands[1]", "{bad:?}");
+        }
     }
 }

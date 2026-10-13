@@ -232,6 +232,8 @@ pub struct Actor<G: GitHubPort> {
     /// Per agent, the `Deactivate`s (`end`) and `Activate`s (`start`) our
     /// own applies made the daemon queue, in apply order (#257).
     expected: HashMap<String, VecDeque<Expect>>,
+    /// Per fleet, the renamed crew key a notice has been posted for (#258).
+    crew_notices: HashMap<String, String>,
     /// Markers evicted inside a sync path, reported on the next tick.
     unconfirmed_queue: Vec<(Sent, Unconfirmed)>,
     /// Wall-clock seconds; a test pins it.
@@ -267,6 +269,7 @@ impl<G: GitHubPort> Actor<G> {
             ended_notice: HashMap::new(),
             first_prompts: HashMap::new(),
             expected: HashMap::new(),
+            crew_notices: HashMap::new(),
             unconfirmed_queue: Vec::new(),
             now_secs: unix_now,
         }
@@ -768,9 +771,6 @@ impl<G: GitHubPort> Actor<G> {
                 return;
             }
         }
-        let agent = format!("{fleet}/repo/{}", kind.agent_name(number));
-        let old_status_comment = self.sessions.get(&agent).and_then(|r| r.status_comment);
-        let resumed = self.sessions.get(&agent).is_some();
         let head = pr.as_ref().map(|(h, _, _)| h.clone());
         let base = pr.as_ref().map(|(_, _, b)| b.clone());
 
@@ -814,14 +814,44 @@ impl<G: GitHubPort> Actor<G> {
                 return;
             }
         };
-        let file = match repo_config::prepare(&text, repo, &fleet, &default_branch, &live) {
-            Ok(f) => f,
+        let prepared = match repo_config::prepare(&text, repo, &fleet, &default_branch, &live) {
+            Ok(p) => p,
             Err(m) => {
                 self.refuse(installation, repo, number, target, &m, "config")
                     .await;
                 return;
             }
         };
+        let declared = prepared.crew.clone();
+        let (file, crew) = self.keep_crew(&fleet, number, prepared);
+        if crew == declared {
+            self.crew_notices.remove(&fleet);
+        } else if self.crew_notices.get(&fleet) != Some(&declared) {
+            self.crew_notices.insert(fleet.clone(), declared.clone());
+            self.post(
+                installation,
+                repo,
+                number,
+                &format!(
+                    "{} names crew {declared}, but sessions are running in crew {crew}; \
+                     the new key takes effect once they end",
+                    self.cfg().config_path
+                ),
+                "notice",
+            )
+            .await;
+        }
+        // The agent runs under the file's crew, whatever its key (#258).
+        let agent = format!("{fleet}/{crew}/{}", kind.agent_name(number));
+        // A closed row under another crew key stands for a session the
+        // daemon no longer runs; it is replaced, not resumed.
+        let prior = self
+            .sessions
+            .by_number(repo, number)
+            .filter(|a| *a != agent)
+            .map(str::to_string);
+        let old_status_comment = self.sessions.get(&agent).and_then(|r| r.status_comment);
+        let resumed = self.sessions.get(&agent).is_some();
         if let Err(e) = self.host.apply_fleet(&fleet, &file).await {
             tracing::warn!("github: applying {fleet} with {agent}: {e}");
             self.refuse(
@@ -889,6 +919,15 @@ impl<G: GitHubPort> Actor<G> {
         if let Err(e) = self.sessions.set(&self.host, &agent, row).await {
             tracing::warn!("github: storing row for {agent}: {e}");
         }
+        if let Some(prior) = prior {
+            if let Err(e) = self.sessions.remove(&self.host, &prior).await {
+                tracing::warn!("github: dropping {prior}, replaced by {agent}: {e}");
+            }
+            self.statuses.remove(&prior);
+            self.status_dirty.remove(&prior);
+            self.rows_dirty.remove(&prior);
+            self.ended_notice.remove(&prior);
+        }
         self.ended_notice.remove(&agent);
         // The first prompt waits for `SessionStart` (§8.2); what it needs is kept here.
         self.first_prompts.insert(
@@ -897,7 +936,7 @@ impl<G: GitHubPort> Actor<G> {
                 title: title.to_string(),
                 body: body.to_string(),
                 url: url.to_string(),
-                branch: head_or_default(&fleet, kind, number, pr.as_ref()),
+                branch: head_or_default(&fleet, &crew, kind, number, pr.as_ref()),
                 base: base.unwrap_or_else(|| default_branch.clone()),
                 asker: asker.to_string(),
                 comment: comment.map(str::to_string),
@@ -921,6 +960,32 @@ impl<G: GitHubPort> Actor<G> {
         self.post(installation, repo, number, message, "notice")
             .await;
         self.react(installation, repo, target, CONFUSED).await;
+    }
+
+    /// #258: the file as applied, and the crew the agents run under.
+    /// While the fleet's other open rows run under one crew key, that
+    /// key stays even when the file now says another: applied under the
+    /// new key, the daemon would replace every running agent. The new
+    /// key takes over once they have ended.
+    fn keep_crew(
+        &self,
+        fleet: &str,
+        except: u64,
+        prepared: repo_config::Prepared,
+    ) -> (Value, String) {
+        let repo_config::Prepared { mut file, crew } = prepared;
+        let running = self.sessions.agents_in(fleet).into_iter().find(|a| {
+            self.sessions
+                .get(a)
+                .is_some_and(|r| !r.closed && r.number != except)
+        });
+        match running.map(|a| session::crew_of(&a).to_string()) {
+            Some(old) if old != crew => {
+                repo_config::rename_crew(&mut file, &crew, &old);
+                (file, old)
+            }
+            _ => (file, crew),
+        }
     }
 
     fn expect(&mut self, agent: &str, call: Expect) {
@@ -1623,7 +1688,9 @@ impl<G: GitHubPort> Actor<G> {
                 return;
             }
         };
-        let file = match repo_config::prepare(&text, &row.repo, &fleet, &default_branch, &live) {
+        let prepared = repo_config::prepare(&text, &row.repo, &fleet, &default_branch, &live)
+            .map(|p| self.keep_crew(&fleet, row.number, p).0);
+        let file = match prepared {
             Ok(f) => f,
             Err(m) => {
                 tracing::warn!("github: {fleet}: {m}");
@@ -1962,12 +2029,13 @@ enum Expect {
 
 fn head_or_default(
     fleet: &str,
+    crew: &str,
     kind: Kind,
     number: u64,
     pr: Option<&(String, String, String)>,
 ) -> String {
     pr.map(|(h, _, _)| h.clone())
-        .unwrap_or_else(|| format!("balerix/{fleet}/repo/{}", kind.agent_name(number)))
+        .unwrap_or_else(|| format!("balerix/{fleet}/{crew}/{}", kind.agent_name(number)))
 }
 
 /// One retry after `Retry-After`, when it is short (matrix's rule).
@@ -2112,6 +2180,136 @@ mod tests {
             "no prompt before SessionStart"
         );
         assert_eq!(a.sessions.open_count(), 1);
+    }
+
+    const BACKEND: &str = "apiVersion: balerix/v1\nkind: Fleet\ncrews:\n  backend:\n    repo: acme/api\n    agents: {}\n";
+    const BACKEND_AGENT: &str = "gh-acme-api/backend/issue-12";
+
+    /// #258: the file's crew key, whatever it is, names the agent, its
+    /// row, its status, its branch and the first prompt's recipient.
+    #[tokio::test]
+    async fn a_crew_key_other_than_repo_names_the_agent_everywhere() {
+        let (fake, port, mut a) = actor().await;
+        port.set_file("acme/api", "main", ".balerix.yaml", BACKEND);
+        a.handle(comment(12, "alice", 5, "@balerix please look"))
+            .await;
+        let applied = fake.applied_fleets();
+        assert_eq!(
+            applied[0].1["crews"]["backend"]["agents"]["issue-12"]["plugins"]["github"]["number"],
+            12
+        );
+        assert!(applied[0].1["crews"].get("repo").is_none());
+        assert_eq!(a.sessions.by_number("acme/api", 12), Some(BACKEND_AGENT));
+        assert!(fake.kv_json(&format!("session/{BACKEND_AGENT}")).is_some());
+        assert!(fake.kv_json("session/gh-acme-api/repo/issue-12").is_none());
+        let c = comments(&port.calls());
+        assert!(c[0].1.contains(&format!("`{BACKEND_AGENT}`")), "{}", c[0].1);
+        a.handle(Command::Activate {
+            agent: BACKEND_AGENT.into(),
+            config: crate::config::parse_agent(&json!({ "kind": "issue", "number": 12 })).unwrap(),
+        })
+        .await;
+        a.handle(Command::Events(vec![event(
+            BACKEND_AGENT,
+            "SessionStart",
+            json!({ "source": "startup" }),
+        )]))
+        .await;
+        let sent = fake.actions_for(BACKEND_AGENT);
+        assert_eq!(sent.len(), 1, "the first prompt went out");
+        let text = actions_text(&sent[0]);
+        assert!(
+            text.contains("Branch: balerix/gh-acme-api/backend/issue-12 (from main)"),
+            "{text}"
+        );
+        assert_eq!(a.sessions.open_count(), 1, "one row, not two");
+        // a comment reaches it; the close refiles the same crew
+        a.handle(comment(12, "bob", 6, "and this")).await;
+        assert_eq!(fake.actions_for(BACKEND_AGENT).len(), 2);
+        a.handle(close()).await;
+        assert!(a.sessions.get(BACKEND_AGENT).unwrap().closed);
+        assert_eq!(
+            fake.applied_fleets()[1].1["crews"]["backend"]["agents"],
+            json!({})
+        );
+    }
+
+    /// #258: a crew key renamed while sessions run keeps the old key
+    /// (applied under the new one, the daemon would replace them), with
+    /// one notice; ending is never blocked, and once the last running
+    /// session ends the new key applies and replaces the old closed row.
+    #[tokio::test]
+    async fn a_crew_renamed_under_running_sessions_keeps_the_old_key_until_they_end() {
+        let (fake, port, mut a) = started().await;
+        port.set_file("acme/api", "main", ".balerix.yaml", BACKEND);
+        port.take_calls();
+        a.handle(comment(13, "alice", 8, "@balerix also this"))
+            .await;
+        a.handle(comment(14, "alice", 9, "@balerix and this")).await;
+        let applied = fake.applied_fleets();
+        assert_eq!(applied.len(), 3);
+        for (_, file) in &applied[1..] {
+            assert!(file["crews"].get("backend").is_none(), "{file}");
+            assert_eq!(file["crews"]["repo"]["repo"], "acme/api");
+        }
+        assert_eq!(
+            applied[2].1["crews"]["repo"]["agents"]
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            a.sessions.by_number("acme/api", 13),
+            Some("gh-acme-api/repo/issue-13")
+        );
+        let notices: Vec<_> = comments(&port.calls())
+            .into_iter()
+            .filter(|(_, b)| b.contains("names crew"))
+            .collect();
+        assert_eq!(
+            notices,
+            vec![(
+                13,
+                ".balerix.yaml names crew backend, but sessions are running in crew repo; \
+                 the new key takes effect once they end"
+                    .into()
+            )],
+            "one notice"
+        );
+        // ending is never blocked: under the old key while others run...
+        a.handle(close()).await;
+        assert!(a.sessions.get(AGENT).unwrap().closed);
+        let last = fake.applied_fleets().last().unwrap().1.clone();
+        assert_eq!(
+            last["crews"]["repo"]["agents"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["issue-13", "issue-14"]
+        );
+        // ...and the last one ends under the new key
+        for n in [13, 14] {
+            a.handle(Command::Webhook(WebhookEvent::Closed {
+                repo: "acme/api".into(),
+                installation: 7,
+                number: n,
+                merged: false,
+            }))
+            .await;
+        }
+        let last = fake.applied_fleets().last().unwrap().1.clone();
+        assert_eq!(last["crews"]["backend"]["agents"], json!({}));
+        assert!(last["crews"].get("repo").is_none());
+        // a resume now runs under the new key, on a new default branch
+        a.handle(comment(12, "alice", 10, "@balerix again")).await;
+        assert_eq!(a.sessions.by_number("acme/api", 12), Some(BACKEND_AGENT));
+        assert!(a.sessions.get(AGENT).is_none());
+        assert!(fake.kv_json(&format!("session/{AGENT}")).is_none());
+        let fp = &a.first_prompts[BACKEND_AGENT];
+        assert!(!fp.resumed);
+        assert_eq!(fp.branch, "balerix/gh-acme-api/backend/issue-12");
     }
 
     #[tokio::test]

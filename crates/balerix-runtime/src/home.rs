@@ -1,6 +1,7 @@
 //! The agent's `$HOME` (Phase 2 spec §4.2 step 2): Claude settings with
 //! balerix's hooks, credentials, a seeded `.claude.json`, gh hosts.
 
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 
 pub use balerix_api::HOOK_EVENTS;
@@ -8,7 +9,10 @@ use balerix_api::{CredentialBundle, GitAuth, GitSettings};
 use balerix_core::{AgentId, HookTarget, MaterializeError};
 use serde_json::{Map, Value, json};
 
-use crate::fsutil::{ensure_dir, ensure_private_dir, write_atomic};
+use crate::fsutil::{
+    DirMode, ensure_dir, ensure_path_at, ensure_private_dir, open_dir_root, relative_to,
+    write_atomic_at,
+};
 use crate::layout::AgentPaths;
 use crate::quote::sh_quote;
 
@@ -136,6 +140,13 @@ fn io_err(id: &AgentId, path: &Path, e: std::io::Error) -> MaterializeError {
     }
 }
 
+/// Writes the agent's home. `root`, `logs` and nono's home are balerix's
+/// own; everything under `home/` is written without following a link
+/// below `home/` itself: `home/` is opened once, each directory beneath it
+/// is reached by descriptor (a link or file found in its place is
+/// replaced by a real directory), modes are set through descriptors, and
+/// each file is a temp file renamed into place in its directory
+/// (`fsutil::write_atomic_at`).
 pub fn write_home(
     id: &AgentId,
     paths: &AgentPaths,
@@ -145,84 +156,92 @@ pub fn write_home(
     // .credentials.json, hosts.yml) and transcripts: 0700, no group or
     // other access. The rest are ordinary tool directories.
     // `tmp/` is 0700 too: claude checks its temp dir's mode before using it.
-    for d in [
-        paths.root.clone(),
-        paths.home.clone(),
-        paths.claude_dir(),
-        paths.logs.clone(),
-        paths.tmp_dir(),
-    ] {
-        ensure_private_dir(&d).map_err(|e| io_err(id, &d, e))?;
+    for d in [&paths.root, &paths.logs] {
+        ensure_private_dir(d).map_err(|e| io_err(id, d, e))?;
     }
-    for d in [
-        paths.gh_dir(),
-        paths.xdg_data(),
-        paths.xdg_state(),
-        paths.xdg_cache(),
-        paths.nono_home.clone(),
-    ] {
-        ensure_dir(&d).map_err(|e| io_err(id, &d, e))?;
+    ensure_dir(&paths.nono_home).map_err(|e| io_err(id, &paths.nono_home, e))?;
+    let home =
+        open_dir_root(&paths.home, DirMode::Private).map_err(|e| io_err(id, &paths.home, e))?;
+    let sub = |path: &Path, mode: DirMode| {
+        relative_to(&paths.home, path)
+            .and_then(|rel| ensure_path_at(home.as_fd(), rel, mode))
+            .map_err(|e| io_err(id, path, e))
+    };
+    let claude_dir = paths.claude_dir();
+    let claude = sub(&claude_dir, DirMode::Private)?;
+    sub(&paths.tmp_dir(), DirMode::Private)?;
+    let gh_dir = paths.gh_dir();
+    let gh = sub(&gh_dir, DirMode::Default)?;
+    for d in [paths.xdg_data(), paths.xdg_state(), paths.xdg_cache()] {
+        sub(&d, DirMode::Default)?;
     }
     let pretty = |v: &Value| serde_json::to_vec_pretty(v).unwrap_or_default();
+    let write = |dir: &OwnedFd, at: &Path, name: &str, contents: &[u8]| {
+        write_atomic_at(dir.as_fd(), name, contents, 0o600)
+            .map_err(|e| io_err(id, &at.join(name), e))
+    };
 
     // 0600: the hooks block carries the per-agent bearer secret.
-    let settings_path = paths.claude_dir().join("settings.json");
-    write_atomic(
-        &settings_path,
+    write(
+        &claude,
+        &claude_dir,
+        "settings.json",
         &pretty(&render_settings(
             inputs.settings,
             id,
             inputs.hooks,
             inputs.relay,
         )),
-        0o600,
-    )
-    .map_err(|e| io_err(id, &settings_path, e))?;
+    )?;
 
-    let creds_path = paths.claude_dir().join(".credentials.json");
     match (&inputs.creds.claude_credentials, inputs.redact_credentials) {
-        (Some(_), true) => write_atomic(&creds_path, &pretty(&json!(REDACTED)), 0o600),
-        (Some(c), false) => write_atomic(&creds_path, &pretty(c), 0o600),
-        (None, _) => Ok(()),
+        (Some(_), true) => write(
+            &claude,
+            &claude_dir,
+            ".credentials.json",
+            &pretty(&json!(REDACTED)),
+        )?,
+        (Some(c), false) => write(&claude, &claude_dir, ".credentials.json", &pretty(c))?,
+        (None, _) => {}
     }
-    .map_err(|e| io_err(id, &creds_path, e))?;
 
     // Claude Code reads `$CLAUDE_CONFIG_DIR/.claude.json` when that variable
     // is set, and the sandbox profile sets it; verified by hand with claude
     // 2.1.263 (only this copy was ever rewritten), so the `$HOME` copy that
     // Phase 2 also wrote is gone.
-    let claude_json = paths.claude_dir().join(".claude.json");
-    write_atomic(
-        &claude_json,
+    write(
+        &claude,
+        &claude_dir,
+        ".claude.json",
         &pretty(&render_claude_json(
             inputs.creds.claude_account.as_ref(),
             inputs.trusted,
         )),
-        0o600,
-    )
-    .map_err(|e| io_err(id, &claude_json, e))?;
+    )?;
 
     if inputs.with_gh
         && let Some(token) = &inputs.creds.gh_token
     {
-        let hosts = paths.gh_dir().join("hosts.yml");
         let token = if inputs.redact_credentials {
             REDACTED
         } else {
             token.as_str()
         };
-        write_atomic(&hosts, render_hosts_yml(token).as_bytes(), 0o600)
-            .map_err(|e| io_err(id, &hosts, e))?;
+        write(
+            &gh,
+            &gh_dir,
+            "hosts.yml",
+            render_hosts_yml(token).as_bytes(),
+        )?;
     }
 
     // 0600 like the rest of home/: it names the credential helper.
-    let gitconfig = paths.home.join(".gitconfig");
-    write_atomic(
-        &gitconfig,
+    write(
+        &home,
+        &paths.home,
+        ".gitconfig",
         render_gitconfig(id, inputs.git).as_bytes(),
-        0o600,
-    )
-    .map_err(|e| io_err(id, &gitconfig, e))?;
+    )?;
     Ok(())
 }
 
@@ -448,5 +467,153 @@ mod tests {
         assert!(!creds_file.contains("SECRET"));
         assert!(creds_file.contains(REDACTED));
         assert!(!paths.gh_dir().join("hosts.yml").exists());
+    }
+
+    fn write(paths: &AgentPaths, c: &CredentialBundle) {
+        write_home(
+            &id(),
+            paths,
+            &HomeInputs {
+                settings: &json!({ "model": "opus" }),
+                creds: c,
+                hooks: &hooks(),
+                git: &GitSettings::default(),
+                relay: Path::new("/opt/balerix"),
+                trusted: &[&paths.workspace],
+                with_gh: true,
+                redact_credentials: false,
+            },
+        )
+        .unwrap();
+    }
+
+    fn mode(p: &Path) -> u32 {
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A 0755 directory beside the state roots holding one sentinel file.
+    fn sentinel_dir(at: &Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(at).unwrap();
+        std::fs::write(at.join("sentinel"), "left alone").unwrap();
+        std::fs::set_permissions(at, std::fs::Permissions::from_mode(0o755)).unwrap();
+        at.to_path_buf()
+    }
+
+    fn assert_untouched(dir: &Path) {
+        assert_eq!(mode(dir), 0o755, "{}", dir.display());
+        let names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["sentinel"], "{}", dir.display());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sentinel")).unwrap(),
+            "left alone"
+        );
+    }
+
+    fn replace_with_link(path: &Path, target: &Path) {
+        std::fs::remove_dir_all(path).unwrap();
+        std::os::unix::fs::symlink(target, path).unwrap();
+    }
+
+    #[test]
+    fn writes_under_home_never_follow_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StateLayout::from_env(dir.path(), |_| None);
+        let paths = layout.agent(&id());
+        let c = creds();
+        let files = |d: &Path, names: &[&str]| {
+            assert!(
+                std::fs::symlink_metadata(d).unwrap().is_dir(),
+                "{} is a real directory again",
+                d.display()
+            );
+            for n in names {
+                let f = d.join(n);
+                assert!(std::fs::symlink_metadata(&f).unwrap().is_file());
+                assert_eq!(mode(&f), 0o600, "{}", f.display());
+            }
+        };
+        for (i, (planted, expected_mode)) in [
+            (paths.claude_dir(), 0o700),
+            (paths.gh_dir(), 0o755),
+            (paths.xdg_config(), 0o755),
+            (paths.tmp_dir(), 0o700),
+            (paths.xdg_cache(), 0o755),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write(&paths, &c);
+            let outside = sentinel_dir(&dir.path().join(format!("outside-{i}")));
+            replace_with_link(&planted, &outside);
+            write(&paths, &c);
+            assert_untouched(&outside);
+            assert!(std::fs::symlink_metadata(&planted).unwrap().is_dir());
+            assert_eq!(mode(&planted) & 0o700, 0o700);
+            if expected_mode == 0o700 {
+                assert_eq!(mode(&planted), 0o700, "{}", planted.display());
+            }
+            files(
+                &paths.claude_dir(),
+                &["settings.json", ".credentials.json", ".claude.json"],
+            );
+            files(&paths.gh_dir(), &["hosts.yml"]);
+            files(&paths.home, &[".gitconfig"]);
+            assert_eq!(mode(&paths.tmp_dir()), 0o700);
+        }
+    }
+
+    #[test]
+    fn a_file_in_place_of_a_home_directory_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StateLayout::from_env(dir.path(), |_| None);
+        let paths = layout.agent(&id());
+        let c = creds();
+        write(&paths, &c);
+        std::fs::remove_dir_all(paths.claude_dir()).unwrap();
+        std::fs::write(paths.claude_dir(), "x").unwrap();
+        write(&paths, &c);
+        assert!(
+            std::fs::symlink_metadata(paths.claude_dir())
+                .unwrap()
+                .is_dir()
+        );
+        assert_eq!(mode(&paths.claude_dir()), 0o700);
+        assert!(paths.claude_dir().join("settings.json").is_file());
+    }
+
+    #[test]
+    fn a_link_at_a_file_name_is_replaced_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = StateLayout::from_env(dir.path(), |_| None);
+        let paths = layout.agent(&id());
+        let c = creds();
+        write(&paths, &c);
+        let outside = sentinel_dir(&dir.path().join("outside"));
+        let target = outside.join("sentinel");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for f in [
+            paths.claude_dir().join("settings.json"),
+            paths.claude_dir().join(".credentials.json"),
+            paths.gh_dir().join("hosts.yml"),
+            paths.home.join(".gitconfig"),
+        ] {
+            std::fs::remove_file(&f).unwrap();
+            std::os::unix::fs::symlink(&target, &f).unwrap();
+            write(&paths, &c);
+            assert_untouched(&outside);
+            assert_eq!(mode(&target), 0o644);
+            let meta = std::fs::symlink_metadata(&f).unwrap();
+            assert!(meta.is_file(), "{} is a regular file again", f.display());
+            assert_eq!(mode(&f), 0o600);
+            assert_ne!(std::fs::read_to_string(&f).unwrap(), "left alone");
+        }
+        assert!(
+            std::fs::read_to_string(paths.claude_dir().join("settings.json"))
+                .unwrap()
+                .contains("hooks")
+        );
     }
 }

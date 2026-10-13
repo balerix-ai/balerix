@@ -340,6 +340,14 @@ makes an existing remote branch its clone's branch and start point
   `MISE_SHARED_INSTALL_DIRS` (crew, then fleet, then daemon). An agent can
   therefore `mise install` what its worktree declares without touching a
   binary any other agent executes.
+- **The daemon installs an agent's and a plugin's tools under nono.** The
+  agent or plugin can write its `home/`, where mise keeps its directories,
+  so the daemon's own `mise trust`/`mise install` for it run in a sandbox
+  of their own (`nono-mise-profile.json`) that writes that `home/` and
+  nothing else of its. A plugin's install writes the daemon pool, so its
+  trust (which writes the plugin's `home/`) and its install (which writes
+  the pool) get a profile each. The pool levels, which write only
+  daemon-owned directories, run outside it.
 - **The daemon pool has one owner.** The system table is installed by a
   `SystemPool` actor at daemon start and re-checked each resync tick, not by
   whichever crew's pass reached it first. Its readiness is a live condition:

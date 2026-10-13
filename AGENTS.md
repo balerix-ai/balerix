@@ -469,11 +469,55 @@ credentials, hook input, or sandbox rules.
   both directions. A refusal reads `<path>: not
   accepted in a plugin's (fleet's) sandbox block`. Widening a list means
   checking what the key lets nono's supervisor do outside the sandbox.
-- The daemon runs `mise trust` + `mise install` on the package's own
-  `mise.toml` with `MISE_STATE_DIR` under the plugin's home; the sandbox uses
-  the same dir, so if `mise run` says the config is untrusted, the two
-  `MISE_STATE_DIR`s diverged (`plugin.rs`: `install_plugin_tools` vs
-  `plugin_env`). Do not set `MISE_GLOBAL_CONFIG_FILE` inside the sandbox —
+- The daemon's own `mise trust` + `mise install` for an agent
+  (`Toolchain::install`) and a plugin (`install_plugin_tools`) run inside
+  nono (`toolchain::SandboxedInstall`, `sandbox::render_mise_profile`),
+  each call its own start, from an empty environment: mise's variables,
+  `HOME` and `TMPDIR` in the root's `mise-install/` (emptied before,
+  removed after), nono's own `$HOME` a `.nono-mise-*` scratch beside
+  `nono/`. Nothing of the daemon's environment reaches mise any more (no
+  proxy variables, no `GITHUB_TOKEN`). An agent's two calls share
+  `nono-mise-profile.json` (`agent_install_grants`), whose read-write
+  grant is `home/` itself, never a directory under it: nono grants what a
+  path resolves to when the sandbox starts, so naming
+  `home/.local/share/mise` would grant the target of a link the agent left
+  there. A plugin's install writes the daemon pool, so its calls get a
+  profile each, and neither writes both the pool and the plugin's `home/`:
+  `mise trust` under `nono-mise-trust-profile.json`
+  (`plugin_trust_grants`) writes the trust record to the plugin's own
+  `MISE_STATE_DIR` in `home/`, and `mise install` under
+  `nono-mise-profile.json` (`plugin_install_grants`) uses the
+  daemon-owned `mise-state/` and the install's home for state, config
+  and cache. `ensure_mise_dirs` (and `write_home`, `write_plugin_home`)
+  remake mise's directories without following links first. nono's log is
+  `logs/nono-mise.log`; the lines in `mise.toolchain.log` now read
+  `$ nono … -- <mise> install`. A failed call is still reported as
+  `mise <subcommand>`; when `/bin/true` cannot start under the profile
+  either, the message says the sandbox did not start, and the pod
+  sidecar reports `SandboxUnavailable` from its self-test. Tests that call
+  `Toolchain::install` need Landlock (`support::landlock_works`). The pool
+  levels (`install_level`) still run unsandboxed: they write only
+  daemon-owned pools.
+- `mise install` rewrites a tool's runtime links (`latest`, the version
+  prefixes and, from mise 2026.10, `global`, which follows the installing
+  table) in every install directory it resolves through,
+  `MISE_SHARED_INSTALL_DIRS` included, and exits non-zero when it may not
+  (`failed to rebuild runtime symlinks`). Unsandboxed, every agent install
+  rewrote the pools' links to its own table. The sandboxed install cannot
+  write a pool, so when `mise install` fails, `SandboxedInstall` asks
+  `mise install --dry-run-code` under the same profile and takes exit 0
+  (every tool the table names is installed, privately or in a pool) as
+  success, logging the refused error at `info`
+  (`an_install_leaves_the_pools_runtime_links_alone`). A test that copies
+  a tool into a pool must also copy its `.mise.backend.toml` and have mise
+  make its links (`toolchain_it::seed_into`), or the pool is not one mise
+  would have made.
+- The daemon runs `mise trust` on the package's own `mise.toml` with
+  `MISE_STATE_DIR` under the plugin's home; the sandbox uses the same dir,
+  so if `mise run` says the config is untrusted, the two `MISE_STATE_DIR`s
+  diverged (`plugin.rs`: `plugin_trust_env` vs `plugin_env`). The
+  daemon's `mise install` uses a state directory of its own
+  (`plugin_install_env`). Do not set `MISE_GLOBAL_CONFIG_FILE` inside the sandbox —
   mise would run the start task in `$HOME` and walk `$HOME`'s ancestors out
   of the sandbox (`plugin.rs::plugin_env` explains).
 - `balerix dev fake-plugin` is what the plugin e2e runs; it binds a loopback

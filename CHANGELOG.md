@@ -155,6 +155,17 @@
   earlier plugin's (`a`'s `b_x` and `a-b`'s `x` are both
   `balerix_plugin_a_b_x`); the log names the clash and
   `balerix_plugin_metrics_scrape_failures_total` counts it.
+- A new or re-created clone now takes about a second longer (#253): the
+  clone step waits for the clock to leave the second the checkout wrote
+  the index in, then refreshes the index under the git profile, so the
+  workspace reader's `version` and `diff` no longer re-hash every file
+  the checkout wrote, on every poll, until the agent's own git rewrote
+  the index (they were about twice as slow on a fresh clone). The wait
+  is per clone, and a fleet pass makes its clones one after another, so
+  `up` on a fleet of N new agents takes about N seconds longer; in
+  Kubernetes each pod's sidecar clones its own agent, so each pod's start
+  is about a second longer. A failed refresh only warns in the crew's
+  `git.log`.
 
 ## 0.2.4 - 2026-10-10
 

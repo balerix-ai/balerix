@@ -2375,8 +2375,8 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
     ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
         .unwrap();
     assert!(
-        !paths.git_profile.exists(),
-        "a fresh clone needs no git profile: the agent has not touched it"
+        paths.git_profile.exists(),
+        "a fresh clone's index refresh runs under the git profile (#253)"
     );
     std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();
     git(&paths.workspace, &["add", "."]);
@@ -2426,6 +2426,211 @@ fn daemon_git_in_a_clone_runs_under_the_git_profile() {
         .filter(|e| e.file_name().to_string_lossy().starts_with(".nono-git-"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// A bare repo whose `main` holds `files` small files, served over
+/// file://: enough entries for a racily clean index to show.
+fn bare_repo_with_files(root: &Path, files: usize) -> RepoRef {
+    let work = root.join("upstream-work");
+    std::fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    for i in 0..files {
+        std::fs::write(work.join(format!("f{i:03}.txt")), format!("{i}\n")).unwrap();
+    }
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "init"]);
+    let bare = root.join("upstream.git");
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &work.display().to_string(),
+            &bare.display().to_string(),
+        ],
+    );
+    RepoRef::parse(&format!("file://{}", bare.display())).unwrap()
+}
+
+/// The index entries git must treat as racily clean: those whose file
+/// mtime is not older, in whole seconds, than the index file's own (the
+/// rule for a git built without `USE_NSEC`, and a superset of the
+/// nanosecond one). Read with `ls-files --debug`, which reads the index
+/// and stats nothing.
+fn racily_clean(clone: &Path) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let index = std::fs::metadata(clone.join(".git/index")).unwrap().mtime();
+    let listing = git(clone, &["ls-files", "--debug"]);
+    let mut racy = Vec::new();
+    let mut path = "";
+    for line in listing.lines() {
+        if !line.starts_with(' ') {
+            path = line;
+        } else if let Some(mtime) = line.trim().strip_prefix("mtime: ") {
+            let secs: i64 = mtime.split(':').next().unwrap().parse().unwrap();
+            if secs >= index {
+                racy.push(path.to_string());
+            }
+        }
+    }
+    racy
+}
+
+/// The `update-index --refresh` lines in the crew's `git.log`.
+fn refresh_lines(crew: &balerix_runtime::CrewPaths) -> Vec<String> {
+    std::fs::read_to_string(crew.root.join("logs/git.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("$ ") && l.contains("update-index -q --refresh"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// #253: a fresh clone's checkout writes the files and the index in the
+/// same second, so every entry is racily clean and the workspace reader
+/// (`GIT_OPTIONAL_LOCKS=0`) re-hashes them on every poll. The clone step
+/// refreshes the index once the clock has left that second, under the git
+/// profile with only the clone's `.git` writable; a re-clone does the
+/// same, a kept clone nothing.
+#[test]
+fn a_new_clone_leaves_no_racily_clean_index_entries() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-index-refresh");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    let layout = support::layout(&root);
+    let repo = bare_repo_with_files(&root, 200);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+        cache_is_read_only: false,
+        git_read: &[],
+        socket_policy: SocketPolicy::Open,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    assert_eq!(racily_clean(&paths.workspace), Vec::<String>::new());
+    let lines = refresh_lines(&crew);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let profile_arg = format!("run --no-audit --profile {}", paths.git_profile.display());
+    let grant = format!("--allow {} --", paths.workspace.join(".git").display());
+    assert!(
+        lines[0].contains(&profile_arg) && lines[0].contains(&grant),
+        "the refresh ran outside the git profile or with more granted: {}",
+        lines[0]
+    );
+    // the reader's status trusts the stat data instead of re-hashing:
+    // a same-size edit put back under the recorded mtime and inode goes
+    // unseen (ctime aside, which only `core.trustctime` checks). With a
+    // racily clean entry git would re-read the file and report it.
+    let file = paths.workspace.join("f000.txt");
+    let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        f.write_all(b"X\n").unwrap();
+        f.set_modified(mtime).unwrap();
+    }
+    let status = git(
+        &paths.workspace,
+        &[
+            "--no-optional-locks",
+            "-c",
+            "core.trustctime=false",
+            "status",
+            "--porcelain",
+        ],
+    );
+    assert_eq!(status, "", "status re-hashed f000.txt");
+    std::fs::write(&file, "0\n").unwrap();
+
+    // kept: no refresh
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    assert_eq!(refresh_lines(&crew).len(), 1);
+
+    // re-created on another branch: refreshed again
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/b", "main")
+        .unwrap();
+    assert_eq!(refresh_lines(&crew).len(), 2);
+    assert_eq!(racily_clean(&paths.workspace), Vec::<String>::new());
+}
+
+/// #253: the index refresh is an optimisation; one that fails is a
+/// warning in the crew's `git.log`, and the clone stands.
+#[test]
+fn a_failed_index_refresh_warns_and_keeps_the_clone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
+        return;
+    };
+    let root = support::temp_root("workspace-index-refresh-fails");
+    if !support::require_or_skip("landlock", support::landlock_works(&tools, &root)) {
+        return;
+    }
+    // a git that takes the index lock on `update-index`, then fails
+    let shim = root.join("git-lock-and-fail.sh");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    --git-dir=*) gd=\"${{a#--git-dir=}}\" ;;\n    \
+             update-index) : > \"$gd/index.lock\"; echo 'shim: update-index refused' >&2; exit 128 ;;\n  \
+             esac\ndone\nexec {} \"$@\"\n",
+            tools.git.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tools = balerix_runtime::ToolPaths {
+        git: shim,
+        ..tools.clone()
+    };
+    let layout = support::layout(&root);
+    let repo = bare_repo(&root);
+    let id: balerix_core::AgentId = "f/c/a".parse().unwrap();
+    let crew = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    let ws = Workspace {
+        tools: &tools,
+        gh_config_dir: None,
+        cache_is_read_only: false,
+        git_read: &[],
+        socket_policy: SocketPolicy::Open,
+    };
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
+    ws.ensure_clone("f/c/a", &crew, &paths, &repo, "balerix/f/c/a", "main")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(paths.branch_marker()).unwrap(),
+        "balerix/f/c/a"
+    );
+    assert_eq!(
+        std::fs::read_to_string(paths.workspace.join("README")).unwrap(),
+        "hi\n"
+    );
+    assert!(
+        !paths.workspace.join(".git/index.lock").exists(),
+        "the failed refresh's lock was left behind"
+    );
+    let log = std::fs::read_to_string(crew.root.join("logs/git.log")).unwrap();
+    assert!(
+        log.contains("# warning: f/c/a: index refresh after the clone failed")
+            && log.contains("index.lock it left)")
+            && log.contains("shim: update-index refused"),
+        "{log}"
+    );
 }
 
 /// Review focus 1: the `--upload-pack` string is run by a shell, and the

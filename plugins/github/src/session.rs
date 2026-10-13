@@ -24,6 +24,10 @@ pub fn repo_key(fleet: &str) -> String {
 pub fn fleet_of(agent: &str) -> &str {
     agent.split('/').next().unwrap_or(agent)
 }
+/// `fleet/crew/agent` → `crew`.
+pub fn crew_of(agent: &str) -> &str {
+    agent.split('/').nth(1).unwrap_or("")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
@@ -44,6 +48,46 @@ pub struct Session {
     pub last_activity: u64,
     #[serde(default)]
     pub closed: bool,
+    /// The comments and reviews acted on for this number, newest last,
+    /// at most `SEEN_LIMIT`: a redelivery is ignored after a restart and
+    /// without a delivery id (#259).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seen: Vec<Seen>,
+}
+
+/// How many `Seen` ids a row keeps.
+pub const SEEN_LIMIT: usize = 256;
+
+/// A webhook's own id, which GitHub keeps across redeliveries. Comment
+/// and review ids are separate sequences, so each is tagged; a number
+/// opens once, so its opening needs no id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Seen {
+    Comment(u64),
+    Review(u64),
+    /// The issue or PR's opening, which the row started from.
+    Opening,
+}
+
+impl Session {
+    pub fn has_seen(&self, id: Seen) -> bool {
+        self.seen.contains(&id)
+    }
+
+    /// Records `id`, dropping the oldest past `SEEN_LIMIT`; `false` when
+    /// it was already there.
+    pub fn see(&mut self, id: Seen) -> bool {
+        if self.has_seen(id) {
+            return false;
+        }
+        self.seen.push(id);
+        if self.seen.len() > SEEN_LIMIT {
+            let over = self.seen.len() - SEEN_LIMIT;
+            self.seen.drain(..over);
+        }
+        true
+    }
 }
 
 #[derive(Debug, Default)]
@@ -72,7 +116,7 @@ impl Sessions {
 
     fn insert(&mut self, agent: String, row: Session) {
         if let Some(old) = self.rows.get(&agent) {
-            self.by_number.remove(&(old.repo.clone(), old.number));
+            self.unmap(&agent, old.repo.clone(), old.number);
         }
         self.by_number
             .insert((row.repo.clone(), row.number), agent.clone());
@@ -104,9 +148,19 @@ impl Sessions {
     pub async fn remove(&mut self, host: &Host, agent: &str) -> Result<(), SdkError> {
         host.kv_delete(&session_key(agent)).await?;
         if let Some(old) = self.rows.remove(agent) {
-            self.by_number.remove(&(old.repo, old.number));
+            self.unmap(agent, old.repo, old.number);
         }
         Ok(())
+    }
+
+    /// Drops `(repo, number) → agent` only while it still names `agent`:
+    /// a crew renamed between sessions leaves an older row for the same
+    /// number (#258).
+    fn unmap(&mut self, agent: &str, repo: String, number: u64) {
+        let key = (repo, number);
+        if self.by_number.get(&key).is_some_and(|a| a == agent) {
+            self.by_number.remove(&key);
+        }
     }
 
     /// The agents the fleet file must carry: every open row in `fleet`.
@@ -175,7 +229,27 @@ mod tests {
             session_id: None,
             last_activity: 0,
             closed: false,
+            seen: Vec::new(),
         }
+    }
+
+    #[test]
+    fn seen_ids_are_bounded_tagged_and_round_trip() {
+        let mut r = row("a/b", 1);
+        assert!(r.see(Seen::Comment(5)));
+        assert!(!r.see(Seen::Comment(5)));
+        assert!(!r.has_seen(Seen::Review(5)), "a review id is its own");
+        for id in 0..SEEN_LIMIT as u64 {
+            r.see(Seen::Review(id));
+        }
+        assert_eq!(r.seen.len(), SEEN_LIMIT);
+        assert!(!r.has_seen(Seen::Comment(5)), "the oldest went first");
+        assert!(r.has_seen(Seen::Review(0)));
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["seen"][0], json!({ "review": 0 }));
+        assert_eq!(serde_json::from_value::<Session>(v).unwrap(), r);
+        let empty = serde_json::to_value(row("a/b", 1)).unwrap();
+        assert!(empty.get("seen").is_none(), "{empty}");
     }
 
     #[tokio::test]
@@ -232,8 +306,13 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !r.closed && r.status_comment.is_none() && r.last_activity == 0 && r.base.is_none()
+            !r.closed
+                && r.status_comment.is_none()
+                && r.last_activity == 0
+                && r.base.is_none()
+                && r.seen.is_empty()
         );
         assert_eq!(fleet_of("gh-a-b/repo/pr-2"), "gh-a-b");
+        assert_eq!(crew_of("gh-a-b/backend/pr-2"), "backend");
     }
 }

@@ -33,7 +33,7 @@ from two files in version control.
 
 | # | Decision | Rationale |
 |---|----------|-----------|
-| M-1 | **One fleet per repository, one crew, one agent per issue or PR.** Fleet `gh-<owner>-<repo>`, crew `repo`, agents `issue-<n>` / `pr-<n>`. | A crew is a repository; an agent is a session; the issue is the session. The plugin's fleet file is the repo's file plus the agents it adds, so `balerix up -f .balerix.yaml` on a laptop and the plugin produce the same agents. |
+| M-1 | **One fleet per repository, one crew, one agent per issue or PR.** Fleet `gh-<owner>-<repo>`, the file's one crew (`repo` by convention), agents `issue-<n>` / `pr-<n>`. | A crew is a repository; an agent is a session; the issue is the session. The plugin's fleet file is the repo's file plus the agents it adds, so `balerix up -f .balerix.yaml` on a laptop and the plugin produce the same agents. |
 | M-2 | **Access is write permission on the repository**, checked per inbound. | A comment is a prompt to an agent holding the operator's credentials and push rights. On a public repo anyone can comment; `admin`/`maintain`/`write` is the boundary GitHub already maintains. Others are ignored silently. |
 | M-3 | **Webhooks on the plugin's own listener**, HMAC-verified. | The daemon's mount is admin- or cookie-authenticated, so GitHub cannot deliver there. Webhooks are instant and the standard App shape; the operator fronts the port with a proxy or tunnel. |
 | M-4 | **Agents push as the operator** (Spec L-3); only comments come from the App. | One long-lived token, no refresh machinery. Attribution of pushes to the bot is deferred. |
@@ -171,6 +171,7 @@ struct Session {
     session_id: Option<String>, // the live Claude session, once seen
     last_activity: u64,         // unix seconds
     closed: bool,
+    seen: Vec<Seen>,            // comment and review ids acted on, last 256 (#259)
 }
 ```
 
@@ -873,3 +874,52 @@ credentials or the gh token (Spec L-3).
   fresh start (a new status comment, no branch line in the prompt) and a
   comment without one is ignored. §10's "row kept" holds for those seven
   days (#97).
+- The daemon deactivates an agent from inside the apply that drops it,
+  so `end`'s `Deactivate` is queued behind whatever the actor already
+  holds, a mention included. Per agent, the actor lists the calls its
+  own applies queue, in order: a `Deactivate` for each `end`, an
+  `Activate` for each `start`. An arriving call takes the list up to its
+  first match, so one that never came (the daemon's pairing is best
+  effort) is written off by the next call after it; a queue gap clears
+  every list. A `Deactivate` with an `Activate` still listed after it was
+  overtaken by a `start` and is ignored whole. Otherwise it deleted the
+  resumed row, and the `Activate` after it rebuilt the row with
+  `installation: 0` and no head, base or status comment (#257). A call
+  not listed is the daemon's own and acts as before. The lists are in
+  memory: a restart between the two loses them, the old behaviour.
+- The agents run under the file's one crew key, not a fixed `repo`:
+  `prepare` returns the key, and the agent id, its row, its status, the
+  first prompt and the default branch (`balerix/<fleet>/<crew>/<agent>`)
+  are built from it. Before, any other key gave the daemon
+  `.../backend/issue-12` while the plugin waited on `.../repo/issue-12`,
+  so the first prompt never went out (#258). The file still declares
+  exactly one crew (§6 check 2), and its key must pass the daemon's name
+  rule (`[a-z0-9-]`, 1 to 63, no `-` at either end) or the start is
+  refused with a message that does not repeat the key; a plugin agent
+  name in a refusal is cut to 63 characters. A key renamed while
+  sessions run in the old one does not take effect yet: the file is
+  applied under the old key (under the new one the daemon would replace
+  every running agent), the start posts one notice that the new key
+  takes effect once they end, and ending is never held up by it. The
+  first apply with no other session running uses the new key. A session
+  for a number whose closed row is under the old key then runs under the
+  new key: the old row is replaced, not resumed, so it gets a new default
+  branch (`balerix/<fleet>/<new crew>/<agent>`) and no branch line for
+  the earlier work.
+- Replay protection does not rest on the delivery-id ring alone, which
+  a request without `X-GitHub-Delivery`, a restart, or a captured body
+  under a fresh id gets past (#259). Each row keeps the comment and
+  review ids it acted on (`seen`, tagged by kind, the last 256), written
+  to KV before the comment or review is acted on (a review once its
+  comments are read, so a failed read leaves it to a redelivery). A
+  comment or review whose id the number's row holds is counted
+  `inbound_total{outcome="duplicate"}` and dropped before the permission
+  check. The comment that starts a session goes into the new row, or
+  `opening` when the issue or PR body started it: a number opens once,
+  so a replayed opening on a closed row is a duplicate too and no longer
+  resumes (amending the #96 entry above; a mention still does). A
+  resumed row, or one replacing a row under an old crew key, keeps the
+  ids before it. A review's inline comments come with the review, so its
+  id covers them. The ids go when the row does: a mention replayed after
+  the seven-day retention starts a session, as a new mention would. The
+  ring stays as the first check.

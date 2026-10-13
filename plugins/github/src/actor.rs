@@ -1,7 +1,7 @@
 //! The actor (Spec M §8): the one task that owns every piece of state
 //! and executes the command loop. Generic over `GitHubPort` (M-11).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +27,7 @@ use crate::github::{
 use crate::mention;
 use crate::prompt;
 use crate::repo_config;
-use crate::session::{self, Session, Sessions};
+use crate::session::{self, Seen, Session, Sessions};
 use crate::status::Status;
 use crate::webhook::{Author, WebhookEvent};
 
@@ -229,6 +229,11 @@ pub struct Actor<G: GitHubPort> {
     ended_notice: HashMap<String, ()>,
     /// What the first prompt needs, kept from `start` until `SessionStart`.
     first_prompts: HashMap<String, FirstPrompt>,
+    /// Per agent, the `Deactivate`s (`end`) and `Activate`s (`start`) our
+    /// own applies made the daemon queue, in apply order (#257).
+    expected: HashMap<String, VecDeque<Expect>>,
+    /// Per fleet, the renamed crew key a notice has been posted for (#258).
+    crew_notices: HashMap<String, String>,
     /// Markers evicted inside a sync path, reported on the next tick.
     unconfirmed_queue: Vec<(Sent, Unconfirmed)>,
     /// Wall-clock seconds; a test pins it.
@@ -263,6 +268,8 @@ impl<G: GitHubPort> Actor<G> {
             held: HashMap::new(),
             ended_notice: HashMap::new(),
             first_prompts: HashMap::new(),
+            expected: HashMap::new(),
+            crew_notices: HashMap::new(),
             unconfirmed_queue: Vec::new(),
             now_secs: unix_now,
         }
@@ -287,6 +294,8 @@ impl<G: GitHubPort> Actor<G> {
             // A dropped command may have held hook events (Spec G-11).
             if queue.take_gap() {
                 self.deliveries.lose_track();
+                // a dropped command may have been one of them
+                self.expected.clear();
             }
         }
     }
@@ -305,15 +314,24 @@ impl<G: GitHubPort> Actor<G> {
         }
         match command {
             Command::Configure(_) => unreachable!("handled above"),
-            Command::Activate { agent, config } => self.on_activate(agent, config).await,
+            Command::Activate { agent, config } => {
+                self.arrived(&agent, Expect::Activate);
+                self.on_activate(agent, config).await
+            }
             // The daemon deactivates every agent an apply drops, including
             // the one `end` just removed. Memory is forgotten either way;
             // the KV row goes only while it is still open (the daemon took
             // away an agent the plugin did not end). A closed row stays:
             // §10's "dropped on Deactivate" loses to its own "row kept with
             // closed = true … the resume case", which the ended reply and
-            // the resume need.
+            // the resume need. One that `end` caused and a `start` has
+            // since overtaken is ignored whole (#257): the row, status and
+            // config are the resumed session's.
             Command::Deactivate { agent } => {
+                if self.arrived(&agent, Expect::Deactivate) {
+                    tracing::debug!("github: a stale deactivate for {agent}, resumed since");
+                    return;
+                }
                 self.agents.remove(&agent);
                 self.questions.clear(&self.host, &agent).await;
                 self.deliveries.forget(&agent);
@@ -378,6 +396,7 @@ impl<G: GitHubPort> Actor<G> {
                 session_id: None,
                 last_activity: (self.now_secs)(),
                 closed: false,
+                seen: Vec::new(),
             };
             if let Err(e) = self.sessions.set(&self.host, &agent, row).await {
                 tracing::warn!("github: rebuilding row for {agent}: {e}");
@@ -565,6 +584,11 @@ impl<G: GitHubPort> Actor<G> {
         // agent already holds this body as its first prompt. A closed row
         // goes on to `start`, which resumes it.
         let live = self.sessions.by_number(repo, number).map(str::to_string);
+        // A number opens once: an opening its row already started from is
+        // a replay, closed row or not (#259).
+        if live.is_some() && self.redelivered(repo, number, Seen::Opening) {
+            return;
+        }
         if let Some(agent) = live
             && self.sessions.get(&agent).is_some_and(|r| !r.closed)
         {
@@ -612,6 +636,9 @@ impl<G: GitHubPort> Actor<G> {
             count(&self.counters, "own_or_bot");
             return;
         }
+        if self.redelivered(repo, number, Seen::Comment(comment_id)) {
+            return;
+        }
         if !self.permitted(installation, repo, &author).await {
             count(&self.counters, "unpermitted");
             return;
@@ -620,11 +647,17 @@ impl<G: GitHubPort> Actor<G> {
         if let Some(agent) = &live {
             self.refresh_installation(agent, installation);
         }
+        // A mention on a closed row is recorded by the row `start` writes.
+        let mentioned = mention::mentions(body, &self.slug);
+        if let Some(agent) = &live
+            && !(mentioned && self.sessions.get(agent).is_some_and(|r| r.closed))
+        {
+            self.remember(agent, Seen::Comment(comment_id)).await;
+        }
         let closed = live
             .as_deref()
             .and_then(|a| self.sessions.get(a))
             .is_some_and(|r| r.closed);
-        let mentioned = mention::mentions(body, &self.slug);
         match (live, closed) {
             (Some(agent), false) => {
                 self.on_message(
@@ -753,9 +786,6 @@ impl<G: GitHubPort> Actor<G> {
                 return;
             }
         }
-        let agent = format!("{fleet}/repo/{}", kind.agent_name(number));
-        let old_status_comment = self.sessions.get(&agent).and_then(|r| r.status_comment);
-        let resumed = self.sessions.get(&agent).is_some();
         let head = pr.as_ref().map(|(h, _, _)| h.clone());
         let base = pr.as_ref().map(|(_, _, b)| b.clone());
 
@@ -799,14 +829,54 @@ impl<G: GitHubPort> Actor<G> {
                 return;
             }
         };
-        let file = match repo_config::prepare(&text, repo, &fleet, &default_branch, &live) {
-            Ok(f) => f,
+        let prepared = match repo_config::prepare(&text, repo, &fleet, &default_branch, &live) {
+            Ok(p) => p,
             Err(m) => {
                 self.refuse(installation, repo, number, target, &m, "config")
                     .await;
                 return;
             }
         };
+        let declared = prepared.crew.clone();
+        let (file, crew) = self.keep_crew(&fleet, number, prepared);
+        if crew == declared {
+            self.crew_notices.remove(&fleet);
+        } else if self.crew_notices.get(&fleet) != Some(&declared) {
+            self.crew_notices.insert(fleet.clone(), declared.clone());
+            self.post(
+                installation,
+                repo,
+                number,
+                &format!(
+                    "{} names crew {declared}, but sessions are running in crew {crew}; \
+                     the new key takes effect once they end",
+                    self.cfg().config_path
+                ),
+                "notice",
+            )
+            .await;
+        }
+        // The agent runs under the file's crew, whatever its key (#258).
+        let agent = format!("{fleet}/{crew}/{}", kind.agent_name(number));
+        // A closed row under another crew key stands for a session the
+        // daemon no longer runs; it is replaced, not resumed.
+        let prior = self
+            .sessions
+            .by_number(repo, number)
+            .filter(|a| *a != agent)
+            .map(str::to_string);
+        let old_status_comment = self.sessions.get(&agent).and_then(|r| r.status_comment);
+        let resumed = self.sessions.get(&agent).is_some();
+        // What the number's row had acted on goes on with it (#259), and
+        // so does the comment that starts this session.
+        let mut seen = Vec::new();
+        if let Some(r) = self
+            .sessions
+            .get(&agent)
+            .or_else(|| prior.as_deref().and_then(|p| self.sessions.get(p)))
+        {
+            seen.clone_from(&r.seen);
+        }
         if let Err(e) = self.host.apply_fleet(&fleet, &file).await {
             tracing::warn!("github: applying {fleet} with {agent}: {e}");
             self.refuse(
@@ -822,6 +892,9 @@ impl<G: GitHubPort> Actor<G> {
         }
         self.counters.applies.with_label_values(&["ok"]).inc();
         self.faults.ok(Fault::Apply);
+        // A `Deactivate` an earlier `end` caused may still be queued
+        // behind this command; the row it would drop is reopened below.
+        self.expect(&agent, Expect::Activate);
         if let Err(e) = session::set_repo_of_fleet(&self.host, &fleet, repo).await {
             tracing::warn!("github: writing repo/{fleet}: {e}");
         }
@@ -856,7 +929,7 @@ impl<G: GitHubPort> Actor<G> {
             },
         };
         self.statuses.insert(agent.clone(), status);
-        let row = Session {
+        let mut row = Session {
             repo: repo.to_string(),
             installation,
             kind,
@@ -867,9 +940,24 @@ impl<G: GitHubPort> Actor<G> {
             session_id: None,
             last_activity: (self.now_secs)(),
             closed: false,
+            seen,
+        };
+        match target {
+            Target::Comment(id) => row.see(Seen::Comment(id)),
+            // only an opening starts with the issue itself as the target
+            Target::Issue(_) => row.see(Seen::Opening),
         };
         if let Err(e) = self.sessions.set(&self.host, &agent, row).await {
             tracing::warn!("github: storing row for {agent}: {e}");
+        }
+        if let Some(prior) = prior {
+            if let Err(e) = self.sessions.remove(&self.host, &prior).await {
+                tracing::warn!("github: dropping {prior}, replaced by {agent}: {e}");
+            }
+            self.statuses.remove(&prior);
+            self.status_dirty.remove(&prior);
+            self.rows_dirty.remove(&prior);
+            self.ended_notice.remove(&prior);
         }
         self.ended_notice.remove(&agent);
         // The first prompt waits for `SessionStart` (§8.2); what it needs is kept here.
@@ -879,7 +967,7 @@ impl<G: GitHubPort> Actor<G> {
                 title: title.to_string(),
                 body: body.to_string(),
                 url: url.to_string(),
-                branch: head_or_default(&fleet, kind, number, pr.as_ref()),
+                branch: head_or_default(&fleet, &crew, kind, number, pr.as_ref()),
                 base: base.unwrap_or_else(|| default_branch.clone()),
                 asker: asker.to_string(),
                 comment: comment.map(str::to_string),
@@ -903,6 +991,102 @@ impl<G: GitHubPort> Actor<G> {
         self.post(installation, repo, number, message, "notice")
             .await;
         self.react(installation, repo, target, CONFUSED).await;
+    }
+
+    /// #258: the file as applied, and the crew the agents run under.
+    /// While the fleet's other open rows run under one crew key, that
+    /// key stays even when the file now says another: applied under the
+    /// new key, the daemon would replace every running agent. The new
+    /// key takes over once they have ended.
+    fn keep_crew(
+        &self,
+        fleet: &str,
+        except: u64,
+        prepared: repo_config::Prepared,
+    ) -> (Value, String) {
+        let repo_config::Prepared { mut file, crew } = prepared;
+        let running = self.sessions.agents_in(fleet).into_iter().find(|a| {
+            self.sessions
+                .get(a)
+                .is_some_and(|r| !r.closed && r.number != except)
+        });
+        match running.map(|a| session::crew_of(&a).to_string()) {
+            Some(old) if old != crew => {
+                repo_config::rename_crew(&mut file, &crew, &old);
+                (file, old)
+            }
+            _ => (file, crew),
+        }
+    }
+
+    fn expect(&mut self, agent: &str, call: Expect) {
+        self.expected
+            .entry(agent.to_string())
+            .or_default()
+            .push_back(call);
+    }
+
+    /// `call` for `agent` arrived. The queue is FIFO, so whatever we
+    /// expected before the first matching entry never came (the daemon's
+    /// pairing is best effort) and goes with it. `true` for a stale
+    /// `Deactivate`: one a later `start` has overtaken. A call we did not
+    /// expect is the daemon's own and is never stale.
+    fn arrived(&mut self, agent: &str, call: Expect) -> bool {
+        let Some(list) = self.expected.get_mut(agent) else {
+            return false;
+        };
+        let Some(i) = list.iter().position(|c| *c == call) else {
+            return false;
+        };
+        list.drain(..=i);
+        let stale = call == Expect::Deactivate && list.contains(&Expect::Activate);
+        if list.is_empty() {
+            self.expected.remove(agent);
+        }
+        stale
+    }
+
+    /// #259: a comment or review the number's row has already acted on,
+    /// redelivered past the delivery-id ring (a restart, no header, a
+    /// fresh id): counted and dropped.
+    fn redelivered(&self, repo: &str, number: u64, id: Seen) -> bool {
+        let seen = self
+            .sessions
+            .by_number(repo, number)
+            .and_then(|a| self.sessions.get(a))
+            .is_some_and(|r| r.has_seen(id));
+        if seen {
+            self.counters
+                .inbound
+                .with_label_values(&["duplicate"])
+                .inc();
+            tracing::debug!("github: {id:?} on {repo}#{number} redelivered");
+        }
+        seen
+    }
+
+    /// Records `id` on `agent`'s row and writes the row now, before the
+    /// comment or review is acted on: a restart must not act on it again.
+    async fn remember(&mut self, agent: &str, id: Seen) {
+        let Some(mut row) = self.sessions.get(agent).cloned() else {
+            return;
+        };
+        if !row.see(id) {
+            return;
+        }
+        match self.sessions.set(&self.host, agent, row).await {
+            // the whole row went, pending changes with it
+            Ok(()) => {
+                self.rows_dirty.remove(agent);
+            }
+            Err(e) => {
+                tracing::warn!("github: recording {id:?} on {agent}: {e}");
+                if let Some(r) = self.sessions.get_mut(agent) {
+                    r.see(id);
+                }
+                self.rows_dirty.insert(agent.to_string(), ());
+            }
+        }
     }
 
     /// A row rebuilt by `on_activate` carries `installation: 0`, and an App
@@ -1467,6 +1651,9 @@ impl<G: GitHubPort> Actor<G> {
         let Some(row) = self.sessions.get(&agent).cloned() else {
             return;
         };
+        if self.redelivered(repo, number, Seen::Review(review_id)) {
+            return;
+        }
         if row.closed || row.kind != Kind::Pr || !self.permitted(installation, repo, &author).await
         {
             return;
@@ -1479,10 +1666,12 @@ impl<G: GitHubPort> Actor<G> {
         {
             Ok(r) => r,
             Err(e) => {
+                // not recorded: a redelivery may yet bring it
                 self.github_failed("review_comments", &e);
                 return;
             }
         };
+        self.remember(&agent, Seen::Review(review_id)).await;
         let base = row.base.clone().unwrap_or_else(|| "main".into());
         let Some(message) = prompt::review(
             &author.login,
@@ -1578,7 +1767,9 @@ impl<G: GitHubPort> Actor<G> {
                 return;
             }
         };
-        let file = match repo_config::prepare(&text, &row.repo, &fleet, &default_branch, &live) {
+        let prepared = repo_config::prepare(&text, &row.repo, &fleet, &default_branch, &live)
+            .map(|p| self.keep_crew(&fleet, row.number, p).0);
+        let file = match prepared {
             Ok(f) => f,
             Err(m) => {
                 tracing::warn!("github: {fleet}: {m}");
@@ -1597,6 +1788,9 @@ impl<G: GitHubPort> Actor<G> {
         }
         self.counters.applies.with_label_values(&["ok"]).inc();
         self.faults.ok(Fault::Apply);
+        // The daemon deactivates the agent from inside that apply; the
+        // command lands behind whatever is already queued (#257).
+        self.expect(agent, Expect::Deactivate);
         self.line(agent, reason);
         // The apply makes the daemon deactivate the agent, which drops its
         // status: the final line goes out now, not on a later tick.
@@ -1905,14 +2099,22 @@ fn status_line(event: &HookEvent) -> String {
     render::event_message(event).replace("**", "")
 }
 
+/// A daemon call one of our own applies queued (#257).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    Activate,
+    Deactivate,
+}
+
 fn head_or_default(
     fleet: &str,
+    crew: &str,
     kind: Kind,
     number: u64,
     pr: Option<&(String, String, String)>,
 ) -> String {
     pr.map(|(h, _, _)| h.clone())
-        .unwrap_or_else(|| format!("balerix/{fleet}/repo/{}", kind.agent_name(number)))
+        .unwrap_or_else(|| format!("balerix/{fleet}/{crew}/{}", kind.agent_name(number)))
 }
 
 /// One retry after `Retry-After`, when it is short (matrix's rule).
@@ -2057,6 +2259,136 @@ mod tests {
             "no prompt before SessionStart"
         );
         assert_eq!(a.sessions.open_count(), 1);
+    }
+
+    const BACKEND: &str = "apiVersion: balerix/v1\nkind: Fleet\ncrews:\n  backend:\n    repo: acme/api\n    agents: {}\n";
+    const BACKEND_AGENT: &str = "gh-acme-api/backend/issue-12";
+
+    /// #258: the file's crew key, whatever it is, names the agent, its
+    /// row, its status, its branch and the first prompt's recipient.
+    #[tokio::test]
+    async fn a_crew_key_other_than_repo_names_the_agent_everywhere() {
+        let (fake, port, mut a) = actor().await;
+        port.set_file("acme/api", "main", ".balerix.yaml", BACKEND);
+        a.handle(comment(12, "alice", 5, "@balerix please look"))
+            .await;
+        let applied = fake.applied_fleets();
+        assert_eq!(
+            applied[0].1["crews"]["backend"]["agents"]["issue-12"]["plugins"]["github"]["number"],
+            12
+        );
+        assert!(applied[0].1["crews"].get("repo").is_none());
+        assert_eq!(a.sessions.by_number("acme/api", 12), Some(BACKEND_AGENT));
+        assert!(fake.kv_json(&format!("session/{BACKEND_AGENT}")).is_some());
+        assert!(fake.kv_json("session/gh-acme-api/repo/issue-12").is_none());
+        let c = comments(&port.calls());
+        assert!(c[0].1.contains(&format!("`{BACKEND_AGENT}`")), "{}", c[0].1);
+        a.handle(Command::Activate {
+            agent: BACKEND_AGENT.into(),
+            config: crate::config::parse_agent(&json!({ "kind": "issue", "number": 12 })).unwrap(),
+        })
+        .await;
+        a.handle(Command::Events(vec![event(
+            BACKEND_AGENT,
+            "SessionStart",
+            json!({ "source": "startup" }),
+        )]))
+        .await;
+        let sent = fake.actions_for(BACKEND_AGENT);
+        assert_eq!(sent.len(), 1, "the first prompt went out");
+        let text = actions_text(&sent[0]);
+        assert!(
+            text.contains("Branch: balerix/gh-acme-api/backend/issue-12 (from main)"),
+            "{text}"
+        );
+        assert_eq!(a.sessions.open_count(), 1, "one row, not two");
+        // a comment reaches it; the close refiles the same crew
+        a.handle(comment(12, "bob", 6, "and this")).await;
+        assert_eq!(fake.actions_for(BACKEND_AGENT).len(), 2);
+        a.handle(close()).await;
+        assert!(a.sessions.get(BACKEND_AGENT).unwrap().closed);
+        assert_eq!(
+            fake.applied_fleets()[1].1["crews"]["backend"]["agents"],
+            json!({})
+        );
+    }
+
+    /// #258: a crew key renamed while sessions run keeps the old key
+    /// (applied under the new one, the daemon would replace them), with
+    /// one notice; ending is never blocked, and once the last running
+    /// session ends the new key applies and replaces the old closed row.
+    #[tokio::test]
+    async fn a_crew_renamed_under_running_sessions_keeps_the_old_key_until_they_end() {
+        let (fake, port, mut a) = started().await;
+        port.set_file("acme/api", "main", ".balerix.yaml", BACKEND);
+        port.take_calls();
+        a.handle(comment(13, "alice", 8, "@balerix also this"))
+            .await;
+        a.handle(comment(14, "alice", 9, "@balerix and this")).await;
+        let applied = fake.applied_fleets();
+        assert_eq!(applied.len(), 3);
+        for (_, file) in &applied[1..] {
+            assert!(file["crews"].get("backend").is_none(), "{file}");
+            assert_eq!(file["crews"]["repo"]["repo"], "acme/api");
+        }
+        assert_eq!(
+            applied[2].1["crews"]["repo"]["agents"]
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            a.sessions.by_number("acme/api", 13),
+            Some("gh-acme-api/repo/issue-13")
+        );
+        let notices: Vec<_> = comments(&port.calls())
+            .into_iter()
+            .filter(|(_, b)| b.contains("names crew"))
+            .collect();
+        assert_eq!(
+            notices,
+            vec![(
+                13,
+                ".balerix.yaml names crew backend, but sessions are running in crew repo; \
+                 the new key takes effect once they end"
+                    .into()
+            )],
+            "one notice"
+        );
+        // ending is never blocked: under the old key while others run...
+        a.handle(close()).await;
+        assert!(a.sessions.get(AGENT).unwrap().closed);
+        let last = fake.applied_fleets().last().unwrap().1.clone();
+        assert_eq!(
+            last["crews"]["repo"]["agents"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["issue-13", "issue-14"]
+        );
+        // ...and the last one ends under the new key
+        for n in [13, 14] {
+            a.handle(Command::Webhook(WebhookEvent::Closed {
+                repo: "acme/api".into(),
+                installation: 7,
+                number: n,
+                merged: false,
+            }))
+            .await;
+        }
+        let last = fake.applied_fleets().last().unwrap().1.clone();
+        assert_eq!(last["crews"]["backend"]["agents"], json!({}));
+        assert!(last["crews"].get("repo").is_none());
+        // a resume now runs under the new key, on a new default branch
+        a.handle(comment(12, "alice", 10, "@balerix again")).await;
+        assert_eq!(a.sessions.by_number("acme/api", 12), Some(BACKEND_AGENT));
+        assert!(a.sessions.get(AGENT).is_none());
+        assert!(fake.kv_json(&format!("session/{AGENT}")).is_none());
+        let fp = &a.first_prompts[BACKEND_AGENT];
+        assert!(!fp.resumed);
+        assert_eq!(fp.branch, "balerix/gh-acme-api/backend/issue-12");
     }
 
     #[tokio::test]
@@ -2314,6 +2646,147 @@ mod tests {
             "a closed row stays for the resume"
         );
         assert!(!a.agents.contains_key(agent));
+    }
+
+    /// The daemon's pairing is best effort: an owed `Deactivate` that
+    /// never comes is written off by the `Activate` after it, so the
+    /// daemon's own later `Deactivate` is acted on.
+    #[tokio::test]
+    async fn a_lost_deactivate_does_not_swallow_a_later_real_one() {
+        let (fake, _port, mut a) = started().await;
+        a.handle(close()).await;
+        // its Deactivate is lost
+        a.handle(comment(12, "alice", 70, "@balerix go on")).await;
+        a.handle(Command::Activate {
+            agent: AGENT.into(),
+            config: AgentConfig::default(),
+        })
+        .await;
+        assert!(a.expected.is_empty());
+        a.handle(Command::Deactivate {
+            agent: AGENT.into(),
+        })
+        .await;
+        assert!(a.sessions.get(AGENT).is_none(), "the open row goes");
+        assert!(fake.kv_json(&format!("session/{AGENT}")).is_none());
+    }
+
+    fn pr_mention(id: u64, body: &str) -> Command {
+        Command::Webhook(WebhookEvent::Comment {
+            repo: "acme/api".into(),
+            installation: 7,
+            number: 34,
+            author: user("alice"),
+            comment_id: id,
+            body: body.into(),
+            is_pr: true,
+        })
+    }
+
+    /// #257: the daemon deactivates from inside `end`'s apply, so the
+    /// `Deactivate` lands behind a mention already queued; once that
+    /// mention has reopened the row, the late `Deactivate` leaves it be.
+    #[tokio::test]
+    async fn a_late_deactivate_leaves_a_resumed_row_intact() {
+        let (fake, port, mut a) = pr_session().await;
+        port.set_issue(
+            "acme/api",
+            34,
+            IssueInfo {
+                title: "t".into(),
+                body: "b".into(),
+                url: "u".into(),
+                pr: Some(("feature/x".into(), "acme/api".into(), "main".into())),
+            },
+        );
+        let before = a.sessions.get(PR_AGENT).cloned().unwrap();
+        assert_eq!(before.installation, 7);
+        assert_eq!(before.head.as_deref(), Some("feature/x"));
+        assert_eq!(before.status_comment, Some(1001));
+        a.handle(Command::Webhook(WebhookEvent::Closed {
+            repo: "acme/api".into(),
+            installation: 7,
+            number: 34,
+            merged: false,
+        }))
+        .await;
+        a.handle(pr_mention(70, "@balerix go on")).await;
+        a.handle(Command::Deactivate {
+            agent: PR_AGENT.into(),
+        })
+        .await;
+        a.handle(Command::Activate {
+            agent: PR_AGENT.into(),
+            config: crate::config::parse_agent(&json!({ "kind": "pr", "number": 34 })).unwrap(),
+        })
+        .await;
+        let row = a.sessions.get(PR_AGENT).cloned().unwrap();
+        assert!(!row.closed);
+        assert_eq!(row.installation, 7);
+        assert_eq!(row.head.as_deref(), Some("feature/x"));
+        assert_eq!(row.base.as_deref(), Some("main"));
+        assert_eq!(row.status_comment, Some(1001));
+        let stored = fake.kv_json(&format!("session/{PR_AGENT}")).unwrap();
+        assert_eq!(stored["status_comment"], 1001, "{stored}");
+        assert!(a.agents.contains_key(PR_AGENT));
+        assert!(
+            a.first_prompts.contains_key(PR_AGENT),
+            "the prompt still waits"
+        );
+        // the next apply still carries the branch
+        a.handle(Command::Webhook(WebhookEvent::Closed {
+            repo: "acme/api".into(),
+            installation: 7,
+            number: 34,
+            merged: true,
+        }))
+        .await;
+        let applied = fake.applied_fleets();
+        assert_eq!(
+            applied[applied.len() - 2].1["crews"]["repo"]["agents"]["pr-34"]["branch"],
+            "feature/x"
+        );
+        // an owed Deactivate with no resume in between drops memory as before
+        a.handle(Command::Deactivate {
+            agent: PR_AGENT.into(),
+        })
+        .await;
+        assert!(!a.agents.contains_key(PR_AGENT));
+        assert!(a.sessions.get(PR_AGENT).unwrap().closed, "closed row kept");
+        assert!(a.expected.is_empty());
+    }
+
+    /// Two end-and-resume rounds before the daemon's calls are handled:
+    /// they arrive as Deactivate, Activate, Deactivate, Activate, and both
+    /// Deactivates are stale (clearing on the first Activate would drop
+    /// the row at the second).
+    #[tokio::test]
+    async fn two_late_deactivates_after_two_resumes_are_both_ignored() {
+        let (_fake, _port, mut a) = started().await;
+        for id in [70, 71] {
+            a.handle(close()).await;
+            a.handle(comment(12, "alice", id, "@balerix go on")).await;
+        }
+        for _ in 0..2 {
+            a.handle(Command::Deactivate {
+                agent: AGENT.into(),
+            })
+            .await;
+            let row = a.sessions.get(AGENT).unwrap();
+            assert!(!row.closed && row.installation == 7 && row.status_comment.is_some());
+            a.handle(Command::Activate {
+                agent: AGENT.into(),
+                config: AgentConfig::default(),
+            })
+            .await;
+        }
+        assert!(a.expected.is_empty());
+        // and the daemon taking the agent away itself still drops the row
+        a.handle(Command::Deactivate {
+            agent: AGENT.into(),
+        })
+        .await;
+        assert!(a.sessions.get(AGENT).is_none());
     }
 
     #[tokio::test]
@@ -3049,10 +3522,9 @@ mod tests {
     #[tokio::test]
     async fn a_review_renders_one_message_and_waits_behind_an_open_question() {
         use balerix_plugin_common::question::fixtures::{color, input};
-        let (fake, _port, mut a) = pr_session().await;
+        let (fake, port, mut a) = pr_session().await;
         let agent = PR_AGENT;
-        let review = || review_by("bob", 9);
-        a.handle(review()).await;
+        a.handle(review_by("bob", 9)).await;
         let sent = fake.actions_for(agent);
         let text = actions_text(sent.last().unwrap());
         assert!(
@@ -3074,7 +3546,9 @@ mod tests {
         q.session_id = Some("s".into());
         a.handle(Command::Events(vec![q])).await;
         let before = fake.actions_for(agent).len();
-        a.handle(review()).await;
+        // a second review: the same one again would be a redelivery (#259)
+        port.set_review_comments("acme/api", 11, Vec::new());
+        a.handle(review_by("bob", 11)).await;
         assert_eq!(fake.actions_for(agent).len(), before, "held");
         assert!(a.statuses[agent].render().contains("review from @bob held"));
         let mut done = event(
@@ -3385,6 +3859,132 @@ mod tests {
             2,
             "routed to the reloaded row"
         );
+    }
+
+    /// #259: a redelivered comment is acted on once, the delivery id
+    /// aside (the actor never sees it): the comment id on the row decides.
+    #[tokio::test]
+    async fn a_comment_delivered_twice_is_acted_on_once() {
+        let (fake, port, mut a) = started().await;
+        a.handle(comment(12, "bob", 60, "carry on")).await;
+        a.handle(comment(12, "bob", 60, "carry on")).await;
+        assert_eq!(fake.actions_for(AGENT).len(), 2, "the first prompt and one");
+        assert_eq!(
+            reactions(&port.calls()),
+            vec![(Target::Comment(60), EYES.into())]
+        );
+        assert_eq!(
+            a.counters.inbound.with_label_values(&["duplicate"]).get(),
+            1
+        );
+        // the comment that started the session counts too
+        a.handle(comment(12, "alice", 5, "@balerix please look"))
+            .await;
+        assert_eq!(fake.actions_for(AGENT).len(), 2);
+        assert_eq!(fake.applied_fleets().len(), 1);
+        // and a closed row's ended reply is not repeated either
+        a.handle(close()).await;
+        port.take_calls();
+        a.handle(comment(12, "bob", 61, "one more")).await;
+        a.handle(comment(12, "bob", 61, "one more")).await;
+        assert_eq!(
+            reactions(&port.calls()),
+            vec![(Target::Comment(61), CONFUSED.into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_review_delivered_twice_reaches_the_agent_once() {
+        let (fake, port, mut a) = pr_session().await;
+        let before = fake.actions_for(PR_AGENT).len();
+        a.handle(review_by("bob", 9)).await;
+        a.handle(review_by("bob", 9)).await;
+        assert_eq!(fake.actions_for(PR_AGENT).len(), before + 1);
+        assert_eq!(
+            port.calls()
+                .iter()
+                .filter(|c| matches!(c, Call::ReviewComments { .. }))
+                .count(),
+            1,
+            "not even read again"
+        );
+    }
+
+    /// A review whose comments could not be read is not recorded: its
+    /// redelivery goes through.
+    #[tokio::test]
+    async fn a_review_whose_fetch_failed_is_delivered_on_redelivery() {
+        let (fake, port, mut a) = pr_session().await;
+        // bob's permission is cached, so the failure hits the fetch
+        port.set_review_comments("acme/api", 10, Vec::new());
+        a.handle(review_by("bob", 10)).await;
+        let before = fake.actions_for(PR_AGENT).len();
+        port.fail_next(GitHubError::Other("reset".into()));
+        a.handle(review_by("bob", 9)).await;
+        assert_eq!(fake.actions_for(PR_AGENT).len(), before);
+        assert!(!a.sessions.get(PR_AGENT).unwrap().has_seen(Seen::Review(9)));
+        a.handle(review_by("bob", 9)).await;
+        assert_eq!(fake.actions_for(PR_AGENT).len(), before + 1);
+        assert!(a.sessions.get(PR_AGENT).unwrap().has_seen(Seen::Review(9)));
+    }
+
+    /// A replayed opening on a closed row does not resume the session.
+    #[tokio::test]
+    async fn a_replayed_opening_on_a_closed_row_does_not_resume() {
+        let (fake, port, mut a) = actor().await;
+        let opened = || {
+            Command::Webhook(WebhookEvent::IssueOpened {
+                repo: "acme/api".into(),
+                installation: 7,
+                number: 12,
+                author: user("bob"),
+                title: "Bug".into(),
+                body: "@balerix fix".into(),
+                url: "u".into(),
+            })
+        };
+        a.handle(opened()).await;
+        a.handle(close()).await;
+        assert_eq!(fake.applied_fleets().len(), 2);
+        port.take_calls();
+        a.handle(opened()).await;
+        assert_eq!(fake.applied_fleets().len(), 2, "no resume");
+        assert!(a.sessions.get(AGENT).unwrap().closed);
+        assert!(reactions(&port.calls()).is_empty());
+        // a mention still resumes
+        a.handle(comment(12, "alice", 80, "@balerix again")).await;
+        assert!(!a.sessions.get(AGENT).unwrap().closed);
+    }
+
+    /// #259: the ids live in the row in KV, so an actor rebuilt from it
+    /// (a plugin restart, the delivery ring gone) ignores a redelivery.
+    #[tokio::test]
+    async fn a_comment_redelivered_after_a_restart_is_ignored() {
+        let (fake, port, mut a) = started().await;
+        a.handle(comment(12, "bob", 60, "carry on")).await;
+        drop(a);
+        let host = Host::new(fake.env("github", std::path::Path::new("scratch"))).unwrap();
+        let mut b = Actor::new(
+            host,
+            port.clone(),
+            counters(),
+            Health::new(),
+            "balerix".into(),
+        );
+        b.handle(Command::Configure(daemon_config())).await;
+        b.load().await;
+        port.take_calls();
+        b.handle(comment(12, "bob", 60, "carry on")).await;
+        b.handle(comment(12, "alice", 5, "@balerix please look"))
+            .await;
+        assert_eq!(fake.actions_for(AGENT).len(), 2, "nothing more sent");
+        assert!(port.calls().is_empty(), "{:?}", port.calls());
+        assert_eq!(
+            b.counters.inbound.with_label_values(&["duplicate"]).get(),
+            2
+        );
+        b.handle(comment(12, "bob", 61, "and this")).await;
+        assert_eq!(fake.actions_for(AGENT).len(), 3, "a new comment still goes");
     }
 
     #[tokio::test]

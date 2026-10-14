@@ -331,15 +331,27 @@ async fn a_sidecar_silent_for_three_pings_is_dropped() {
     let ws = connect(w.port, &token, "1").await.unwrap();
     wait_for(async || hub.linked(&id)).await;
     // reading answers the Daemon's pings; told to stop, the sidecar keeps
-    // its socket open and reads nothing more
+    // its socket open and reads nothing more. The reader returns when it
+    // last received a frame: its pong goes out on the very next read, so
+    // that is when the Daemon last heard from it and its silence began
+    // (#272: timing from the stop instead was up to a ping early).
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let reader = tokio::spawn(async move {
         let mut ws = ws;
         let mut stopped = stopped;
+        let mut last = Instant::now();
         loop {
             tokio::select! {
-                _ = &mut stopped => return ws,
-                msg = ws.next() => assert!(matches!(msg, Some(Ok(_))), "{msg:?}"),
+                _ = &mut stopped => {
+                    // a pong queued by the last read goes out now, so the
+                    // Daemon's silence cannot start before `last`
+                    ws.flush().await.unwrap();
+                    return (ws, last);
+                }
+                msg = ws.next() => {
+                    assert!(matches!(msg, Some(Ok(_))), "{msg:?}");
+                    last = Instant::now();
+                }
             }
         }
     });
@@ -347,13 +359,14 @@ async fn a_sidecar_silent_for_three_pings_is_dropped() {
     assert!(hub.linked(&id), "a sidecar that answers pings stays linked");
 
     stop.send(()).unwrap();
-    let _held = reader.await.unwrap();
-    let silent = Instant::now();
+    let (_held, last) = reader.await.unwrap();
     wait_for(async || !hub.linked(&id)).await;
-    let after = silent.elapsed();
+    let after = last.elapsed();
+    // the Daemon drops the link `SILENT_PINGS` pings after the last frame
+    // it received; allow a little for the pong's flight
     assert!(
-        after >= PING * (SILENT_PINGS - 1),
-        "dropped after {after:?}, before the deadline"
+        after >= PING * SILENT_PINGS - Duration::from_millis(100),
+        "dropped {after:?} after the sidecar's last frame, before the deadline"
     );
     let started = Instant::now();
     let (hub2, id2) = (hub.clone(), id.clone());

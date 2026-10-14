@@ -1,11 +1,8 @@
 {
   "name": "balerix",
-  "image": "ghcr.io/rahulmutt/dev:sha-5e218bd",
+  "image": "ghcr.io/rahulmutt/dev:sha-1707365",
   "workspaceFolder": "/workspace",
   "remoteUser": "dev",
-  "containerEnv": {
-    "INSTALL_DEVENV": "true"
-  },
   "postCreateCommand": "post-create.sh",
   "customizations": {
     "devpod": {

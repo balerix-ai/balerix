@@ -1553,7 +1553,15 @@ fn web_journey() {
         ],
     );
     let fleet = root.join("fleet.yaml");
-    fs::write(&fleet, fleet_yaml(&bare, None, Some("{ web: {} }"))).unwrap();
+    // fake-claude records turns the way Claude Code 2.1.283+ wraps a
+    // paste (#279)
+    let yaml = fleet_yaml(&bare, None, Some("{ web: {} }")).replacen(
+        "args: [dev, fake-claude, ",
+        "args: [dev, fake-claude, --wrap-pastes, ",
+        1,
+    );
+    assert!(yaml.contains("--wrap-pastes"), "{yaml}");
+    fs::write(&fleet, yaml).unwrap();
 
     let out = w.ok(&[
         "serve",
@@ -1881,6 +1889,25 @@ fn web_journey() {
         "{stdin}"
     );
     assert!(stdin.contains("Overall:\nLooks fine."), "{stdin}");
+    // #279: the submitted turn holds the review inside Claude's paste
+    // wrapper and the lead outside it, as the user's own words
+    let turns = wait_file_until(&w.agent_dir("alice").join("home/fake-claude.turns"), |s| {
+        s.contains("Looks fine.")
+    });
+    let turn: String = turns
+        .lines()
+        .map(|l| serde_json::from_str::<String>(l).unwrap())
+        .find(|t| t.contains("Looks fine."))
+        .unwrap();
+    let (wrapped, after) = turn.rsplit_once("</pasted_content id=").expect(&turn);
+    assert!(
+        wrapped.starts_with("\n\n<pasted_content id=")
+            && wrapped.contains("Review against origin/main at ")
+            && wrapped.ends_with("Overall:\nLooks fine.\n"),
+        "{turn:?}"
+    );
+    let lead = balerix_api::PASTE_LEAD;
+    assert!(after.ends_with(&format!("\">\n\n{lead}")), "{turn:?}");
     let start = Instant::now();
     loop {
         let (_, _, body) = raw_get(

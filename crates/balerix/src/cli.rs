@@ -286,6 +286,8 @@ pub enum DevCommand {
     /// Stand-in for `claude` in the e2e: runs the SessionStart command hooks,
     /// posts Notification, PreToolUse and Stop to their HTTP hooks, records
     /// the replies, echoes stdin to $HOME/fake-claude.stdin, then sleeps.
+    /// `--wrap-pastes` models Claude Code 2.1.283+'s paste wrapping (#279):
+    /// each submitted turn goes to $HOME/fake-claude.turns.
     FakeClaude(FakeClaudeArgs),
     /// Stand-in plugin for the e2e on the SDK: blocks `rm -rf`, answers Stop
     /// with send_text, observes into scratch.
@@ -294,6 +296,13 @@ pub enum DevCommand {
 
 #[derive(Debug, Args)]
 pub struct FakeClaudeArgs {
+    /// Ask for bracketed paste and record each submitted turn, a JSON
+    /// string per line in `$HOME/fake-claude.turns`, with a paste Claude
+    /// would collapse wrapped in `<pasted_content>` the way Claude Code
+    /// 2.1.283 and later hand it to the model (#279). Not passed on in
+    /// the recorded argv.
+    #[arg(long)]
+    pub wrap_pastes: bool,
     /// Whatever the fleet passes to claude (`--verbose`, `--continue`, …); recorded, not interpreted.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub rest: Vec<String>,

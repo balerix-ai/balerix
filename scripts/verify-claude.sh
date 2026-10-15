@@ -13,6 +13,11 @@
 # and that a text sent the moment `SessionStart` arrives is submitted once
 # its Enter is pressed again (#99: the first Enter is lost while Claude's
 # TUI starts; section H adds a second agent and times its first start).
+# With the web plugin packaged, section R reads the agent's transcript and
+# fails the run (exit 1) unless an edit follows the review sent from the
+# browser (Spec C §8; #279: Claude 2.1.283+ wraps a multi-line paste in
+# <pasted_content> and, without send_text's lead typed after it, often
+# only summarises it).
 #
 # Your real $HOME stays: the client needs ~/.claude for credentials and the
 # host settings layer. Only the three XDG roots move: config and state to
@@ -141,7 +146,7 @@ AGENT_EXTRA=""
 [ -n "$BRANCH" ] && AGENT_EXTRA=", branch: \"$BRANCH\""
 if [ "$FAKE" = 1 ]; then
   CLAUDE_BLOCK="    binary: \"$BALERIX\"
-    args: [dev, fake-claude, \"--verbose\"]
+    args: [dev, fake-claude, --wrap-pastes, \"--verbose\"]
     settings: {}"
   HOST_FLAG=--no-host-defaults
 else
@@ -194,6 +199,9 @@ browser_login() {
     say ">>> Then click 'review' beside $AGENT: comment on a line, add a summary, Send review."
     say ">>> The verdict (Spec C §8): the agent's terminal shows ONE pasted message, and the"
     say ">>> activity column shows 'review sent' followed by the agent's tool calls."
+    say ">>> Ask for a change in the review (a comment such as 'add a line saying hi') and"
+    say ">>> send it before you come back here: section R reads the agent's transcript and"
+    say ">>> fails the run unless an edit follows the review (#279)."
     say ">>> Spec D: with the review page open, edit a file in the agent's worktree (or let"
     say ">>> the agent do it): the diff updates within a few seconds and 'updated N s ago'"
     say ">>> flashes; with a comment box open the update waits until Save or Cancel."
@@ -207,6 +215,12 @@ browser_login() {
 if [ "$WEB" = 1 ] && [ "$UP" = ok ] && [ "$FAKE" = 1 ]; then browser_login; fi
 
 metrics() { curl -sf "$URL/metrics" 2>/dev/null | grep '^balerix_hook_events_total' || say "(no hook events counted yet)"; }
+hook_count() { # hook_count <event> [agent]: how many the daemon has counted, 0 when none
+  local n
+  n="$(curl -sf "$URL/metrics" 2>/dev/null | grep "agent=\"${2:-$AGENT}\".*fleet=\"$FLEET\"" \
+    | sed -n "s/^balerix_hook_events_total{.*event=\"$1\".*} //p" | head -1)"
+  printf '%s' "${n:-0}"
+}
 
 say
 say "=============================== REPORT (paste everything from here) ==============================="
@@ -249,6 +263,75 @@ fi
 
 hr "B. HTTP hooks to loopback http:// with the literal header (counts after one prompt)"
 metrics
+# What send_text types after a text Claude may collapse into a paste:
+# balerix_api::PASTE_LEAD (#279), kept equal to it by a test in the
+# balerix crate (`verify_claude_types_the_runners_lead`).
+LEAD=" Act on the message above as this turn's request."
+REVIEW_FAIL=0
+# Section R is checked here, before G's `/exit` ends agent $AGENT's
+# session (the edit has to land while it runs), and reported after H.
+R_OUT=""
+rsay() { R_OUT="$R_OUT$*"$'\n'; }
+if [ "$WEB" = 1 ]; then
+  if [ "$FAKE" = 1 ]; then
+    rsay "skipped (fake: no browser review is sent)"
+  else
+    # The review's turn: the first user entry holding the review header;
+    # wrapped and led say what Claude received, and its tool calls are
+    # the assistant entries' tool_use parts after it.
+    review_turn() {
+      local files
+      files="$(find "$AGENT_DIR"/home/.claude/projects -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2-)"
+      [ -n "$files" ] || { printf 'no-transcript'; return; }
+      # shellcheck disable=SC2086
+      cat $files | jq -rs --arg lead "${LEAD# }" '
+        def text: .message.content | if type == "string" then . else (map(.text? // "") | join("")) end;
+        (map(.type == "user" and (text | contains("Review against "))) | index(true)) as $i
+        | if $i == null then "no-review" else
+            (.[$i] | text) as $p
+            | [ .[$i + 1:][] | select(.type == "assistant") | .message.content[]? | select(.type == "tool_use") | .name ] as $t
+            | "wrapped=\($p | contains("<pasted_content"))\tlead=\($p | contains($lead))\ttools=\($t | join(","))"
+          end' 2>/dev/null || printf 'unreadable'
+    }
+    # An edit is an edit tool, or a change in the agent's clone: a Bash
+    # `echo >> README` edits too (seen on 2.1.300). The clone's config is
+    # the agent's to write, so git reads it with no fsmonitor and no hooks.
+    changed() {
+      [ -n "$(git -c core.fsmonitor=false -c core.hooksPath=/dev/null --no-optional-locks \
+        -C "$AGENT_DIR/workspace" status --porcelain 2>/dev/null)" ]
+    }
+    edited() {
+      printf '%s' "${1##*tools=}" | grep -qE '(^|,)(Edit|MultiEdit|Write|NotebookEdit)(,|$)' \
+        || { case "$1" in *tools=?*) changed ;; *) false ;; esac; }
+    }
+    # a Read or a Bash look usually comes first: wait for the edit itself
+    seen=""
+    for _ in $(seq 1 120); do
+      seen="$(review_turn)"
+      edited "$seen" && break
+      sleep 1
+    done
+    rsay "review turn: ${seen:-none}"
+    tools="${seen##*tools=}"
+    case "$seen" in
+      no-review|no-transcript|unreadable|"")
+        rsay "FAIL: no review in the agent's transcript (was Send review pressed before coming back?)"; REVIEW_FAIL=1 ;;
+      *wrapped=true*lead=false*)
+        rsay "FAIL (#279): the review reached Claude wrapped in <pasted_content> without the lead"; REVIEW_FAIL=1 ;;
+      *)
+        if edited "$seen"; then
+          rsay "ACTED: the agent edited after the review ($tools; clone: $(changed && echo changed || echo clean))"
+        elif [ -n "$tools" ]; then
+          # an unled wrapped review was seen to draw a read-only look and a question
+          rsay "FAIL (#279?): tool calls follow the review but no edit within 120 s ($tools); the review asked for a change"
+          REVIEW_FAIL=1
+        else
+          rsay "FAIL (#279): no tool call followed the review within 120 s; the agent only answered"; REVIEW_FAIL=1
+        fi ;;
+    esac
+    rsay "PreToolUse / PostToolUse counted: $(hook_count PreToolUse) / $(hook_count PostToolUse)"
+  fi
+fi
 hr "C. which .claude.json copy Claude read (newest mtime wins); first-start dialog seen: $ONBOARD"
 stat_mtime "$AGENT_DIR/home/.claude.json"
 stat_mtime "$AGENT_DIR/home/.claude/.claude.json"
@@ -276,12 +359,6 @@ hr "G. #41: a slash command typed the way send_text types it (send-keys -l, then
 # what a claude bump has to keep true. The fake only records what arrived;
 # the real claude proves the exit (pane dead, SessionEnd counted).
 TARGET="$FLEET/$CREW:$AGENT"
-hook_count() { # hook_count <event> [agent]: how many the daemon has counted, 0 when none
-  local n
-  n="$(curl -sf "$URL/metrics" 2>/dev/null | grep "agent=\"${2:-$AGENT}\".*fleet=\"$FLEET\"" \
-    | sed -n "s/^balerix_hook_events_total{.*event=\"$1\".*} //p" | head -1)"
-  printf '%s' "${n:-0}"
-}
 session_ends() { hook_count SessionEnd; }
 if tmux -L "$SOCKET" has-session -t "=$FLEET/$CREW" >/dev/null 2>&1; then
   ends_before="$(session_ends)"; ends_before="${ends_before:-0}"
@@ -324,7 +401,8 @@ hr "H. #99: a text sent the moment SessionStart arrives is submitted (UserPrompt
 # $AGENT_B here. How long Enter is swallowed varies between cold starts
 # (1 s to 10 s here, over 20 s in the github check), so zero resent Enters
 # on one run does not mean the race is gone. The text has several lines so that it travels as the
-# first prompt does: `load-buffer -`, `paste-buffer -p -d`, then `Enter`.
+# first prompt does: `load-buffer -`, `paste-buffer -p -d`, the lead
+# (`send-keys -l`, #279), then `Enter`.
 NUDGE="${BALERIX_VERIFY_NUDGE:-5}"                 # seconds between Enters
 STARTUP_WAIT="${BALERIX_VERIFY_STARTUP_WAIT:-60}"  # seconds to wait for the submit
 AGENT_B=b
@@ -351,13 +429,20 @@ else
     printf 'Reply with the single word ready.\n\nThe lines below only make this text a paste,\nas the first prompt of the github plugin is:\n\n- one\n- two\n' \
       | tmux -L "$SOCKET" load-buffer -b balerix-verify-h -
     tmux -L "$SOCKET" paste-buffer -p -d -b balerix-verify-h -t "$B_TARGET"
+    tmux -L "$SOCKET" send-keys -t "$B_TARGET" -l -- "$LEAD"
     tmux -L "$SOCKET" send-keys -t "$B_TARGET" Enter
     sent="$(now_ms)"; last="$sent"; resent=0; verdict=""
     say "SessionStart seen; text and Enter sent $(secs $(( sent - started ))) s later"
     while [ $(( $(now_ms) - sent )) -lt $(( STARTUP_WAIT * 1000 )) ]; do
       if [ "$FAKE" = 1 ]; then
-        if grep -q '^- two$' "$B_DIR/home/fake-claude.stdin" 2>/dev/null; then
-          verdict="arrived: the text and its Enter reached the fake's stdin (the fake reads from the start and fires no UserPromptSubmit)"; break
+        if grep -q '^- two$' "$B_DIR/home/fake-claude.stdin" 2>/dev/null \
+          && grep -qF "</pasted_content id=" "$B_DIR/home/fake-claude.turns" 2>/dev/null; then
+          turn="$(tail -n 1 "$B_DIR/home/fake-claude.turns" | jq -r .)"
+          case "$turn" in
+            *"</pasted_content id="*"$LEAD") verdict="arrived: the text, the lead after its paste wrapper and the Enter reached the fake (which fires no UserPromptSubmit)" ;;
+            *) verdict="arrived, but the lead is not after the paste wrapper (#279): $(printf '%s' "$turn" | tail -c 120)" ;;
+          esac
+          break
         fi
       elif [ "$(hook_count UserPromptSubmit "$AGENT_B")" -gt 0 ]; then
         verdict="submitted: UserPromptSubmit $(secs $(( $(now_ms) - sent ))) s after the send, after $resent resent Enter(s)"; break
@@ -378,5 +463,9 @@ else
     fi
   fi
 fi
+if [ "$WEB" = 1 ]; then
+  hr "R. Spec C §8 / #279: the web review is acted on (an edit follows it in the transcript)"
+  printf '%s' "$R_OUT"
+fi
 say "=============================== END REPORT ==============================="
-exit 0
+exit "$REVIEW_FAIL"

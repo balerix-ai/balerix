@@ -56,7 +56,10 @@ pub use status::{
     ActivationState, AgentPhase, AgentStatus, FleetPhase, FleetStatus, FleetSummary,
     PluginActivation, SpecHash, Timestamp,
 };
-pub use text::{MODE_CHARS, prompt_text, strip_terminal_controls};
+pub use text::{
+    MODE_CHARS, PASTE_LEAD, PASTE_LEAD_ABOVE, needs_paste_lead, prompt_text,
+    strip_terminal_controls, submitted_candidates, submitted_text,
+};
 pub use workspace::{
     EntryKind, FileDiff, FileStatus, TreeEntry, WORKSPACE_DIFF_LIMIT, WORKSPACE_FILE_COUNT_LIMIT,
     WORKSPACE_FILE_LIMIT, WORKSPACE_PATCH_LIMIT, WORKSPACE_TREE_ENTRY_LIMIT, WorkspaceDiff,

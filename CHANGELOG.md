@@ -241,6 +241,17 @@
   records, don't carry over: run `mise install` / `mise trust` again
   inside the agent. The old `home/.local/share/mise` is unused and can be
   deleted.
+- Release core and the plugins together (#279). The daemon now types a
+  one-line lead after a pasted multi-line or long `send_text`, and Claude
+  Code 2.1.283+ wraps such a paste in `<pasted_content>`; the github,
+  matrix and flow plugins confirm a delivery by matching the
+  `UserPromptSubmit` prompt, and only plugins built on this
+  `balerix-api` (`submitted_candidates`) see through the lead and the
+  wrapper. A new daemon with older plugins leaves multi-line deliveries
+  unconfirmed (nudged for 90 s, then reported as not delivered), as
+  they already are with an older daemon on Claude 2.1.283+; the text
+  itself still arrives and is acted on. Newer plugins also confirm a
+  wrapped prompt from an older daemon.
 
 ## 0.2.4 - 2026-10-10
 

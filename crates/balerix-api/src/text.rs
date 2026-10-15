@@ -112,9 +112,156 @@ pub fn prompt_text(text: &str) -> Cow<'_, str> {
     Cow::Owned(body.to_string())
 }
 
+/// What `send_text` types, with `send-keys -l`, after a text it pasted
+/// and before the submitting Enter (#279). Since Claude Code 2.1.283 a
+/// paste Claude collapses (more than 800 characters, or four lines or
+/// more) reaches the model inside `<pasted_content id="…">` tags, and the
+/// model treats a turn that is only pasted text as reference material:
+/// it summarises a review and asks, instead of acting on it. A short line
+/// typed after the paste makes the turn a request, as the same text typed
+/// was before 2.1.283. It is neutral on purpose: it claims no authorship
+/// for text that may come from outside parties (an issue author, a room
+/// member), and gives the paste no more standing than a typed prompt
+/// (docs/THREAT-MODEL.md). Claude puts a blank line between the wrapper
+/// and it; a version that does not wrap (2.1.267) joins the two, hence
+/// the leading space. It opens with a space, never with `/` or a
+/// [`MODE_CHARS`] character, ends without `;` (tmux's separator), and
+/// holds no newline or control character,
+/// so it can neither submit early nor switch the input line to another
+/// mode.
+pub const PASTE_LEAD: &str = " Act on the message above as this turn's request.";
+
+/// Above this many bytes a single line is pasted with a lead. Claude
+/// Code 2.1.299 and 2.1.300 wrap input of more than 800 characters, or
+/// with more than two newlines (four lines); 790 characters arrive as
+/// typed. Bytes count at least as many as Claude's characters, and the
+/// margin below 800 is for a version that wraps sooner: a lead on a text
+/// Claude would not have wrapped costs one sentence.
+pub const PASTE_LEAD_ABOVE: usize = 500;
+
+/// Whether `send_text` pastes `text` and, when it submits, types
+/// [`PASTE_LEAD`] after it: any text with a newline, or longer than
+/// [`PASTE_LEAD_ABOVE`], unless it is a slash command (its first visible
+/// character `/`), whose arguments the lead would change.
+pub fn needs_paste_lead(text: &str) -> bool {
+    !text.trim_start_matches(is_blank).starts_with('/')
+        && (text.contains('\n') || text.len() > PASTE_LEAD_ABOVE)
+}
+
+/// `prompt` less a trailing [`PASTE_LEAD`], trimmed; `None` without one.
+fn strip_paste_lead(prompt: &str) -> Option<&str> {
+    let body = prompt.trim_end().strip_suffix(PASTE_LEAD.trim_start())?;
+    Some(body.trim())
+}
+
+/// The inside of a `<pasted_content …>` wrapper around all of `text`
+/// (blanks around it allowed), closed by `</pasted_content>` with the
+/// same attributes or with none; `None` when `text` is not one wrapper.
+fn unwrap_pasted(text: &str) -> Option<&str> {
+    let rest = text.trim().strip_prefix("<pasted_content")?;
+    let (attrs, inner) = rest.split_once('>')?;
+    if attrs.contains('<') {
+        return None;
+    }
+    let close = format!("</pasted_content{attrs}>");
+    inner
+        .strip_suffix(close.as_str())
+        .or_else(|| inner.strip_suffix("</pasted_content>"))
+}
+
+/// What a `UserPromptSubmit`'s `prompt` may be the submission of, least
+/// stripped first (#279): the prompt itself, then without a trailing
+/// [`PASTE_LEAD`], then without that and a `<pasted_content>` wrapper
+/// around all of the rest (also without a lead, from a daemon before
+/// #279). Match a sent text against them in this order, so text that
+/// itself ends in the lead or is shaped like a wrapper is matched as it
+/// was sent before anything is stripped. Whitespace is not normalised.
+pub fn submitted_candidates(prompt: &str) -> Vec<&str> {
+    let mut out = vec![prompt];
+    let unled = strip_paste_lead(prompt);
+    out.extend(unled);
+    out.extend(unwrap_pasted(unled.unwrap_or(prompt)));
+    out.dedup();
+    out
+}
+
+/// The text a plugin sent, from the `prompt` of the `UserPromptSubmit`
+/// that took it: the most stripped of [`submitted_candidates`] (a
+/// trailing [`PASTE_LEAD`] and a `<pasted_content>` wrapper gone, #279).
+/// A prompt with neither is borrowed unchanged.
+pub fn submitted_text(prompt: &str) -> Cow<'_, str> {
+    Cow::Borrowed(submitted_candidates(prompt).pop().unwrap_or(prompt))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lead_is_one_short_line_that_opens_no_mode() {
+        let visible = PASTE_LEAD.trim_start_matches(is_blank);
+        assert!(!visible.starts_with('/') && !visible.starts_with(MODE_CHARS));
+        assert!(!PASTE_LEAD.starts_with('/') && !PASTE_LEAD.starts_with(MODE_CHARS));
+        assert_eq!(strip_terminal_controls(PASTE_LEAD), PASTE_LEAD);
+        assert!(!PASTE_LEAD.contains('\n'));
+        // tmux takes a trailing `;` as its command separator
+        assert!(!PASTE_LEAD.ends_with(';'));
+        assert!(!needs_paste_lead(PASTE_LEAD), "never collapsed itself");
+        assert_eq!(prompt_text(visible), visible, "nothing to escape");
+    }
+
+    #[test]
+    fn a_lead_follows_multi_line_and_long_text_but_not_commands() {
+        assert!(needs_paste_lead("a\nb"));
+        assert!(needs_paste_lead(&"x".repeat(PASTE_LEAD_ABOVE + 1)));
+        assert!(!needs_paste_lead(&"x".repeat(PASTE_LEAD_ABOVE)));
+        assert!(!needs_paste_lead("run the tests"));
+        assert!(!needs_paste_lead("/compact keep\nthe plan"));
+        assert!(!needs_paste_lead(" \u{200B}/compact keep\nthe plan"));
+        assert!(needs_paste_lead("\\/x\ny"), "an escaped slash is prose");
+    }
+
+    #[test]
+    fn the_submitted_text_drops_the_lead_and_the_wrapper() {
+        // what claude 2.1.299's UserPromptSubmit carried
+        let wrapped = format!(
+            "\n\n<pasted_content id=\"74ce\">\nline one\n\nline two\n</pasted_content id=\"74ce\">\n\n{PASTE_LEAD}"
+        );
+        assert_eq!(submitted_text(&wrapped).trim(), "line one\n\nline two");
+        // 2.1.267: as typed, the lead joined on
+        assert_eq!(
+            submitted_text(&format!("line one\nline two{PASTE_LEAD}")),
+            "line one\nline two"
+        );
+        // a bare closing tag
+        assert_eq!(
+            submitted_text(&format!(
+                "<pasted_content id=\"9\">\nx\ny\n</pasted_content>{PASTE_LEAD}"
+            ))
+            .trim(),
+            "x\ny"
+        );
+        // least stripped first
+        let led = format!("x{PASTE_LEAD}");
+        assert_eq!(submitted_candidates(&led), vec![led.as_str(), "x"]);
+        assert_eq!(submitted_candidates("plain"), vec!["plain"]);
+        // a wrapper without the lead (a daemon from before #279)
+        assert_eq!(
+            submitted_text("<pasted_content id=\"1\">\nx\ny\n</pasted_content id=\"1\">").trim(),
+            "x\ny"
+        );
+        for t in [
+            "run the tests",
+            "<pasted_content id=\"1\">x</pasted_content id=\"2\">",
+            "<pasted_content id=\"1\">a</pasted_content id=\"1\"> and more",
+            "",
+        ] {
+            assert!(
+                matches!(submitted_text(t), Cow::Borrowed(b) if b == t),
+                "{t:?}"
+            );
+        }
+    }
 
     #[test]
     fn terminal_controls_are_stripped() {

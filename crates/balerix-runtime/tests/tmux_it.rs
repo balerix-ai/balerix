@@ -401,10 +401,16 @@ fn send_text_with_newlines_arrives_as_one_paste() {
     r.send_text(&id, "bell\u{7}esc\u{1b}[31m", true).unwrap();
     r.send_text(&id, "c1\u{85}\u{9b}x cr\r\nnext\rjoined last", true)
         .unwrap();
-    wait_for(|| std::fs::read_to_string(&stdin_log).is_ok_and(|s| s.contains("last")));
+    // a pasted text is followed by the lead (#279)
+    let lead = balerix_api::PASTE_LEAD;
+    let end = format!("last{lead}\n");
+    wait_for(|| std::fs::read_to_string(&stdin_log).is_ok_and(|s| s.ends_with(&end)));
     let got = std::fs::read_to_string(&stdin_log).unwrap();
     assert_eq!(
-        got, "single\nline one\nline two\n\nline four\nbellesc[31m\nc1x cr\nnextjoined last\n",
+        got,
+        format!(
+            "single\nline one\nline two\n\nline four{lead}\nbellesc[31m\nc1x cr\nnextjoined last{lead}\n"
+        ),
         "{got:?}"
     );
     // the paste buffer was deleted afterwards
@@ -516,8 +522,11 @@ fn send_text_of_seventy_kilobytes_arrives_whole() {
     assert!(text.len() > 70 << 10, "{}", text.len());
     r.send_text(&id, &text, true).unwrap();
 
-    let expected = format!("{text}\n");
-    wait_for(|| std::fs::read_to_string(&stdin_log).is_ok_and(|s| s.contains("line 00999")));
+    let expected = format!("{text}{}\n", balerix_api::PASTE_LEAD);
+    wait_for(|| {
+        std::fs::read_to_string(&stdin_log)
+            .is_ok_and(|s| s.ends_with('\n') && s.contains("line 00999"))
+    });
     let got = std::fs::read_to_string(&stdin_log).unwrap();
     assert_eq!(
         got.len(),
@@ -598,9 +607,12 @@ fn a_long_single_line_send_text_arrives_whole() {
     assert!(long.len() > 16 << 10 && !long.contains('\n'));
     r.send_text(&id, "short", true).unwrap();
     r.send_text(&id, &long, true).unwrap();
-    wait_for(|| std::fs::read_to_string(&stdin_log).is_ok_and(|s| s.len() >= long.len() + 7));
+    let lead = balerix_api::PASTE_LEAD;
+    wait_for(|| {
+        std::fs::read_to_string(&stdin_log).is_ok_and(|s| s.len() >= long.len() + lead.len() + 7)
+    });
     let got = std::fs::read_to_string(&stdin_log).unwrap();
-    assert_eq!(got, format!("short\n{long}\n"), "len {}", got.len());
+    assert_eq!(got, format!("short\n{long}{lead}\n"), "len {}", got.len());
     // no buffer left behind
     let buffers = std::process::Command::new(&tools.tmux)
         .args(["-L", &socket, "list-buffers"])
@@ -608,6 +620,43 @@ fn a_long_single_line_send_text_arrives_whole() {
         .unwrap();
     assert!(!String::from_utf8_lossy(&buffers.stdout).contains("balerix-send-"));
     r.stop_crew(&crew).unwrap();
+}
+
+/// #279: to an application that asked for bracketed paste, a text Claude
+/// may collapse arrives inside the paste markers with the lead typed
+/// after the end marker and before the Enter, so the lead is the user's
+/// own text and never part of the paste; a short line, a slash command
+/// and a text left unsubmitted get no lead.
+#[test]
+fn a_pasted_text_is_followed_by_the_lead_outside_the_paste() {
+    let Some(p) = pane(
+        "paste-lead",
+        "stty -echo\nprintf '\\033[?2004h'\ntouch ready\nexec cat -v >> stdin.log",
+    ) else {
+        return;
+    };
+    let log = p.plan.cwd.join("stdin.log");
+    // the pane asked for bracketed paste before it marked itself ready
+    wait_for(|| p.plan.cwd.join("ready").exists());
+    let long = "y".repeat(balerix_api::PASTE_LEAD_ABOVE + 1);
+    p.r.send_text(&p.id, "short", true).unwrap();
+    p.r.send_text(&p.id, "one\ntwo\nthree\nfour", true).unwrap();
+    p.r.send_text(&p.id, &long, true).unwrap();
+    // left unsubmitted: no lead, the text stays the plugin's own
+    p.r.send_text(&p.id, "p\nq\nr\ns", false).unwrap();
+    p.r.send_text(&p.id, "/compact keep\nthe plan", true)
+        .unwrap();
+    wait_for(|| std::fs::read_to_string(&log).is_ok_and(|s| s.ends_with("plan^[[201~\n")));
+    let got = std::fs::read_to_string(&log).unwrap();
+    let lead = balerix_api::PASTE_LEAD;
+    assert_eq!(
+        got,
+        format!(
+            "short\n^[[200~one\ntwo\nthree\nfour^[[201~{lead}\n^[[200~{long}^[[201~{lead}\n^[[200~p\nq\nr\ns^[[201~^[[200~/compact keep\nthe plan^[[201~\n"
+        ),
+        "{got:?}"
+    );
+    p.r.stop_crew(&p.id.crew_ref()).unwrap();
 }
 
 /// What `cat_v_pane` hands back. `_root` and `_server` are held for their

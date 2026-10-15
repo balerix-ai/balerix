@@ -795,12 +795,12 @@ impl AgentRunner for TmuxRunner {
         Ok(out)
     }
 
-    /// One short line goes through `send-keys -l`; text with a newline, or
-    /// longer than `SEND_KEYS_LIMIT`, goes through a named buffer and
+    /// One short line goes through `send-keys -l`; text with a newline,
+    /// longer than `SEND_KEYS_LIMIT`, or that [`balerix_api::needs_paste_lead`]
+    /// says Claude may collapse, goes through a named buffer and
     /// `paste-buffer -p` (Spec C §3.3): `-p`
     /// wraps it in bracketed-paste markers when the application asked for
-    /// them, on which a multi-line paste is expected to arrive as one
-    /// message (verify with `mise run verify-claude`; Spec C §8, pending);
+    /// them, on which a multi-line paste arrives as one message;
     /// `-d` deletes the buffer. The buffer is filled by `load-buffer -`
     /// from the tmux client's stdin, not by `set-buffer -- <text>`: the
     /// client refuses a command whose packed argv exceeds 16 KiB, and
@@ -809,6 +809,14 @@ impl AgentRunner for TmuxRunner {
     /// paste (the target window gone, say) the buffer is deleted before
     /// the error is returned, so failures do not leak buffers. The text is
     /// passed through `strip_terminal_controls` first.
+    ///
+    /// After such a paste, and before the submitting Enter,
+    /// [`balerix_api::PASTE_LEAD`] is typed with `send-keys -l` (#279):
+    /// Claude Code 2.1.283 and later hand a collapsed paste to the model
+    /// inside `<pasted_content>` tags, and a turn that is only pasted
+    /// text is not acted on. Only with `submit`: a text left unsubmitted
+    /// (a flow `send` with `submit: false`) is someone else's to finish,
+    /// and stays exactly what the plugin sent.
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
         let lock = self.send_lock(agent);
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -816,7 +824,8 @@ impl AgentRunner for TmuxRunner {
         let target = Self::window_target(agent);
         let text = strip_terminal_controls(text);
         let text = text.as_ref();
-        if text.contains('\n') || text.len() > SEND_KEYS_LIMIT {
+        let paste = balerix_api::needs_paste_lead(text);
+        if paste || text.contains('\n') || text.len() > SEND_KEYS_LIMIT {
             let buffer = format!(
                 "balerix-send-{}-{}",
                 std::process::id(),
@@ -829,6 +838,10 @@ impl AgentRunner for TmuxRunner {
             ) {
                 let _ = self.run(&id, &["delete-buffer", "-b", &buffer]);
                 return Err(err);
+            }
+            if paste && submit {
+                let lead = balerix_api::PASTE_LEAD;
+                self.run(&id, &["send-keys", "-t", &target, "-l", "--", lead])?;
             }
         } else {
             self.run(&id, &["send-keys", "-t", &target, "-l", "--", text])?;

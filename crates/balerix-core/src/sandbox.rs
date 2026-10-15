@@ -6,7 +6,7 @@
 //! which runs over the grants this check returns.
 //!
 //! Everything nono accepts outside the allowlist reaches past the
-//! filesystem rules (nono 0.79.0's profile schema): `extends`, `groups`,
+//! filesystem rules (nono 0.80.0's profile schema): `extends`, `groups`,
 //! `packs`, `command_policies` (with its own `fs_read`), `workdir`, `hooks`
 //! and `session_hooks` (run outside the sandbox), credential capture and
 //! injection, raw Seatbelt rules, process inspection and capability

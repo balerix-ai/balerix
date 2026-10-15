@@ -65,7 +65,9 @@ credentials, hook input, or sandbox rules.
   `dev fake-claude`. Section G sends `/exit` the way `send_text`
   does and reports whether the session ended (#41); section H adds a
   second agent, sends a text the moment its `SessionStart` arrives and
-  reports how many Enters it took before `UserPromptSubmit` (#99). Its data root (`target/tmp/verify-data`, the daemon
+  reports how many Enters it took before `UserPromptSubmit` (#99). With the web plugin packaged,
+  section R fails the run unless the agent's transcript shows an edit
+  after the browser review (#279). Its data root (`target/tmp/verify-data`, the daemon
   pool) is kept across runs so claude downloads once per version; config and
   state under `target/tmp/verify-claude` are wiped.
 - `verify-matrix` — Spec G's manual check against a real Matrix homeserver
@@ -687,15 +689,26 @@ credentials, hook input, or sandbox rules.
   on `…Key=void 0`; `.gitleaks.toml` keeps the default ruleset and
   allowlists exactly the three vendored files by anchored path. Anything
   else under `assets/` is still scanned.
-- `send_text` with a newline, or longer than 4 KiB, goes through
+- `send_text` with a newline, or longer than 500 bytes
+  (`PASTE_LEAD_ABOVE`), goes through
   `load-buffer -b <name> -` + `paste-buffer -p -d` (a bracketed paste);
   shorter single lines go through `send-keys -l`. The text rides in on the
   tmux client's *stdin*, not in the argv: the client refuses a command
   whose packed argv is over 16 KiB ("command too long"), and a review may
-  be 64 KiB. The e2e's
-  `fake-claude` records a paste line by line; the real `claude` is expected
-  to arrive as one message — verify with `mise run verify-claude`
-  (Spec C §8, pending).
+  be 64 KiB. Since claude 2.1.283 a paste Claude collapses (four lines or
+  more, or over 800 characters; typed input too) reaches the model inside
+  `<pasted_content id="…">` tags and is often not acted on (#279), so
+  after the paste, before Enter, `send_text` types `balerix_api::PASTE_LEAD`
+  with `send-keys -l` (only with `submit`, never after a slash command);
+  the turn's own words then carry the request. The lead is neutral and
+  claims no authorship (THREAT-MODEL.md). A `UserPromptSubmit` prompt is
+  matched as it came first, then through
+  `balerix_api::submitted_candidates` (lead dropped, then the wrapper).
+  `dev fake-claude --wrap-pastes` (the web e2e's alice, verify-claude's
+  self-test) models the wrapping and records each turn in
+  `fake-claude.turns`; without it the fake records a paste line by line.
+  `scripts/verify-claude.sh` types the lead by hand in section H, and a
+  test keeps its copy equal to the constant.
   `TmuxRunner::send_text` strips terminal control characters from the
   text first (`strip_terminal_controls`: C0 but `\n` and `\t`, DEL, C1;
   `\r\n` becomes `\n`, a lone `\r` goes). Local tmux and the Kubernetes

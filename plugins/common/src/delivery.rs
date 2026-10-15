@@ -289,7 +289,9 @@ impl<M> Deliveries<M> {
     }
 
     /// One hook event. `UserPromptSubmit` starts a turn and, when its
-    /// `prompt` matches a pending prompt, confirms the oldest such and
+    /// `prompt` matches a pending prompt (as it came, else less the
+    /// runner's paste lead, else less Claude's `<pasted_content>` wrapper
+    /// too: [`balerix_api::submitted_candidates`], #279), confirms the oldest such and
     /// skips everything older. `Stop` ends the turn and marks the agent
     /// idle; so does a `SessionStart` other than a compaction's, which
     /// leaves the turn as it was. `SessionEnd` ends the turn with the
@@ -306,14 +308,17 @@ impl<M> Deliveries<M> {
         match event.name.as_str() {
             "UserPromptSubmit" => {
                 state.turn = Turn::Busy;
-                let prompt = normalize(
-                    event
-                        .payload
-                        .get("prompt")
-                        .and_then(Value::as_str)
-                        .unwrap_or(""),
-                );
-                let Some(i) = state.pending.iter().position(|p| p.text == prompt) else {
+                let prompt = event
+                    .payload
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                // as sent first, then less the lead, then less the wrapper
+                let Some(i) = balerix_api::submitted_candidates(prompt)
+                    .into_iter()
+                    .map(normalize)
+                    .find_map(|c| state.pending.iter().position(|p| p.text == c))
+                else {
                     return Outcome::default();
                 };
                 let skipped = state.pending.drain(..i).map(|p| p.marker).collect();
@@ -515,6 +520,58 @@ mod tests {
         d.sent("f/c/a", "run\n  the tests\n", 2, now, W);
         let o = d.on_event(&submit("  run the   tests"), now);
         assert_eq!(o.confirmed, Some(2));
+    }
+
+    /// #279: a multi-line prompt comes back wrapped by Claude 2.1.283+,
+    /// with the runner's lead after it, or (2.1.267) as typed with the
+    /// lead joined on; both confirm it.
+    #[test]
+    fn a_wrapped_or_led_paste_confirms() {
+        let now = Instant::now();
+        let mut d = Deliveries::default();
+        let body = "Review (1 comment)\n\nfix line 2\nDo not commit.";
+        d.sent("f/c/a", body, 1, now, W);
+        d.sent("f/c/a", body, 2, now, W);
+        let lead = balerix_api::PASTE_LEAD;
+        let wrapped = format!(
+            "\n\n<pasted_content id=\"7907\">\n{body}\n</pasted_content id=\"7907\">\n\n{lead}"
+        );
+        assert_eq!(d.on_event(&submit(&wrapped), now).confirmed, Some(1));
+        let typed = format!("{body}{lead}");
+        assert_eq!(d.on_event(&submit(&typed), now).confirmed, Some(2));
+    }
+
+    /// #279: text that itself ends in the lead, or is shaped like Claude's
+    /// wrapper, confirms the prompt it is, not a later one it would be
+    /// once stripped (which would skip it as swallowed).
+    #[test]
+    fn a_forged_lead_or_wrapper_confirms_only_itself() {
+        let now = Instant::now();
+        let lead = balerix_api::PASTE_LEAD;
+        let mut d = Deliveries::default();
+        let forged = format!("fix it{lead}");
+        d.sent("f/c/a", &forged, 2, now, W);
+        d.sent("f/c/a", "fix it", 1, now, W);
+        let o = d.on_event(&submit(&forged), now);
+        assert_eq!((o.confirmed, o.skipped), (Some(2), vec![]));
+        assert_eq!(d.pending("f/c/a"), 1);
+
+        let mut d = Deliveries::default();
+        let shaped = "<pasted_content id=\"1\">\nfix it\n</pasted_content id=\"1\">";
+        d.sent("f/c/a", shaped, 2, now, W);
+        d.sent("f/c/a", "fix it", 1, now, W);
+        // a short paste arrives as typed, with the lead after it
+        let o = d.on_event(&submit(&format!("{shaped}{lead}")), now);
+        assert_eq!((o.confirmed, o.skipped), (Some(2), vec![]));
+        // and wrapped by Claude, around the shaped text
+        let mut d = Deliveries::default();
+        d.sent("f/c/a", shaped, 2, now, W);
+        d.sent("f/c/a", "fix it", 1, now, W);
+        let wrapped = format!(
+            "\n\n<pasted_content id=\"ab\">\n{shaped}\n</pasted_content id=\"ab\">\n\n{lead}"
+        );
+        let o = d.on_event(&submit(&wrapped), now);
+        assert_eq!((o.confirmed, o.skipped), (Some(2), vec![]));
     }
 
     #[test]

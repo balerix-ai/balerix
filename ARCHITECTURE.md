@@ -448,6 +448,10 @@ makes an existing remote branch its clone's branch and start point
   `send_text`; `TmuxRunner` fills a named buffer with `load-buffer -`
   from the tmux client's stdin (an argv over 16 KiB is refused, and a
   review may be 64 KiB) and sends it with `paste-buffer -p`, which Claude
-  Code is expected to take as one message — verify with `mise run
-  verify-claude` (Spec C §8, pending). A literal newline through
-  `send-keys -l` is Ctrl-J to the application (Spec C PC-5).
+  Code takes as one message. From 2.1.283 Claude hands that message to
+  the model inside `<pasted_content>` tags, as reference material, so
+  `send_text` types a one-line lead (`balerix_api::PASTE_LEAD`) after the
+  paste and before Enter: the turn's own words ask for it to be acted on
+  (#279; `mise run verify-claude` section R checks an edit follows). A
+  literal newline through `send-keys -l` is Ctrl-J to the application
+  (Spec C PC-5).

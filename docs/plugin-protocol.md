@@ -138,6 +138,20 @@ shape for one fleet. `owner` is present when a plugin manages the fleet
   `MAX_SEND_TEXT`); a longer one answers 400 `text: expected at most
   262144 bytes, got <n>` and nothing is typed. The call returns when the
   text (and, with `submit`, the Enter) has been sent.
+  A text with a newline, or over 500 bytes (`PASTE_LEAD_ABOVE`), is sent
+  as a bracketed paste. With `submit`, and unless the text is a slash
+  command, the runner then types `balerix_api::PASTE_LEAD` (" Act on the
+  message above as this turn's request.") before the Enter (#279): Claude
+  Code 2.1.283 and later hand a collapsed paste to the model inside
+  `<pasted_content id="…">` tags, and a turn that is only pasted text is
+  often not acted on. Without `submit` nothing is added: the text is left
+  in the input line exactly as sent, for whoever submits it.
+  The `UserPromptSubmit` that takes such a text therefore carries a
+  `prompt` that may be wrapped in `<pasted_content …>` … `</pasted_content
+  …>` and may end with the lead. A plugin that confirms deliveries by
+  comparing prompts should match the prompt as it came first, then
+  `balerix_api::submitted_candidates` in order (lead stripped, then the
+  wrapper too); `balerix_api::submitted_text` is the fully stripped form.
 - `{ "action": "send_keys", "steps": [<step>…], "delay_ms": <int> }`
   (`action-send-keys.json`). A step is `{ "key": "up" | "down" | "enter" |
   "escape" }` or `{ "text": <string> }`. The daemon pauses `delay_ms`

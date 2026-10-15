@@ -137,11 +137,139 @@ pub fn fake_claude_command(args: &FakeClaudeArgs) -> Result<String> {
     let config_dir =
         PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").context("CLAUDE_CONFIG_DIR not set")?);
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME not set")?);
-    let _pump = fake_claude_once(&config_dir, &home, &args.rest, std::io::stdin())?;
+    if args.wrap_pastes {
+        // ask the terminal for bracketed paste, as Claude does
+        let mut out = std::io::stdout();
+        out.write_all(BRACKETED_PASTE_ON.as_bytes())?;
+        out.flush()?;
+    }
+    let _pump = fake_claude_once(
+        &config_dir,
+        &home,
+        &args.rest,
+        std::io::stdin(),
+        args.wrap_pastes,
+    )?;
     eprintln!("fake-claude: hooks done; sleeping until killed");
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }
+}
+
+const BRACKETED_PASTE_ON: &str = "\x1b[?2004h";
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// What `--wrap-pastes` makes of the pane's input (#279): the turns
+/// Claude Code 2.1.283+ would submit. Outside a bracketed paste a
+/// newline (a cooked tty's Enter) submits the turn so far, if any;
+/// inside one it is text. A paste of more than 800 characters or more
+/// than two newlines (what 2.1.299 and 2.1.300 collapse) joins the turn
+/// as `\n\n<pasted_content id="…">\n{paste}\n</pasted_content id="…">\n\n`,
+/// any other paste as it was. `log` is the input less the paste markers,
+/// for `fake-claude.stdin`.
+#[derive(Debug, Default)]
+pub struct PasteComposer {
+    carry: Vec<u8>,
+    paste: Option<Vec<u8>>,
+    turn: Vec<u8>,
+    pastes: u32,
+}
+
+impl PasteComposer {
+    /// Feeds `bytes`; answers the input less the paste markers and every
+    /// turn submitted. A marker split across two feeds waits for the
+    /// second.
+    pub fn feed(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<String>) {
+        self.carry.extend_from_slice(bytes);
+        let buf = std::mem::take(&mut self.carry);
+        let (mut log, mut turns) = (Vec::new(), Vec::new());
+        let mut i = 0;
+        while i < buf.len() {
+            let rest = &buf[i..];
+            if rest.starts_with(PASTE_START) {
+                self.paste = Some(Vec::new());
+                i += PASTE_START.len();
+                continue;
+            }
+            if rest.starts_with(PASTE_END) {
+                let paste = self.paste.take().unwrap_or_default();
+                self.join_paste(&paste);
+                i += PASTE_END.len();
+                continue;
+            }
+            if rest.len() < PASTE_START.len()
+                && (PASTE_START.starts_with(rest) || PASTE_END.starts_with(rest))
+            {
+                self.carry = rest.to_vec();
+                break;
+            }
+            let b = rest[0];
+            let b = if b == b'\r' { b'\n' } else { b };
+            log.push(b);
+            match &mut self.paste {
+                Some(paste) => paste.push(b),
+                None if b == b'\n' => {
+                    let turn = std::mem::take(&mut self.turn);
+                    if !turn.iter().all(u8::is_ascii_whitespace) {
+                        turns.push(String::from_utf8_lossy(&turn).into_owned());
+                    }
+                }
+                None => self.turn.push(b),
+            }
+            i += 1;
+        }
+        (log, turns)
+    }
+
+    fn join_paste(&mut self, paste: &[u8]) {
+        let text = String::from_utf8_lossy(paste);
+        let newlines = text.matches('\n').count();
+        if text.chars().count() > 800 || newlines > 2 {
+            self.pastes += 1;
+            let id = format!("{:04x}", 0x7900 + self.pastes);
+            let wrapped = format!(
+                "\n\n<pasted_content id=\"{id}\">\n{text}\n</pasted_content id=\"{id}\">\n\n"
+            );
+            self.turn.extend_from_slice(wrapped.as_bytes());
+        } else {
+            self.turn.extend_from_slice(paste);
+        }
+    }
+}
+
+/// `pump_stdin` for `--wrap-pastes`: `input` through a [`PasteComposer`],
+/// the input less the paste markers appended to `out`, each submitted
+/// turn to `turns` as a JSON string on a line of its own.
+pub fn pump_composer(
+    mut input: impl Read + Send + 'static,
+    out: PathBuf,
+    turns: PathBuf,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut composer = PasteComposer::default();
+        let mut buf = [0u8; 8192];
+        let append = |path: &Path, bytes: &[u8]| {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = f.write_all(bytes);
+            }
+        };
+        loop {
+            let n = match input.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let (log, submitted) = composer.feed(&buf[..n]);
+            append(&out, &log);
+            for turn in submitted {
+                append(&turns, format!("{}\n", Value::String(turn)).as_bytes());
+            }
+        }
+    })
 }
 
 /// Reads `input` line by line until EOF, appending each line to `out`.
@@ -211,6 +339,7 @@ pub fn fake_claude_once(
     home: &Path,
     argv: &[String],
     stdin: impl Read + Send + 'static,
+    wrap_pastes: bool,
 ) -> Result<std::thread::JoinHandle<()>> {
     std::fs::write(home.join("fake-claude.argv"), argv.join("\n") + "\n")?;
     let projects = config_dir.join("projects").join("e2e");
@@ -252,7 +381,15 @@ pub fn fake_claude_once(
         );
     }
 
-    let pump = pump_stdin(stdin, home.join("fake-claude.stdin"));
+    let pump = if wrap_pastes {
+        pump_composer(
+            stdin,
+            home.join("fake-claude.stdin"),
+            home.join("fake-claude.turns"),
+        )
+    } else {
+        pump_stdin(stdin, home.join("fake-claude.stdin"))
+    };
 
     post_hook(
         &settings,
@@ -515,6 +652,71 @@ mod tests {
         });
     }
 
+    /// #279: a collapsible paste is recorded wrapped, a short one as
+    /// typed, and the text typed after it (the runner's lead) stays
+    /// outside the wrapper; split markers wait for the rest.
+    #[test]
+    fn the_composer_wraps_a_collapsible_paste_as_claude_does() {
+        let mut c = PasteComposer::default();
+        let (log, turns) = c.feed(b"short line\n");
+        assert_eq!(
+            (log.as_slice(), turns),
+            (&b"short line\n"[..], vec!["short line".to_string()])
+        );
+        // four lines, the second chunk splitting the end marker
+        let (_, turns) = c.feed(b"\x1b[200~a\nb\n\nd\x1b[20");
+        assert!(turns.is_empty());
+        let (log, turns) = c.feed(b"1~ Act on it.\n");
+        assert_eq!(
+            turns,
+            vec!["\n\n<pasted_content id=\"7901\">\na\nb\n\nd\n</pasted_content id=\"7901\">\n\n Act on it.".to_string()]
+        );
+        assert_eq!(log, b" Act on it.\n".to_vec());
+        // three lines arrive as typed; a lone Enter submits nothing
+        let (_, turns) = c.feed(b"\x1b[200~x\ny\nz\x1b[201~\n\n");
+        assert_eq!(turns, vec!["x\ny\nz".to_string()]);
+        // one line over 800 characters is wrapped; 800 is not
+        let long = "y".repeat(801);
+        let (_, turns) = c.feed(format!("\x1b[200~{long}\x1b[201~\r").as_bytes());
+        assert!(
+            turns[0].starts_with("\n\n<pasted_content id=\"7902\">\ny"),
+            "{turns:?}"
+        );
+        let (_, turns) = c.feed(format!("\x1b[200~{}\x1b[201~\n", &long[1..]).as_bytes());
+        assert_eq!(turns, vec![long[1..].to_string()]);
+    }
+
+    /// `scripts/verify-claude.sh` types the lead by hand, as `send_text`
+    /// does (#279): the two must not drift apart.
+    #[test]
+    fn verify_claude_types_the_runners_lead() {
+        let script = include_str!("../../../../scripts/verify-claude.sh");
+        let line = format!("LEAD=\"{}\"", balerix_api::PASTE_LEAD);
+        assert!(script.contains(&line), "{line}");
+    }
+
+    #[test]
+    fn wrap_pastes_is_the_fakes_own_flag_and_the_rest_is_recorded() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from([
+            "balerix",
+            "dev",
+            "fake-claude",
+            "--wrap-pastes",
+            "--verbose",
+            "--continue",
+        ])
+        .unwrap();
+        let crate::cli::Command::Dev {
+            command: crate::cli::DevCommand::FakeClaude(args),
+        } = cli.command
+        else {
+            panic!("not fake-claude");
+        };
+        assert!(args.wrap_pastes);
+        assert_eq!(args.rest, ["--verbose", "--continue"]);
+    }
+
     #[test]
     fn fake_claude_runs_command_hooks_posts_three_http_hooks_records_replies_and_reads_stdin() {
         let (url, seen) = stub_server_n(3, "200 OK", "{\"ok\":true}");
@@ -537,6 +739,7 @@ mod tests {
             &home,
             &["--verbose".into(), "--continue".into()],
             std::io::Cursor::new("hello there\nsecond line\n"),
+            false,
         )
         .unwrap();
 

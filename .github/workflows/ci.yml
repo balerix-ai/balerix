@@ -4,6 +4,12 @@ on:
   pull_request:
   schedule:
     - cron: "17 3 * * *"   # nightly tier
+# A new push to a pull request cancels that pull request's older runs; on
+# main, the nightly and a dispatch the group is the run's own id, so those
+# runs never cancel (or, pending, replace) one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 permissions:
   contents: read
 env:

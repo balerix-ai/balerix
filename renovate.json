@@ -10,6 +10,14 @@
       "rangeStrategy": "bump"
     },
     {
+      "description": "Cargo patch updates: one pull request per cargo project, so a round of crate patches is one serial CI cycle per project rather than one per crate",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["patch"],
+      "groupName": "cargo patch updates",
+      "additionalBranchPrefix": "{{#if parentDir}}{{parentDir}}-{{/if}}",
+      "commitMessageSuffix": "({{#if packageFileDir}}{{packageFileDir}}{{else}}core{{/if}})"
+    },
+    {
       "description": "A unit's base image ships only in a release, so its updates take a releasable type (docs/RELEASING.md)",
       "matchManagers": ["dockerfile"],
       "matchFileNames": ["docker/**"],

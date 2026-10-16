@@ -99,12 +99,12 @@ jobs:
         with:
           unit: ${{ matrix.unit }}
           target: ${{ matrix.target }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: archive-${{ matrix.unit }}-${{ matrix.arch }}
           path: ${{ steps.build.outputs.dist }}/*.tar.gz
           if-no-files-found: error
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binary-${{ matrix.unit }}-${{ matrix.arch }}
           path: |
@@ -165,7 +165,7 @@ jobs:
           UNIT: ${{ matrix.unit }}
         run: mise x -- scripts/release/save-images.sh "$UNIT" "$RUNNER_TEMP/images"
       - if: ${{ inputs.dry-run && matrix.arch == 'amd64' && needs.plan.outputs.charts == 'true' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{ matrix.unit }}-amd64
           path: ${{ runner.temp }}/images/${{ matrix.unit }}.tar.gz
@@ -174,7 +174,7 @@ jobs:
           compression-level: 0
           retention-days: 1
       - if: ${{ !inputs.dry-run }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digest-${{ matrix.unit }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests
@@ -258,7 +258,7 @@ jobs:
       - env:
           UNIT: ${{ matrix.unit }}
         run: mise x -- scripts/release/package.sh "$UNIT" "$RUNNER_TEMP/dist" "$RUNNER_TEMP/package"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: package-${{ matrix.unit }}
           path: ${{ runner.temp }}/package/*.tar.gz
@@ -356,7 +356,7 @@ jobs:
         run: mise x helm@4.3.0 -- scripts/release/package-charts.sh "$RUNNER_TEMP/charts"
       # Uploaded before any step runs cargo-built code, which could
       # otherwise tamper with the archives on disk.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: archive-charts-helm
           path: ${{ runner.temp }}/charts/*.tgz

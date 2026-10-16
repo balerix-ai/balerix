@@ -4,6 +4,10 @@ name: pr-title
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+# Superseded pull request runs are cancelled (see ci.yml).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 permissions: {}
 jobs:
   conventional:

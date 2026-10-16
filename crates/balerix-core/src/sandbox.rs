@@ -459,6 +459,10 @@ mod tests {
                 "platform_overrides.linux.environment",
             ),
             (
+                json!({ "platform_overrides": { "linux": { "meta": {} } } }),
+                "platform_overrides.linux.meta",
+            ),
+            (
                 json!({ "platform_overrides": { "linux": { "platform_overrides": {} } } }),
                 "platform_overrides.linux.platform_overrides",
             ),

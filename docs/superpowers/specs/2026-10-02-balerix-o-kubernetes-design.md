@@ -2822,7 +2822,12 @@ rule, and two fixes that go with it.
   object (`<why>`): it is left alone; rename this object, or remove that
   one". Where the owner has no `Ready` of its own to say it in, its
   readiness condition names the object. The reconcile fails with
-  `Error::Conflict` and `error_policy` backs it off.
+  `Error::Conflict`, which `error_policy` neither counts nor backs off: it
+  requeues at `fleet_period`, as a Plugin's `Conflict` does. The other
+  object is not the owner's, so no watch maps its removal to the owner;
+  the poll is what reconciles promptly once it is removed. Counted, the
+  reconciles the owner's own status writes set off had grown the backoff
+  to 40 s or 80 s within a second of the first `Conflict`.
 - **In a cleanup** an Agent's Pod or claim by name that is not its own
   counts as absent: the Agent's own cannot exist beside it, and the
   deletion must not wait on someone else's object. A harvest or cleanup

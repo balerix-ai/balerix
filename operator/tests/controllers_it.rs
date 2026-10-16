@@ -3329,12 +3329,13 @@ async fn an_object_with_the_right_name_but_foreign_labels_is_left_alone() {
         secret.metadata.resource_version
     );
 
-    // once it is gone the Fleet mints its own
+    // once it is gone the Fleet mints its own, at its next poll (a
+    // `fleet_period` of 1 s here), not after a growing backoff
     secrets
         .delete("f-c-b-token", &DeleteParams::default())
         .await
         .unwrap();
-    let put = wait_for("a PUT", Duration::from_secs(60), || async {
+    let put = wait_for("a PUT", Duration::from_secs(10), || async {
         stub.puts().into_iter().next()
     })
     .await;

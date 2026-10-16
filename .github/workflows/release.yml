@@ -139,7 +139,7 @@ jobs:
           install: false
           cache: false
       - run: mise install rust jq hadolint trivy
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: binary-${{ matrix.unit }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/dist
@@ -205,7 +205,7 @@ jobs:
           install: false
           cache: false
       - run: mise install rust jq cosign
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: digest-${{ matrix.unit }}-*
           merge-multiple: true
@@ -250,7 +250,7 @@ jobs:
           install: false
           cache: false
       - run: mise install rust jq
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: archive-${{ matrix.unit }}-*
           merge-multiple: true
@@ -321,7 +321,7 @@ jobs:
       # finds none. The next step runs even if this one fails, and fails the
       # job with what to do.
       - if: steps.pins.outputs.moved == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: image-*-amd64
           merge-multiple: true
@@ -395,7 +395,7 @@ jobs:
           install: false
           cache: false
       - run: mise install jq cosign helm@4.3.0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: archive-charts-helm
           path: ${{ runner.temp }}/charts
@@ -520,13 +520,13 @@ jobs:
           cache: false
       - run: mise install rust jq gh
       - if: ${{ !contains(fromJSON(needs.plan.outputs.crates), matrix.unit) || matrix.unit == 'core' }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: archive-${{ matrix.unit }}-*
           merge-multiple: true
           path: ${{ runner.temp }}/assets
       - if: ${{ contains(fromJSON(needs.plan.outputs.plugins), matrix.unit) }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: package-${{ matrix.unit }}
           path: ${{ runner.temp }}/assets
@@ -582,7 +582,7 @@ jobs:
           install: false
           cache: false
       - run: mise install jq helm@4.3.0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: archive-charts-helm
           path: ${{ runner.temp }}/charts

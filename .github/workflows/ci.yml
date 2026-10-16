@@ -11,6 +11,9 @@ env:
   # (two cargo: tools build from source); each job installs only what it needs.
   MISE_AUTO_INSTALL: "false"
 jobs:
+  # On a pull request each job's `changes` step (scripts/ci-affected.sh)
+  # skips the rest of its steps when nothing the job depends on changed;
+  # the job still reports, so it can be a required check.
   # check runs the core workspace, e2e included; BALERIX_REQUIRE_TOOLS makes a missing tool fail.
   check:
     runs-on: ubuntu-latest
@@ -22,11 +25,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: scripts/ci-affected.sh check
+      - if: steps.changes.outputs.run == 'true'
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with: { version: 2026.9.2, install: false, cache: true }
-      - run: mise install rust cargo:cargo-nextest cargo-insta tmux nono gh gitleaks zizmor actionlint shellcheck hadolint
+      - if: steps.changes.outputs.run == 'true'
+        run: mise install rust cargo:cargo-nextest cargo-insta tmux nono gh gitleaks zizmor actionlint shellcheck hadolint
       # nono's pathname mediation needs ptrace_scope below 2; shown for a failed Mediate test
-      - run: cat /proc/sys/kernel/yama/ptrace_scope || echo unavailable
+      - if: steps.changes.outputs.run == 'true'
+        run: cat /proc/sys/kernel/yama/ptrace_scope || echo unavailable
       # The core workspace, plus the two plugin projects `check` builds for
       # the e2e (`package-plugins flow web`) — without them here, 180 and 179
       # packages compile cold on every run and are thrown away. They share
@@ -37,13 +48,15 @@ jobs:
       # the core target cache too; both move rarely, and matrix — the
       # expensive project, and what Spec H §7's promise is really about —
       # stays fully independent either way.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - if: steps.changes.outputs.run == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             . -> target
             plugins/flow -> target
             plugins/web -> target
-      - run: mise run check
+      - if: steps.changes.outputs.run == 'true'
+        run: mise run check
   # Each plugin is a standalone project with its own lockfile (Spec H), so
   # each gets its own job and its own cache. They run concurrently with
   # `check`, which no longer lints or tests any of them (it still builds
@@ -67,16 +80,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: scripts/ci-affected.sh plugin-${{ matrix.plugin }}
+      - if: steps.changes.outputs.run == 'true'
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with: { version: 2026.9.2, install: false, cache: true }
-      - run: mise install rust cargo:cargo-nextest node
+      - if: steps.changes.outputs.run == 'true'
+        run: mise install rust cargo:cargo-nextest node
       # One cache per plugin project: each has its own lockfile and its own
       # target directory under plugins/<name>/target (scripts/plugin.sh).
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - if: steps.changes.outputs.run == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "plugins/${{ matrix.plugin }} -> target"
           key: ${{ matrix.plugin }}
-      - run: mise run plugin ${{ matrix.plugin }}
+      - if: steps.changes.outputs.run == 'true'
+        run: mise run plugin ${{ matrix.plugin }}
   # The agent project (Spec O §12) is standalone like a plugin, with one
   # difference: its two-process tests run the core `balerix` binary, so
   # the job carries the core target cache too and the real tools.
@@ -88,16 +110,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: scripts/ci-affected.sh agent
+      - if: steps.changes.outputs.run == 'true'
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with: { version: 2026.9.2, install: false, cache: true }
-      - run: mise install rust cargo:cargo-nextest tmux nono gh
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - if: steps.changes.outputs.run == 'true'
+        run: mise install rust cargo:cargo-nextest tmux nono gh
+      - if: steps.changes.outputs.run == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             . -> target
             agent -> target
           key: agent
-      - run: mise run agent
+      - if: steps.changes.outputs.run == 'true'
+        run: mise run agent
   # The operator project (Spec O §12): standalone like the agent, and like it runs the core balerix binary in one test.
   operator:
     runs-on: ubuntu-latest
@@ -107,18 +138,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: scripts/ci-affected.sh operator
+      - if: steps.changes.outputs.run == 'true'
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with: { version: 2026.9.2, install: false, cache: true }
       # the envtest binaries are the operator task's own tool, which
       # MISE_AUTO_INSTALL=false never installs on its own
-      - run: mise install rust cargo:cargo-nextest tmux nono gh github:kubernetes-sigs/controller-tools@envtest-v1.34.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - if: steps.changes.outputs.run == 'true'
+        run: mise install rust cargo:cargo-nextest tmux nono gh github:kubernetes-sigs/controller-tools@envtest-v1.34.1
+      - if: steps.changes.outputs.run == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             . -> target
             operator -> target
           key: operator
-      - run: mise run operator
+      - if: steps.changes.outputs.run == 'true'
+        run: mise run operator
   # The charts (Spec O §24.3): helm lint, renderings asserted and dry-run
   # applied on the envtest API server, the controllers as the chart's
   # service account. Path-filtered on pull requests.
@@ -135,14 +175,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
-        run: |
-          if [[ $EVENT != pull_request ]]; then echo run=true >>"$GITHUB_OUTPUT"; exit 0; fi
-          git fetch -q --depth=1 origin "$BASE"
-          if git diff --name-only "$BASE" HEAD | grep -qE '^(charts/|operator/|plugins/|scripts/operator\.sh|scripts/kind-up\.sh|mise\.toml|\.github/workflows/ci\.yml)'; then
-            echo run=true >>"$GITHUB_OUTPUT"
-          else
-            echo "nothing the charts depend on changed"; echo run=false >>"$GITHUB_OUTPUT"
-          fi
+        run: scripts/ci-affected.sh charts
       - if: steps.changes.outputs.run == 'true'
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with: { version: 2026.9.2, install: false, cache: true }
@@ -172,14 +205,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
-        run: |
-          if [[ $EVENT != pull_request ]]; then echo run=true >>"$GITHUB_OUTPUT"; exit 0; fi
-          git fetch -q --depth=1 origin "$BASE"
-          if git diff --name-only "$BASE" HEAD | grep -qE '^(charts/|operator/|agent/|crates/|plugins/|docker/|scripts/kind-up\.sh|scripts/operator\.sh|scripts/release/(image-context|build|lib)\.sh|mise\.toml|Cargo\.(toml|lock)|\.github/workflows/ci\.yml)'; then
-            echo run=true >>"$GITHUB_OUTPUT"
-          else
-            echo "nothing e2e-k8s depends on changed"; echo run=false >>"$GITHUB_OUTPUT"
-          fi
+        run: scripts/ci-affected.sh e2e-k8s
       - if: steps.changes.outputs.run == 'true'
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with: { version: 2026.9.2, install: false, cache: true }

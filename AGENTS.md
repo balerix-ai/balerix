@@ -136,6 +136,10 @@ credentials, hook input, or sandbox rules.
   project that uses them: a core dependency in the root
   `[workspace.dependencies]`, a plugin dependency in that plugin's own
   manifest. Exact version either way, and say why in the commit.
+- On a pull request each `ci.yml` job runs only when a path in its entry in
+  `scripts/ci-affected.sh` changed. A new path dependency, or a file a test
+  reads from outside its own project, goes into that entry too, or the job
+  skips a pull request that breaks it.
 - An agent's and a plugin's `launch.sh` start under `balerix
   agent-supervise` (Spec N amendment §13, #119). `balerix-runtime`'s test
   support fills the `balerix` tool slot with the test executable, so a

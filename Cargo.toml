@@ -78,7 +78,7 @@ rustix = { version = "1.1.4", default-features = false, features = ["std", "proc
 # `balerix sandbox-exec`'s seccomp filter (Linux only): no Unix socket
 # creation for a sandboxed process.
 seccompiler = "0.5.0"
-libc = "0.2.189"
+libc = "0.2.190"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

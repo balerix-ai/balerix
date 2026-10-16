@@ -31,66 +31,66 @@ balerix-api = { path = "../crates/balerix-api" }
 balerix-core = { path = "../crates/balerix-core" }
 balerix-config = { path = "../crates/balerix-config" }
 # Error context on the entrypoint's failures.
-anyhow = "1.0.104"
+anyhow = "=1.0.104"
 # The command line: `crds` and `run`; `env` for `--namespace`'s POD_NAMESPACE.
-clap = { version = "4.6.6", features = ["derive", "env"] }
+clap = { version = "=4.6.7", features = ["derive", "env"] }
 # The client, the controller runtime and the derive. `rustls-tls` + `ring`
 # is kube 4.2's default TLS stack, on the provider the Daemon client uses.
-kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ring"] }
+kube = { version = "=4.2.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ring"] }
 # The controllers' watch client (`watch_client`, hyper#4207): kube's own
 # connector stack over a hyper-util client that pools nothing. The versions
 # kube 4.2 already locks.
-hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
-hyper-timeout = "0.5.2"
-hyper = { version = "1.11.1", default-features = false }
-tower-http = { version = "0.6.11", default-features = false, features = ["trace"] }
-tower = { version = "0.5.3", default-features = false, features = ["retry", "timeout", "util"] }
+hyper-util = { version = "=0.1.21", features = ["client-legacy", "http1", "tokio"] }
+hyper-timeout = "=0.5.2"
+hyper = { version = "=1.11.1", default-features = false }
+tower-http = { version = "=0.6.11", default-features = false, features = ["trace"] }
+tower = { version = "=0.5.3", default-features = false, features = ["retry", "timeout", "util"] }
 # The controllers' streams: `for_each` over a Controller's results.
-futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 # The controllers' logs: namespace, name, reason; never a token.
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 # Typed Pods, Jobs, claims and policies. `v1_32` is the oldest API this
 # release offers; `schemars` so `Condition` can sit in a status schema.
-k8s-openapi = { version = "0.28.0", features = ["v1_32", "schemars"] }
+k8s-openapi = { version = "=0.28.0", features = ["v1_32", "schemars"] }
 # The kinds' OpenAPI schemas; the version kube 4.2 derives against.
-schemars = "1.2.2"
+schemars = "=1.2.2"
 # The kinds' spec and status types, and the opaque JSON layers in them.
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
 # The generated CRD files, in the YAML crate the core already uses.
-serde_norway = "0.9.42"
+serde_norway = "=0.9.42"
 # Typed errors for the library modules.
-thiserror = "2.0.20"
+thiserror = "=2.0.21"
 # specHash and the Jobs' input hash.
-sha2 = "0.11.0"
-hex = "0.4.3"
+sha2 = "=0.11.0"
+hex = "=0.4.3"
 # Tokens (agent, admin): 32 random bytes, as the daemon's vault mints them.
-rand = "0.10.2"
+rand = "=0.10.3"
 # The per-Daemon authority and serving certificates (Spec O §10.3).
-rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "ring"] }
 # rcgen's validity dates.
-time = "0.3.55"
+time = "=0.3.55"
 # The Daemon admin API over TLS from the Daemon's own authority (§10.3):
 # rustls with no provider of its own, ring below. The same stack as agent/.
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pki-types = { version = "1.15.1", features = ["std"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "=1.15.1", features = ["std"] }
 # The controllers' runtime, SIGTERM, the record cache's locks, the
 # envtest harness's child processes in tests.
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync", "process"] }
+tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync", "process"] }
 
 [dev-dependencies]
 # every `desired` function is pinned by a YAML snapshot (Spec O §15)
-insta = { version = "1.49.0", features = ["yaml"] }
+insta = { version = "=1.49.0", features = ["yaml"] }
 # a Fleet's spec resolves as the same content does as a file (§15)
-proptest = "1.11.0"
+proptest = "=1.11.0"
 # the stub Daemon the client tests talk to
-axum = "0.8.9"
+axum = "=0.8.9"
 # the envtest harness's raw `GET /readyz` through the kube client
 # (`Client::request_text` takes an `http::Request`); the version kube 4.2
 # already locks
-http = "1.5.0"
+http = "=1.5.0"
 
 [lints.rust]
 unsafe_code = "forbid"

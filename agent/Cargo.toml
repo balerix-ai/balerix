@@ -29,36 +29,36 @@ balerix-api = { path = "../crates/balerix-api", features = ["axum"] }
 balerix-core = { path = "../crates/balerix-core" }
 balerix-runtime = { path = "../crates/balerix-runtime" }
 # Error context on the entrypoints' failures, printed as the exit reason.
-anyhow = "1.0.104"
+anyhow = "=1.0.104"
 # The command line: `sidecar` and `run` with the pod's mount defaults.
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "=4.6.7", features = ["derive"] }
 # The agent bundle (Spec O §5.4) and the link's frames (§7.2).
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
 # `run`'s signal wait; the sidecar's listener, link and forwarder.
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "fs"] }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "fs"] }
 # The hook listener on 127.0.0.1 (§7.1): plain HTTP, as the daemon's own
 # ingress is on one machine. `ws` for the tests' fake Daemon.
-axum = { version = "0.8.9", features = ["ws"] }
+axum = { version = "=0.8.9", features = ["ws"] }
 # The hook forwarder to the Daemon (§7.1) over TLS from the mounted
 # authority (§10.3): rustls with no provider of its own, ring below.
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pki-types = { version = "1.15.1", features = ["std"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "=1.15.1", features = ["std"] }
 # The link (§7.2). `rustls-tls-webpki-roots` is the feature that enables
 # `Connector::Rustls`; the bundled roots go unused, since the Daemon's
 # authority is the only one trusted.
-tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
-futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "=0.30.0", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"] }
 # Structured logs on stderr, the container's log stream.
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 # a throwaway authority for the two-process TLS test
-rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "ring"] }
 # a scratch directory for the CLI tests' termination log
-tempfile = "3.27.0"
+tempfile = "=3.27.0"
 
 [lints.rust]
 unsafe_code = "forbid"

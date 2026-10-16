@@ -15,6 +15,17 @@
       "matchFileNames": ["docker/**"],
       "semanticCommitType": "fix",
       "semanticCommitScope": "deps"
+    },
+    {
+      "description": "Patch and digest updates merge themselves once required checks pass",
+      "matchUpdateTypes": ["patch", "digest"],
+      "automerge": true
+    },
+    {
+      "description": "Never automerge what reaches agents or the sandbox: a claude bump needs `mise run verify-claude` and `verify-questions` by hand (AGENTS.md), gh and claude are inherited by agents, nono is the sandbox",
+      "matchManagers": ["mise"],
+      "matchDepNames": ["claude", "gh", "nono"],
+      "automerge": false
     }
   ]
 }

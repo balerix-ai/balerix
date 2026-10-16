@@ -5,6 +5,11 @@
   "rangeStrategy": "pin",
   "packageRules": [
     {
+      "description": "Cargo: rewrite the full version in each manifest rather than add `=` pins, which would bind users of the published crates (balerix-api, balerix-plugin-sdk, plugins/common) to exact versions; the lockfiles already pin",
+      "matchManagers": ["cargo"],
+      "rangeStrategy": "bump"
+    },
+    {
       "description": "A unit's base image ships only in a release, so its updates take a releasable type (docs/RELEASING.md)",
       "matchManagers": ["dockerfile"],
       "matchFileNames": ["docker/**"],

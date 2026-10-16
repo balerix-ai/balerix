@@ -106,7 +106,8 @@ pub enum Error {
     #[error("{0}")]
     Missing(String),
     /// An object found by name that is not the reconciled object's (§26):
-    /// left alone, said in a `Conflict` condition, and backed off.
+    /// left alone, said in a `Conflict` condition, and polled at
+    /// `fleet_period` (`error_policy`).
     #[error("{0}")]
     Conflict(String),
     /// A cleanup that is not finished: requeued in 2 s, not an error.
@@ -519,14 +520,24 @@ pub fn reconciled<K: Resource>(ctx: &Context, object: &K) {
         .remove(&object_key(object));
 }
 
-/// The requeue after a failed reconcile: `Waiting` in 2 s, `TimedOut` per
-/// §22.2, anything else by `backoff`.
+/// The requeue after a failed reconcile: `Waiting` in 2 s, a `Conflict`
+/// at `fleet_period`, `TimedOut` per §22.2, anything else by `backoff`.
 pub fn error_policy<K: Resource>(object: Arc<K>, error: &Error, ctx: Arc<Context>) -> Action {
     let key = object_key(object.as_ref());
     let (namespace, name) = (object.namespace().unwrap_or_default(), object.name_any());
     if let Error::Waiting(why) = error {
         tracing::debug!(namespace = %namespace, name = %name, "{why}");
         return Action::requeue(Duration::from_secs(2));
+    }
+    // A `Conflict` lasts until the other object is removed; it is not a
+    // failure to back off. No watch maps that object (it is not ours) to
+    // this one, so the status poll, as for a Plugin's `Conflict`, is what
+    // reconciles promptly once it is removed. Counted, the reconciles this
+    // object's own status writes set off grew the backoff to minutes.
+    if let Error::Conflict(why) = error {
+        tracing::debug!(namespace = %namespace, name = %name, "{why}");
+        reconciled(&ctx, object.as_ref());
+        return Action::requeue(ctx.run.fleet_period);
     }
     // `within` counted it: the first ones are lost requests, not the object
     if let Error::TimedOut(_) = error {
@@ -723,6 +734,26 @@ mod tests {
         let lost = std::future::pending::<Result<Action, Error>>();
         let error = within(limit, object(), &ctx, lost).await.unwrap_err();
         assert_eq!(error_policy(object(), &error, ctx), secs(2));
+    }
+
+    #[tokio::test]
+    async fn a_conflict_is_polled_at_the_fleet_period_however_often_it_repeats() {
+        let ctx = context();
+        let period = ctx.run.fleet_period;
+        let conflict = Error::Conflict("Secret s exists and was not made for this object".into());
+        // reconciles the object's own writes set off count for nothing
+        for _ in 0..6 {
+            assert_eq!(
+                error_policy(object(), &conflict, ctx.clone()),
+                Action::requeue(period)
+            );
+        }
+        // and leave no count behind: a failure after it is the first
+        let failed = Error::Missing("Daemon d does not exist".into());
+        assert_eq!(
+            error_policy(object(), &failed, ctx),
+            Action::requeue(Duration::from_secs(5))
+        );
     }
 
     #[test]

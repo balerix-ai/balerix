@@ -28,7 +28,10 @@ case "$1" in
     (cd "$repo" && cargo build -q -p balerix)
     export BALERIX_BIN="${CARGO_TARGET_DIR:-$repo/target}/debug/balerix"
     CARGO_TARGET_DIR="$target" cargo fmt --manifest-path "$dir/Cargo.toml" --all --check
-    CARGO_TARGET_DIR="$target" cargo clippy --manifest-path "$dir/Cargo.toml" --all-targets -- -D warnings
+    # --locked: a lockfile that no longer satisfies the manifests (this
+    # project's, or a core or common crate's it builds by path) fails here,
+    # not first in an image build
+    CARGO_TARGET_DIR="$target" cargo clippy --locked --manifest-path "$dir/Cargo.toml" --all-targets -- -D warnings
     # the envtest binaries the task pins; the harness skips (fails under
     # BALERIX_REQUIRE_TOOLS=1) without them
     if command -v kube-apiserver >/dev/null; then

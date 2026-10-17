@@ -26,7 +26,10 @@ case "$1" in
     (cd "$repo" && cargo build -q -p balerix)
     export BALERIX_BIN="${CARGO_TARGET_DIR:-$repo/target}/debug/balerix"
     CARGO_TARGET_DIR="$target" cargo fmt --manifest-path "$dir/Cargo.toml" --all --check
-    CARGO_TARGET_DIR="$target" cargo clippy --manifest-path "$dir/Cargo.toml" --all-targets -- -D warnings
+    # --locked: a lockfile that no longer satisfies the manifests (this
+    # project's, or a core or common crate's it builds by path) fails here,
+    # not first in an image build
+    CARGO_TARGET_DIR="$target" cargo clippy --locked --manifest-path "$dir/Cargo.toml" --all-targets -- -D warnings
     CARGO_TARGET_DIR="$target" cargo nextest run \
       --config-file "$repo/.config/nextest.toml" \
       --manifest-path "$dir/Cargo.toml"

@@ -49,7 +49,10 @@ case "$cmd" in
   check)
     version_check
     CARGO_TARGET_DIR="$target" cargo fmt --manifest-path "$dir/Cargo.toml" --all --check
-    CARGO_TARGET_DIR="$target" cargo clippy --manifest-path "$dir/Cargo.toml" --all-targets -- -D warnings
+    # --locked: a lockfile that no longer satisfies the manifests (this
+    # project's, or a core or common crate's it builds by path) fails here,
+    # not first in an image build
+    CARGO_TARGET_DIR="$target" cargo clippy --locked --manifest-path "$dir/Cargo.toml" --all-targets -- -D warnings
     # nextest resolves .config/nextest.toml from the workspace root, and each
     # plugin is now its own root: without --config-file the plugin tiers would
     # run under stock defaults, with no slow-timeout to kill a hung test.

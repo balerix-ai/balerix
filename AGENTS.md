@@ -140,6 +140,9 @@ credentials, hook input, or sandbox rules.
   `scripts/ci-affected.sh` changed. A new path dependency, or a file a test
   reads from outside its own project, goes into that entry too, or the job
   skips a pull request that breaks it.
+- A workflow never writes a tool's version: it installs and runs a task's
+  tools with `scripts/task-tools.sh` (`install`, `exec`), which reads them
+  from `mise.toml`, the one place Renovate moves them.
 - An agent's and a plugin's `launch.sh` start under `balerix
   agent-supervise` (Spec N amendment §13, #119). `balerix-runtime`'s test
   support fills the `balerix` tool slot with the test executable, so a

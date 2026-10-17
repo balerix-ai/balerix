@@ -56,7 +56,7 @@ run = [
   "cargo package --no-verify --allow-dirty --manifest-path plugins/common/Cargo.toml --config 'patch.crates-io.balerix-api.path=\"crates/balerix-api\"' --config 'patch.crates-io.balerix-plugin-sdk.path=\"crates/balerix-plugin-sdk\"'",
   "actionlint",
   "zizmor --offline --min-severity medium .github",
-  "shellcheck -x scripts/release/*.sh scripts/ci-affected.sh",
+  "shellcheck -x scripts/release/*.sh scripts/ci-affected.sh scripts/task-tools.sh",
   # every Dockerfile, the two images `build-image` never builds included
   # (docker/operator, docker/agent: Spec O §21.6)
   "hadolint docker/*/Dockerfile",

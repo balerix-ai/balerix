@@ -85,7 +85,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # dev
 insta = { version = "1.49.0", features = ["yaml", "json"] }
 proptest = "1.11.0"
-proptest-state-machine = "0.8.0"
+proptest-state-machine = "0.9.0"
 tempfile = "3.27.0"
 # a throwaway authority and a leaf for 127.0.0.1 in the TLS tests
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }

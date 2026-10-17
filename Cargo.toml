@@ -47,7 +47,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 # dependencies now: the proxy is a plain reverse proxy on hyper's legacy
 # client (upgrades passed through as bytes), and the SDK's stream clients
 # need Sink/Stream adaptors.
-hyper = { version = "1.11.1", features = ["http1", "client"] }
+hyper = { version = "1.12.0", features = ["http1", "client"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 # The WebSocket client for the SDK and the tests. `rustls-tls-webpki-roots`

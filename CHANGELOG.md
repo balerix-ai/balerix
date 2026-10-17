@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.3.0 - 2026-10-17
+
+### Features
+
+- **operator:** Purge a deleted Fleet's Daemon record on balerix.ai/purge (#135) (#238)
+- **api:** [**breaking**] Non-exhaustive plugin-read types; WorkspaceTree.truncated (#240) (#266)
+- Channel text hardening, an idle-only nudge, and a slash-command allowlist (#268)
+- Report missed hook events to plugins; reset turn tracking on re-activation (#274)
+
+### Bug fixes
+
+- Workspace reader — single-flight version, diff in two sandbox starts (#185, #186) (#212)
+- **core:** Hold fleet sandbox blocks to an allowlist and off balerix's paths (#187, #183) (#216)
+- Write_atomic temp names per call; operator NetworkPolicy test race (#21, #215) (#219)
+- **runtime:** Bound the workspace reader's sandbox starts (#213, #214) (#220)
+- **runtime:** Start plugins under the supervisor, so stop ends their whole tree (#119) (#237)
+- **operator:** Replace ended agent pods, freeze Fleet.spec.daemon, keep Job attempt counts (#234, #235, #236) (#241)
+- Kubernetes link and attach limits, silence deadlines, workspace reply caps (#229, #230, #231) (#244)
+- **operator:** Verify ownership of objects found by name; keep harvest and cleanup under foreground deletion (#232, #233) (#249)
+- **web:** Review page sweep fixes; bound SDK handshakes; strip control characters from sent text (#225, #226, #227, #228) (#242)
+- **server:** Plugin hello, kv prefixes and metric names (#222, #223, #224) (#243)
+- Attach writes see a viewer leave and end on a stall; sidecar side tested (#245) (#250)
+- **operator:** Harvest the old branch and re-clone when an Agent's branch changes (#128) (#252)
+- **runtime:** Refresh a new clone's index once the checkout's second has passed (#253) (#263)
+- **runtime:** Write agent and plugin homes without following links (#264)
+- **server:** Scope each browser session to its own mount path; Kubernetes login URLs; CLAUDE_CONFIG_DIR (#265)
+- **runtime:** Run every tool install under the sandbox (#269)
+- Make Claude act on pasted plugin messages; confirm wrapped deliveries (#279) (#282)
+- **deps:** Rustls 0.23.46 and quinn-proto 0.11.19 for RUSTSEC advisories (#284)
+- **operator:** Reconcile promptly once a conflicting object is removed (#286)
+- **deps:** Update debian:trixie-slim docker digest to a29215f (#289)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to e2e927e (#293)
+- **deps:** Update cargo patch updates (operator) (#319)
+- **deps:** Update cargo patch updates (agent) (#318)
+- **deps:** Update rust crate tower-http to 0.7.1 (#332)
+
 ### Upgrading
 
 - A fleet's `sandbox` block (fleet, crew and agent `defaults`, a plugin

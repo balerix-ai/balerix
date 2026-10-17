@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.0 - 2026-10-17
+
+### Features
+
+- **api:** [**breaking**] Non-exhaustive plugin-read types; WorkspaceTree.truncated (#240) (#266)
+- Channel text hardening, an idle-only nudge, and a slash-command allowlist (#268)
+- Report missed hook events to plugins; reset turn tracking on re-activation (#274)
+
+### Bug fixes
+
+- Kubernetes link and attach limits, silence deadlines, workspace reply caps (#229, #230, #231) (#244)
+- **web:** Review page sweep fixes; bound SDK handshakes; strip control characters from sent text (#225, #226, #227, #228) (#242)
+- **server:** Plugin hello, kv prefixes and metric names (#222, #223, #224) (#243)
+- Attach writes see a viewer leave and end on a stall; sidecar side tested (#245) (#250)
+- **common:** [**breaking**] Split always ends on long fence lines; a two-lane plugin queue (#254, #260) (#273)
+- Make Claude act on pasted plugin messages; confirm wrapped deliveries (#279) (#282)
+- **deps:** Rustls 0.23.46 and quinn-proto 0.11.19 for RUSTSEC advisories (#284)
+- **deps:** Update cargo patch updates (plugins/common) (#320)
+
 ## 0.1.4 - 2026-10-10
 
 ### Bug fixes

@@ -33,10 +33,10 @@ balerix-plugin-common = { path = "../common" }
 # unconditionally, which is exactly why this project has its own lockfile.
 matrix-sdk = { version = "0.19.1", features = ["markdown", "bundled-sqlite"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 serde_path_to_error = "0.1.20"
-thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 anyhow = "1.0.104"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -50,12 +50,12 @@ axum = "0.8.9"
 insta = { version = "1.49.0", features = ["yaml", "json"] }
 # The model-based test of the key plan (Spec J §10). Same exact version as
 # the core workspace's.
-proptest = "1.11.0"
+proptest = "1.12.0"
 # `test-util` gives the actor's delivery-window tests a paused, advanceable
 # clock (`tokio::time::pause`, `tokio::time::advance`); cargo unifies it
 # into the same tokio already in `[dependencies]`, so nothing new is
 # pulled in for the built binary.
-tokio = { version = "1.53.1", features = ["test-util"] }
+tokio = { version = "1.53.3", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

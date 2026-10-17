@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.0 - 2026-10-17
+
+### Features
+
+- **operator:** Purge a deleted Fleet's Daemon record on balerix.ai/purge (#135) (#238)
+
+### Bug fixes
+
+- **operator:** Replace ended agent pods, freeze Fleet.spec.daemon, keep Job attempt counts (#234, #235, #236) (#241)
+- **operator:** Verify ownership of objects found by name; keep harvest and cleanup under foreground deletion (#232, #233) (#249)
+
+
+### Images
+
+- `balerix` 0.2.4 → 0.3.0
+- `balerix-plugin-flow` 0.1.4 → 0.2.0
+- `balerix-plugin-web` 0.2.4 → 0.3.0
+- `balerix-plugin-matrix` 0.1.4 → 0.2.0
+- `balerix-plugin-github` 0.1.2 → 0.2.0
+
 ## 0.1.3 - 2026-10-10
 
 

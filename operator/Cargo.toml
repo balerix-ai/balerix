@@ -33,7 +33,7 @@ balerix-config = { path = "../crates/balerix-config" }
 # Error context on the entrypoint's failures.
 anyhow = "1.0.104"
 # The command line: `crds` and `run`; `env` for `--namespace`'s POD_NAMESPACE.
-clap = { version = "4.6.6", features = ["derive", "env"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 # The client, the controller runtime and the derive. `rustls-tls` + `ring`
 # is kube 4.2's default TLS stack, on the provider the Daemon client uses.
 kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ring"] }

@@ -10,6 +10,12 @@
       "rangeStrategy": "bump"
     },
     {
+      "description": "Manifests other projects build by path (the core workspace for agent, operator and the plugins; common for the plugins) only move their lockfile: a raised minimum there would leave every dependent project's lockfile stale",
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["Cargo.toml", "plugins/common/Cargo.toml"],
+      "rangeStrategy": "update-lockfile"
+    },
+    {
       "description": "Cargo patch updates: one pull request per cargo project, so a round of crate patches is one serial CI cycle per project rather than one per crate",
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["patch"],

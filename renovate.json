@@ -31,6 +31,11 @@
       "semanticCommitScope": "deps"
     },
     {
+      "description": "kubectl stays on the minor of the kind node image (scripts/kind-up.sh) and envtest (Spec O §19): kubectl supports a server one minor away at most. Move all three together, by hand",
+      "matchDepNames": ["kubectl"],
+      "allowedVersions": "<1.35"
+    },
+    {
       "description": "Patch and digest updates merge themselves once required checks pass",
       "matchUpdateTypes": ["patch", "digest"],
       "automerge": true

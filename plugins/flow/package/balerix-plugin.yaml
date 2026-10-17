@@ -1,7 +1,7 @@
 apiVersion: balerix/v1
 kind: Plugin
 name: flow
-version: 0.1.4
+version: 0.2.0
 protocol: 1
 start: serve
 hooks:

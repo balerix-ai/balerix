@@ -194,7 +194,7 @@ description = "verify-matrix against a local tuwunel homeserver it starts itself
 # mise deprecates ubi in favour of `github:`, but that backend cannot unpack
 # a bare .zst (tuwunel ships no tarball), so ubi stays until 2027.1 forces
 # the move; nixpkgs has it as `matrix-tuwunel` should mise ever lose it.
-tools = { "ubi:matrix-construct/tuwunel" = { version = "1.9.3", matching_regex = "(x86_64-v1|aarch64-v8)-linux-gnu-tuwunel\\.zst$" } }
+tools = { "ubi:matrix-construct/tuwunel" = { version = "1.9.4", matching_regex = "(x86_64-v1|aarch64-v8)-linux-gnu-tuwunel\\.zst$" } }
 run = "scripts/verify-matrix-local.sh"
 
 [tasks.verify-questions]

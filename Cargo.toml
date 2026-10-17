@@ -36,7 +36,7 @@ tar = "0.4.46"
 flate2 = "1.1.10"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 axum = { version = "0.8.9", features = ["ws"] }
-ureq = { version = "3.4.1", default-features = false, features = ["json"] }
+ureq = { version = "3.4.2", default-features = false, features = ["json"] }
 # Async HTTP for the daemon → plugin calls and the plugin SDK (plugins spec
 # §16.1). Spec O §23.1: TLS, trusting one authority, for a plugin in a pod
 # and the Daemon that calls it — rustls with no provider of its own (ring

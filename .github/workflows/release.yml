@@ -34,7 +34,7 @@ jobs:
     # A real release only from main; any branch may dry-run. Every other job
     # needs plan, so all of them skip with it.
     if: ${{ github.ref == 'refs/heads/main' || inputs.dry-run }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     outputs:
@@ -183,7 +183,7 @@ jobs:
   merge-images:
     needs: [plan, images]
     if: ${{ !inputs.dry-run && needs.plan.outputs.images != '[]' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -233,7 +233,7 @@ jobs:
   package:
     needs: [plan, build]
     if: needs.plan.outputs.plugins != '[]'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     strategy:
@@ -282,7 +282,7 @@ jobs:
       && (needs.build.result == 'success' || needs.build.result == 'skipped')
       && (needs.images.result == 'success' || needs.images.result == 'skipped')
       && (needs.merge-images.result == 'success' || needs.merge-images.result == 'skipped') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     permissions:
       contents: read
@@ -380,7 +380,7 @@ jobs:
     # without !cancelled().
     needs: [plan, charts]
     if: ${{ !cancelled() && !inputs.dry-run && needs.charts.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -425,7 +425,7 @@ jobs:
       ${{ !cancelled() && needs.plan.result == 'success'
       && (needs.build.result == 'success' || needs.build.result == 'skipped')
       && needs.plan.outputs.crates != '[]' && (inputs.dry-run || github.repository != 'balerix-ai/balerix') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -461,7 +461,7 @@ jobs:
       && (needs.plan.outputs.charts != 'true' || (needs.charts.result == 'success'
         && needs.charts-publish.result == 'success'))
       && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     environment: release
     permissions:
       contents: read
@@ -502,7 +502,7 @@ jobs:
       && (needs.plan.outputs.crates == '[]' || needs.publish-crates.result == 'success'
         || needs.publish-crates-dry-run.result == 'success')
       && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
       id-token: write
@@ -556,7 +556,7 @@ jobs:
     # Step 5, after the tag: the index names the release's asset URLs.
     needs: [plan, github-release]
     if: ${{ !cancelled() && needs.github-release.result == 'success' && needs.plan.outputs.charts == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     environment: release-bot
     permissions:
       contents: read
@@ -597,7 +597,7 @@ jobs:
   charts-verify:
     needs: [plan, charts-index]
     if: ${{ !cancelled() && needs.charts-index.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
@@ -662,7 +662,7 @@ jobs:
       ${{ !cancelled() && needs.github-release.result == 'success'
       && (needs.verify-package.result == 'success' || needs.verify-package.result == 'skipped')
       && needs.plan.outputs.images != '[]' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write

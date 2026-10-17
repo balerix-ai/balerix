@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 - 2026-10-17
+
+### Bug fixes
+
+- **deps:** Update ghcr.io/balerix-ai/balerix docker tag to v0.3.0 (#337)
+
 ## 0.3.0 - 2026-10-17
 
 ### Features

@@ -1,0 +1,7 @@
+# actionlint 1.7.12 (the newest release) predates GitHub's ubuntu-26.04
+# image and rejects the label as unknown; declaring it here is actionlint's
+# own way to accept a label it does not know. Remove once actionlint ships
+# ubuntu-26.04.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

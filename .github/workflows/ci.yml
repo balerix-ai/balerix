@@ -38,7 +38,7 @@ jobs:
         run: scripts/ci-affected.sh check
       - if: steps.changes.outputs.run == 'true'
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with: { version: 2026.9.2, install: false, cache: true }
+        with: { version: 2026.10.12, install: false, cache: true }
       - if: steps.changes.outputs.run == 'true'
         run: mise install rust cargo:cargo-nextest cargo-insta tmux nono gh gitleaks zizmor actionlint shellcheck hadolint
       # nono's pathname mediation needs ptrace_scope below 2; shown for a failed Mediate test
@@ -93,7 +93,7 @@ jobs:
         run: scripts/ci-affected.sh plugin-${{ matrix.plugin }}
       - if: steps.changes.outputs.run == 'true'
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with: { version: 2026.9.2, install: false, cache: true }
+        with: { version: 2026.10.12, install: false, cache: true }
       - if: steps.changes.outputs.run == 'true'
         run: mise install rust cargo:cargo-nextest node
       # One cache per plugin project: each has its own lockfile and its own
@@ -123,7 +123,7 @@ jobs:
         run: scripts/ci-affected.sh agent
       - if: steps.changes.outputs.run == 'true'
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with: { version: 2026.9.2, install: false, cache: true }
+        with: { version: 2026.10.12, install: false, cache: true }
       - if: steps.changes.outputs.run == 'true'
         run: mise install rust cargo:cargo-nextest tmux nono gh
       - if: steps.changes.outputs.run == 'true'
@@ -151,7 +151,7 @@ jobs:
         run: scripts/ci-affected.sh operator
       - if: steps.changes.outputs.run == 'true'
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with: { version: 2026.9.2, install: false, cache: true }
+        with: { version: 2026.10.12, install: false, cache: true }
       # the envtest binaries are the operator task's own tool, which
       # MISE_AUTO_INSTALL=false never installs on its own
       - if: steps.changes.outputs.run == 'true'
@@ -184,7 +184,7 @@ jobs:
         run: scripts/ci-affected.sh charts
       - if: steps.changes.outputs.run == 'true'
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with: { version: 2026.9.2, install: false, cache: true }
+        with: { version: 2026.10.12, install: false, cache: true }
       - if: steps.changes.outputs.run == 'true'
         run: mise install rust cargo:cargo-nextest helm@4.3.0 github:kubernetes-sigs/controller-tools@envtest-v1.34.1
       - if: steps.changes.outputs.run == 'true'
@@ -214,7 +214,7 @@ jobs:
         run: scripts/ci-affected.sh e2e-k8s
       - if: steps.changes.outputs.run == 'true'
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with: { version: 2026.9.2, install: false, cache: true }
+        with: { version: 2026.10.12, install: false, cache: true }
       - if: steps.changes.outputs.run == 'true'
         run: |
           sudo apt-get update -q
@@ -258,7 +258,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with: { version: 2026.9.2, install: false, cache: true }
+        with: { version: 2026.10.12, install: false, cache: true }
       - run: mise install rust github:sourcefrog/cargo-mutants
       - run: mise run mutants
   audit:
@@ -269,7 +269,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with: { version: 2026.9.2, install: false, cache: true }
+        with: { version: 2026.10.12, install: false, cache: true }
       - run: mise install rust cargo:cargo-audit aqua:EmbarkStudios/cargo-deny
       - run: mise run audit
   # A release PR (release-pr.yml's `release/<unit>` branch) runs the audit
@@ -284,7 +284,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with: { version: 2026.9.2, install: false, cache: true }
+        with: { version: 2026.10.12, install: false, cache: true }
       - run: mise install rust cargo:cargo-audit aqua:EmbarkStudios/cargo-deny
       - env:
           HEAD: ${{ github.head_ref }}

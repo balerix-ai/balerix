@@ -64,8 +64,9 @@ async fn run(args: RunArgs) -> Result<()> {
     let config = kube::Config::infer()
         .await
         .context("cannot connect to the cluster (KUBECONFIG, or in-cluster)")?;
-    let watches = balerix_operator::watch_client::watch_client(config.clone())
-        .context("cannot build the watch client")?;
+    // kube's own client, unbounded: `request_client`'s bound would cut a watch
+    let watches =
+        kube::Client::try_from(config.clone()).context("cannot build the watch client")?;
     let client = balerix_operator::request_client::request_client(config)
         .context("cannot build the client")?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())

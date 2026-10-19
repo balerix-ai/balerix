@@ -36,7 +36,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 # `run`'s signal wait; the sidecar's listener, link and forwarder.
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "fs"] }
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "fs"] }
 # The hook listener on 127.0.0.1 (§7.1): plain HTTP, as the daemon's own
 # ingress is on one machine. `ws` for the tests' fake Daemon.
 axum = { version = "0.8.9", features = ["ws"] }

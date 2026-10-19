@@ -76,7 +76,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 # The controllers' runtime, SIGTERM, the record cache's locks, the
 # envtest harness's child processes in tests.
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync", "process"] }
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync", "process"] }
 
 [dev-dependencies]
 # every `desired` function is pinned by a YAML snapshot (Spec O §15)

@@ -588,8 +588,8 @@ where
 }
 
 /// The controllers, one set per watched namespace, until the future is
-/// dropped. `client` serves the reconciles; `watches`, from
-/// `watch_client::watch_client`, every watch (hyper#4207, #129).
+/// dropped. `client` serves the reconciles; `watches`, a client with no
+/// per-request bound, every watch.
 pub async fn run(client: Client, watches: Client, cfg: RunConfig) {
     let ctx = Arc::new(Context::new(client, cfg));
     let namespaces: Vec<Option<String>> = match &ctx.run.watch_namespaces {

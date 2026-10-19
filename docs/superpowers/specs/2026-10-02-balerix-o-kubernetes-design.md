@@ -1761,8 +1761,10 @@ Known in 3b and left open:
   request no longer hangs a test: probes are bounded at 5 s and every
   other request at 10 s (§22.1).
 - The lost requests are hyper#4207 (a stale HTTP/1 want pools a connection
-  mid-watch); until a fixed hyper ships, the watches run on an unpooled
-  client (#129). The per-request timeout is §22.1.
+  mid-watch); until a fixed hyper shipped, the watches ran on an unpooled
+  client (#129). The per-request timeout is §22.1. hyper 1.12.0 has the fix
+  (2026-10): the watches run on kube's own client, and the operator's
+  `Cargo.toml` keeps hyper at 1.12.0 or later.
 - Done in §27 (#128): §8.5's "the Agent's branch changed" row was not
   built: a branch change is a spec change, so the Pod was replaced on
   the same claim, and the sidecar's `ensure_clone` then wanted to
@@ -1816,7 +1818,10 @@ down-record purge path (#135); the runtime flakes #136 and #137.
   not the test.
 - **`watch_client` stays** until a hyper with the fix for hyperium/hyper#4207
   (hyperium/hyper#4208 and seanmonstar/want#6) ships. #129 closes with this
-  item; the upstream report is hyper#4207 itself.
+  item; the upstream report is hyper#4207 itself. *Done 2026-10:* hyper
+  1.12.0 (want 0.3.2) ships the fix; `watch_client` is removed and the
+  watches run on `Client::try_from`, unbounded, still apart from the
+  reconcile client so its bound never cuts a watch.
 - **This amends §21.6.** Its "per-request client timeout for production"
   item is done, and its "occasional 180 s hang" item no longer holds: a
   probe is bounded at 5 s and every other test request at 10 s.

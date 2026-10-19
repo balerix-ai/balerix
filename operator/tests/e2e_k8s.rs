@@ -476,10 +476,9 @@ async fn the_phase_3_journey_on_kind() {
     // 5. drop bob: harvested into the crew cache. The harvest Job and its
     // pod are bob's Agent's and go with it, so their outcome is watched
     // as it happens, not read after
-    // on a client of their own (`watch_client`, #129): a watch on the pooled
-    // `client` could hold up the probes below for up to 290 s
-    let watch_client =
-        balerix_operator::watch_client::watch_client(kube::Config::infer().await.unwrap()).unwrap();
+    // on an unbounded client of their own: `client`'s per-request bound
+    // would cut the watches
+    let watch_client = kube::Client::try_from(kube::Config::infer().await.unwrap()).unwrap();
     let jobs: Api<Job> = Api::namespaced(watch_client.clone(), &ns);
     let watch_pods: Api<Pod> = Api::namespaced(watch_client, &ns);
     let succeeded = Arc::new(Mutex::new(None::<i32>));

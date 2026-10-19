@@ -395,7 +395,7 @@ async fn as_service_account(env: &EnvTest, namespace: &str, name: &str) -> (Clie
     ]);
     (
         balerix_operator::request_client::request_client(config.clone()).unwrap(),
-        balerix_operator::watch_client::watch_client(config).unwrap(),
+        Client::try_from(config).unwrap(),
     )
 }
 

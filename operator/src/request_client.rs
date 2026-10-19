@@ -5,8 +5,8 @@
 //! reads the body after it. It sits outside kube's default stack, so it
 //! also covers kube's own 429/503/504 retries and a credential refresh: a
 //! throttled or restarting API server fails as `Error::Kube`, not a long
-//! wait. Watches never run on this client: they get `watch_client`'s,
-//! where a bound would cut an idle watch.
+//! wait. Watches never run on this client: they get kube's own
+//! `Client::try_from`, where a bound would cut an idle watch.
 
 use std::time::Duration;
 

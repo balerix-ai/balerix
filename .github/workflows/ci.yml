@@ -55,7 +55,7 @@ jobs:
       # expensive project, and what Spec H §7's promise is really about —
       # stays fully independent either way.
       - if: steps.changes.outputs.run == 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             . -> target
@@ -99,7 +99,7 @@ jobs:
       # One cache per plugin project: each has its own lockfile and its own
       # target directory under plugins/<name>/target (scripts/plugin.sh).
       - if: steps.changes.outputs.run == 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: "plugins/${{ matrix.plugin }} -> target"
           key: ${{ matrix.plugin }}
@@ -127,7 +127,7 @@ jobs:
       - if: steps.changes.outputs.run == 'true'
         run: mise install rust cargo:cargo-nextest tmux nono gh
       - if: steps.changes.outputs.run == 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             . -> target
@@ -159,7 +159,7 @@ jobs:
           mise install rust cargo:cargo-nextest tmux nono gh
           scripts/task-tools.sh install operator
       - if: steps.changes.outputs.run == 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             . -> target
@@ -192,7 +192,7 @@ jobs:
           mise install rust cargo:cargo-nextest
           scripts/task-tools.sh install charts
       - if: steps.changes.outputs.run == 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             operator -> target
@@ -226,7 +226,7 @@ jobs:
           mise install rust jq cargo:cargo-nextest
           scripts/task-tools.sh install kind-up e2e-k8s
       - if: steps.changes.outputs.run == 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             . -> target

@@ -2,7 +2,7 @@
 # git is a system prerequisite (not in the mise registry); the devcontainer ships 2.47.3.
 [tools]
 rust = { version = "1.99.1", components = ["rustfmt", "clippy"] }
-"cargo:cargo-nextest" = "0.9.148"
+"cargo:cargo-nextest" = "0.9.149"
 cargo-insta = "1.49.0"
 "cargo:cargo-audit" = "0.22.2"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"

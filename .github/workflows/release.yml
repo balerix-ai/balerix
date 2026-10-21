@@ -52,7 +52,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: mise install rust jq cargo:cargo-audit aqua:EmbarkStudios/cargo-deny
@@ -90,7 +90,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: mise install rust jq
@@ -135,7 +135,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: mise install rust jq hadolint trivy
@@ -201,7 +201,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: mise install rust jq cosign
@@ -246,7 +246,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: mise install rust jq
@@ -296,7 +296,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: |
@@ -391,7 +391,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: |
@@ -434,7 +434,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: mise install rust jq
@@ -472,7 +472,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: mise install rust jq
@@ -517,7 +517,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: mise install rust jq gh
@@ -580,7 +580,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: |
@@ -606,7 +606,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: |
@@ -637,7 +637,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: mise install rust jq gh
@@ -676,7 +676,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde # v5.2.1
         with:
-          version: 2026.10.15
+          version: 2026.10.17
           install: false
           cache: false
       - run: mise install rust jq gh

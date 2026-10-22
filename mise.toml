@@ -21,7 +21,7 @@ node = "26.12.1"
 # table reach agents (balerix-runtime's INHERITED list).
 jq = "1.8.2"
 git-cliff = "2.14.2"
-"cargo:cargo-edit" = "0.13.13"
+"cargo:cargo-edit" = "0.13.14"
 cosign = "3.1.4"
 hadolint = "2.15.1"
 trivy = "0.76.1"

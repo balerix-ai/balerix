@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.1 - 2026-10-24
+
+### Bug fixes
+
+- **deps:** Update ghcr.io/balerix-ai/balerix docker tag to v0.3.0 (#337)
+- **deps:** Update rust crate tokio to 1.54.0 (#349)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to 5167571 (#354)
+- **deps:** Update debian:trixie-slim docker digest to 62bd423 (#361)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to d620678 (#366)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to 18f4cc2 (#374)
+
+### Refactoring
+
+- **operator:** Drop the unpooled watch client now hyper 1.12.0 has the fix (#345)
+
 ## 0.3.0 - 2026-10-17
 
 ### Features

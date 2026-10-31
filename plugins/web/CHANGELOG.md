@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 - 2026-10-31
+
+### Bug fixes
+
+- **deps:** Update rust crate tokio to 1.54.0 (#349)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to 5167571 (#354)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to d620678 (#366)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to 18f4cc2 (#374)
+
 ## 0.3.0 - 2026-10-17
 
 ### Features

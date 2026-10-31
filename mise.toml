@@ -15,7 +15,7 @@ claude = "2.1.304"
 # The web plugin's review-page script runs under node in its tests
 # (plugins/web/src/routes.rs, #20). The 26 line, LTS from late October
 # 2026; never inherited by agents (INHERITED is claude and gh only).
-node = "26.12.1"
+node = "26.13.0"
 
 # Release and workflow tooling (Spec I). Only `claude` and `gh` from this
 # table reach agents (balerix-runtime's INHERITED list).

@@ -9,7 +9,7 @@ cargo-insta = "1.49.0"
 "github:sourcefrog/cargo-mutants" = "27.1.0"
 gitleaks = "8.30.1"
 tmux = "3.7c"
-gh = "2.102.0"
+gh = "2.103.3"
 nono = "0.80.0"
 claude = "2.1.304"
 # The web plugin's review-page script runs under node in its tests

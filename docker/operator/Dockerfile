@@ -2,7 +2,7 @@
 # as the plugin images are. The context from the release scripts
 # (sub-project 5) or scripts/kind-up.sh holds it as `balerix-operator`.
 # distroless/static carries the CA bundle the Kubernetes client needs.
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:18f4cc26c9ffa7f20a359298be7deadac5c607c8e03a02b8119f1a5fc2f82c99
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
 COPY --chmod=0755 balerix-operator /usr/local/bin/balerix-operator
 ENTRYPOINT ["/usr/local/bin/balerix-operator"]
 CMD ["run"]

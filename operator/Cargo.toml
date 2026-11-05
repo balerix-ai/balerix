@@ -36,7 +36,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 # The client, the controller runtime and the derive. `rustls-tls` + `ring`
 # is kube 4.2's default TLS stack, on the provider the Daemon client uses.
-kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ring"] }
+kube = { version = "5.0.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ring"] }
 # Not used directly: the floor for kube's hyper. 1.12.0 has the fix for a
 # connection pooled while a watch still streams on it (hyperium/hyper#4207,
 # #129); older ones lose requests.

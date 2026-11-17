@@ -1,6 +1,6 @@
 {
   "name": "balerix",
-  "image": "ghcr.io/rahulmutt/dev:sha-1707365",
+  "image": "ghcr.io/rahulmutt/dev:sha-48845ce",
   "workspaceFolder": "/workspace",
   "remoteUser": "dev",
   "postCreateCommand": "post-create.sh",

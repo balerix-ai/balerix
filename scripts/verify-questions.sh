@@ -169,8 +169,9 @@ run_case() {
   fi
   play "$ROOT/$name.plan.json"
   if [ "$want" = declined ]; then
-    if wait_for 30 pane_has 'declined to answer'; then say "PASS $name"; else
+    if wait_for 30 pane_has '[Dd]eclined to answer'; then say "PASS $name"; else
       say "FAIL $name: claude did not report a declined question"
+      pane | grep -v '^\s*$' | tail -n 12
       fails=$((fails + 1))
       reset
       return

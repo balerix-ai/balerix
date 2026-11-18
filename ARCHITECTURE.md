@@ -430,7 +430,7 @@ makes an existing remote branch its clone's branch and start point
   is what tells the daemon apart (§18.3). Still protocol 1.
 - **An attach is a grouped tmux session, set `destroy-unattached` after
   the client is on it.** Attaching the crew session would flip the
-  operator's current window; a grouped session has its own. tmux 3.7c
+  operator's current window; a grouped session has its own. tmux 3.8
   destroys a detached session the instant the option lands, so the
   create, select, set sequence runs in the PTY with the client attached.
   `kill-session` on the crew alone leaves windows alive in the group, so

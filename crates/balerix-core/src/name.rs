@@ -88,15 +88,18 @@ macro_rules! name_type {
 
 name_type!(
     /// Name of a fleet.
-    FleetName, "fleet"
+    FleetName,
+    "fleet"
 );
 name_type!(
     /// Name of a crew within a fleet.
-    CrewName, "crew"
+    CrewName,
+    "crew"
 );
 name_type!(
     /// Name of an agent within a crew.
-    AgentName, "agent"
+    AgentName,
+    "agent"
 );
 
 /// Fully-qualified agent identity, written `fleet/crew/agent`.

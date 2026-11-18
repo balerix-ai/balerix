@@ -496,7 +496,11 @@ pub(crate) fn parse_windows(
         let Ok(agent) = name.parse::<AgentName>() else {
             continue; // a window we did not create; ignore
         };
-        let state = if dead == "1" {
+        // tmux 3.8 clears `pane_pid` when the pane's process exits, and a
+        // listing can land after that and before `pane_dead` is set (seen
+        // in CI as `a\t0\t\t` during a pod-mode stop): no pid is an exited
+        // process whose status tmux has not reported yet.
+        let state = if dead == "1" || pid.is_empty() {
             ProcessState::Exited {
                 code: status.parse().ok(),
             }
@@ -1099,6 +1103,29 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("expected 4 columns")
+        );
+    }
+
+    /// tmux 3.8 clears `pane_pid` when the pane's process exits and can
+    /// list the pane like that a moment before it sets `pane_dead`.
+    #[test]
+    fn a_live_pane_with_no_pid_has_exited_with_its_status_not_yet_known() {
+        let f: FleetName = "f".parse().unwrap();
+        let c: CrewName = "c".parse().unwrap();
+        let w = parse_windows(&f, &c, "balerix\t0\t10\t\na\t0\t\t\nb\t1\t\t\n").unwrap();
+        assert_eq!(
+            w[&"a".parse::<AgentName>().unwrap()],
+            ProcessState::Exited { code: None }
+        );
+        assert_eq!(
+            w[&"b".parse::<AgentName>().unwrap()],
+            ProcessState::Exited { code: None }
+        );
+        assert!(
+            parse_windows(&f, &c, "a\t0\tx\t\n")
+                .unwrap_err()
+                .to_string()
+                .contains("bad pid")
         );
     }
 

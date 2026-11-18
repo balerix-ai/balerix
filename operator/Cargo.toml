@@ -33,7 +33,7 @@ balerix-config = { path = "../crates/balerix-config" }
 # Error context on the entrypoint's failures.
 anyhow = "1.0.104"
 # The command line: `crds` and `run`; `env` for `--namespace`'s POD_NAMESPACE.
-clap = { version = "4.6.7", features = ["derive", "env"] }
+clap = { version = "4.6.8", features = ["derive", "env"] }
 # The client, the controller runtime and the derive. `rustls-tls` + `ring`
 # is kube 4.2's default TLS stack, on the provider the Daemon client uses.
 kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ring"] }
@@ -64,7 +64,7 @@ thiserror = "2.0.21"
 sha2 = "0.11.1"
 hex = "0.4.3"
 # Tokens (agent, admin): 32 random bytes, as the daemon's vault mints them.
-rand = "0.10.3"
+rand = "0.10.4"
 # The per-Daemon authority and serving certificates (Spec O §10.3).
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 # rcgen's validity dates.
@@ -73,7 +73,7 @@ time = "0.3.55"
 # rustls with no provider of its own, ring below. The same stack as agent/.
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pki-types = { version = "1.15.1", features = ["std"] }
+rustls-pki-types = { version = "1.16.0", features = ["std"] }
 # The controllers' runtime, SIGTERM, the record cache's locks, the
 # envtest harness's child processes in tests.
 tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync", "process"] }

@@ -27,7 +27,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls", 
 # the crypto backend jsonwebtoken 11 now requires explicitly; reqwest's
 # rustls already pulls aws-lc-rs, so this reuses it rather than adding
 # the pure-Rust `rust_crypto` backend's own dependency tree.
-jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12.0.0", features = ["aws_lc_rs"] }
 # Webhook signatures: HMAC-SHA256 over the raw body.
 hmac = "0.13.0"
 sha2 = "0.11.1"

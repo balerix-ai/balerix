@@ -65,7 +65,7 @@ portable-pty = "0.9.0"
 # binds rustls to axum; `tls-rustls-no-provider` so the crypto provider is
 # chosen here — ring, which builds for static musl with no cmake and a
 # smaller C build than aws-lc-rs — rather than aws-lc-rs.
-axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.9.0", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 prometheus = "0.14.0"

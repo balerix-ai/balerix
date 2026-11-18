@@ -74,7 +74,7 @@ pub fn agent_env(
     }
     // The pane's own TERM never arrives: `launch.sh` runs `env -i` and the
     // profile denies every variable. Without one claude renders no colour.
-    // `tmux-256color` is what tmux 3.7c gives its panes; these are defaults,
+    // `tmux-256color` is what tmux 3.8 gives its panes; these are defaults,
     // not isolation rows, so user `env` wins (a host lacking that terminfo
     // sets another).
     for (k, v) in [("TERM", "tmux-256color"), ("COLORTERM", "truecolor")] {

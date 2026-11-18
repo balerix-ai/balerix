@@ -469,7 +469,8 @@ pub fn plan(questions: &[Question], selections: &[Selection]) -> Vec<KeyStep> {
     steps
 }
 
-/// Declining the dialog: Claude sees "User declined to answer questions".
+/// Declining the dialog: the pane shows "Declined to answer Claude's questions"
+/// (claude 2.1.327; "User declined to answer questions" before it).
 pub fn skip_plan() -> Vec<KeyStep> {
     vec![KeyStep::Key(Key::Escape)]
 }

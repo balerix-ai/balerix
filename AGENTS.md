@@ -625,7 +625,7 @@ credentials, hook input, or sandbox rules.
   is a session grouped with the crew's, and `kill-session` on the crew
   alone would leave its windows — and the agents — alive in the group.
 - Never set `destroy-unattached` on an attach session before its client
-  is attached: tmux 3.7c destroys a detached session the moment the option
+  is attached: tmux 3.8 destroys a detached session the moment the option
   lands. `TmuxRunner::attach` runs create, select-window and both
   set-options as one command sequence inside the PTY.
 - Every daemon → plugin call carries the plugin's own token; the SDK

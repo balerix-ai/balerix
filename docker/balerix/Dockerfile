@@ -1,7 +1,7 @@
 # The balerix runtime image (Spec I §6.2): the static `balerix` plus every
 # tool `serve` looks for on PATH. Built by scripts/release/image-context.sh's
 # context: `balerix` (a built binary) and the repository's mise.toml.
-FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS base
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS base
 
 FROM base AS tools
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]

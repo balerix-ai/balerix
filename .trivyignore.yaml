@@ -2,13 +2,4 @@
 # Every entry names the binary it applies to, why it is accepted and when it
 # lapses. An expired entry fails the gate again: renew it only with a fresh
 # reason, and delete it once the pinned tool ships the fix (docs/RELEASING.md).
-vulnerabilities:
-  # gh 2.104.0, the newest release (built with Go 1.27.4), carries
-  # golang.org/x/net v0.61.0; the fix is in 0.62.0. gh is a client of
-  # GitHub's API here and the bug is a denial of service on crafted HTML.
-  # Drop this when mise.toml moves to a gh built with x/net 0.62.0 or later.
-  - id: CVE-2026-78661
-    paths:
-      - usr/local/bin/gh
-    expired_at: 2026-12-09
-    statement: golang.org/x/net/html DoS on crafted HTML in x/net v0.61.0; gh only talks to GitHub's API, so a malicious server would be needed; no gh release with x/net 0.62.0 yet
+vulnerabilities: []

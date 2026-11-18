@@ -536,6 +536,9 @@ fn mise_install_in_the_worktree_lands_privately_and_leaves_every_pool_alone() {
     let crew_paths = layout.crew(&id.crew_ref());
     let paths = layout.agent(&id);
     std::fs::create_dir_all(&paths.workspace).unwrap();
+    // `$HOME` for the install below, as `write_home` makes it: mise
+    // 2026.11.9 fails on a `HOME` that does not exist.
+    std::fs::create_dir_all(&paths.home).unwrap();
 
     let (url, hits) = support::serve_tarball(support::probe_tarball(&root));
 

@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-api"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-config"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "balerix-api",
  "balerix-core",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "balerix-api",
  "hex",
@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "balerix-operator"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",

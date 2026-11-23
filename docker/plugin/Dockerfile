@@ -2,6 +2,6 @@
 # scripts/release/image-context.sh holds it as `plugin`, whichever plugin it
 # is. distroless/static carries the CA bundle matrix's HTTP client needs.
 # The daemon does not run plugins from images; it runs the release package.
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:8ce6dd87e9823c5b48dcfb2c8604714ccb351ce59607327bcc4957448da279b5
 COPY --chmod=0755 plugin /usr/local/bin/balerix-plugin
 ENTRYPOINT ["/usr/local/bin/balerix-plugin"]

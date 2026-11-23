@@ -29,7 +29,7 @@ balerix-api = { path = "../crates/balerix-api", features = ["axum"] }
 balerix-core = { path = "../crates/balerix-core" }
 balerix-runtime = { path = "../crates/balerix-runtime" }
 # Error context on the entrypoints' failures, printed as the exit reason.
-anyhow = "1.0.104"
+anyhow = "1.0.105"
 # The command line: `sidecar` and `run` with the pod's mount defaults.
 clap = { version = "4.6.9", features = ["derive"] }
 # The agent bundle (Spec O §5.4) and the link's frames (§7.2).

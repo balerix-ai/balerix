@@ -40,7 +40,7 @@ kube = { version = "5.1.0", default-features = false, features = ["client", "run
 # Not used directly: the floor for kube's hyper. 1.12.0 has the fix for a
 # connection pooled while a watch still streams on it (hyperium/hyper#4207,
 # #129); older ones lose requests.
-hyper = { version = "1.12.0", default-features = false }
+hyper = { version = "1.13.0", default-features = false }
 # The reconcile client's per-request bound (`request_client`).
 tower = { version = "0.5.3", default-features = false, features = ["timeout", "util"] }
 # The controllers' streams: `for_each` over a Controller's results.

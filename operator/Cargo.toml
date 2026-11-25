@@ -61,7 +61,7 @@ serde_norway = "0.9.42"
 # Typed errors for the library modules.
 thiserror = "2.0.21"
 # specHash and the Jobs' input hash.
-sha2 = "0.11.1"
+sha2 = "0.11.2"
 hex = "0.4.3"
 # Tokens (agent, admin): 32 random bytes, as the daemon's vault mints them.
 rand = "0.10.4"

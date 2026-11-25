@@ -30,7 +30,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls", 
 jsonwebtoken = { version = "12.0.0", features = ["aws_lc_rs"] }
 # Webhook signatures: HMAC-SHA256 over the raw body.
 hmac = "0.13.0"
-sha2 = "0.11.1"
+sha2 = "0.11.2"
 # `contents` API bodies are base64.
 base64 = "0.23.1"
 # `.balerix.yaml` is parsed here (the core's YAML crate).

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 - 2026-11-25
+
+### Bug fixes
+
+- **deps:** Update kube to 5.1.0 and k8s-openapi to 0.29.0 (#407)
+
 ## 0.2.0 - 2026-10-17
 
 ### Features

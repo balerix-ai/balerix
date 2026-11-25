@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.3.1 - 2026-11-25
+
+### Bug fixes
+
+- **deps:** Update ghcr.io/balerix-ai/balerix docker tag to v0.3.0 (#337)
+- **deps:** Update rust crate tokio to 1.54.0 (#349)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to 5167571 (#354)
+- **deps:** Update debian:trixie-slim docker digest to 62bd423 (#361)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to d620678 (#366)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to 18f4cc2 (#374)
+- **deps:** Update debian:trixie-slim docker digest to 89c1ea9 (#380)
+- **deps:** Update debian:trixie-slim docker digest to f6b08b0 (#384)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to 25ac8f0 (#387)
+- **deps:** Update debian:trixie-slim docker digest to a72b443 (#391)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to aafe993 (#392)
+- **deps:** Update rust crate clap to 4.6.8 (agent) (#399)
+- **deps:** Update cargo patch updates (operator) (#397)
+- **deps:** Update rust crate rustls-pki-types to 1.16.0 (agent) (#401)
+- **runtime:** Treat a pane tmux lists with no pid as exited (#403)
+- **deps:** Update kube to 5.1.0 and k8s-openapi to 0.29.0 (#407)
+- **deps:** Update rust crate clap to 4.6.9 (agent) (#417)
+- **deps:** Update rust crate clap to 4.6.9 (operator) (#418)
+- **deps:** Update rust crate anyhow to 1.0.105 (agent) (#428)
+- **deps:** Update gcr.io/distroless/static-debian13:nonroot docker digest to 8ce6dd8 (#425)
+- **deps:** Update rust crate anyhow to 1.0.105 (operator) (#429)
+- **deps:** Update debian:trixie-slim docker digest to 8aa5a7b (#437)
+- **deps:** Update rust crate clap to 4.6.10 (operator) (#443)
+- **deps:** Update rust crate clap to 4.6.10 (agent) (#442)
+- **deps:** Update rust crate sha2 to 0.11.2 (operator) (#447)
+
+### Refactoring
+
+- **operator:** Drop the unpooled watch client now hyper 1.12.0 has the fix (#345)
+
 ## 0.3.0 - 2026-10-17
 
 ### Features
